@@ -7,12 +7,12 @@ from typing import Tuple
 
 from hello_agents import ToolAwareSimpleAgent
 
-from models import SummaryState, TodoItem
 from config import Configuration
 from metrics import RequestTrace
-from utils import strip_thinking_tokens, truncate_text
+from models import SummaryState, TodoItem
 from services.notes import build_note_guidance
 from services.text_processing import strip_tool_calls
+from utils import strip_thinking_tokens, truncate_text
 
 
 class SummarizationService:
@@ -34,7 +34,6 @@ class SummarizationService:
         observer: RequestTrace | None = None,
     ) -> str:
         """Generate a task-specific summary using the summarizer agent."""
-
         prompt = self._build_prompt(state, task, context)
 
         agent = self._agent_factory()
@@ -75,7 +74,6 @@ class SummarizationService:
         observer: RequestTrace | None = None,
     ) -> Tuple[Iterator[str], Callable[[], str]]:
         """Stream the summary text for a task while collecting full output."""
-
         prompt = self._build_prompt(state, task, context)
         remove_thinking = self._config.strip_thinking_tokens
         raw_buffer = ""
@@ -162,7 +160,6 @@ class SummarizationService:
 
     def _build_prompt(self, state: SummaryState, task: TodoItem, context: str) -> str:
         """Construct the summarization prompt shared by both modes."""
-
         trimmed_context = truncate_text(
             context,
             self._config.resolved_task_context_char_limit(),

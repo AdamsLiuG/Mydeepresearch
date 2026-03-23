@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from models import SummaryState, TodoItem
 
@@ -24,23 +24,22 @@ class ToolCallEvent:
     raw_parameters: str
     parsed_parameters: dict[str, Any]
     result: str
-    task_id: Optional[int]
-    note_id: Optional[str]
+    task_id: int | None
+    note_id: str | None
 
 
 class ToolCallTracker:
     """Collects tool call events and converts them to SSE payloads."""
 
-    def __init__(self, notes_workspace: Optional[str]) -> None:
+    def __init__(self, notes_workspace: str | None) -> None:
         self._notes_workspace = notes_workspace
         self._events: list[ToolCallEvent] = []
         self._cursor = 0
         self._lock = Lock()
-        self._event_sink: Optional[Callable[[dict[str, Any]], None]] = None
+        self._event_sink: Callable[[dict[str, Any]], None] | None = None
 
     def record(self, payload: dict[str, Any]) -> None:
         """记录模型工具调用情况，便于日志与前端展示。"""
-
         agent_name = str(payload.get("agent_name") or "unknown")
         tool_name = str(payload.get("tool_name") or "unknown")
         raw_parameters = str(payload.get("raw_parameters") or "")
@@ -51,7 +50,7 @@ class ToolCallTracker:
             parsed_parameters = {}
 
         task_id = self._infer_task_id(parsed_parameters)
-        note_id: Optional[str] = None
+        note_id: str | None = None
 
         if tool_name == "note":
             note_id = parsed_parameters.get("note_id")
@@ -88,9 +87,8 @@ class ToolCallTracker:
     # ------------------------------------------------------------------
     # Draining helpers
     # ------------------------------------------------------------------
-    def drain(self, state: SummaryState, *, step: Optional[int] = None) -> list[dict[str, Any]]:
+    def drain(self, state: SummaryState, *, step: int | None = None) -> list[dict[str, Any]]:
         """提取尚未消费的工具调用事件，并同步任务的 note_id。"""
-
         with self._lock:
             if self._cursor >= len(self._events):
                 return []
@@ -114,14 +112,12 @@ class ToolCallTracker:
 
     def reset(self) -> None:
         """Clear recorded events."""
-
         with self._lock:
             self._events.clear()
             self._cursor = 0
 
     def as_dicts(self) -> list[dict[str, Any]]:
         """Expose a snapshot of raw events for backwards compatibility."""
-
         with self._lock:
             return [
                 {
@@ -137,12 +133,11 @@ class ToolCallTracker:
                 for event in self._events
             ]
 
-    def set_event_sink(self, sink: Optional[Callable[[dict[str, Any]], None]]) -> None:
+    def set_event_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
         """Register a callback for immediate tool event notifications."""
-
         self._event_sink = sink
 
-    def _build_payload(self, event: ToolCallEvent, step: Optional[int]) -> dict[str, Any]:
+    def _build_payload(self, event: ToolCallEvent, step: int | None) -> dict[str, Any]:
         payload = {
             "type": "tool_call",
             "event_id": event.id,
@@ -165,7 +160,6 @@ class ToolCallTracker:
     # ------------------------------------------------------------------
     def _attach_note_to_task(self, tasks: list[TodoItem], task_id: int, note_id: str) -> None:
         """Update matching TODO item with note metadata."""
-
         for task in tasks:
             if task.id != task_id:
                 continue
@@ -178,9 +172,8 @@ class ToolCallTracker:
                 task.note_path = str(Path(self._notes_workspace) / f"{note_id}.md")
             break
 
-    def _infer_task_id(self, parameters: dict[str, Any]) -> Optional[int]:
+    def _infer_task_id(self, parameters: dict[str, Any]) -> int | None:
         """尝试从工具参数推断 task_id。"""
-
         if not parameters:
             return None
 
@@ -205,7 +198,7 @@ class ToolCallTracker:
 
         return None
 
-    def _extract_note_id(self, response: str) -> Optional[str]:
+    def _extract_note_id(self, response: str) -> str | None:
         if not response:
             return None
 

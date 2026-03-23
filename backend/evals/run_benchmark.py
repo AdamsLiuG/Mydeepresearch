@@ -21,7 +21,6 @@ from evals.runner import run_benchmark_suite
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI options for the benchmark runner."""
-
     parser = argparse.ArgumentParser(description="Run offline benchmark cases.")
     parser.add_argument(
         "--input",
@@ -54,7 +53,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """Run the benchmark suite and print a compact summary."""
-
     args = parse_args()
     cases = load_benchmark_cases(args.input)
     if args.limit and args.limit > 0:

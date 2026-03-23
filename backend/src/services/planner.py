@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, List, Optional
+from typing import Any, List
 
 from hello_agents import ToolAwareSimpleAgent
 
-from models import SummaryState, TodoItem
 from config import Configuration
 from metrics import RequestTrace
+from models import SummaryState, TodoItem
 from prompts import get_current_date, todo_planner_instructions
 from utils import strip_thinking_tokens
 
@@ -35,7 +35,6 @@ class PlanningService:
         observer: RequestTrace | None = None,
     ) -> List[TodoItem]:
         """Ask the planner agent to break the topic into actionable tasks."""
-
         prompt = todo_planner_instructions.format(
             current_date=get_current_date(),
             research_topic=state.research_topic,
@@ -92,7 +91,6 @@ class PlanningService:
     @staticmethod
     def create_fallback_task(state: SummaryState) -> TodoItem:
         """Create a minimal fallback task when planning failed."""
-
         return TodoItem(
             id=1,
             title="基础背景梳理",
@@ -105,7 +103,6 @@ class PlanningService:
     # ------------------------------------------------------------------
     def _extract_tasks(self, raw_response: str) -> List[dict[str, Any]]:
         """Parse planner output into a list of task dictionaries."""
-
         text = raw_response.strip()
         if self._config.strip_thinking_tokens:
             text = strip_thinking_tokens(text)
@@ -133,9 +130,8 @@ class PlanningService:
 
         return tasks
 
-    def _extract_json_payload(self, text: str) -> Optional[dict[str, Any] | list]:
+    def _extract_json_payload(self, text: str) -> dict[str, Any] | list | None:
         """Try to locate and parse a JSON object or array from the text."""
-
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -156,9 +152,8 @@ class PlanningService:
 
         return None
 
-    def _extract_tool_payload(self, text: str) -> Optional[dict[str, Any]]:
+    def _extract_tool_payload(self, text: str) -> dict[str, Any] | None:
         """Parse the first TOOL_CALL expression in the output."""
-
         match = TOOL_CALL_PATTERN.search(text)
         if not match:
             return None

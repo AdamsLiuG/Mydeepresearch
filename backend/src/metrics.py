@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from time import perf_counter
-from typing import Any, Optional
+from typing import Any
 
 CHARS_PER_TOKEN = 4
 
@@ -287,7 +287,7 @@ class StageSpan:
 
     def __init__(
         self,
-        observer: "RequestTrace",
+        observer: RequestTrace,
         *,
         stage: str,
         scope: str,

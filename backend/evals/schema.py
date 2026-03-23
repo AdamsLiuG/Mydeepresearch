@@ -40,9 +40,8 @@ class BenchmarkCase:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "BenchmarkCase":
+    def from_dict(cls, payload: dict[str, Any]) -> BenchmarkCase:
         """Create a benchmark case from a plain dictionary."""
-
         if not isinstance(payload, dict):
             raise ValueError("benchmark payload must be an object")
 
@@ -83,5 +82,4 @@ class BenchmarkCase:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the benchmark case to a serializable dictionary."""
-
         return asdict(self)

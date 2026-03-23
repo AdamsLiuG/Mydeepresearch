@@ -59,7 +59,6 @@ def evaluate_case(
     request_id_prefix: str = "eval",
 ) -> dict[str, Any]:
     """Run a single benchmark case and return structured metrics."""
-
     judge_impl = judge or HeuristicJudge()
 
     report_markdown = ""
@@ -109,7 +108,6 @@ def evaluate_case(
 
 def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate per-case results into a compact benchmark summary."""
-
     total = len(results)
     if total == 0:
         return {
@@ -165,7 +163,6 @@ def run_benchmark_suite(
     request_id_prefix: str = "eval",
 ) -> dict[str, Any]:
     """Run a full benchmark suite and optionally write the result file."""
-
     results = [
         evaluate_case(
             case,

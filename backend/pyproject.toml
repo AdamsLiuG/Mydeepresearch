@@ -46,8 +46,6 @@ lint.select = [
     "E",    # pycodestyle
     "F",    # pyflakes
     "I",    # isort
-    "D",    # pydocstyle
-    "D401", # First line should be in imperative mood
     "T201",
     "UP",
 ]
@@ -55,12 +53,20 @@ lint.ignore = [
     "UP006",
     "UP007",
     "UP035",
-    "D417",
     "E501",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D107",
+    "D401",
+    "D415",
+    "D417",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D", "UP"]
+"evals/run_benchmark.py" = ["E402", "T201"]
+"tests/*" = ["E402", "UP"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

@@ -15,12 +15,12 @@ from hello_agents.tools.builtin.note_tool import NoteTool
 
 from config import Configuration
 from metrics import RequestTrace
+from models import SummaryState, SummaryStateOutput, TodoItem
 from prompts import (
     report_writer_instructions,
     task_summarizer_instructions,
     todo_planner_system_prompt,
 )
-from models import SummaryState, SummaryStateOutput, TodoItem
 from services.planner import PlanningService
 from services.reporter import ReportingService
 from services.search import dispatch_search, prepare_research_context
@@ -36,7 +36,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
     @staticmethod
     def _coerce_text(value: Any) -> str:
         """Best-effort extraction of text from OpenAI-compatible response fields."""
-
         if value is None:
             return ""
 
@@ -69,7 +68,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
     @classmethod
     def _extract_message_text(cls, payload: Any) -> tuple[str, str]:
         """Return `(content, reasoning)` from a message or delta object."""
-
         if payload is None:
             return "", ""
 
@@ -92,7 +90,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
     @classmethod
     def _extract_chunk_text(cls, chunk: Any) -> tuple[str, str]:
         """Return `(content, reasoning)` from a streamed completion chunk."""
-
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             return "", ""
@@ -110,7 +107,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build request kwargs shared by sync and streaming invocations."""
-
         request_kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -128,7 +124,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 
     def _normalize_response_text(self, response: Any) -> str:
         """Normalize empty and non-string responses to strings."""
-
         if response is None:
             logger.warning(
                 "LLM returned empty content; normalizing to empty string provider=%s model=%s",
@@ -150,7 +145,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 
     def invoke(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
         """Aggregate a streaming response to avoid long blocking reads with local vLLM."""
-
         visible_parts: list[str] = []
         reasoning_parts: list[str] = []
 
@@ -177,7 +171,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 
     def stream_invoke(self, messages: list[dict[str, str]], **kwargs: Any) -> Iterator[str]:
         """Stream visible content, falling back to reasoning text if no answer content exists."""
-
         saw_visible_content = False
         buffered_reasoning: list[str] = []
 
@@ -210,7 +203,6 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         temperature: float | None = None,
     ) -> Iterator[str]:
         """Keep the upstream think API but route through the safer streaming path."""
-
         kwargs: dict[str, Any] = {}
         if temperature is not None:
             kwargs["temperature"] = temperature
@@ -320,7 +312,6 @@ class DeepResearchAgent:
 
     def _start_request_trace(self, topic: str) -> RequestTrace:
         """Create the per-request trace collector."""
-
         search_api = (
             self.config.search_api.value
             if hasattr(self.config.search_api, "value")
@@ -338,7 +329,6 @@ class DeepResearchAgent:
 
     def _request_status(self, state: SummaryState, report: str | None = None) -> str:
         """Resolve success state for the overall request."""
-
         if not report or not report.strip():
             return "failed"
 
@@ -763,8 +753,13 @@ class DeepResearchAgent:
             state.research_loop_count += 1
 
         summary_text: str | None = None
-        with_summary_slot = self._summary_slots.acquire
-        release_summary_slot = self._summary_slots.release
+        summary_slots = getattr(self, "_summary_slots", None)
+        if summary_slots is None:
+            summary_slots = Semaphore(self.config.task_summary_max_concurrency)
+            self._summary_slots = summary_slots
+
+        with_summary_slot = summary_slots.acquire
+        release_summary_slot = summary_slots.release
 
         with_summary_slot()
         try:
@@ -926,7 +921,6 @@ class DeepResearchAgent:
         step: int | None = None,
     ) -> list[dict[str, Any]]:
         """Update task state for a recoverable failure and emit stream events when needed."""
-
         task.status = "failed"
         task.summary = summary
         if detail and detail not in task.notices:

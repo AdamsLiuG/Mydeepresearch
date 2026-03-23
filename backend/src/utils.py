@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List
 
 CHARS_PER_TOKEN = 4
 
@@ -12,13 +12,11 @@ logger = logging.getLogger(__name__)
 
 def get_config_value(value: Any) -> str:
     """Return configuration value as plain string."""
-
     return value if isinstance(value, str) else value.value
 
 
 def strip_thinking_tokens(text: str) -> str:
     """Remove ``<think>`` sections from model responses."""
-
     while "<think>" in text and "</think>" in text:
         start = text.find("<think>")
         end = text.find("</think>") + len("</think>")
@@ -28,7 +26,6 @@ def strip_thinking_tokens(text: str) -> str:
 
 def truncate_text(text: str, max_chars: int, *, suffix: str = "... [truncated]") -> str:
     """Truncate text to a fixed character budget."""
-
     if max_chars <= 0:
         return ""
 
@@ -46,7 +43,6 @@ def deduplicate_and_format_sources(
     fetch_full_page: bool = False,
 ) -> str:
     """Format and deduplicate search results for downstream prompting."""
-
     if isinstance(search_response, dict):
         sources_list = search_response.get("results", [])
     else:
@@ -85,7 +81,6 @@ def deduplicate_and_format_sources(
 
 def format_sources(search_results: Dict[str, Any] | None) -> str:
     """Return bullet list summarising search sources."""
-
     if not search_results:
         return ""
 

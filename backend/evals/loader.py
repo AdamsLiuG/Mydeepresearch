@@ -35,7 +35,6 @@ def _read_jsonl_payload(path: Path) -> list[dict]:
 
 def load_benchmark_cases(path: str | Path) -> list[BenchmarkCase]:
     """Load benchmark cases from a JSON or JSONL file."""
-
     benchmark_path = Path(path).expanduser().resolve()
     if not benchmark_path.exists():
         raise FileNotFoundError(f"Benchmark file not found: {benchmark_path}")

@@ -6,11 +6,11 @@ import json
 
 from hello_agents import ToolAwareSimpleAgent
 
-from models import SummaryState
 from config import Configuration
 from metrics import RequestTrace
-from utils import strip_thinking_tokens, truncate_text
+from models import SummaryState
 from services.text_processing import strip_tool_calls
+from utils import strip_thinking_tokens, truncate_text
 
 
 class ReportingService:
@@ -26,7 +26,6 @@ class ReportingService:
         observer: RequestTrace | None = None,
     ) -> str:
         """Generate a structured report based on completed tasks."""
-
         tasks_block = []
         for task in state.todo_items:
             summary_block = truncate_text(

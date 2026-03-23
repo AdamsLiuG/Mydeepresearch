@@ -1,12 +1,11 @@
-import os
 import json
+import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
-
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _DOTENV_PATH = _BACKEND_ROOT / ".env"
@@ -15,13 +14,11 @@ _DOTENV_LOADED = False
 
 def backend_root() -> Path:
     """Return the backend project root directory."""
-
     return _BACKEND_ROOT
 
 
 def _load_backend_env() -> None:
     """Load the backend .env file once when available."""
-
     global _DOTENV_LOADED
     if _DOTENV_LOADED:
         return
@@ -96,17 +93,17 @@ class Configuration(BaseModel):
         title="Use Tool Calling",
         description="Use tool calling instead of JSON mode for structured output",
     )
-    llm_api_key: Optional[str] = Field(
+    llm_api_key: str | None = Field(
         default=None,
         title="LLM API Key",
         description="Optional API key when using custom OpenAI-compatible services",
     )
-    llm_base_url: Optional[str] = Field(
+    llm_base_url: str | None = Field(
         default=None,
         title="LLM Base URL",
         description="Optional base URL when using custom OpenAI-compatible services",
     )
-    llm_model_id: Optional[str] = Field(
+    llm_model_id: str | None = Field(
         default=None,
         title="LLM Model ID",
         description="Optional model identifier for custom OpenAI-compatible services",
@@ -146,12 +143,12 @@ class Configuration(BaseModel):
         title="Search Cache TTL",
         description="How long to keep in-process search cache entries",
     )
-    max_tokens_per_source: Optional[int] = Field(
+    max_tokens_per_source: int | None = Field(
         default=None,
         title="Max Tokens Per Source",
         description="Optional override for source token budget used when expanding search results into prompts",
     )
-    task_context_char_limit: Optional[int] = Field(
+    task_context_char_limit: int | None = Field(
         default=None,
         title="Task Context Character Limit",
         description="Optional override for task summarizer context character budget",
@@ -162,17 +159,17 @@ class Configuration(BaseModel):
         title="Task Summary Max Concurrency",
         description="Maximum number of task summarization LLM calls allowed to run at once",
     )
-    direct_answer_char_limit: Optional[int] = Field(
+    direct_answer_char_limit: int | None = Field(
         default=None,
         title="Direct Answer Character Limit",
         description="Optional override for search backend direct answer character budget",
     )
-    report_summary_char_limit: Optional[int] = Field(
+    report_summary_char_limit: int | None = Field(
         default=None,
         title="Report Summary Character Limit",
         description="Optional override for task summary budget in the final report prompt",
     )
-    report_sources_char_limit: Optional[int] = Field(
+    report_sources_char_limit: int | None = Field(
         default=None,
         title="Report Sources Character Limit",
         description="Optional override for task source budget in the final report prompt",
@@ -240,12 +237,11 @@ class Configuration(BaseModel):
     @classmethod
     def from_env(
         cls,
-        overrides: Optional[dict[str, Any]] = None,
+        overrides: dict[str, Any] | None = None,
         *,
         load_env_file: bool = True,
     ) -> "Configuration":
         """Create a configuration object using environment variables and overrides."""
-
         if load_env_file:
             _load_backend_env()
 
@@ -303,20 +299,17 @@ class Configuration(BaseModel):
 
     def sanitized_ollama_url(self) -> str:
         """Ensure Ollama base URL includes the /v1 suffix required by OpenAI clients."""
-
         base = self.ollama_base_url.rstrip("/")
         if not base.endswith("/v1"):
             base = f"{base}/v1"
         return base
 
-    def resolved_model(self) -> Optional[str]:
+    def resolved_model(self) -> str | None:
         """Best-effort resolution of the model identifier to use."""
-
         return self.llm_model_id or self.local_llm
 
     def resolved_context_window(self) -> int:
         """Return the configured model context window with a safe lower bound."""
-
         return max(2048, int(self.llm_context_window or 2048))
 
     @staticmethod
@@ -325,7 +318,6 @@ class Configuration(BaseModel):
 
     def resolved_max_tokens_per_source(self) -> int:
         """Resolve per-source token budget, scaling with model context by default."""
-
         if self.max_tokens_per_source is not None:
             return max(32, int(self.max_tokens_per_source))
 
@@ -334,7 +326,6 @@ class Configuration(BaseModel):
 
     def resolved_direct_answer_char_limit(self) -> int:
         """Resolve direct-answer character budget, scaling with model context by default."""
-
         if self.direct_answer_char_limit is not None:
             return max(100, int(self.direct_answer_char_limit))
 
@@ -343,7 +334,6 @@ class Configuration(BaseModel):
 
     def resolved_task_context_char_limit(self) -> int:
         """Resolve task summarization context budget, scaling with model context by default."""
-
         if self.task_context_char_limit is not None:
             return max(500, int(self.task_context_char_limit))
 
@@ -353,7 +343,6 @@ class Configuration(BaseModel):
 
     def resolved_report_summary_char_limit(self) -> int:
         """Resolve per-task summary budget for the final report prompt."""
-
         if self.report_summary_char_limit is not None:
             return max(100, int(self.report_summary_char_limit))
 
@@ -362,7 +351,6 @@ class Configuration(BaseModel):
 
     def resolved_report_sources_char_limit(self) -> int:
         """Resolve per-task source budget for the final report prompt."""
-
         if self.report_sources_char_limit is not None:
             return max(80, int(self.report_sources_char_limit))
 

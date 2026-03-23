@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,9 +14,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from agent import DeepResearchAgent
 from config import Configuration, SearchAPI
 from metrics import metrics_registry
-from agent import DeepResearchAgent
 
 LOG_FORMAT = (
     "%(asctime)s | %(levelname)-8s | %(name)s | "
@@ -37,7 +37,6 @@ class RequestContextFilter(logging.Filter):
 
 def configure_logging(level: str) -> None:
     """Configure the root logger for API and service observability."""
-
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format=LOG_FORMAT,
@@ -71,7 +70,7 @@ class ResearchResponse(BaseModel):
     )
 
 
-def _mask_secret(value: Optional[str], visible: int = 4) -> str:
+def _mask_secret(value: str | None, visible: int = 4) -> str:
     """Mask sensitive tokens while keeping leading and trailing characters."""
     if not value:
         return "unset"
@@ -93,7 +92,6 @@ def _build_config(payload: ResearchRequest) -> Configuration:
 
 def _request_id(request: Request) -> str:
     """Fetch the request identifier assigned by middleware."""
-
     return getattr(request.state, "request_id", "-")
 
 

@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
 from time import perf_counter
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 from hello_agents.tools import SearchTool
 
@@ -32,7 +32,7 @@ _CACHE_LOCK = Lock()
 class SearchCacheEntry:
     payload: dict[str, Any]
     notices: list[str]
-    answer_text: Optional[str]
+    answer_text: str | None
     backend_label: str
     created_at: float
 
@@ -42,7 +42,6 @@ _SEARCH_CACHE: dict[str, SearchCacheEntry] = {}
 
 def clear_search_cache() -> None:
     """Clear the in-process search cache."""
-
     with _CACHE_LOCK:
         _SEARCH_CACHE.clear()
 
@@ -93,9 +92,8 @@ def dispatch_search(
     config: Configuration,
     loop_count: int,
     observer: RequestTrace | None = None,
-) -> Tuple[dict[str, Any] | None, list[str], Optional[str], str, bool]:
+) -> Tuple[dict[str, Any] | None, list[str], str | None, str, bool]:
     """Execute configured search backend and normalise response payload."""
-
     search_api = get_config_value(config.search_api)
     cache_key = _build_cache_key(query, search_api, config)
     cache_hit = False
@@ -182,11 +180,10 @@ def dispatch_search(
 
 def prepare_research_context(
     search_result: dict[str, Any] | None,
-    answer_text: Optional[str],
+    answer_text: str | None,
     config: Configuration,
 ) -> tuple[str, str]:
     """Build structured context and source summary for downstream agents."""
-
     sources_summary = format_sources(search_result)
     context = deduplicate_and_format_sources(
         search_result or {"results": []},
