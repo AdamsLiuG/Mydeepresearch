@@ -1,0 +1,238 @@
+import sys
+import types
+import unittest
+from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
+from unittest.mock import patch
+
+BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(BACKEND_SRC) not in sys.path:
+    sys.path.insert(0, str(BACKEND_SRC))
+
+
+hello_agents_stub = types.ModuleType("hello_agents")
+
+
+class DummyLLM:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class DummyToolAwareSimpleAgent:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    def run(self, prompt: str):
+        return prompt
+
+    def stream_run(self, prompt: str):
+        if False:
+            yield prompt
+
+    def clear_history(self):
+        return None
+
+
+hello_agents_stub.HelloAgentsLLM = DummyLLM
+hello_agents_stub.ToolAwareSimpleAgent = DummyToolAwareSimpleAgent
+sys.modules.setdefault("hello_agents", hello_agents_stub)
+
+tools_stub = types.ModuleType("hello_agents.tools")
+
+
+class DummyToolRegistry:
+    def register_tool(self, tool):
+        self.tool = tool
+
+
+class DummySearchTool:
+    def __init__(self, backend="hybrid"):
+        self.backend = backend
+
+    def run(self, payload):
+        return payload
+
+
+tools_stub.ToolRegistry = DummyToolRegistry
+tools_stub.SearchTool = DummySearchTool
+sys.modules.setdefault("hello_agents.tools", tools_stub)
+
+tools_builtin_stub = types.ModuleType("hello_agents.tools.builtin")
+sys.modules.setdefault("hello_agents.tools.builtin", tools_builtin_stub)
+
+note_tool_stub = types.ModuleType("hello_agents.tools.builtin.note_tool")
+
+
+class DummyNoteTool:
+    def __init__(self, workspace=None):
+        self.workspace = workspace
+
+    def run(self, payload):
+        return "OK"
+
+
+note_tool_stub.NoteTool = DummyNoteTool
+sys.modules.setdefault("hello_agents.tools.builtin.note_tool", note_tool_stub)
+
+import agent as agent_module
+from config import Configuration
+from metrics import RequestTrace, metrics_registry
+from models import SummaryState, TodoItem
+
+
+class StubTracker:
+    def drain(self, state, *, step=None):
+        return []
+
+    def as_dicts(self):
+        return []
+
+    def set_event_sink(self, sink):
+        self.sink = sink
+
+
+class AgentExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        metrics_registry.reset()
+
+    def _build_agent(self):
+        instance = agent_module.DeepResearchAgent.__new__(agent_module.DeepResearchAgent)
+        instance.config = Configuration.from_env(
+            overrides={"enable_notes": False},
+            load_env_file=False,
+        )
+        instance.request_id = "req-test"
+        instance.note_tool = None
+        instance.tools_registry = None
+        instance._tool_tracker = StubTracker()
+        instance._tool_event_sink_enabled = False
+        instance._state_lock = Lock()
+        instance._last_search_notices = []
+        instance._request_trace = None
+        instance.planner = SimpleNamespace(
+            plan_todo_list=lambda state, observer=None: [
+                TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
+            ],
+            create_fallback_task=lambda state: TodoItem(
+                id=1,
+                title="兜底任务",
+                intent="收集背景",
+                query=state.research_topic,
+            ),
+        )
+        instance.reporting = SimpleNamespace(
+            generate_report=lambda state, observer=None: "# report"
+        )
+        instance.summarizer = SimpleNamespace(
+            summarize_task=lambda state, task, context, observer=None: "summary"
+        )
+        return instance
+
+    def test_run_consumes_task_generator_for_sync_endpoint(self):
+        agent = self._build_agent()
+        calls = []
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            calls.append(task.id)
+            task.status = "completed"
+            task.summary = "summary"
+            task.sources_summary = "* Example : https://example.com"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+
+        result = agent.run("AI agent")
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(result.todo_items[0].status, "completed")
+        self.assertEqual(result.todo_items[0].summary, "summary")
+
+    def test_execute_task_marks_search_failures_without_raising(self):
+        agent = self._build_agent()
+        observer = RequestTrace(
+            request_id="req-search",
+            topic="AI agent",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        agent._request_trace = observer
+
+        state = SummaryState(research_topic="AI agent")
+        task = TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
+
+        with patch.object(agent_module, "dispatch_search", side_effect=RuntimeError("search offline")):
+            events = list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    task,
+                    emit_stream=False,
+                )
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(task.status, "failed")
+        self.assertIn("搜索失败", task.notices[0])
+        self.assertEqual(observer.snapshot()["failed_tasks"], 1)
+
+    def test_execute_task_marks_summary_failures_without_raising(self):
+        agent = self._build_agent()
+        observer = RequestTrace(
+            request_id="req-summary",
+            topic="AI agent",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        agent._request_trace = observer
+
+        def failing_summary(state, task, context, observer=None):
+            raise RuntimeError("summary offline")
+
+        agent.summarizer = SimpleNamespace(summarize_task=failing_summary)
+
+        state = SummaryState(research_topic="AI agent")
+        task = TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
+
+        with patch.object(
+            agent_module,
+            "dispatch_search",
+            return_value=(
+                {
+                    "results": [
+                        {
+                            "title": "Example",
+                            "url": "https://example.com",
+                            "content": "content",
+                        }
+                    ]
+                },
+                [],
+                None,
+                "duckduckgo",
+                False,
+            ),
+        ):
+            events = list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    task,
+                    emit_stream=False,
+                )
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(task.summary, "总结阶段失败，请参考已收集来源。")
+        self.assertTrue(task.sources_summary)
+        self.assertEqual(observer.snapshot()["failed_tasks"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

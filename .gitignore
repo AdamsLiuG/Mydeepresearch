@@ -1,0 +1,29 @@
+.DS_Store
+.vscode/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env.local
+frontend/.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+backend/.venv/
+backend/build/
+backend/*.egg-info/
+backend/src/*.egg-info/
+backend/evals/results/
+backend/notes/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
