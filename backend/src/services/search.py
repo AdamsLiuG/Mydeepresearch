@@ -51,7 +51,7 @@ _TRACKING_QUERY_PARAMS = {
     "ref_src",
 }
 
-_MEMORY_CACHE: dict[str, "SearchCacheEntry"] = {}
+_MEMORY_CACHE: dict[str, SearchCacheEntry] = {}
 _MEMORY_SCOPE_INDEX: dict[str, list[str]] = {}
 _DISK_CACHE: Any | None = None
 _DISK_CACHE_DIR: str | None = None
@@ -74,7 +74,7 @@ class SearchCacheEntry:
     created_at: float
     embedding: list[float] | None = None
 
-    def clone(self) -> "SearchCacheEntry":
+    def clone(self) -> SearchCacheEntry:
         """Return a defensive copy of the cache entry."""
 
         return SearchCacheEntry(
@@ -107,7 +107,7 @@ class SearchCacheEntry:
         }
 
     @classmethod
-    def from_record(cls, record: dict[str, Any]) -> "SearchCacheEntry":
+    def from_record(cls, record: dict[str, Any]) -> SearchCacheEntry:
         """Deserialize a cache entry from disk or memory."""
 
         return cls(
