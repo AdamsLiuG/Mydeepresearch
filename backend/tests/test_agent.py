@@ -11,7 +11,7 @@ if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
 
-hello_agents_stub = types.ModuleType("hello_agents")
+hello_agents_stub = sys.modules.get("hello_agents") or types.ModuleType("hello_agents")
 
 
 class DummyLLM:
@@ -38,7 +38,7 @@ hello_agents_stub.HelloAgentsLLM = DummyLLM
 hello_agents_stub.ToolAwareSimpleAgent = DummyToolAwareSimpleAgent
 sys.modules.setdefault("hello_agents", hello_agents_stub)
 
-tools_stub = types.ModuleType("hello_agents.tools")
+tools_stub = sys.modules.get("hello_agents.tools") or types.ModuleType("hello_agents.tools")
 
 
 class DummyToolRegistry:
@@ -233,6 +233,63 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertTrue(task.sources_summary)
         self.assertEqual(observer.snapshot()["failed_tasks"], 1)
 
+    def test_execute_task_retries_with_broader_query_before_skipping(self):
+        agent = self._build_agent()
+        observer = RequestTrace(
+            request_id="req-retry",
+            topic="探索多模态大模型在2025年的关键进展",
+            search_api="searxng",
+            provider="custom",
+            model="Qwen/Qwen3.5-27B",
+            pricing_catalog={},
+        )
+        agent._request_trace = observer
+
+        state = SummaryState(research_topic="探索多模态大模型在2025年的关键进展")
+        task = TodoItem(id=2, title="性能基准对比", intent="评估主流模型能力水平与资源消耗", query="性能基准对比")
+
+        with patch.object(
+            agent_module,
+            "dispatch_search",
+            side_effect=[
+                ({"results": []}, [], None, "searxng", False),
+                (
+                    {
+                        "results": [
+                            {
+                                "title": "Benchmark",
+                                "url": "https://example.com/bench",
+                                "content": "content",
+                            }
+                        ]
+                    },
+                    [],
+                    None,
+                    "searxng",
+                    False,
+                ),
+            ],
+        ) as mock_dispatch:
+            events = list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    task,
+                    emit_stream=False,
+                )
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(
+            task.query,
+            "探索多模态大模型在2025年的关键进展 性能基准对比",
+        )
+        self.assertTrue(any("更宽泛检索词" in notice for notice in task.notices))
+        self.assertEqual(mock_dispatch.call_count, 2)
+        self.assertEqual(observer.snapshot()["completed_tasks"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+    

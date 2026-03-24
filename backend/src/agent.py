@@ -392,6 +392,12 @@ class DeepResearchAgent:
             state.structured_report = report
             state.running_summary = report
             self._persist_final_report(state, report)
+            observer.attach_result(
+                report_markdown=report,
+                todo_items=[self._serialize_task(task) for task in state.todo_items],
+                report_note_id=state.report_note_id,
+                report_note_path=state.report_note_path,
+            )
 
             status = self._request_status(state, report)
             observer.complete_request(status=status)
@@ -591,6 +597,12 @@ class DeepResearchAgent:
             if request_status == "partial_success":
                 yield observer.record_degraded("partial_result_completed")
 
+            observer.attach_result(
+                report_markdown=report,
+                todo_items=[self._serialize_task(task) for task in state.todo_items],
+                report_note_id=state.report_note_id,
+                report_note_path=state.report_note_path,
+            )
             observer.complete_request(status=request_status)
             yield observer.metrics_event()
 
@@ -607,6 +619,90 @@ class DeepResearchAgent:
     # ------------------------------------------------------------------
     # Execution helpers
     # ------------------------------------------------------------------
+    def _task_search_queries(self, state: SummaryState, task: TodoItem) -> list[str]:
+        """Return progressively broader queries for a task-level search retry."""
+
+        topic = (state.research_topic or "").strip()
+        title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
+        intent = (task.intent or "").strip()
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            normalized = " ".join((value or "").strip().split())
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            candidates.append(normalized)
+
+        add(task.query or "")
+        if topic and title:
+            add(f"{topic} {title}")
+            add(f"{topic} {title} 最新进展")
+        if topic and intent:
+            add(f"{topic} {intent}")
+        add(topic)
+
+        return candidates or [" ".join(part for part in [title, intent] if part).strip()]
+
+    def _search_with_fallback_queries(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        observer: RequestTrace | None,
+    ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool]:
+        """Retry a task search with broader queries before marking it skipped."""
+
+        search_result: dict[str, Any] | None = None
+        answer_text: str | None = None
+        backend = ""
+        cache_hit = False
+        notices: list[str] = []
+        original_query = (task.query or "").strip()
+
+        for attempt_index, candidate in enumerate(self._task_search_queries(state, task)):
+            (
+                current_result,
+                current_notices,
+                current_answer,
+                current_backend,
+                current_cache_hit,
+            ) = dispatch_search(
+                candidate,
+                self.config,
+                state.research_loop_count,
+                observer=observer,
+            )
+
+            if attempt_index > 0:
+                retry_notice = f"原检索词未命中，改用更宽泛检索词：{candidate}"
+                if retry_notice not in notices:
+                    notices.append(retry_notice)
+
+            for notice in current_notices:
+                if notice and notice not in notices:
+                    notices.append(notice)
+
+            search_result = current_result
+            answer_text = current_answer
+            backend = current_backend
+            cache_hit = current_cache_hit
+            task.query = candidate
+
+            if current_result and current_result.get("results"):
+                if attempt_index > 0 and original_query and original_query != candidate:
+                    logger.info(
+                        "Recovered task search with broader query task_id=%s title=%s original_query=%s fallback_query=%s",
+                        task.id,
+                        task.title,
+                        original_query,
+                        candidate,
+                    )
+                return search_result, notices, answer_text, backend, cache_hit
+
+        return search_result, notices, answer_text, backend, cache_hit
+
     def _execute_task(
         self,
         state: SummaryState,
@@ -636,11 +732,10 @@ class DeepResearchAgent:
             yield started
 
         try:
-            search_result, notices, answer_text, backend, cache_hit = dispatch_search(
-                task.query,
-                self.config,
-                state.research_loop_count,
-                observer=observer,
+            search_result, notices, answer_text, backend, cache_hit = self._search_with_fallback_queries(
+                state,
+                task,
+                observer,
             )
         except Exception as exc:
             if search_span:

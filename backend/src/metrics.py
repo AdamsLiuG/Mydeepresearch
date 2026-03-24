@@ -203,6 +203,8 @@ class MetricsRegistry:
             if request_total
             else 0.0,
             "failure_rate": round((failed_total / request_total), 4) if request_total else 0.0,
+            "cache_hit_total": cache_hits,
+            "cache_miss_total": cache_misses,
             "cache_hit_rate": round((cache_hits / cache_total), 4) if cache_total else 0.0,
             "latencies_ms": latencies,
             "estimated_cost": estimated_cost,
@@ -385,6 +387,10 @@ class RequestTrace:
         self.completion_tokens = 0
         self.total_tokens = 0
         self.estimated_cost = 0.0
+        self.report_markdown: str | None = None
+        self.todo_items: list[dict[str, Any]] = []
+        self.report_note_id: str | None = None
+        self.report_note_path: str | None = None
         self.token_sources: set[str] = set()
         metrics_registry.increment("request_total")
 
@@ -500,6 +506,20 @@ class RequestTrace:
             self.skipped_tasks += skipped
             self.failed_tasks += failed
 
+    def attach_result(
+        self,
+        *,
+        report_markdown: str | None,
+        todo_items: list[dict[str, Any]] | None = None,
+        report_note_id: str | None = None,
+        report_note_path: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.report_markdown = report_markdown.strip() if isinstance(report_markdown, str) else None
+            self.todo_items = _clone_dict({"items": todo_items or []}).get("items", [])
+            self.report_note_id = report_note_id
+            self.report_note_path = report_note_path
+
     def complete_request(self, *, status: str, error: Any = None) -> dict[str, Any]:
         elapsed_ms = round((perf_counter() - self._perf_start) * 1000, 2)
         with self._lock:
@@ -553,6 +573,10 @@ class RequestTrace:
                 "total_tokens": self.total_tokens,
                 "token_source": token_source,
                 "estimated_cost": round(self.estimated_cost, 6),
+                "report_markdown": self.report_markdown,
+                "todo_items": _clone_dict({"items": self.todo_items}).get("items", []),
+                "report_note_id": self.report_note_id,
+                "report_note_path": self.report_note_path,
                 "stages": [stage.to_dict() for stage in self.stages],
             }
 

@@ -30,9 +30,15 @@ def _load_backend_env() -> None:
 class SearchAPI(Enum):
     PERPLEXITY = "perplexity"
     TAVILY = "tavily"
+    SERPAPI = "serpapi"
     DUCKDUCKGO = "duckduckgo"
     SEARXNG = "searxng"
     ADVANCED = "advanced"
+
+    @classmethod
+    def fusion_backends(cls) -> set[str]:
+        """Return the concrete search backends allowed in fusion mode."""
+        return {member.value for member in cls if member is not cls.ADVANCED}
 
 
 class Configuration(BaseModel):
@@ -57,6 +63,11 @@ class Configuration(BaseModel):
         default=SearchAPI.DUCKDUCKGO,
         title="Search API",
         description="Web search API to use",
+    )
+    advanced_search_backends: list[str] = Field(
+        default_factory=lambda: ["searxng", "tavily", "serpapi", "duckduckgo"],
+        title="Advanced Search Backends",
+        description="Ordered backends to query and fuse when search_api=advanced",
     )
     enable_notes: bool = Field(
         default=True,
@@ -143,6 +154,28 @@ class Configuration(BaseModel):
         title="Search Cache TTL",
         description="How long to keep in-process search cache entries",
     )
+    search_cache_dir: str = Field(
+        default="./.cache/search",
+        title="Search Cache Directory",
+        description="Directory used by the persistent search cache store",
+    )
+    semantic_cache_enabled: bool = Field(
+        default=True,
+        title="Semantic Cache Enabled",
+        description="Whether to use embedding similarity to reuse semantically similar search results",
+    )
+    semantic_cache_embedding_model: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        title="Semantic Cache Embedding Model",
+        description="Embedding model used to vectorize search queries for semantic cache matching",
+    )
+    semantic_cache_similarity_threshold: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        title="Semantic Cache Similarity Threshold",
+        description="Cosine similarity threshold for semantic search cache hits",
+    )
     max_tokens_per_source: int | None = Field(
         default=None,
         title="Max Tokens Per Source",
@@ -192,6 +225,47 @@ class Configuration(BaseModel):
             return value.strip().lower()
         return value
 
+    @field_validator("advanced_search_backends", mode="before")
+    @classmethod
+    def _normalize_advanced_search_backends(cls, value: Any) -> list[str]:
+        default_backends = ["searxng", "tavily", "serpapi", "duckduckgo"]
+        if value in (None, "", []):
+            return default_backends
+
+        if isinstance(value, str):
+            raw_items = value.split(",")
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raise ValueError("advanced_search_backends must be a string or list of backends")
+
+        supported = SearchAPI.fusion_backends()
+        normalized: list[str] = []
+        seen: set[str] = set()
+        invalid: list[str] = []
+
+        for item in raw_items:
+            backend = str(item or "").strip().lower()
+            if not backend or backend == SearchAPI.ADVANCED.value:
+                continue
+            if backend not in supported:
+                invalid.append(backend)
+                continue
+            if backend in seen:
+                continue
+            seen.add(backend)
+            normalized.append(backend)
+
+        if invalid:
+            supported_list = ", ".join(sorted(supported))
+            invalid_list = ", ".join(sorted(set(invalid)))
+            raise ValueError(
+                f"Unsupported advanced_search_backends: {invalid_list}. "
+                f"Supported backends: {supported_list}"
+            )
+
+        return normalized or default_backends
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: Any) -> Any:
@@ -232,6 +306,13 @@ class Configuration(BaseModel):
             if not workspace_path.is_absolute():
                 workspace_path = backend_root() / workspace_path
             self.notes_workspace = str(workspace_path.resolve(strict=False))
+
+        cache_dir = (self.search_cache_dir or "").strip()
+        if cache_dir:
+            cache_path = Path(cache_dir).expanduser()
+            if not cache_path.is_absolute():
+                cache_path = backend_root() / cache_path
+            self.search_cache_dir = str(cache_path.resolve(strict=False))
         return self
 
     @classmethod
@@ -268,6 +349,7 @@ class Configuration(BaseModel):
             "strip_thinking_tokens": os.getenv("STRIP_THINKING_TOKENS"),
             "use_tool_calling": os.getenv("USE_TOOL_CALLING"),
             "search_api": os.getenv("SEARCH_API"),
+            "advanced_search_backends": os.getenv("ADVANCED_SEARCH_BACKENDS"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
             "host": os.getenv("HOST"),
@@ -276,6 +358,10 @@ class Configuration(BaseModel):
             "cors_origins": os.getenv("CORS_ORIGINS"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
+            "search_cache_dir": os.getenv("SEARCH_CACHE_DIR"),
+            "semantic_cache_enabled": os.getenv("SEMANTIC_CACHE_ENABLED"),
+            "semantic_cache_embedding_model": os.getenv("SEMANTIC_CACHE_EMBEDDING_MODEL"),
+            "semantic_cache_similarity_threshold": os.getenv("SEMANTIC_CACHE_SIMILARITY_THRESHOLD"),
             "max_tokens_per_source": os.getenv("MAX_TOKENS_PER_SOURCE"),
             "task_context_char_limit": os.getenv("TASK_CONTEXT_CHAR_LIMIT"),
             "task_summary_max_concurrency": os.getenv("TASK_SUMMARY_MAX_CONCURRENCY"),
@@ -311,6 +397,14 @@ class Configuration(BaseModel):
     def resolved_context_window(self) -> int:
         """Return the configured model context window with a safe lower bound."""
         return max(2048, int(self.llm_context_window or 2048))
+
+    def resolved_search_cache_dir(self) -> str:
+        """Return the persistent cache directory."""
+        return self.search_cache_dir
+
+    def resolved_advanced_search_backends(self) -> list[str]:
+        """Return the ordered concrete backends used for fused search."""
+        return list(self.advanced_search_backends or ["searxng", "tavily", "serpapi", "duckduckgo"])
 
     @staticmethod
     def _clamp(value: int, minimum: int, maximum: int) -> int:

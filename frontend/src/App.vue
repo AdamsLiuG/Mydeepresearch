@@ -131,6 +131,51 @@
             开始新研究
           </button>
         </div>
+
+        <section class="sidebar-history">
+          <div class="sidebar-history-head">
+            <h3>最近研究历史</h3>
+            <span class="history-count">{{ recentResearchHistory.length }} 条</span>
+          </div>
+          <ul v-if="recentResearchHistory.length" class="sidebar-history-list">
+            <li
+              v-for="item in recentResearchHistory"
+              :key="item.requestId"
+              :class="['sidebar-history-item', { selected: selectedHistoryRequestId === item.requestId }]"
+            >
+              <div class="sidebar-history-main">
+                <p class="sidebar-history-topic" :title="item.topic">
+                  {{ item.topic }}
+                </p>
+                <div class="sidebar-history-meta">
+                  <span class="history-status-chip" :class="item.status">
+                    {{ formatRequestStatus(item.status) }}
+                  </span>
+                  <span>{{ formatElapsed(item.elapsedMs) }}</span>
+                </div>
+              </div>
+              <div class="sidebar-history-actions">
+                <button
+                  type="button"
+                  class="history-view-btn"
+                  @click="viewHistoryResearch(item)"
+                  :disabled="loading || !item.canViewContent"
+                >
+                  查看内容
+                </button>
+                <button
+                  type="button"
+                  class="history-repeat-btn"
+                  @click="repeatResearch(item)"
+                  :disabled="loading"
+                >
+                  再次研究
+                </button>
+              </div>
+            </li>
+          </ul>
+          <p v-else class="sidebar-history-empty">暂无历史研究记录</p>
+        </section>
       </aside>
 
       <!-- 右侧：研究结果 -->
@@ -170,6 +215,9 @@
             <strong class="metric-value">
               {{ requestCacheHits }} 命中 / {{ requestCacheMisses }} 未命中
             </strong>
+            <span class="metric-hint">
+              全局累计：{{ globalCacheHits }} 命中 / {{ globalCacheMisses }} 未命中
+            </span>
           </div>
           <div class="metric-card">
             <span class="metric-label">Token / 成本</span>
@@ -365,9 +413,10 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, onBeforeUnmount, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 
 import {
+  fetchMetricsSnapshot,
   runResearchStream,
   type ResearchStreamEvent
 } from "./services/api";
@@ -405,6 +454,18 @@ interface TodoTaskView {
   toolCalls: ToolCallLog[];
 }
 
+interface RecentResearchView {
+  requestId: string;
+  topic: string;
+  status: string;
+  elapsedMs: number;
+  searchApi: string;
+  reportMarkdown: string;
+  todoItems: TodoTaskView[];
+  requestMetrics: UnknownRecord;
+  canViewContent: boolean;
+}
+
 type UnknownRecord = Record<string, unknown>;
 
 const form = reactive({
@@ -423,6 +484,7 @@ const activeTaskId = ref<number | null>(null);
 const reportMarkdown = ref("");
 const latestRequestMetrics = ref<UnknownRecord | null>(null);
 const latestAggregateMetrics = ref<UnknownRecord | null>(null);
+const selectedHistoryRequestId = ref<string | null>(null);
 
 const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
@@ -430,6 +492,7 @@ const reportHighlight = ref(false);
 const toolHighlight = ref(false);
 
 let currentController: AbortController | null = null;
+let globalMetricsTimer: number | null = null;
 
 const searchOptions = [
   "advanced",
@@ -445,9 +508,19 @@ const TASK_STATUS_LABEL: Record<string, string> = {
   completed: "已完成",
   skipped: "已跳过"
 };
+const REQUEST_STATUS_LABEL: Record<string, string> = {
+  success: "成功",
+  partial_success: "部分成功",
+  failed: "失败",
+  in_progress: "进行中"
+};
 
 function formatTaskStatus(status: string): string {
   return TASK_STATUS_LABEL[status] ?? status;
+}
+
+function formatRequestStatus(status: string): string {
+  return REQUEST_STATUS_LABEL[status] ?? status;
 }
 
 const totalTasks = computed(() => todoTasks.value.length);
@@ -505,6 +578,55 @@ const requestCacheHits = computed(() =>
 const requestCacheMisses = computed(() =>
   getNumber(latestRequestMetrics.value?.cache_misses)
 );
+const globalCacheHits = computed(() => {
+  const direct = getNumber(latestAggregateMetrics.value?.cache_hit_total);
+  if (direct) {
+    return direct;
+  }
+  return getNumber(
+    ensureRecord(latestAggregateMetrics.value?.counters).cache_hit_total
+  );
+});
+const globalCacheMisses = computed(() => {
+  const direct = getNumber(latestAggregateMetrics.value?.cache_miss_total);
+  if (direct) {
+    return direct;
+  }
+  return getNumber(
+    ensureRecord(latestAggregateMetrics.value?.counters).cache_miss_total
+  );
+});
+const recentResearchHistory = computed<RecentResearchView[]>(() => {
+  const items = latestAggregateMetrics.value?.recent_requests;
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((entry) => ensureRecord(entry))
+    .map((entry, index) => {
+      const topic = getString(entry.topic, "");
+      if (!topic) {
+        return null;
+      }
+      const historyTasks = mapHistoryTasks(entry.todo_items);
+      const reportMarkdown =
+        typeof entry.report_markdown === "string" ? entry.report_markdown.trim() : "";
+
+      return {
+        requestId: getString(entry.request_id, `recent-${index}`),
+        topic,
+        status: getString(entry.status, "unknown"),
+        elapsedMs: getNumber(entry.elapsed_ms),
+        searchApi: getString(entry.search_api, ""),
+        reportMarkdown,
+        todoItems: historyTasks,
+        requestMetrics: entry,
+        canViewContent: Boolean(reportMarkdown) || historyTasks.length > 0
+      };
+    })
+    .filter((entry): entry is RecentResearchView => entry !== null);
+});
 const aggregateSuccessRateText = computed(() => {
   const rate = getNumber(latestAggregateMetrics.value?.success_rate);
   return `${(rate * 100).toFixed(1)}%`;
@@ -642,6 +764,57 @@ function parseSources(raw: string): SourceItem[] {
   return items;
 }
 
+function mapHistoryTasks(value: unknown): TodoTaskView[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map((item, index) => {
+    const payload = ensureRecord(item);
+    const rawId =
+      typeof payload.id === "number"
+        ? payload.id
+        : typeof payload.id === "string"
+        ? Number(payload.id)
+        : index + 1;
+    const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
+    const sourcesSummary =
+      typeof payload.sources_summary === "string" ? payload.sources_summary.trim() : "";
+
+    return {
+      id,
+      title:
+        typeof payload.title === "string" && payload.title.trim()
+          ? payload.title.trim()
+          : `任务${id}`,
+      intent:
+        typeof payload.intent === "string" && payload.intent.trim()
+          ? payload.intent.trim()
+          : "历史任务",
+      query:
+        typeof payload.query === "string" && payload.query.trim()
+          ? payload.query.trim()
+          : "",
+      status:
+        typeof payload.status === "string" && payload.status.trim()
+          ? payload.status.trim()
+          : "completed",
+      summary:
+        typeof payload.summary === "string" && payload.summary.trim()
+          ? payload.summary.trim()
+          : "暂无可用信息",
+      sourcesSummary,
+      sourceItems: parseSources(sourcesSummary),
+      notices: Array.isArray(payload.notices)
+        ? payload.notices.filter((notice): notice is string => typeof notice === "string")
+        : [],
+      noteId: extractOptionalString(payload.note_id),
+      notePath: extractOptionalString(payload.note_path),
+      toolCalls: []
+    };
+  });
+}
+
 function extractOptionalString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -706,18 +879,65 @@ async function copyNotePath(path: string | null | undefined) {
   }
 }
 
+async function refreshGlobalMetrics(signal?: AbortSignal) {
+  try {
+    const snapshot = await fetchMetricsSnapshot({ signal });
+    latestAggregateMetrics.value = {
+      ...ensureRecord(latestAggregateMetrics.value),
+      ...ensureRecord(snapshot)
+    };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return;
+    }
+    console.warn("获取全局缓存指标失败", error);
+  }
+}
+
 function resetWorkflowState() {
   todoTasks.value = [];
   activeTaskId.value = null;
   reportMarkdown.value = "";
   progressLogs.value = [];
   latestRequestMetrics.value = null;
-  latestAggregateMetrics.value = null;
+   selectedHistoryRequestId.value = null;
   summaryHighlight.value = false;
   sourcesHighlight.value = false;
   reportHighlight.value = false;
   toolHighlight.value = false;
   logsCollapsed.value = false;
+}
+
+async function repeatResearch(item: RecentResearchView) {
+  if (loading.value) {
+    return;
+  }
+
+  form.topic = item.topic;
+  form.searchApi = item.searchApi;
+  await handleSubmit();
+}
+
+function viewHistoryResearch(item: RecentResearchView) {
+  if (loading.value) {
+    return;
+  }
+
+  resetWorkflowState();
+  selectedHistoryRequestId.value = item.requestId;
+  form.topic = item.topic;
+  form.searchApi = item.searchApi;
+  todoTasks.value = item.todoItems.map((task) => ({
+    ...task,
+    sourceItems: [...task.sourceItems],
+    notices: [...task.notices],
+    toolCalls: []
+  }));
+  activeTaskId.value = todoTasks.value[0]?.id ?? null;
+  reportMarkdown.value = item.reportMarkdown || "该历史研究未保存最终报告";
+  latestRequestMetrics.value = { ...item.requestMetrics };
+  progressLogs.value = [`已载入历史研究：${item.topic}`];
+  isExpanded.value = true;
 }
 
 function findTask(taskId: unknown): TodoTaskView | undefined {
@@ -1062,7 +1282,15 @@ const handleSubmit = async () => {
         if (event.type === "metrics_snapshot") {
           const payload = event as UnknownRecord;
           latestRequestMetrics.value = ensureRecord(payload.request_metrics);
-          latestAggregateMetrics.value = ensureRecord(payload.aggregate_metrics);
+          const nextAggregate = ensureRecord(payload.aggregate_metrics);
+          const previousAggregate = ensureRecord(latestAggregateMetrics.value);
+          if (
+            !Array.isArray(nextAggregate.recent_requests) &&
+            Array.isArray(previousAggregate.recent_requests)
+          ) {
+            nextAggregate.recent_requests = previousAggregate.recent_requests;
+          }
+          latestAggregateMetrics.value = nextAggregate;
           return;
         }
 
@@ -1100,6 +1328,7 @@ const handleSubmit = async () => {
     }
   } finally {
     loading.value = false;
+    void refreshGlobalMetrics();
     if (currentController === controller) {
       currentController = null;
     }
@@ -1131,10 +1360,21 @@ const startNewResearch = () => {
   form.searchApi = "";
 };
 
+onMounted(() => {
+  void refreshGlobalMetrics();
+  globalMetricsTimer = window.setInterval(() => {
+    void refreshGlobalMetrics();
+  }, 15000);
+});
+
 onBeforeUnmount(() => {
   if (currentController) {
     currentController.abort();
     currentController = null;
+  }
+  if (globalMetricsTimer !== null) {
+    window.clearInterval(globalMetricsTimer);
+    globalMetricsTimer = null;
   }
 });
 </script>
@@ -2446,6 +2686,177 @@ select:focus {
 
 .new-research-btn:active {
   transform: translateY(0);
+}
+
+.sidebar-history {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 20px;
+  background: rgba(248, 250, 252, 0.88);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.sidebar-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sidebar-history-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.history-count {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.sidebar-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-history-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.sidebar-history-item.selected {
+  border-color: rgba(59, 130, 246, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.12);
+}
+
+.sidebar-history-main {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar-history-topic {
+  margin: 0;
+  color: #1f2937;
+  font-size: 14px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.sidebar-history-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.history-status-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+  background: rgba(148, 163, 184, 0.16);
+}
+
+.history-status-chip.success {
+  color: #166534;
+  background: rgba(34, 197, 94, 0.16);
+}
+
+.history-status-chip.partial_success {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.18);
+}
+
+.history-status-chip.failed {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.history-status-chip.in_progress {
+  color: #1d4ed8;
+  background: rgba(59, 130, 246, 0.16);
+}
+
+.history-repeat-btn {
+  align-self: flex-start;
+  border: 1px solid rgba(59, 130, 246, 0.24);
+  background: rgba(59, 130, 246, 0.08);
+  color: #1d4ed8;
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.history-repeat-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: rgba(59, 130, 246, 0.14);
+  box-shadow: 0 10px 20px rgba(59, 130, 246, 0.12);
+}
+
+.history-repeat-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.sidebar-history-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.history-view-btn {
+  align-self: flex-start;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  background: rgba(15, 23, 42, 0.04);
+  color: #0f172a;
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.history-view-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: rgba(15, 23, 42, 0.08);
+  box-shadow: 0 10px 20px rgba(15, 23, 42, 0.08);
+}
+
+.history-view-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.sidebar-history-empty {
+  margin: 0;
+  font-size: 13px;
+  color: #64748b;
 }
 
 /* 全屏状态下的结果面板 */

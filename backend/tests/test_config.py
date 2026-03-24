@@ -26,7 +26,8 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             cfg = config.Configuration.from_env(
                 overrides={
-                    "search_api": "tavily",
+                    "search_api": "advanced",
+                    "advanced_search_backends": " searxng, tavily, serpapi, searxng ",
                     "log_level": "debug",
                     "port": "9001",
                     "cors_origins": "http://localhost:5174, http://localhost:3000",
@@ -34,7 +35,11 @@ class ConfigurationTests(unittest.TestCase):
                 load_env_file=False,
             )
 
-        self.assertEqual(cfg.search_api, config.SearchAPI.TAVILY)
+        self.assertEqual(cfg.search_api, config.SearchAPI.ADVANCED)
+        self.assertEqual(
+            cfg.advanced_search_backends,
+            ["searxng", "tavily", "serpapi"],
+        )
         self.assertEqual(cfg.log_level, "DEBUG")
         self.assertEqual(cfg.port, 9001)
         self.assertEqual(

@@ -43,10 +43,27 @@ class MetricsTests(unittest.TestCase):
         )
         observer.set_task_totals(total_tasks=1)
         observer.update_task_status_counts(completed=1)
+        observer.attach_result(
+            report_markdown="# Final Report",
+            todo_items=[
+                {
+                    "id": 1,
+                    "title": "任务1",
+                    "intent": "验证指标",
+                    "query": "ai agent",
+                    "status": "completed",
+                    "summary": "完成",
+                    "sources_summary": "source",
+                }
+            ],
+        )
         request_snapshot = observer.complete_request(status="partial_success")
         aggregate_snapshot = metrics_registry.snapshot()
 
         self.assertTrue(request_snapshot["fallback_triggered"])
+        self.assertEqual(request_snapshot["report_markdown"], "# Final Report")
+        self.assertEqual(len(request_snapshot["todo_items"]), 1)
+        self.assertEqual(aggregate_snapshot["recent_requests"][0]["report_markdown"], "# Final Report")
         self.assertEqual(aggregate_snapshot["counters"]["request_total"], 1)
         self.assertEqual(aggregate_snapshot["counters"]["request_partial_success_total"], 1)
         self.assertEqual(aggregate_snapshot["counters"]["fallback_trigger_total"], 1)

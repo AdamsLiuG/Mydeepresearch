@@ -15,6 +15,15 @@ export interface StreamOptions {
   signal?: AbortSignal;
 }
 
+export interface MetricsSnapshot {
+  generated_at?: string;
+  cache_hit_total?: number;
+  cache_miss_total?: number;
+  counters?: Record<string, number>;
+  recent_requests?: Record<string, unknown>[];
+  [key: string]: unknown;
+}
+
 export async function runResearchStream(
   payload: ResearchRequest,
   onEvent: (event: ResearchStreamEvent) => void,
@@ -93,4 +102,26 @@ export async function runResearchStream(
       break;
     }
   }
+}
+
+export async function fetchMetricsSnapshot(
+  options: StreamOptions = {}
+): Promise<MetricsSnapshot> {
+  const response = await fetch(`${baseURL}/metrics/json`, {
+    method: "GET",
+    headers: {
+      Accept: "application/json"
+    },
+    signal: options.signal
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(
+      errorText || `获取全局指标失败，状态码：${response.status}`
+    );
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as MetricsSnapshot;
+  return payload && typeof payload === "object" ? payload : {};
 }

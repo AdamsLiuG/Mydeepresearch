@@ -9,6 +9,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
+    "diskcache>=5.6.3",
     "fastapi>=0.115.0",
     "hello-agents>=0.2.8",
     "huggingface_hub>=0.26.0",
@@ -16,6 +17,7 @@ dependencies = [
     "python-dotenv==1.0.1",
     "requests>=2.31.0",
     "openai>=1.12.0",
+    "sentence-transformers>=3.0.1",
     "uvicorn[standard]>=0.32.0",
     "ddgs>=9.6.1",
     "loguru>=0.7.3",
