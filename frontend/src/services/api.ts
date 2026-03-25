@@ -1,5 +1,17 @@
-const baseURL =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+function resolveBaseURL(): string {
+  const configured = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (configured) {
+    return configured.replace(/\/+$/, "");
+  }
+
+  if (typeof window !== "undefined" && window.location?.hostname) {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+
+  return "http://localhost:8000";
+}
+
+const baseURL = resolveBaseURL();
 
 export interface ResearchRequest {
   topic: string;
@@ -29,15 +41,25 @@ export async function runResearchStream(
   onEvent: (event: ResearchStreamEvent) => void,
   options: StreamOptions = {}
 ): Promise<void> {
-  const response = await fetch(`${baseURL}/research/stream`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream"
-    },
-    body: JSON.stringify(payload),
-    signal: options.signal
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${baseURL}/research/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream"
+      },
+      body: JSON.stringify(payload),
+      signal: options.signal
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    throw new Error(
+      `无法连接研究后端（${baseURL}）。请检查前端访问地址、VITE_API_BASE_URL 和后端 CORS 配置，尤其确认 localhost 与 127.0.0.1 是否一致。`
+    );
+  }
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");

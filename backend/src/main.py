@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Iterator
+from typing import Any, Callable, Dict, Iterator
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,9 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agent import DeepResearchAgent
 from config import Configuration, SearchAPI
 from metrics import metrics_registry
+
+DeepResearchAgent: Any | None = None
 
 LOG_FORMAT = (
     "%(asctime)s | %(levelname)-8s | %(name)s | "
@@ -95,8 +96,34 @@ def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 
 
-def create_app() -> FastAPI:
-    base_config = Configuration.from_env()
+def _resolve_agent_factory(
+    base_config: Configuration,
+    agent_factory: Callable[..., Any] | None = None,
+) -> Callable[..., Any]:
+    if agent_factory is not None:
+        return agent_factory
+
+    if base_config.benchmark_stub_enabled:
+        from perf.stub_agent import BenchmarkStubAgent
+
+        return BenchmarkStubAgent
+
+    global DeepResearchAgent
+    if DeepResearchAgent is None:
+        from agent import DeepResearchAgent as ImportedDeepResearchAgent
+
+        DeepResearchAgent = ImportedDeepResearchAgent
+
+    return DeepResearchAgent
+
+
+def create_app(
+    *,
+    base_config: Configuration | None = None,
+    agent_factory: Callable[..., Any] | None = None,
+) -> FastAPI:
+    base_config = base_config or Configuration.from_env()
+    resolved_agent_factory = _resolve_agent_factory(base_config, agent_factory)
     configure_logging(base_config.log_level)
     metrics_registry.configure(
         recent_request_limit=base_config.metrics_recent_requests_limit,
@@ -116,7 +143,8 @@ def create_app() -> FastAPI:
         logger.info(
             "DeepResearch configuration loaded: provider=%s model=%s base_url=%s search_api=%s "
             "max_loops=%s fetch_full_page=%s tool_calling=%s strip_thinking=%s api_key=%s "
-            "notes_workspace=%s cors_origins=%s search_cache_enabled=%s search_cache_ttl_seconds=%s",
+            "notes_workspace=%s cors_origins=%s search_cache_enabled=%s search_cache_ttl_seconds=%s "
+            "benchmark_stub_enabled=%s benchmark_profile=%s",
             config.llm_provider,
             config.resolved_model() or "unset",
             base_url,
@@ -130,12 +158,15 @@ def create_app() -> FastAPI:
             ",".join(config.cors_origins),
             config.search_cache_enabled,
             config.search_cache_ttl_seconds,
+            config.benchmark_stub_enabled,
+            config.benchmark_profile,
             extra={"request_id": "startup"},
         )
         yield
 
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
     app.state.base_config = base_config
+    app.state.agent_factory = resolved_agent_factory
 
     app.add_middleware(
         CORSMiddleware,
@@ -198,7 +229,7 @@ def create_app() -> FastAPI:
         request_id = _request_id(request)
         try:
             config = _build_config(payload)
-            agent = DeepResearchAgent(config=config, request_id=request_id)
+            agent = app.state.agent_factory(config=config, request_id=request_id)
             result = agent.run(payload.topic)
         except ValueError as exc:  # Likely due to unsupported configuration
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -238,7 +269,7 @@ def create_app() -> FastAPI:
         request_id = _request_id(request)
         try:
             config = _build_config(payload)
-            agent = DeepResearchAgent(config=config, request_id=request_id)
+            agent = app.state.agent_factory(config=config, request_id=request_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -296,4 +327,3 @@ if __name__ == "__main__":
         reload_dirs=["./"],
         log_level=runtime_config.log_level.lower(),
     )
-

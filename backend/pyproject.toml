@@ -24,7 +24,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["mypy>=1.11.1", "pytest>=8.3.4", "ruff>=0.6.1"]
+dev = [
+    "locust>=2.31.8",
+    "mypy>=1.11.1",
+    "psutil>=5.9.8",
+    "pytest>=8.3.4",
+    "ruff>=0.6.1",
+]
 
 [build-system]
 requires = ["setuptools>=73.0.0", "wheel"]
@@ -38,7 +44,7 @@ py-modules = ["agent", "config", "main", "metrics", "models", "prompts", "utils"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["services*"]
+include = ["perf*", "services*"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
@@ -75,6 +81,8 @@ convention = "google"
 
 [dependency-groups]
 dev = [
+    "locust>=2.31.8",
+    "psutil>=5.9.8",
     "pytest>=8.3.4",
     "ruff>=0.12.7",
 ]

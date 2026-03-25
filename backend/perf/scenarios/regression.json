@@ -1,0 +1,14 @@
+{
+  "topics": [
+    "总结 2025 年多模态模型的主要进展与限制",
+    "比较 RAG 与 Web Search 在开放域研究中的角色"
+  ],
+  "requests_total": 4,
+  "concurrency": 2,
+  "timeout_seconds": 180,
+  "sample_interval_seconds": 0.5,
+  "validate_stream": false,
+  "server_env": {
+    "ENABLE_NOTES": "False"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "topics": [
+    "什么是 MCP（Model Context Protocol），它解决了什么问题？",
+    "为什么结构化日志对长链路 agent 系统重要？",
+    "对比 Tavily 和 DuckDuckGo 在研究任务中的差异"
+  ],
+  "requests_total": 3,
+  "concurrency": 1,
+  "timeout_seconds": 120,
+  "sample_interval_seconds": 0.5,
+  "validate_stream": true,
+  "server_env": {
+    "ENABLE_NOTES": "False",
+    "MAX_WEB_RESEARCH_LOOPS": "1"
+  }
+}

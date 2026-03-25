@@ -6,6 +6,7 @@ import types
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
@@ -141,10 +142,16 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(DummySearchTool.call_count, 1)
         self.assertFalse(first[4])
         self.assertTrue(second[4])
+        self.assertEqual(first[5], "miss")
+        self.assertEqual(second[5], "exact")
         self.assertEqual(observer.snapshot()["cache_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_exact_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 0)
         self.assertEqual(observer.snapshot()["cache_misses"], 1)
         metrics_snapshot = metrics_registry.snapshot()
         self.assertEqual(metrics_snapshot["cache_hit_total"], 1)
+        self.assertEqual(metrics_snapshot["cache_exact_hit_total"], 1)
+        self.assertEqual(metrics_snapshot["cache_semantic_hit_total"], 0)
         self.assertEqual(metrics_snapshot["cache_miss_total"], 1)
 
     def test_dispatch_search_fuses_advanced_backends_and_deduplicates_urls(self):
@@ -205,7 +212,7 @@ class SearchCacheTests(unittest.TestCase):
             load_env_file=False,
         )
 
-        payload, notices, answer_text, backend_label, cache_hit = services_search.dispatch_search(
+        payload, notices, answer_text, backend_label, cache_hit, cache_strategy = services_search.dispatch_search(
             "same fusion query",
             config,
             0,
@@ -213,6 +220,7 @@ class SearchCacheTests(unittest.TestCase):
         )
 
         self.assertFalse(cache_hit)
+        self.assertEqual(cache_strategy, "miss")
         self.assertEqual(answer_text, "direct answer")
         self.assertEqual(backend_label, "advanced[searxng, tavily]")
         self.assertEqual([item["url"] for item in payload["results"]], [
@@ -271,7 +279,7 @@ class SearchCacheTests(unittest.TestCase):
         )
 
         started_at = time.perf_counter()
-        payload, notices, answer_text, backend_label, cache_hit = services_search.dispatch_search(
+        payload, notices, answer_text, backend_label, cache_hit, cache_strategy = services_search.dispatch_search(
             "parallel fusion query",
             config,
             0,
@@ -280,6 +288,7 @@ class SearchCacheTests(unittest.TestCase):
 
         self.assertLess(duration, 0.45)
         self.assertFalse(cache_hit)
+        self.assertEqual(cache_strategy, "miss")
         self.assertIsNone(answer_text)
         self.assertFalse(notices)
         self.assertEqual(backend_label, "advanced[searxng, tavily, serpapi]")
@@ -321,8 +330,122 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(DummySearchTool.call_count, 1)
         self.assertFalse(first[4])
         self.assertTrue(second[4])
+        self.assertEqual(second[5], "semantic")
         self.assertEqual(observer.snapshot()["cache_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
         self.assertEqual(observer.snapshot()["cache_misses"], 1)
+
+    def test_dispatch_search_uses_lexical_semantic_cache_with_same_topic_context(self):
+        observer = RequestTrace(
+            request_id="req-lexical-cache",
+            topic="多模态大模型前沿技术",
+            search_api="duckduckgo",
+            provider="custom",
+            model="Qwen/Qwen3.5-27B",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "semantic_cache_enabled": True,
+                "semantic_cache_similarity_threshold": 0.95,
+                "semantic_cache_lexical_threshold": 0.35,
+            },
+            load_env_file=False,
+        )
+
+        first_context = {
+            "research_topic": "多模态大模型前沿技术",
+            "task_title": "架构创新与模型设计",
+            "task_intent": "梳理多模态大模型的核心架构演进与融合机制",
+        }
+        second_context = {
+            "research_topic": "多模态大模型前沿技术",
+            "task_title": "架构创新调研",
+            "task_intent": "梳理核心架构设计、跨模态融合与注意力机制创新",
+        }
+
+        with patch.object(services_search, "_embed_query", return_value=None):
+            first = services_search.dispatch_search(
+                "多模态大模型 架构 视觉语言融合 最新研究 2024 2025",
+                config,
+                0,
+                observer=observer,
+                cache_context=first_context,
+            )
+            second = services_search.dispatch_search(
+                "多模态大模型 架构设计 2024 2025 跨模态融合 注意力机制",
+                config,
+                1,
+                observer=observer,
+                cache_context=second_context,
+            )
+
+        self.assertEqual(DummySearchTool.call_count, 1)
+        self.assertFalse(first[4])
+        self.assertEqual(first[5], "miss")
+        self.assertTrue(second[4])
+        self.assertEqual(second[5], "semantic")
+        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
+        metrics_snapshot = metrics_registry.snapshot()
+        self.assertEqual(metrics_snapshot["cache_semantic_hit_total"], 1)
+
+    def test_dispatch_search_does_not_reuse_semantic_cache_across_topics(self):
+        observer = RequestTrace(
+            request_id="req-topic-isolation",
+            topic="多模态大模型前沿技术",
+            search_api="duckduckgo",
+            provider="custom",
+            model="Qwen/Qwen3.5-27B",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "semantic_cache_enabled": True,
+                "semantic_cache_similarity_threshold": 0.95,
+                "semantic_cache_lexical_threshold": 0.35,
+            },
+            load_env_file=False,
+        )
+
+        first_context = {
+            "research_topic": "多模态大模型前沿技术",
+            "task_title": "架构创新调研",
+            "task_intent": "梳理核心架构设计、跨模态融合与注意力机制创新",
+        }
+        second_context = {
+            "research_topic": "医疗多模态模型落地实践",
+            "task_title": "架构创新调研",
+            "task_intent": "梳理核心架构设计、跨模态融合与注意力机制创新",
+        }
+
+        with patch.object(services_search, "_embed_query", return_value=None):
+            first = services_search.dispatch_search(
+                "多模态大模型 架构设计 2024 2025 跨模态融合 注意力机制",
+                config,
+                0,
+                observer=observer,
+                cache_context=first_context,
+            )
+            second = services_search.dispatch_search(
+                "多模态模型 架构设计 2025 跨模态融合 注意力创新",
+                config,
+                1,
+                observer=observer,
+                cache_context=second_context,
+            )
+
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(second[5], "miss")
+        self.assertEqual(DummySearchTool.call_count, 2)
 
 
 if __name__ == "__main__":

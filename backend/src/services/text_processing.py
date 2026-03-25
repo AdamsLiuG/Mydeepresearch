@@ -2,7 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
+from typing import Any
+
+JSON_TEXT_KEYS = (
+    "report_markdown",
+    "report",
+    "summary",
+    "content",
+    "text",
+    "message",
+    "output",
+)
+JSON_FIELD_PATTERNS = tuple(
+    re.compile(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', re.DOTALL)
+    for key in JSON_TEXT_KEYS
+)
 
 
 def strip_tool_calls(text: str) -> str:
@@ -13,3 +29,101 @@ def strip_tool_calls(text: str) -> str:
     pattern = re.compile(r"\[TOOL_CALL:[^\]]+\]")
     return pattern.sub("", text)
 
+
+def normalize_agent_markdown(text: str) -> str:
+    """Best-effort cleanup for model outputs that leak JSON/string wrappers."""
+    if not text:
+        return text
+
+    cleaned = strip_tool_calls(text).strip()
+    for _ in range(4):
+        updated = _unwrap_json_like_text(cleaned)
+        updated = strip_tool_calls(updated).strip()
+        if updated == cleaned:
+            break
+        cleaned = updated
+
+    cleaned = _unescape_common_sequences(cleaned)
+    cleaned = strip_tool_calls(cleaned).strip().strip("`").strip()
+    cleaned = re.sub(r'^(?:(?:"|\')?\s*[:：]\s*(?:"|\')?\s*)+', "", cleaned).strip()
+    cleaned = cleaned.strip('"').strip("'").strip()
+    return cleaned
+
+
+def _unwrap_json_like_text(text: str) -> str:
+    candidate = text.strip()
+    if not candidate:
+        return candidate
+
+    parsed_text = _parse_json_candidate(candidate)
+    if parsed_text is not None:
+        return parsed_text
+
+    embedded_text = _extract_embedded_json_text(candidate)
+    if embedded_text is not None:
+        return embedded_text
+
+    return candidate
+
+
+def _parse_json_candidate(candidate: str) -> str | None:
+    if candidate[0] not in {'"', "{", "["}:
+        return None
+
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+    return _extract_text_from_payload(payload)
+
+
+def _extract_text_from_payload(payload: Any) -> str | None:
+    if isinstance(payload, str):
+        return payload.strip()
+
+    if isinstance(payload, dict):
+        for key in JSON_TEXT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        for value in payload.values():
+            extracted = _extract_text_from_payload(value)
+            if extracted:
+                return extracted
+
+    if isinstance(payload, list):
+        for item in payload:
+            extracted = _extract_text_from_payload(item)
+            if extracted:
+                return extracted
+
+    return None
+
+
+def _extract_embedded_json_text(candidate: str) -> str | None:
+    for pattern in JSON_FIELD_PATTERNS:
+        match = pattern.search(candidate)
+        if not match:
+            continue
+
+        try:
+            return json.loads(f'"{match.group(1)}"').strip()
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+def _unescape_common_sequences(text: str) -> str:
+    if not any(token in text for token in ("\\n", "\\r", "\\t", '\\"')):
+        return text
+
+    return (
+        text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+    )

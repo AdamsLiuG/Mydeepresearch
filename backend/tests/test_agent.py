@@ -216,6 +216,7 @@ class AgentExecutionTests(unittest.TestCase):
                 None,
                 "duckduckgo",
                 False,
+                "miss",
             ),
         ):
             events = list(
@@ -252,7 +253,7 @@ class AgentExecutionTests(unittest.TestCase):
             agent_module,
             "dispatch_search",
             side_effect=[
-                ({"results": []}, [], None, "searxng", False),
+                ({"results": []}, [], None, "searxng", False, "miss"),
                 (
                     {
                         "results": [
@@ -267,6 +268,7 @@ class AgentExecutionTests(unittest.TestCase):
                     None,
                     "searxng",
                     False,
+                    "miss",
                 ),
             ],
         ) as mock_dispatch:
@@ -288,6 +290,116 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertTrue(any("更宽泛检索词" in notice for notice in task.notices))
         self.assertEqual(mock_dispatch.call_count, 2)
         self.assertEqual(observer.snapshot()["completed_tasks"], 1)
+
+    def test_execute_task_records_semantic_cache_hits_on_second_request(self):
+        agent = self._build_agent()
+        state = SummaryState(research_topic="多模态大模型前沿技术")
+        first_task = TodoItem(
+            id=1,
+            title="架构创新与模型设计",
+            intent="梳理多模态大模型的核心架构演进与融合机制",
+            query="多模态大模型 架构 视觉语言融合 最新研究 2024 2025",
+        )
+        second_task = TodoItem(
+            id=1,
+            title="架构创新调研",
+            intent="梳理核心架构设计、跨模态融合与注意力机制创新",
+            query="多模态大模型 架构设计 2024 2025 跨模态融合 注意力机制",
+        )
+
+        dispatch_results = iter(
+            [
+                (
+                    {
+                        "results": [
+                            {
+                                "title": "Architecture",
+                                "url": "https://example.com/arch",
+                                "content": "content",
+                            }
+                        ]
+                    },
+                    [],
+                    None,
+                    "advanced[searxng, tavily]",
+                    False,
+                    "miss",
+                ),
+                (
+                    {
+                        "results": [
+                            {
+                                "title": "Architecture",
+                                "url": "https://example.com/arch",
+                                "content": "content",
+                            }
+                        ]
+                    },
+                    [],
+                    None,
+                    "advanced[searxng, tavily]",
+                    True,
+                    "semantic",
+                ),
+            ]
+        )
+
+        def fake_dispatch_search(query, config, loop_count, observer=None, cache_context=None):
+            result = next(dispatch_results)
+            if observer is not None:
+                observer.record_search_attempt(
+                    cache_hit=result[4],
+                    success=True,
+                    cache_strategy=result[5],
+                )
+            return result
+
+        with patch.object(agent_module, "dispatch_search", side_effect=fake_dispatch_search):
+            first_observer = RequestTrace(
+                request_id="req-semantic-first",
+                topic="多模态大模型前沿技术",
+                search_api="advanced",
+                provider="custom",
+                model="Qwen/Qwen3.5-27B",
+                pricing_catalog={},
+            )
+            agent._request_trace = first_observer
+            list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    first_task,
+                    emit_stream=False,
+                )
+            )
+
+            second_observer = RequestTrace(
+                request_id="req-semantic-second",
+                topic="多模态大模型前沿技术",
+                search_api="advanced",
+                provider="custom",
+                model="Qwen/Qwen3.5-27B",
+                pricing_catalog={},
+            )
+            agent._request_trace = second_observer
+            list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    second_task,
+                    emit_stream=False,
+                )
+            )
+
+        self.assertEqual(first_observer.snapshot()["cache_semantic_hits"], 0)
+        self.assertEqual(second_observer.snapshot()["cache_semantic_hits"], 1)
+        search_stages = [
+            stage
+            for stage in second_observer.snapshot()["stages"]
+            if stage.get("stage") == "search"
+        ]
+        self.assertTrue(search_stages)
+        self.assertEqual(search_stages[-1]["metadata"]["cache_strategy"], "semantic")
 
 
 if __name__ == "__main__":

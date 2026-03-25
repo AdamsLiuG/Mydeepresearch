@@ -34,8 +34,9 @@ class MetricsTests(unittest.TestCase):
         planning_span.complete(status="success", metadata={"task_count": 1})
         observer.record_fallback("planning_returned_no_tasks")
         observer.record_degraded("fallback_task_used")
-        observer.record_search_attempt(cache_hit=False, success=True)
-        observer.record_search_attempt(cache_hit=True, success=True)
+        observer.record_search_attempt(cache_hit=False, success=True, cache_strategy="miss")
+        observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="exact")
+        observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="semantic")
         observer.record_llm_call(
             success=True,
             prompt_text="p" * 400,
@@ -67,9 +68,13 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(aggregate_snapshot["counters"]["request_total"], 1)
         self.assertEqual(aggregate_snapshot["counters"]["request_partial_success_total"], 1)
         self.assertEqual(aggregate_snapshot["counters"]["fallback_trigger_total"], 1)
-        self.assertEqual(aggregate_snapshot["counters"]["search_call_total"], 2)
-        self.assertEqual(aggregate_snapshot["counters"]["cache_hit_total"], 1)
+        self.assertEqual(aggregate_snapshot["counters"]["search_call_total"], 3)
+        self.assertEqual(aggregate_snapshot["counters"]["cache_hit_total"], 2)
+        self.assertEqual(aggregate_snapshot["counters"]["cache_exact_hit_total"], 1)
+        self.assertEqual(aggregate_snapshot["counters"]["cache_semantic_hit_total"], 1)
         self.assertEqual(aggregate_snapshot["counters"]["cache_miss_total"], 1)
+        self.assertEqual(request_snapshot["cache_exact_hits"], 1)
+        self.assertEqual(request_snapshot["cache_semantic_hits"], 1)
         self.assertEqual(aggregate_snapshot["counters"]["llm_call_total"], 1)
         self.assertGreater(aggregate_snapshot["counters"]["total_tokens"], 0)
         self.assertGreater(aggregate_snapshot["estimated_cost"], 0)

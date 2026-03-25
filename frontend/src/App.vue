@@ -180,6 +180,7 @@
 
       <!-- 右侧：研究结果 -->
       <section
+        ref="resultPanelRef"
         class="panel panel-result"
         v-if="todoTasks.length || reportMarkdown || progressLogs.length"
       >
@@ -195,7 +196,7 @@
             </span>
           </div>
           <div class="status-controls">
-            <button class="secondary-btn" @click="logsCollapsed = !logsCollapsed">
+            <button class="secondary-btn" @click="toggleLogsVisibility">
               {{ logsCollapsed ? "展开流程" : "收起流程" }}
             </button>
           </div>
@@ -233,14 +234,59 @@
           </div>
         </section>
 
-        <div class="timeline-wrapper" v-show="!logsCollapsed && progressLogs.length">
-          <transition-group name="timeline" tag="ul" class="timeline">
-            <li v-for="(log, index) in progressLogs" :key="`${log}-${index}`">
-              <span class="timeline-node"></span>
-              <p>{{ log }}</p>
-            </li>
-          </transition-group>
-        </div>
+        <section v-if="todoTasks.length" class="planning-summary">
+          <div class="planning-summary-head">
+            <div>
+              <h3>任务规划概览</h3>
+              <p>始终按结构化任务展示当前主题的规划结果。</p>
+            </div>
+            <span class="planning-count">{{ todoTasks.length }} 个任务</span>
+          </div>
+          <div class="planning-grid">
+            <article
+              v-for="task in todoTasks"
+              :key="`plan-${task.id}`"
+              class="planning-card"
+            >
+              <div class="planning-card-head">
+                <strong>{{ task.title }}</strong>
+                <span class="task-status" :class="task.status">
+                  {{ formatTaskStatus(task.status) }}
+                </span>
+              </div>
+              <p class="planning-intent">{{ task.intent }}</p>
+              <p class="planning-query">查询：{{ task.query || form.topic }}</p>
+              <p v-if="task.noteId" class="planning-note">笔记：{{ task.noteId }}</p>
+            </article>
+          </div>
+        </section>
+
+        <section
+          v-if="progressLogs.length"
+          ref="timelineSectionRef"
+          class="timeline-section"
+        >
+          <div class="timeline-head">
+            <div>
+              <h3>流程记录</h3>
+              <p>展示规划、搜索、总结和报告阶段的实时过程。</p>
+            </div>
+            <span class="timeline-count">{{ progressLogs.length }} 条</span>
+          </div>
+
+          <div
+            ref="timelineWrapperRef"
+            class="timeline-wrapper"
+            v-show="!logsCollapsed"
+          >
+            <transition-group name="timeline" tag="ul" class="timeline">
+              <li v-for="(log, index) in progressLogs" :key="`${log}-${index}`">
+                <span class="timeline-node"></span>
+                <p>{{ log }}</p>
+              </li>
+            </transition-group>
+          </div>
+        </section>
 
         <div class="tasks-section" v-if="todoTasks.length">
           <aside class="tasks-list">
@@ -345,7 +391,10 @@
               :class="{ 'block-highlight': summaryHighlight }"
             >
               <h3>任务总结</h3>
-              <pre class="block-pre">{{ currentTaskSummary || "暂无可用信息" }}</pre>
+              <div
+                class="markdown-block"
+                v-html="currentTaskSummaryHtml"
+              ></div>
             </section>
 
             <section
@@ -404,7 +453,10 @@
           :class="{ 'block-highlight': reportHighlight }"
         >
           <h3>最终报告</h3>
-          <pre class="block-pre">{{ reportMarkdown }}</pre>
+          <div
+            class="markdown-block"
+            v-html="reportMarkdownHtml"
+          ></div>
         </div>
       </section>
 
@@ -413,7 +465,8 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { marked } from "marked";
 
 import {
   fetchMetricsSnapshot,
@@ -490,6 +543,9 @@ const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
 const reportHighlight = ref(false);
 const toolHighlight = ref(false);
+const resultPanelRef = ref<HTMLElement | null>(null);
+const timelineSectionRef = ref<HTMLElement | null>(null);
+const timelineWrapperRef = ref<HTMLElement | null>(null);
 
 let currentController: AbortController | null = null;
 let globalMetricsTimer: number | null = null;
@@ -548,6 +604,12 @@ const currentTaskToolCalls = computed(
 const hasMetrics = computed(
   () => latestRequestMetrics.value !== null || latestAggregateMetrics.value !== null
 );
+const currentTaskSummaryHtml = computed(() =>
+  renderMarkdownBlock(currentTaskSummary.value || "暂无可用信息")
+);
+const reportMarkdownHtml = computed(() =>
+  renderMarkdownBlock(reportMarkdown.value || "暂无生成的报告")
+);
 
 function getNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -555,6 +617,25 @@ function getNumber(value: unknown): number {
 
 function getString(value: unknown, fallback = "-"): string {
   return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function renderMarkdownBlock(value: string): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) {
+    return "<p>暂无可用信息</p>";
+  }
+
+  return marked.parse(escapeHtml(text), {
+    breaks: true,
+    gfm: true
+  }) as string;
 }
 
 const requestMetricElapsedMs = computed(() =>
@@ -987,6 +1068,38 @@ function formatStageLabel(stage: string): string {
     report: "报告"
   };
   return labels[stage] ?? stage;
+}
+
+async function toggleLogsVisibility() {
+  const nextCollapsed = !logsCollapsed.value;
+  logsCollapsed.value = nextCollapsed;
+
+  await nextTick();
+
+  const panel = resultPanelRef.value;
+  const timelineSection = timelineSectionRef.value;
+  if (!panel || !timelineSection) {
+    return;
+  }
+
+  const targetTop = Math.max(0, timelineSection.offsetTop - 24);
+
+  if (nextCollapsed) {
+    const maxScrollTop = Math.max(0, panel.scrollHeight - panel.clientHeight);
+    const safeScrollTop = Math.min(targetTop, maxScrollTop);
+    if (panel.scrollTop > safeScrollTop) {
+      panel.scrollTo({
+        top: safeScrollTop,
+        behavior: "smooth"
+      });
+    }
+    return;
+  }
+
+  panel.scrollTo({
+    top: targetTop,
+    behavior: "smooth"
+  });
 }
 
 const handleSubmit = async () => {
@@ -1775,10 +1888,143 @@ select:focus {
   color: #475569;
 }
 
+.planning-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.35);
+}
+
+.planning-summary-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.planning-summary-head h3 {
+  margin: 0;
+  font-size: 16px;
+  color: #0f172a;
+}
+
+.planning-summary-head p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: #64748b;
+}
+
+.planning-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(191, 219, 254, 0.34);
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.planning-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.planning-card {
+  padding: 14px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.96));
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.planning-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.planning-card-head strong {
+  font-size: 14px;
+  color: #0f172a;
+}
+
+.planning-intent,
+.planning-query,
+.planning-note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.planning-intent {
+  color: #334155;
+}
+
+.planning-query,
+.planning-note {
+  color: #475569;
+}
+
+.timeline-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.28);
+  overflow-anchor: none;
+}
+
+.timeline-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.timeline-head h3 {
+  margin: 0;
+  font-size: 16px;
+  color: #0f172a;
+}
+
+.timeline-head p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: #64748b;
+}
+
+.timeline-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(191, 219, 254, 0.34);
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .timeline-wrapper {
-  margin-top: 12px;
+  scroll-margin-top: 18px;
   max-height: 220px;
   overflow-y: auto;
+  padding: 4px 8px 4px 0;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.84);
   padding-right: 8px;
   scrollbar-width: thin;
   scrollbar-color: rgba(129, 140, 248, 0.45) rgba(226, 232, 240, 0.6);
@@ -1829,6 +2075,10 @@ select:focus {
   color: #1e293b;
   font-size: 14px;
   line-height: 1.5;
+}
+
+.timeline li p {
+  margin: 0;
 }
 
 .timeline-node {
@@ -2140,9 +2390,117 @@ select:focus {
   background: linear-gradient(180deg, rgba(79, 70, 229, 0.8), rgba(37, 99, 235, 0.75));
 }
 
-.summary-block .block-pre,
-.sources-block .block-pre {
+.markdown-block {
+  font-size: 14px;
+  line-height: 1.75;
+  color: #1f2937;
+  background: rgba(248, 250, 252, 0.9);
+  padding: 16px 18px;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  overflow: auto;
+  max-height: 420px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(129, 140, 248, 0.6) rgba(226, 232, 240, 0.7);
+}
+
+.markdown-block::-webkit-scrollbar {
+  width: 6px;
+}
+
+.markdown-block::-webkit-scrollbar-track {
+  background: rgba(226, 232, 240, 0.7);
+  border-radius: 999px;
+}
+
+.markdown-block::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.75), rgba(59, 130, 246, 0.65));
+  border-radius: 999px;
+}
+
+.markdown-block::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(79, 70, 229, 0.8), rgba(37, 99, 235, 0.75));
+}
+
+.summary-block .markdown-block,
+.report-block .markdown-block {
   max-height: 360px;
+}
+
+.markdown-block :deep(h1),
+.markdown-block :deep(h2),
+.markdown-block :deep(h3),
+.markdown-block :deep(h4) {
+  margin: 0 0 12px;
+  color: #0f172a;
+  line-height: 1.35;
+}
+
+.markdown-block :deep(h1) {
+  font-size: 22px;
+}
+
+.markdown-block :deep(h2) {
+  font-size: 18px;
+}
+
+.markdown-block :deep(h3) {
+  font-size: 16px;
+}
+
+.markdown-block :deep(p),
+.markdown-block :deep(ul),
+.markdown-block :deep(ol),
+.markdown-block :deep(blockquote) {
+  margin: 0 0 12px;
+}
+
+.markdown-block :deep(ul),
+.markdown-block :deep(ol) {
+  padding-left: 20px;
+}
+
+.markdown-block :deep(li + li) {
+  margin-top: 6px;
+}
+
+.markdown-block :deep(code) {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular,
+    Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  background: rgba(224, 231, 255, 0.65);
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.markdown-block :deep(pre) {
+  margin: 0 0 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.92);
+  color: #e2e8f0;
+  overflow: auto;
+}
+
+.markdown-block :deep(pre code) {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.markdown-block :deep(a) {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.markdown-block :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.markdown-block :deep(blockquote) {
+  padding-left: 12px;
+  border-left: 3px solid rgba(59, 130, 246, 0.35);
+  color: #475569;
 }
 
 

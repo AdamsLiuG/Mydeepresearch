@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -50,6 +51,7 @@ _TRACKING_QUERY_PARAMS = {
     "ref",
     "ref_src",
 }
+_CJK_CHAR_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 _MEMORY_CACHE: dict[str, SearchCacheEntry] = {}
 _MEMORY_SCOPE_INDEX: dict[str, list[str]] = {}
@@ -65,6 +67,8 @@ _EMBEDDING_WARNING_EMITTED = False
 class SearchCacheEntry:
     query: str
     normalized_query: str
+    semantic_text: str
+    topic_scope: str
     search_api: str
     fetch_full_page: bool
     payload: dict[str, Any]
@@ -80,6 +84,8 @@ class SearchCacheEntry:
         return SearchCacheEntry(
             query=self.query,
             normalized_query=self.normalized_query,
+            semantic_text=self.semantic_text,
+            topic_scope=self.topic_scope,
             search_api=self.search_api,
             fetch_full_page=self.fetch_full_page,
             payload=deepcopy(self.payload),
@@ -96,6 +102,8 @@ class SearchCacheEntry:
         return {
             "query": self.query,
             "normalized_query": self.normalized_query,
+            "semantic_text": self.semantic_text,
+            "topic_scope": self.topic_scope,
             "search_api": self.search_api,
             "fetch_full_page": self.fetch_full_page,
             "payload": deepcopy(self.payload),
@@ -113,6 +121,8 @@ class SearchCacheEntry:
         return cls(
             query=str(record.get("query") or ""),
             normalized_query=str(record.get("normalized_query") or ""),
+            semantic_text=str(record.get("semantic_text") or record.get("normalized_query") or ""),
+            topic_scope=str(record.get("topic_scope") or ""),
             search_api=str(record.get("search_api") or ""),
             fetch_full_page=bool(record.get("fetch_full_page", False)),
             payload=deepcopy(record.get("payload") or {}),
@@ -146,6 +156,95 @@ def _normalize_query(query: str) -> str:
     return " ".join((query or "").strip().lower().split())
 
 
+def _normalize_cache_context(cache_context: dict[str, Any] | None) -> dict[str, str]:
+    """Return a sanitized cache-context mapping."""
+
+    if not isinstance(cache_context, dict):
+        return {}
+
+    normalized: dict[str, str] = {}
+    for field in ("research_topic", "task_title", "task_intent"):
+        value = cache_context.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            normalized[field] = text
+    return normalized
+
+
+def _build_topic_scope(cache_context: dict[str, str] | None) -> str:
+    """Return the normalized topic scope used to isolate semantic cache reuse."""
+
+    if not cache_context:
+        return ""
+    return _normalize_query(cache_context.get("research_topic") or "")
+
+
+def _build_semantic_text(query: str, cache_context: dict[str, str] | None) -> str:
+    """Return the normalized text used for semantic and lexical cache matching."""
+
+    parts = [
+        cache_context.get("research_topic", "") if cache_context else "",
+        cache_context.get("task_title", "") if cache_context else "",
+        cache_context.get("task_intent", "") if cache_context else "",
+        query,
+    ]
+    combined = " ".join(part.strip() for part in parts if part and str(part).strip())
+    return _normalize_query(combined)
+
+
+def _contains_cjk(text: str) -> bool:
+    """Return whether the text contains any CJK characters."""
+
+    return bool(_CJK_CHAR_PATTERN.search(text or ""))
+
+
+def _lexical_tokens(text: str) -> set[str]:
+    """Tokenize text into robust word and character n-grams for lexical similarity."""
+
+    normalized = _normalize_query(text)
+    if not normalized:
+        return set()
+
+    compact = normalized.replace(" ", "")
+    tokens = {part for part in normalized.split(" ") if part}
+    if not compact:
+        return tokens
+
+    if _contains_cjk(compact):
+        tokens.update(char for char in compact if _contains_cjk(char))
+        sizes = (2, 3)
+    else:
+        sizes = (3,)
+
+    for size in sizes:
+        if len(compact) < size:
+            continue
+        for index in range(len(compact) - size + 1):
+            tokens.add(compact[index : index + size])
+
+    if len(compact) <= 3:
+        tokens.add(compact)
+
+    return tokens
+
+
+def _lexical_similarity(left: str, right: str) -> float:
+    """Compute Jaccard similarity over normalized lexical features."""
+
+    left_tokens = _lexical_tokens(left)
+    right_tokens = _lexical_tokens(right)
+    if not left_tokens or not right_tokens:
+        return -1.0
+
+    union = left_tokens | right_tokens
+    if not union:
+        return -1.0
+
+    return len(left_tokens & right_tokens) / len(union)
+
+
 def _coerce_embedding(value: Any) -> list[float] | None:
     """Normalize an embedding payload into a list of floats."""
 
@@ -167,10 +266,16 @@ def _coerce_embedding(value: Any) -> list[float] | None:
         return None
 
 
-def _build_scope_key(search_api: str, fetch_full_page: bool) -> str:
+def _build_scope_key(search_api: str, fetch_full_page: bool, topic_scope: str = "") -> str:
     """Return the namespace key used to group semantically comparable entries."""
 
-    return f"scope::{search_api}::{int(fetch_full_page)}"
+    base = f"scope::{search_api}::{int(fetch_full_page)}"
+    normalized_topic_scope = _normalize_query(topic_scope)
+    if not normalized_topic_scope:
+        return base
+
+    digest = hashlib.sha256(normalized_topic_scope.encode("utf-8")).hexdigest()
+    return f"{base}::{digest}"
 
 
 def _build_cache_key(query: str, search_api: str, config: Configuration) -> str:
@@ -280,7 +385,7 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
     """Persist a search cache entry to disk or memory."""
 
     disk_cache = _get_disk_cache(config)
-    scope_key = _build_scope_key(entry.search_api, entry.fetch_full_page)
+    scope_key = _build_scope_key(entry.search_api, entry.fetch_full_page, entry.topic_scope)
     if disk_cache is not None:
         disk_cache.set(key, entry.to_record(), expire=config.search_cache_ttl_seconds)
     else:
@@ -370,22 +475,29 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
 
 def _read_semantic_cache(
     query_embedding: list[float] | None,
+    semantic_text: str,
     search_api: str,
     config: Configuration,
-) -> tuple[SearchCacheEntry | None, float]:
+    *,
+    topic_scope: str = "",
+) -> tuple[SearchCacheEntry | None, float, float]:
     """Read the best semantic cache match for a query."""
 
-    if query_embedding is None:
-        return None, 0.0
+    if query_embedding is None and not semantic_text:
+        return None, 0.0, 0.0
 
-    scope_key = _build_scope_key(search_api, config.fetch_full_page)
+    scope_key = _build_scope_key(search_api, config.fetch_full_page, topic_scope)
     candidate_keys = _get_scope_keys(config, scope_key)
     if not candidate_keys:
-        return None, 0.0
+        return None, 0.0, 0.0
 
     best_entry: SearchCacheEntry | None = None
-    best_similarity = 0.0
+    best_similarity = -1.0
+    best_lexical_similarity = -1.0
+    best_score = 0.0
     live_keys: list[str] = []
+    semantic_threshold = max(config.semantic_cache_similarity_threshold, 1e-9)
+    lexical_threshold = max(config.semantic_cache_lexical_threshold, 1e-9)
 
     for candidate_key in candidate_keys:
         entry = _read_exact_cache(candidate_key, config.search_cache_ttl_seconds, config)
@@ -393,21 +505,36 @@ def _read_semantic_cache(
             continue
 
         live_keys.append(candidate_key)
-        if entry.embedding is None:
-            continue
+        similarity = (
+            _cosine_similarity(query_embedding, entry.embedding)
+            if query_embedding is not None and entry.embedding is not None
+            else -1.0
+        )
+        lexical_similarity = _lexical_similarity(
+            semantic_text,
+            entry.semantic_text or entry.normalized_query,
+        )
 
-        similarity = _cosine_similarity(query_embedding, entry.embedding)
-        if similarity > best_similarity:
+        semantic_score = (similarity / semantic_threshold) if similarity >= 0.0 else 0.0
+        lexical_score = (lexical_similarity / lexical_threshold) if lexical_similarity >= 0.0 else 0.0
+        combined_score = max(semantic_score, lexical_score)
+
+        if combined_score > best_score or (
+            math.isclose(combined_score, best_score)
+            and (similarity, lexical_similarity) > (best_similarity, best_lexical_similarity)
+        ):
+            best_score = combined_score
             best_similarity = similarity
+            best_lexical_similarity = lexical_similarity
             best_entry = entry
 
     if live_keys != candidate_keys:
         _set_scope_keys(config, scope_key, live_keys)
 
-    if best_entry and best_similarity >= config.semantic_cache_similarity_threshold:
-        return best_entry, best_similarity
+    if best_entry and best_score >= 1.0:
+        return best_entry, max(best_similarity, 0.0), max(best_lexical_similarity, 0.0)
 
-    return None, best_similarity
+    return None, max(best_similarity, 0.0), max(best_lexical_similarity, 0.0)
 
 
 def _normalize_search_payload(
@@ -661,19 +788,23 @@ def dispatch_search(
     config: Configuration,
     loop_count: int,
     observer: RequestTrace | None = None,
-) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool]:
+    cache_context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool, str]:
     """Execute configured search backend and normalise response payload."""
 
     search_api = get_config_value(config.search_api)
     cache_key = _build_cache_key(query, search_api, config)
-    query_embedding: list[float] | None = None
+    normalized_cache_context = _normalize_cache_context(cache_context)
+    topic_scope = _build_topic_scope(normalized_cache_context)
+    semantic_text = _build_semantic_text(query, normalized_cache_context)
+    semantic_embedding: list[float] | None = None
     max_results = 5
 
     if config.search_cache_enabled:
         exact_cached = _read_exact_cache(cache_key, config.search_cache_ttl_seconds, config)
         if exact_cached:
             if observer:
-                observer.record_search_attempt(cache_hit=True, success=True)
+                observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="exact")
             logger.info("Search exact cache hit: backend=%s query=%s", search_api, query)
             return (
                 exact_cached.payload,
@@ -681,28 +812,38 @@ def dispatch_search(
                 exact_cached.answer_text,
                 exact_cached.backend_label,
                 True,
+                "exact",
             )
 
         if config.semantic_cache_enabled:
-            query_embedding = _embed_query(query, config)
-        semantic_cached, similarity = _read_semantic_cache(query_embedding, search_api, config)
-        if semantic_cached:
-            if observer:
-                observer.record_search_attempt(cache_hit=True, success=True)
-            logger.info(
-                "Search semantic cache hit: backend=%s query=%s matched_query=%s similarity=%.4f",
+            semantic_embedding = _embed_query(semantic_text or query, config)
+            semantic_cached, similarity, lexical_similarity = _read_semantic_cache(
+                semantic_embedding,
+                semantic_text,
                 search_api,
-                query,
-                semantic_cached.query,
-                similarity,
+                config,
+                topic_scope=topic_scope,
             )
-            return (
-                semantic_cached.payload,
-                semantic_cached.notices,
-                semantic_cached.answer_text,
-                semantic_cached.backend_label,
-                True,
-            )
+            if semantic_cached:
+                if observer:
+                    observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="semantic")
+                logger.info(
+                    "Search semantic cache hit: backend=%s query=%s matched_query=%s similarity=%.4f lexical_similarity=%.4f topic_scope=%s",
+                    search_api,
+                    query,
+                    semantic_cached.query,
+                    similarity,
+                    lexical_similarity,
+                    topic_scope or "<global>",
+                )
+                return (
+                    semantic_cached.payload,
+                    semantic_cached.notices,
+                    semantic_cached.answer_text,
+                    semantic_cached.backend_label,
+                    True,
+                    "semantic",
+                )
 
     try:
         if search_api == "advanced":
@@ -740,12 +881,14 @@ def dispatch_search(
     )
 
     if observer:
-        observer.record_search_attempt(cache_hit=False, success=True)
+        observer.record_search_attempt(cache_hit=False, success=True, cache_strategy="miss")
 
     if config.search_cache_enabled:
         cache_entry = SearchCacheEntry(
             query=query.strip(),
             normalized_query=_normalize_query(query),
+            semantic_text=semantic_text,
+            topic_scope=topic_scope,
             search_api=search_api,
             fetch_full_page=config.fetch_full_page,
             payload=payload,
@@ -753,11 +896,11 @@ def dispatch_search(
             answer_text=answer_text,
             backend_label=backend_label,
             created_at=time.time(),
-            embedding=query_embedding,
+            embedding=semantic_embedding,
         )
         _write_cache(cache_key, cache_entry, config)
 
-    return payload, notices, answer_text, backend_label, False
+    return payload, notices, answer_text, backend_label, False, "miss"
 
 
 def prepare_research_context(

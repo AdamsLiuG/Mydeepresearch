@@ -11,7 +11,7 @@ from config import Configuration
 from metrics import RequestTrace
 from models import SummaryState, TodoItem
 from services.notes import build_note_guidance
-from services.text_processing import strip_tool_calls
+from services.text_processing import normalize_agent_markdown
 from utils import strip_thinking_tokens, truncate_text
 
 
@@ -62,7 +62,7 @@ class SummarizationService:
         if self._config.strip_thinking_tokens:
             summary_text = strip_thinking_tokens(summary_text)
 
-        summary_text = strip_tool_calls(summary_text).strip()
+        summary_text = normalize_agent_markdown(summary_text)
 
         return summary_text or "暂无可用信息"
 
@@ -154,7 +154,7 @@ class SummarizationService:
                 )
                 call_recorded = True
 
-            return strip_tool_calls(cleaned).strip()
+            return normalize_agent_markdown(cleaned)
 
         return generator(), get_summary
 
@@ -174,4 +174,3 @@ class SummarizationService:
             f"{build_note_guidance(task)}\n"
             "请按照以上协作要求先同步笔记，然后返回一份面向用户的 Markdown 总结（仍遵循任务总结模板）。"
         )
-

@@ -94,6 +94,8 @@ class StubAgent:
                 "status": "in_progress",
                 "elapsed_ms": 12,
                 "cache_hits": 0,
+                "cache_exact_hits": 0,
+                "cache_semantic_hits": 0,
                 "cache_misses": 1,
                 "total_tokens": 120,
                 "estimated_cost": 0.0012,
@@ -101,7 +103,13 @@ class StubAgent:
             },
             "aggregate_metrics": {
                 "success_rate": 1.0,
-                "counters": {"fallback_trigger_total": 0},
+                "counters": {
+                    "fallback_trigger_total": 0,
+                    "cache_exact_hit_total": 0,
+                    "cache_semantic_hit_total": 0,
+                },
+                "cache_exact_hit_total": 0,
+                "cache_semantic_hit_total": 0,
             },
         }
         yield {
@@ -239,6 +247,36 @@ class ApiTests(unittest.TestCase):
                 "done",
             ],
         )
+        metrics_event = next(event for event in events if event["type"] == "metrics_snapshot")
+        self.assertIn("cache_exact_hits", metrics_event["request_metrics"])
+        self.assertIn("cache_semantic_hits", metrics_event["request_metrics"])
+        self.assertIn("cache_exact_hit_total", metrics_event["aggregate_metrics"])
+        self.assertIn("cache_semantic_hit_total", metrics_event["aggregate_metrics"])
+
+    def test_stream_endpoint_allows_loopback_origin_pair(self):
+        base_config = main.Configuration.from_env(
+            overrides={
+                "cors_origins": "http://localhost:5174",
+            },
+            load_env_file=False,
+        )
+
+        with isolated_configuration():
+            with patch.object(main, "DeepResearchAgent", StubAgent):
+                with TestClient(main.create_app(base_config=base_config)) as client:
+                    response = client.options(
+                        "/research/stream",
+                        headers={
+                            "Origin": "http://127.0.0.1:5174",
+                            "Access-Control-Request-Method": "POST",
+                        },
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "http://127.0.0.1:5174",
+        )
 
     def test_metrics_json_endpoint_returns_snapshot(self):
         with isolated_configuration():
@@ -260,6 +298,24 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertIn("request_id=", response.json()["detail"])
         self.assertIn("X-Request-ID", response.headers)
+
+    def test_benchmark_stub_mode_returns_deterministic_payload(self):
+        base_config = main.Configuration.from_env(
+            overrides={
+                "benchmark_stub_enabled": True,
+                "benchmark_profile": "stub",
+            },
+            load_env_file=False,
+        )
+
+        with isolated_configuration():
+            with TestClient(main.create_app(base_config=base_config)) as client:
+                response = client.post("/research", json={"topic": "工程 benchmark 验证"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("Deterministic benchmark summary.", json.dumps(payload, ensure_ascii=False))
+        self.assertIn("Benchmark Stub Task", json.dumps(payload, ensure_ascii=False))
 
     def test_stream_endpoint_emits_error_event_when_runtime_fails(self):
         with isolated_configuration():

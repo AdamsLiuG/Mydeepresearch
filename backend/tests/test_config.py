@@ -31,6 +31,7 @@ class ConfigurationTests(unittest.TestCase):
                     "log_level": "debug",
                     "port": "9001",
                     "cors_origins": "http://localhost:5174, http://localhost:3000",
+                    "semantic_cache_lexical_threshold": "0.81",
                 },
                 load_env_file=False,
             )
@@ -42,10 +43,48 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(cfg.log_level, "DEBUG")
         self.assertEqual(cfg.port, 9001)
+        self.assertEqual(cfg.semantic_cache_lexical_threshold, 0.81)
         self.assertEqual(
             cfg.cors_origins,
-            ["http://localhost:5174", "http://localhost:3000"],
+            [
+                "http://localhost:5174",
+                "http://127.0.0.1:5174",
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+            ],
         )
+
+    def test_loopback_cors_origins_expand_to_localhost_and_127(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={
+                    "cors_origins": ["http://127.0.0.1:5174"],
+                },
+                load_env_file=False,
+            )
+
+        self.assertEqual(
+            cfg.cors_origins,
+            ["http://127.0.0.1:5174", "http://localhost:5174"],
+        )
+
+    def test_perf_settings_are_normalized(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={
+                    "benchmark_profile": "STUB",
+                    "perf_thresholds_path": "perf/baselines/stub_baseline.json",
+                    "perf_sample_interval_seconds": "0.25",
+                },
+                load_env_file=False,
+            )
+
+        expected_thresholds = str(
+            (config.backend_root() / "perf/baselines/stub_baseline.json").resolve(strict=False)
+        )
+        self.assertEqual(cfg.benchmark_profile, "stub")
+        self.assertEqual(cfg.perf_thresholds_path, expected_thresholds)
+        self.assertEqual(cfg.perf_sample_interval_seconds, 0.25)
 
 
 if __name__ == "__main__":

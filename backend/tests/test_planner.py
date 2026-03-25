@@ -111,6 +111,49 @@ class PlannerParsingTests(unittest.TestCase):
         self.assertEqual(tasks[0]["intent"], "识别核心技术创新与架构突破")
         self.assertEqual(tasks[4]["title"], "挑战与未来方向")
 
+    def test_extract_tasks_prefers_markdown_table_over_followup_numbered_text(self):
+        raw_response = """
+| 任务ID | 任务名称 | 核心关注点 | 笔记ID |
+| --- | --- | --- | --- |
+| 1 | 技术架构演进 | 模型设计原理与训练范式 | note_1 |
+| 2 | 主流模型能力对比 | 核心能力与性能差异 | note_2 |
+| 3 | 典型应用场景 | 行业落地案例与商业价值 | note_3 |
+| 4 | 技术瓶颈与前沿 | 技术局限与未来方向 | note_4 |
+
+1. 交叉验证：检查任务 2 和任务 4 的一致性
+2. 综合报告：整合所有任务结论
+3. 迭代更新：根据新发现补充说明
+"""
+
+        tasks = self.service._extract_tasks(raw_response)
+
+        self.assertEqual(len(tasks), 4)
+        self.assertEqual(tasks[0]["title"], "技术架构演进")
+        self.assertEqual(tasks[3]["title"], "技术瓶颈与前沿")
+
+    def test_extract_tasks_recovers_task_confirmation_table_without_intent_column(self):
+        raw_response = """
+| 任务ID | 任务名称 | 笔记ID | 状态 |
+|--------|----------|--------|------|
+| task_1 | 技术架构与模型创新 | note_1 | 已创建 |
+| task_2 | 应用场景与落地实践 | note_2 | 已创建 |
+| task_3 | 性能评估与基准测试 | note_3 | 已创建 |
+| task_4 | 伦理安全与治理挑战 | note_4 | 已创建 |
+| task_5 | 未来趋势与研究方向 | note_5 | 已创建 |
+
+1. 风险前置：先标记潜在争议点
+2. 交叉验证：检查任务结论一致性
+3. 综合报告：汇总所有发现
+4. 迭代更新：补充遗漏细节
+"""
+
+        tasks = self.service._extract_tasks(raw_response)
+
+        self.assertEqual(len(tasks), 5)
+        self.assertEqual(tasks[0]["title"], "技术架构与模型创新")
+        self.assertEqual(tasks[0]["intent"], "聚焦主题的关键问题")
+        self.assertEqual(tasks[4]["title"], "未来趋势与研究方向")
+
     def test_plan_todo_list_repairs_workflow_like_titles(self):
         DummyToolAwareSimpleAgent.responses = [
             """
@@ -137,6 +180,31 @@ class PlannerParsingTests(unittest.TestCase):
         self.assertEqual(todo_items[1].title, "能力对比")
         self.assertNotIn("启动检索", [item.title for item in todo_items])
 
+    def test_plan_todo_list_uses_task_confirmation_table_without_repair(self):
+        DummyToolAwareSimpleAgent.responses = [
+            """
+| 任务ID | 任务名称 | 笔记ID | 状态 |
+|--------|----------|--------|------|
+| task_1 | 技术架构与融合机制 | note_1 | 已创建 |
+| task_2 | 主流模型能力对比 | note_2 | 已创建 |
+| task_3 | 典型应用场景与落地 | note_3 | 已创建 |
+| task_4 | 评估基准与性能指标 | note_4 | 已创建 |
+| task_5 | 技术瓶颈与未来方向 | note_5 | 已创建 |
+
+1. 风险前置：先说明研究边界
+2. 交叉验证：校验多个任务结论
+3. 综合报告：汇总结论
+4. 迭代更新：根据结果补充说明
+""",
+        ]
+
+        state = types.SimpleNamespace(research_topic="探索多模态大模型的前沿技术")
+        todo_items = self.service.plan_todo_list(state)
+
+        self.assertEqual(len(todo_items), 5)
+        self.assertEqual(todo_items[0].title, "技术架构与融合机制")
+        self.assertEqual(todo_items[4].title, "技术瓶颈与未来方向")
+
     def test_plan_todo_list_builds_task_specific_query_when_missing(self):
         DummyToolAwareSimpleAgent.responses = [
             """
@@ -159,6 +227,55 @@ class PlannerParsingTests(unittest.TestCase):
             todo_items[1].query,
             "探索多模态大模型在2025年的关键进展 应用场景落地",
         )
+
+    def test_normalize_task_title_prefers_arrow_suffix_and_strips_task_refs(self):
+        title = "并行应用层+评估层**（任务2、3）→ 验证技术价值"
+
+        normalized = self.service._normalize_task_title(title)
+
+        self.assertEqual(normalized, "验证技术价值")
+
+    def test_sanitize_tasks_rejects_phase_style_titles_without_real_task_name(self):
+        tasks, rejected = self.service._sanitize_tasks(
+            [
+                {
+                    "title": "优先技术层（任务1）",
+                    "intent": "先执行第一组任务",
+                    "query": "优先技术层 任务1",
+                },
+                {
+                    "title": "技术发展脉络",
+                    "intent": "梳理核心技术路线",
+                    "query": "多模态模型 技术发展脉络",
+                },
+            ],
+            research_topic="探索多模态大模型在2025年的关键进展",
+        )
+
+        self.assertEqual(rejected, 1)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["title"], "技术发展脉络")
+
+    def test_sanitize_tasks_rejects_iteration_update_title(self):
+        tasks, rejected = self.service._sanitize_tasks(
+            [
+                {
+                    "title": "迭代更新",
+                    "intent": "根据中间结果继续补充工作流说明",
+                    "query": "迭代更新",
+                },
+                {
+                    "title": "技术发展脉络",
+                    "intent": "梳理核心技术路线",
+                    "query": "多模态模型 技术发展脉络",
+                },
+            ],
+            research_topic="探索多模态大模型在2025年的关键进展",
+        )
+
+        self.assertEqual(rejected, 1)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["title"], "技术发展脉络")
 
 
 if __name__ == "__main__":

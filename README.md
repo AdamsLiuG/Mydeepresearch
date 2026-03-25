@@ -109,6 +109,27 @@ cd backend
 
 > 说明：即使某些 case 因本地 LLM / Search 不可用而失败，runner 也会继续执行并产出结果文件，便于离线排查与比较。
 
+## Engineering Perf
+
+除了 `backend/evals/` 的质量 benchmark 外，仓库现在还提供了独立的工程化性能基准：
+
+- `python -m perf.run_smoke`：轻量 smoke benchmark，默认适合 PR / CI
+- `python -m perf.run_regression`：回归基线对比，可选择 `--write-baseline`
+- `python -m perf.run_load`：基于 Locust 的 load/stress benchmark
+- `python -m perf.run_profile`：请求延迟 + CPU/RSS profiling
+
+场景和基线文件位于 `backend/perf/scenarios/` 与 `backend/perf/baselines/`，运行结果默认输出到 `backend/perf/results/`。
+
+### perf 运行命令
+
+```bash
+cd backend
+/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_smoke --profile stub
+/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_regression --profile real_local --write-baseline
+/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_load --profile stub --users 4 --spawn-rate 2 --duration 20s
+/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_profile --profile real_local
+```
+
 ## Docker
 
 后端提供了 [backend/Dockerfile](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/Dockerfile) 和根目录 [docker-compose.yml](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/docker-compose.yml)。
@@ -129,7 +150,10 @@ CI 配置位于 [.github/workflows/ci.yml](/media/main/hjz/agent/deepresearch/he
 - backend lint：`ruff check`
 - backend test：`pytest`
 - backend build check：`pip wheel ./backend --no-deps`
+- perf smoke：`python -m perf.run_smoke` + `python -m perf.run_load`
 - frontend build check：`npm run build`
+
+重型 benchmark 还提供了单独的 [.github/workflows/perf-regression.yml](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/.github/workflows/perf-regression.yml)，支持手动和定时运行 regression / load / profile。
 
 ## 已知限制
 

@@ -1,0 +1,68 @@
+name: Perf Regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Benchmark profile to run"
+        required: true
+        default: "stub"
+        type: choice
+        options:
+          - stub
+          - real_local
+      run_load:
+        description: "Run the Locust load benchmark"
+        required: true
+        default: true
+        type: boolean
+      run_profile:
+        description: "Run the profiling benchmark"
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  perf-regression:
+    runs-on: ubuntu-latest
+    env:
+      PERF_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile || 'stub' }}
+      PERF_RUN_LOAD: ${{ github.event_name != 'workflow_dispatch' || inputs.run_load }}
+      PERF_RUN_PROFILE: ${{ github.event_name != 'workflow_dispatch' || inputs.run_profile }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./backend[dev]"
+
+      - name: Run regression benchmark
+        working-directory: backend
+        run: python -m perf.run_regression --profile "${{ env.PERF_PROFILE }}" --baseline "perf/baselines/${{ env.PERF_PROFILE }}_baseline.json"
+
+      - name: Run load benchmark
+        if: ${{ env.PERF_RUN_LOAD == 'true' }}
+        working-directory: backend
+        run: python -m perf.run_load --profile "${{ env.PERF_PROFILE }}" --users 4 --spawn-rate 2 --duration 30s --output "perf/results/load-${{ env.PERF_PROFILE }}.json"
+
+      - name: Run profile benchmark
+        if: ${{ env.PERF_RUN_PROFILE == 'true' }}
+        working-directory: backend
+        run: python -m perf.run_profile --profile "${{ env.PERF_PROFILE }}" --output "perf/results/profile-${{ env.PERF_PROFILE }}.json"
+
+      - name: Upload perf artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-regression-results-${{ env.PERF_PROFILE }}
+          path: backend/perf/results/

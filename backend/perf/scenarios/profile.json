@@ -1,0 +1,14 @@
+{
+  "topics": [
+    "为什么结构化日志对长链路 agent 系统重要？",
+    "梳理 AI agent 系统的 fallback / degrade 设计模式"
+  ],
+  "requests_total": 3,
+  "concurrency": 1,
+  "timeout_seconds": 180,
+  "sample_interval_seconds": 0.25,
+  "validate_stream": false,
+  "server_env": {
+    "ENABLE_NOTES": "False"
+  }
+}

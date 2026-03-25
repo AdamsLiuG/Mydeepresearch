@@ -651,13 +651,14 @@ class DeepResearchAgent:
         state: SummaryState,
         task: TodoItem,
         observer: RequestTrace | None,
-    ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool]:
+    ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool, str]:
         """Retry a task search with broader queries before marking it skipped."""
 
         search_result: dict[str, Any] | None = None
         answer_text: str | None = None
         backend = ""
         cache_hit = False
+        cache_strategy = "miss"
         notices: list[str] = []
         original_query = (task.query or "").strip()
 
@@ -668,11 +669,17 @@ class DeepResearchAgent:
                 current_answer,
                 current_backend,
                 current_cache_hit,
+                current_cache_strategy,
             ) = dispatch_search(
                 candidate,
                 self.config,
                 state.research_loop_count,
                 observer=observer,
+                cache_context={
+                    "research_topic": state.research_topic,
+                    "task_title": task.title,
+                    "task_intent": task.intent,
+                },
             )
 
             if attempt_index > 0:
@@ -688,6 +695,7 @@ class DeepResearchAgent:
             answer_text = current_answer
             backend = current_backend
             cache_hit = current_cache_hit
+            cache_strategy = current_cache_strategy
             task.query = candidate
 
             if current_result and current_result.get("results"):
@@ -699,9 +707,9 @@ class DeepResearchAgent:
                         original_query,
                         candidate,
                     )
-                return search_result, notices, answer_text, backend, cache_hit
+                return search_result, notices, answer_text, backend, cache_hit, cache_strategy
 
-        return search_result, notices, answer_text, backend, cache_hit
+        return search_result, notices, answer_text, backend, cache_hit, cache_strategy
 
     def _execute_task(
         self,
@@ -732,7 +740,14 @@ class DeepResearchAgent:
             yield started
 
         try:
-            search_result, notices, answer_text, backend, cache_hit = self._search_with_fallback_queries(
+            (
+                search_result,
+                notices,
+                answer_text,
+                backend,
+                cache_hit,
+                cache_strategy,
+            ) = self._search_with_fallback_queries(
                 state,
                 task,
                 observer,
@@ -779,6 +794,7 @@ class DeepResearchAgent:
                     "backend": backend,
                     "result_count": len((search_result or {}).get("results", [])),
                     "cache_hit": cache_hit,
+                    "cache_strategy": cache_strategy,
                     "notice_count": len(notices),
                 },
             )

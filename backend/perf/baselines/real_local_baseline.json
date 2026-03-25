@@ -1,0 +1,50 @@
+{
+  "profile": "real_local",
+  "baseline_ready": false,
+  "summary": {
+    "requests_total": 0,
+    "success_rate": 0.0,
+    "error_rate": 0.0,
+    "rps": 0.0,
+    "avg_latency_ms": 0.0,
+    "p50_latency_ms": 0.0,
+    "p95_latency_ms": 0.0,
+    "p99_latency_ms": 0.0,
+    "cpu_percent_avg": 0.0,
+    "cpu_percent_peak": 0.0,
+    "rss_mb_avg": 0.0,
+    "rss_mb_peak": 0.0,
+    "estimated_cost_total": 0.0,
+    "estimated_cost_per_request": 0.0
+  },
+  "thresholds": {
+    "smoke": {
+      "success_rate": {
+        "direction": "higher_better",
+        "min_absolute": 1.0
+      },
+      "error_rate": {
+        "direction": "lower_better",
+        "max_absolute": 0.0
+      }
+    },
+    "regression": {
+      "rps": {
+        "direction": "higher_better",
+        "min_ratio": 0.5
+      },
+      "p95_latency_ms": {
+        "direction": "lower_better",
+        "max_ratio": 1.5
+      },
+      "p99_latency_ms": {
+        "direction": "lower_better",
+        "max_ratio": 1.75
+      },
+      "rss_mb_peak": {
+        "direction": "lower_better",
+        "max_ratio": 1.5
+      }
+    }
+  }
+}

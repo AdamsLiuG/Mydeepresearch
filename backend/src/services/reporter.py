@@ -9,7 +9,7 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace
 from models import SummaryState
-from services.text_processing import strip_tool_calls
+from services.text_processing import normalize_agent_markdown
 from utils import strip_thinking_tokens, truncate_text
 
 
@@ -99,6 +99,6 @@ class ReportingService:
         if self._config.strip_thinking_tokens:
             report_text = strip_thinking_tokens(report_text)
 
-        report_text = strip_tool_calls(report_text).strip()
+        report_text = normalize_agent_markdown(report_text)
 
         return report_text or "报告生成失败，请检查输入。"

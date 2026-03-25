@@ -23,6 +23,7 @@ backend/build/
 backend/*.egg-info/
 backend/src/*.egg-info/
 backend/evals/results/
+backend/perf/results/
 backend/notes/
 
 # Frontend

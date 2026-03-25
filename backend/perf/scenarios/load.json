@@ -1,0 +1,13 @@
+{
+  "topics": [
+    "对比 ReAct、Plan-and-Execute 和 Deep Research agent 的适用场景"
+  ],
+  "users": 4,
+  "spawn_rate": 2,
+  "duration": "20s",
+  "timeout_seconds": 120,
+  "sample_interval_seconds": 0.5,
+  "server_env": {
+    "ENABLE_NOTES": "False"
+  }
+}

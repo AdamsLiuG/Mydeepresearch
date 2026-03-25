@@ -23,11 +23,14 @@ NUMBERED_TASK_PATTERN = re.compile(
 MARKDOWN_TABLE_TASK_PATTERN = re.compile(
     r"^\|\s*(?P<index>\d+)\s*\|\s*(?P<title>[^|]+?)\s*\|\s*(?P<intent>[^|]+?)\s*\|(?:\s*[^|]+?\s*\|)?$"
 )
+MARKDOWN_TABLE_SEPARATOR_PATTERN = re.compile(r"^\|\s*[:\-| ]+\|\s*$")
 META_WORKFLOW_KEYWORDS = (
     "启动检索",
     "进度同步",
     "交叉验证",
     "综合报告",
+    "迭代更新",
+    "风险前置",
     "并行执行",
     "依赖关系",
     "信息整合",
@@ -47,6 +50,16 @@ META_WORKFLOW_HINTS = (
     "工作流",
     "流程",
     "同步任务",
+)
+META_PHASE_PREFIXES = (
+    "优先",
+    "并行",
+    "跟进",
+    "最后",
+    "首先",
+    "随后",
+    "先做",
+    "后做",
 )
 
 class PlanningService:
@@ -168,14 +181,6 @@ class PlanningService:
             )
             return tool_payload_tasks
 
-        numbered_tasks = self._extract_tasks_from_numbered_text(text)
-        if numbered_tasks:
-            logger.warning(
-                "Planner response did not contain parseable task JSON; recovered %d tasks from numbered text",
-                len(numbered_tasks),
-            )
-            return numbered_tasks
-
         markdown_table_tasks = self._extract_tasks_from_markdown_table(text)
         if markdown_table_tasks:
             logger.warning(
@@ -183,6 +188,14 @@ class PlanningService:
                 len(markdown_table_tasks),
             )
             return markdown_table_tasks
+
+        numbered_tasks = self._extract_tasks_from_numbered_text(text)
+        if numbered_tasks:
+            logger.warning(
+                "Planner response did not contain parseable task JSON; recovered %d tasks from numbered text",
+                len(numbered_tasks),
+            )
+            return numbered_tasks
 
         return []
 
@@ -381,6 +394,11 @@ class PlanningService:
     def _extract_tasks_from_markdown_table(self, text: str) -> List[dict[str, Any]]:
         """Recover tasks from a markdown table with title and intent columns."""
 
+        for block in self._iter_markdown_table_blocks(text):
+            structured_tasks = self._extract_tasks_from_markdown_table_block(block)
+            if structured_tasks:
+                return structured_tasks
+
         tasks: List[dict[str, Any]] = []
         for line in text.splitlines():
             stripped = line.strip()
@@ -408,11 +426,120 @@ class PlanningService:
 
         return tasks if len(tasks) >= 2 else []
 
+    def _iter_markdown_table_blocks(self, text: str):
+        """Yield contiguous markdown table blocks."""
+
+        current_block: list[str] = []
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("|"):
+                current_block.append(stripped)
+                continue
+
+            if current_block:
+                yield current_block
+                current_block = []
+
+        if current_block:
+            yield current_block
+
+    def _extract_tasks_from_markdown_table_block(self, lines: list[str]) -> List[dict[str, Any]]:
+        """Recover tasks from a single markdown table block with flexible headers."""
+
+        if len(lines) < 3:
+            return []
+
+        header_cells = self._split_markdown_table_row(lines[0])
+        if not header_cells:
+            return []
+
+        title_index = self._find_markdown_table_column(
+            header_cells,
+            ("任务名称", "任务标题", "标题", "名称"),
+        )
+        if title_index is None:
+            return []
+
+        intent_index = self._find_markdown_table_column(
+            header_cells,
+            ("任务目标", "核心关注点", "核心问题", "目标意图", "任务意图", "关注点", "研究重点"),
+        )
+        query_index = self._find_markdown_table_column(
+            header_cells,
+            ("检索方向", "检索关键词", "建议检索", "查询", "query"),
+        )
+
+        start_index = 1
+        if len(lines) > 1 and self._is_markdown_table_separator(lines[1]):
+            start_index = 2
+
+        tasks: List[dict[str, Any]] = []
+        for line in lines[start_index:]:
+            if self._is_markdown_table_separator(line):
+                continue
+
+            cells = self._split_markdown_table_row(line)
+            if title_index >= len(cells):
+                continue
+
+            title = self._normalize_task_title(cells[title_index])
+            if not title:
+                continue
+
+            intent = cells[intent_index].strip() if intent_index is not None and intent_index < len(cells) else ""
+            query = cells[query_index].strip() if query_index is not None and query_index < len(cells) else ""
+            tasks.append(
+                {
+                    "title": title,
+                    "intent": intent or "聚焦主题的关键问题",
+                    "query": query,
+                }
+            )
+
+        return tasks if len(tasks) >= 2 else []
+
+    def _split_markdown_table_row(self, line: str) -> list[str]:
+        """Split a markdown table row into normalized cell strings."""
+
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            return []
+        return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+    def _is_markdown_table_separator(self, line: str) -> bool:
+        """Return whether the line is a markdown table separator row."""
+
+        return bool(MARKDOWN_TABLE_SEPARATOR_PATTERN.match(line.strip()))
+
+    def _find_markdown_table_column(
+        self,
+        headers: list[str],
+        candidates: tuple[str, ...],
+    ) -> int | None:
+        """Find the first header column whose normalized text contains a candidate token."""
+
+        normalized_headers = [re.sub(r"\s+", "", header).casefold() for header in headers]
+        for candidate in candidates:
+            token = candidate.casefold()
+            for index, header in enumerate(normalized_headers):
+                if token in header:
+                    return index
+        return None
+
     def _normalize_task_title(self, title: str) -> str:
         """Strip common task numbering prefixes from recovered titles."""
 
-        cleaned = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", title.strip())
+        cleaned = title.strip()
+        arrow_match = re.search(r"(?:→|->|=>|➜)\s*(.+)$", cleaned)
+        if arrow_match and arrow_match.group(1).strip():
+            cleaned = arrow_match.group(1).strip()
+
+        cleaned = re.sub(r"^(?:[-*#]\s*)?(?:任务\s*)?\d+\s*[\.\)、:：\-]\s*", "", cleaned)
+        cleaned = re.sub(r"[（(]\s*任务\s*[\d、,，\s]+\s*[）)]", "", cleaned)
+        cleaned = cleaned.replace("**", "").replace("__", "")
         cleaned = cleaned.strip().strip('"').strip("'").strip("*").strip("`")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.strip(" -:：|/").strip()
         return cleaned.strip()
 
     def _extract_intent_from_text(self, text: str) -> str:
@@ -473,14 +600,20 @@ class PlanningService:
         rejected_count = 0
 
         for item in tasks:
-            title = self._normalize_task_title(str(item.get("title") or ""))
+            original_title = str(item.get("title") or "")
+            title = self._normalize_task_title(original_title)
             intent = str(item.get("intent") or "").strip()
             query = str(item.get("query") or "").strip()
             if not title:
                 rejected_count += 1
                 continue
 
-            if self._is_meta_workflow_task(title=title, intent=intent, query=query):
+            if self._is_meta_workflow_task(
+                title=title,
+                intent=intent,
+                query=query,
+                raw_title=original_title,
+            ):
                 rejected_count += 1
                 continue
 
@@ -514,10 +647,27 @@ class PlanningService:
         keyword_hits = sum(1 for keyword in META_WORKFLOW_KEYWORDS if keyword.casefold() in normalized_response)
         return keyword_hits >= 2
 
-    def _is_meta_workflow_task(self, *, title: str, intent: str, query: str) -> bool:
+    def _is_meta_workflow_task(
+        self,
+        *,
+        title: str,
+        intent: str,
+        query: str,
+        raw_title: str | None = None,
+    ) -> bool:
+        raw_title = raw_title or title
         normalized_title = self._normalize_task_title(title).replace(" ", "").casefold()
         normalized_intent = intent.replace(" ", "").casefold()
         normalized_query = query.replace(" ", "").casefold()
+
+        if any(token in raw_title for token in ("→", "->", "=>", "➜")):
+            return True
+
+        if re.search(r"[（(]\s*任务\s*[\d、,，\s]+\s*[）)]", raw_title):
+            return True
+
+        if any(normalized_title.startswith(prefix.casefold()) for prefix in META_PHASE_PREFIXES):
+            return True
 
         if any(keyword.casefold() in normalized_title for keyword in META_WORKFLOW_KEYWORDS):
             return True

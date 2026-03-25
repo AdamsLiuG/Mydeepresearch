@@ -117,6 +117,8 @@ class MetricsRegistry:
             "search_success_total": 0,
             "search_failed_total": 0,
             "cache_hit_total": 0,
+            "cache_exact_hit_total": 0,
+            "cache_semantic_hit_total": 0,
             "cache_miss_total": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -193,6 +195,8 @@ class MetricsRegistry:
         partial_total = counters.get("request_partial_success_total", 0)
         failed_total = counters.get("request_failed_total", 0)
         cache_hits = counters.get("cache_hit_total", 0)
+        cache_exact_hits = counters.get("cache_exact_hit_total", 0)
+        cache_semantic_hits = counters.get("cache_semantic_hit_total", 0)
         cache_misses = counters.get("cache_miss_total", 0)
         cache_total = cache_hits + cache_misses
 
@@ -204,6 +208,8 @@ class MetricsRegistry:
             else 0.0,
             "failure_rate": round((failed_total / request_total), 4) if request_total else 0.0,
             "cache_hit_total": cache_hits,
+            "cache_exact_hit_total": cache_exact_hits,
+            "cache_semantic_hit_total": cache_semantic_hits,
             "cache_miss_total": cache_misses,
             "cache_hit_rate": round((cache_hits / cache_total), 4) if cache_total else 0.0,
             "latencies_ms": latencies,
@@ -382,6 +388,8 @@ class RequestTrace:
         self.skipped_tasks = 0
         self.failed_tasks = 0
         self.cache_hits = 0
+        self.cache_exact_hits = 0
+        self.cache_semantic_hits = 0
         self.cache_misses = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -412,17 +420,34 @@ class RequestTrace:
             metadata=metadata,
         )
 
-    def record_search_attempt(self, *, cache_hit: bool, success: bool, error: Any = None) -> None:
+    def record_search_attempt(
+        self,
+        *,
+        cache_hit: bool,
+        success: bool,
+        error: Any = None,
+        cache_strategy: str = "miss",
+    ) -> None:
         metrics_registry.increment("search_call_total")
         if success:
             metrics_registry.increment("search_success_total")
         else:
             metrics_registry.increment("search_failed_total")
 
+        normalized_strategy = cache_strategy if cache_strategy in {"exact", "semantic"} else "miss"
+
         if cache_hit:
             metrics_registry.increment("cache_hit_total")
             with self._lock:
                 self.cache_hits += 1
+            if normalized_strategy == "exact":
+                metrics_registry.increment("cache_exact_hit_total")
+                with self._lock:
+                    self.cache_exact_hits += 1
+            elif normalized_strategy == "semantic":
+                metrics_registry.increment("cache_semantic_hit_total")
+                with self._lock:
+                    self.cache_semantic_hits += 1
         else:
             metrics_registry.increment("cache_miss_total")
             with self._lock:
@@ -567,6 +592,8 @@ class RequestTrace:
                 "skipped_tasks": self.skipped_tasks,
                 "failed_tasks": self.failed_tasks,
                 "cache_hits": self.cache_hits,
+                "cache_exact_hits": self.cache_exact_hits,
+                "cache_semantic_hits": self.cache_semantic_hits,
                 "cache_misses": self.cache_misses,
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,

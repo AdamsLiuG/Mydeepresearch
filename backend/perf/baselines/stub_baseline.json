@@ -1,0 +1,66 @@
+{
+  "profile": "stub",
+  "baseline_ready": true,
+  "summary": {
+    "requests_total": 3,
+    "success_rate": 1.0,
+    "error_rate": 0.0,
+    "rps": 1.0,
+    "avg_latency_ms": 150.0,
+    "p50_latency_ms": 150.0,
+    "p95_latency_ms": 500.0,
+    "p99_latency_ms": 750.0,
+    "cpu_percent_avg": 20.0,
+    "cpu_percent_peak": 60.0,
+    "rss_mb_avg": 180.0,
+    "rss_mb_peak": 320.0,
+    "estimated_cost_total": 0.0,
+    "estimated_cost_per_request": 0.0
+  },
+  "thresholds": {
+    "smoke": {
+      "success_rate": {
+        "direction": "higher_better",
+        "min_absolute": 1.0
+      },
+      "error_rate": {
+        "direction": "lower_better",
+        "max_absolute": 0.0
+      },
+      "p95_latency_ms": {
+        "direction": "lower_better",
+        "max_absolute": 2000.0
+      },
+      "p99_latency_ms": {
+        "direction": "lower_better",
+        "max_absolute": 3000.0
+      },
+      "rps": {
+        "direction": "higher_better",
+        "min_absolute": 0.1
+      },
+      "rss_mb_peak": {
+        "direction": "lower_better",
+        "max_absolute": 1024.0
+      }
+    },
+    "regression": {
+      "rps": {
+        "direction": "higher_better",
+        "min_ratio": 0.2
+      },
+      "p95_latency_ms": {
+        "direction": "lower_better",
+        "max_ratio": 5.0
+      },
+      "p99_latency_ms": {
+        "direction": "lower_better",
+        "max_ratio": 5.0
+      },
+      "rss_mb_peak": {
+        "direction": "lower_better",
+        "max_ratio": 4.0
+      }
+    }
+  }
+}

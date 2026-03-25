@@ -3,6 +3,7 @@ import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -10,6 +11,49 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _DOTENV_PATH = _BACKEND_ROOT / ".env"
 _DOTENV_LOADED = False
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _expand_loopback_origin(origin: str) -> list[str]:
+    cleaned = (origin or "").strip()
+    if not cleaned or cleaned == "*":
+        return [cleaned] if cleaned else []
+
+    parsed = urlsplit(cleaned)
+    hostname = (parsed.hostname or "").strip().lower()
+    if parsed.scheme not in {"http", "https"} or hostname not in {"localhost", "127.0.0.1"}:
+        return [cleaned]
+
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    paired_host = "127.0.0.1" if hostname == "localhost" else "localhost"
+    paired_origin = f"{parsed.scheme}://{paired_host}{port}"
+    if paired_origin == cleaned:
+        return [cleaned]
+
+    return [cleaned, paired_origin]
+
+
+def _normalize_origin_values(value: Any) -> list[str]:
+    if value is None:
+        return ["*"]
+
+    if isinstance(value, str):
+        raw_items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        raw_items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        return value
+
+    normalized: list[str] = []
+    for item in raw_items or ["*"]:
+        for expanded in _expand_loopback_origin(item):
+            _append_unique(normalized, expanded)
+
+    return normalized or ["*"]
 
 
 def backend_root() -> Path:
@@ -176,6 +220,13 @@ class Configuration(BaseModel):
         title="Semantic Cache Similarity Threshold",
         description="Cosine similarity threshold for semantic search cache hits",
     )
+    semantic_cache_lexical_threshold: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        title="Semantic Cache Lexical Threshold",
+        description="Lexical similarity threshold used to reuse semantically related cache entries when embeddings are weak",
+    )
     max_tokens_per_source: int | None = Field(
         default=None,
         title="Max Tokens Per Source",
@@ -211,6 +262,27 @@ class Configuration(BaseModel):
         default=25,
         title="Recent Request Limit",
         description="How many completed request traces to keep in memory",
+    )
+    benchmark_stub_enabled: bool = Field(
+        default=False,
+        title="Benchmark Stub Enabled",
+        description="Use the deterministic benchmark stub agent for perf runs",
+    )
+    benchmark_profile: str = Field(
+        default="real_local",
+        title="Benchmark Profile",
+        description="Named benchmark profile used by perf tooling",
+    )
+    perf_sample_interval_seconds: float = Field(
+        default=0.5,
+        gt=0.0,
+        title="Perf Sample Interval Seconds",
+        description="Sampling interval used by performance profiling helpers",
+    )
+    perf_thresholds_path: str | None = Field(
+        default=None,
+        title="Perf Thresholds Path",
+        description="Optional baseline or threshold file consumed by perf tooling",
     )
     llm_pricing_json: dict[str, Any] = Field(
         default_factory=dict,
@@ -273,17 +345,24 @@ class Configuration(BaseModel):
             return value.strip().upper() or "INFO"
         return value
 
+    @field_validator("benchmark_profile", mode="before")
+    @classmethod
+    def _normalize_benchmark_profile(cls, value: Any) -> Any:
+        if value is None:
+            return "real_local"
+
+        if isinstance(value, str):
+            normalized = value.strip().lower() or "real_local"
+            if normalized not in {"stub", "real_local"}:
+                raise ValueError("benchmark_profile must be either 'stub' or 'real_local'")
+            return normalized
+
+        return value
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _normalize_cors_origins(cls, value: Any) -> Any:
-        if value is None:
-            return ["*"]
-
-        if isinstance(value, str):
-            items = [item.strip() for item in value.split(",") if item.strip()]
-            return items or ["*"]
-
-        return value
+        return _normalize_origin_values(value)
 
     @field_validator("llm_pricing_json", mode="before")
     @classmethod
@@ -313,6 +392,13 @@ class Configuration(BaseModel):
             if not cache_path.is_absolute():
                 cache_path = backend_root() / cache_path
             self.search_cache_dir = str(cache_path.resolve(strict=False))
+
+        thresholds_path = (self.perf_thresholds_path or "").strip()
+        if thresholds_path:
+            perf_path = Path(thresholds_path).expanduser()
+            if not perf_path.is_absolute():
+                perf_path = backend_root() / perf_path
+            self.perf_thresholds_path = str(perf_path.resolve(strict=False))
         return self
 
     @classmethod
@@ -362,6 +448,7 @@ class Configuration(BaseModel):
             "semantic_cache_enabled": os.getenv("SEMANTIC_CACHE_ENABLED"),
             "semantic_cache_embedding_model": os.getenv("SEMANTIC_CACHE_EMBEDDING_MODEL"),
             "semantic_cache_similarity_threshold": os.getenv("SEMANTIC_CACHE_SIMILARITY_THRESHOLD"),
+            "semantic_cache_lexical_threshold": os.getenv("SEMANTIC_CACHE_LEXICAL_THRESHOLD"),
             "max_tokens_per_source": os.getenv("MAX_TOKENS_PER_SOURCE"),
             "task_context_char_limit": os.getenv("TASK_CONTEXT_CHAR_LIMIT"),
             "task_summary_max_concurrency": os.getenv("TASK_SUMMARY_MAX_CONCURRENCY"),
@@ -369,6 +456,10 @@ class Configuration(BaseModel):
             "report_summary_char_limit": os.getenv("REPORT_SUMMARY_CHAR_LIMIT"),
             "report_sources_char_limit": os.getenv("REPORT_SOURCES_CHAR_LIMIT"),
             "metrics_recent_requests_limit": os.getenv("METRICS_RECENT_REQUESTS_LIMIT"),
+            "benchmark_stub_enabled": os.getenv("BENCHMARK_STUB_ENABLED"),
+            "benchmark_profile": os.getenv("BENCHMARK_PROFILE"),
+            "perf_sample_interval_seconds": os.getenv("PERF_SAMPLE_INTERVAL_SECONDS"),
+            "perf_thresholds_path": os.getenv("PERF_THRESHOLDS_PATH"),
             "llm_pricing_json": os.getenv("LLM_PRICING_JSON"),
         }
 
