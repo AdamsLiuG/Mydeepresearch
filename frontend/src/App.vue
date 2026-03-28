@@ -50,6 +50,37 @@
             </label>
           </section>
 
+          <section class="demo-presets">
+            <div class="demo-presets-head">
+              <div>
+                <h3>固定演示场景</h3>
+                <p>优先使用这 3 个题目，更适合展示 Agent 全流程。</p>
+              </div>
+              <span class="demo-count">{{ demoScenarios.length }} 个</span>
+            </div>
+            <div class="demo-grid">
+              <button
+                v-for="scenario in demoScenarios"
+                :key="scenario.id"
+                type="button"
+                class="demo-card"
+                :class="{ active: activeDemoScenario?.id === scenario.id }"
+                @click="applyDemoScenario(scenario)"
+              >
+                <span class="demo-card-label">{{ scenario.title }}</span>
+                <strong>{{ scenario.topic }}</strong>
+                <p>{{ scenario.focus }}</p>
+                <span class="demo-card-meta">
+                  {{ scenario.searchApi || "沿用后端配置" }}
+                </span>
+              </button>
+            </div>
+            <p class="demo-note">
+              需要绝对稳定的流程演示时，可在后端设置
+              <code>BENCHMARK_STUB_ENABLED=True</code>。
+            </p>
+          </section>
+
           <div class="form-actions">
             <button class="submit" type="submit" :disabled="loading">
               <span class="submit-label">
@@ -107,6 +138,14 @@
           <div class="info-item">
             <label>研究主题</label>
             <p class="topic-display">{{ form.topic }}</p>
+          </div>
+
+          <div class="info-item" v-if="activeDemoScenario">
+            <label>当前演示场景</label>
+            <div class="demo-focus-card">
+              <strong>{{ activeDemoScenario.title }}</strong>
+              <p>{{ activeDemoScenario.focus }}</p>
+            </div>
           </div>
 
           <div class="info-item" v-if="form.searchApi">
@@ -171,6 +210,15 @@
                 >
                   再次研究
                 </button>
+                <button
+                  v-if="item.canResume"
+                  type="button"
+                  class="history-repeat-btn"
+                  @click="resumePersistedResearch(item)"
+                  :disabled="loading"
+                >
+                  恢复执行
+                </button>
               </div>
             </li>
           </ul>
@@ -217,7 +265,13 @@
               {{ requestCacheHits }} 命中 / {{ requestCacheMisses }} 未命中
             </strong>
             <span class="metric-hint">
+              请求细分：精确 {{ requestExactCacheHits }} / 语义 {{ requestSemanticCacheHits }}
+            </span>
+            <span class="metric-hint">
               全局累计：{{ globalCacheHits }} 命中 / {{ globalCacheMisses }} 未命中
+            </span>
+            <span class="metric-hint">
+              全局细分：精确 {{ globalExactCacheHits }} / 语义 {{ globalSemanticCacheHits }}
             </span>
           </div>
           <div class="metric-card">
@@ -249,7 +303,12 @@
               class="planning-card"
             >
               <div class="planning-card-head">
-                <strong>{{ task.title }}</strong>
+                <div class="planning-title-wrap">
+                  <strong>{{ task.title }}</strong>
+                  <span v-if="isSupplementalTask(task)" class="task-origin-badge">
+                    补充任务
+                  </span>
+                </div>
                 <span class="task-status" :class="task.status">
                   {{ formatTaskStatus(task.status) }}
                 </span>
@@ -302,7 +361,12 @@
                   class="task-button"
                   @click="activeTaskId = task.id"
                 >
-                  <span class="task-title">{{ task.title }}</span>
+                  <span class="task-title-wrap">
+                    <span class="task-title">{{ task.title }}</span>
+                    <span v-if="isSupplementalTask(task)" class="task-origin-badge">
+                      补充
+                    </span>
+                  </span>
                   <span class="task-status" :class="task.status">
                     {{ formatTaskStatus(task.status) }}
                   </span>
@@ -322,6 +386,12 @@
               </div>
               <div class="task-chip-group">
                 <span class="task-label">查询：{{ currentTaskQuery || "" }}</span>
+                <span
+                  v-if="currentTask && isSupplementalTask(currentTask)"
+                  class="task-label origin-chip"
+                >
+                  补充任务 · 第 {{ currentTask.round }} 轮
+                </span>
                 <span
                   v-if="currentTaskNoteId"
                   class="task-label note-chip"
@@ -357,6 +427,21 @@
             </section>
 
             <section
+              v-if="currentTaskReviewIssues.length"
+              class="task-notices review-notices"
+            >
+              <h4>审查发现</h4>
+              <ul>
+                <li
+                  v-for="(issue, idx) in currentTaskReviewIssues"
+                  :key="`${issue.message}-${idx}`"
+                >
+                  <strong>[{{ issue.severity }}]</strong> {{ issue.message }}
+                </li>
+              </ul>
+            </section>
+
+            <section
               class="sources-block"
               :class="{ 'block-highlight': sourcesHighlight }"
             >
@@ -380,6 +465,17 @@
                       <p v-if="item.snippet">{{ item.snippet }}</p>
                       <p v-if="item.raw" class="muted-text">{{ item.raw }}</p>
                     </div>
+                    <div
+                      v-if="item.sourceId || item.domain || item.sourceType || item.qualityLabel || item.freshnessLabel || item.publishedAt"
+                      class="source-meta-row"
+                    >
+                      <span v-if="item.sourceId" class="source-meta-chip">{{ item.sourceId }}</span>
+                      <span v-if="item.domain" class="source-meta-chip">{{ item.domain }}</span>
+                      <span v-if="item.sourceType" class="source-meta-chip">{{ item.sourceType }}</span>
+                      <span v-if="item.qualityLabel" class="source-meta-chip">{{ item.qualityLabel }}</span>
+                      <span v-if="item.freshnessLabel" class="source-meta-chip">{{ item.freshnessLabel }}</span>
+                      <span v-if="item.publishedAt" class="source-meta-chip">{{ item.publishedAt }}</span>
+                    </div>
                   </li>
                 </ul>
               </template>
@@ -395,6 +491,15 @@
                 class="markdown-block"
                 v-html="currentTaskSummaryHtml"
               ></div>
+            </section>
+
+            <section v-if="currentTaskClaims.length" class="task-notices">
+              <h4>Claim 校验</h4>
+              <ul>
+                <li v-for="(claim, idx) in currentTaskClaims" :key="`${claim.text}-${idx}`">
+                  <strong>[{{ claim.support_status }}]</strong> {{ claim.text }}
+                </li>
+              </ul>
             </section>
 
             <section
@@ -469,16 +574,40 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 import { marked } from "marked";
 
 import {
+  fetchPersistedRequests,
   fetchMetricsSnapshot,
+  resumeResearchStream,
   runResearchStream,
   type ResearchStreamEvent
 } from "./services/api";
 
 interface SourceItem {
+  sourceId: string;
   title: string;
   url: string;
   snippet: string;
   raw: string;
+  domain: string;
+  sourceType: string;
+  qualityLabel: string;
+  freshnessLabel: string;
+  publishedAt: string;
+  providerCount: number;
+}
+
+interface ReviewIssue {
+  task_id?: number | null;
+  severity: string;
+  check: string;
+  message: string;
+  source_ids: string[];
+  origin?: string;
+}
+
+interface ClaimItem {
+  text: string;
+  source_ids: string[];
+  support_status: string;
 }
 
 interface ToolCallLog {
@@ -502,9 +631,14 @@ interface TodoTaskView {
   sourcesSummary: string;
   sourceItems: SourceItem[];
   notices: string[];
+  claims: ClaimItem[];
+  reviewIssues: ReviewIssue[];
+  reviewStatus: string;
   noteId: string | null;
   notePath: string | null;
   toolCalls: ToolCallLog[];
+  origin: string;
+  round: number;
 }
 
 interface RecentResearchView {
@@ -517,6 +651,17 @@ interface RecentResearchView {
   todoItems: TodoTaskView[];
   requestMetrics: UnknownRecord;
   canViewContent: boolean;
+  canResume: boolean;
+  phase?: string;
+  updatedAt?: string;
+}
+
+interface DemoScenario {
+  id: string;
+  title: string;
+  topic: string;
+  searchApi: string;
+  focus: string;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -538,6 +683,7 @@ const reportMarkdown = ref("");
 const latestRequestMetrics = ref<UnknownRecord | null>(null);
 const latestAggregateMetrics = ref<UnknownRecord | null>(null);
 const selectedHistoryRequestId = ref<string | null>(null);
+const persistedHistory = ref<RecentResearchView[]>([]);
 
 const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
@@ -549,6 +695,30 @@ const timelineWrapperRef = ref<HTMLElement | null>(null);
 
 let currentController: AbortController | null = null;
 let globalMetricsTimer: number | null = null;
+
+const demoScenarios: DemoScenario[] = [
+  {
+    id: "multimodal-breakthroughs",
+    title: "开放信息研究",
+    topic: "探索多模态大模型在 2025 年的关键突破",
+    searchApi: "advanced",
+    focus: "适合展示 planner、多任务执行、来源引用和最终报告"
+  },
+  {
+    id: "agent-engineering",
+    title: "Agent 工程实践",
+    topic: "AI 搜索 Agent 在互联网信息研究中的工程化实践",
+    searchApi: "advanced",
+    focus: "适合展示工具调用、过程记录、metrics 和降级设计"
+  },
+  {
+    id: "inference-ops",
+    title: "推理服务工程",
+    topic: "开源大模型推理服务的部署、监控与成本控制",
+    searchApi: "",
+    focus: "适合展示性能、成本、可观测性和工程化叙事"
+  }
+];
 
 const searchOptions = [
   "advanced",
@@ -562,7 +732,8 @@ const TASK_STATUS_LABEL: Record<string, string> = {
   pending: "待执行",
   in_progress: "进行中",
   completed: "已完成",
-  skipped: "已跳过"
+  skipped: "已跳过",
+  failed: "失败"
 };
 const REQUEST_STATUS_LABEL: Record<string, string> = {
   success: "成功",
@@ -579,6 +750,10 @@ function formatRequestStatus(status: string): string {
   return REQUEST_STATUS_LABEL[status] ?? status;
 }
 
+function isSupplementalTask(task: Pick<TodoTaskView, "origin" | "round">): boolean {
+  return task.origin === "replanned" || task.round > 1;
+}
+
 const totalTasks = computed(() => todoTasks.value.length);
 const completedTasks = computed(() =>
   todoTasks.value.filter((task) => task.status === "completed").length
@@ -593,6 +768,8 @@ const currentTask = computed(() => {
 
 const currentTaskSources = computed(() => currentTask.value?.sourceItems ?? []);
 const currentTaskSummary = computed(() => currentTask.value?.summary ?? "");
+const currentTaskClaims = computed(() => currentTask.value?.claims ?? []);
+const currentTaskReviewIssues = computed(() => currentTask.value?.reviewIssues ?? []);
 const currentTaskTitle = computed(() => currentTask.value?.title ?? "");
 const currentTaskIntent = computed(() => currentTask.value?.intent ?? "");
 const currentTaskQuery = computed(() => currentTask.value?.query ?? "");
@@ -656,6 +833,12 @@ const requestTokenSource = computed(() =>
 const requestCacheHits = computed(() =>
   getNumber(latestRequestMetrics.value?.cache_hits)
 );
+const requestExactCacheHits = computed(() =>
+  getNumber(latestRequestMetrics.value?.cache_exact_hits)
+);
+const requestSemanticCacheHits = computed(() =>
+  getNumber(latestRequestMetrics.value?.cache_semantic_hits)
+);
 const requestCacheMisses = computed(() =>
   getNumber(latestRequestMetrics.value?.cache_misses)
 );
@@ -677,13 +860,39 @@ const globalCacheMisses = computed(() => {
     ensureRecord(latestAggregateMetrics.value?.counters).cache_miss_total
   );
 });
-const recentResearchHistory = computed<RecentResearchView[]>(() => {
-  const items = latestAggregateMetrics.value?.recent_requests;
-  if (!Array.isArray(items)) {
-    return [];
+const globalExactCacheHits = computed(() => {
+  const direct = getNumber(latestAggregateMetrics.value?.cache_exact_hit_total);
+  if (direct) {
+    return direct;
   }
-
-  return items
+  return getNumber(
+    ensureRecord(latestAggregateMetrics.value?.counters).cache_exact_hit_total
+  );
+});
+const globalSemanticCacheHits = computed(() => {
+  const direct = getNumber(latestAggregateMetrics.value?.cache_semantic_hit_total);
+  if (direct) {
+    return direct;
+  }
+  return getNumber(
+    ensureRecord(latestAggregateMetrics.value?.counters).cache_semantic_hit_total
+  );
+});
+const activeDemoScenario = computed(() => {
+  const topic = form.topic.trim();
+  const searchApi = form.searchApi.trim();
+  return (
+    demoScenarios.find(
+      (scenario) =>
+        scenario.topic === topic && scenario.searchApi === searchApi
+    ) ?? null
+  );
+});
+const recentResearchHistory = computed<RecentResearchView[]>(() => {
+  const metricItems = Array.isArray(latestAggregateMetrics.value?.recent_requests)
+    ? latestAggregateMetrics.value?.recent_requests
+    : [];
+  const metricHistory = metricItems
     .map((entry) => ensureRecord(entry))
     .map((entry, index) => {
       const topic = getString(entry.topic, "");
@@ -703,10 +912,24 @@ const recentResearchHistory = computed<RecentResearchView[]>(() => {
         reportMarkdown,
         todoItems: historyTasks,
         requestMetrics: entry,
-        canViewContent: Boolean(reportMarkdown) || historyTasks.length > 0
+        canViewContent: Boolean(reportMarkdown) || historyTasks.length > 0,
+        canResume:
+          getString(entry.status, "unknown") !== "success" &&
+          getString(entry.status, "unknown") !== "partial_success",
+        phase: getString(entry.phase, ""),
+        updatedAt: getString(entry.updated_at, "")
       };
     })
-    .filter((entry): entry is RecentResearchView => entry !== null);
+    .filter((entry) => entry !== null) as RecentResearchView[];
+
+  const merged = [...persistedHistory.value];
+  const existingIds = new Set(merged.map((item) => item.requestId));
+  for (const item of metricHistory) {
+    if (!existingIds.has(item.requestId)) {
+      merged.push(item);
+    }
+  }
+  return merged;
 });
 const aggregateSuccessRateText = computed(() => {
   const rate = getNumber(latestAggregateMetrics.value?.success_rate);
@@ -736,7 +959,7 @@ function parseSources(raw: string): SourceItem[] {
   const items: SourceItem[] = [];
   const lines = raw.split("\n");
 
-  let current: SourceItem | null = null;
+  let current: Partial<SourceItem> | null = null;
   const truncate = (value: string, max = 360) => {
     const trimmed = value.trim();
     return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
@@ -747,10 +970,17 @@ function parseSources(raw: string): SourceItem[] {
       return;
     }
     const normalized: SourceItem = {
+      sourceId: "",
       title: current.title?.trim() || "",
       url: current.url?.trim() || "",
       snippet: current.snippet ? truncate(current.snippet) : "",
-      raw: current.raw ? truncate(current.raw, 420) : ""
+      raw: current.raw ? truncate(current.raw, 420) : "",
+      domain: "",
+      sourceType: "",
+      qualityLabel: "",
+      freshnessLabel: "",
+      publishedAt: "",
+      providerCount: 0
     };
 
     if (
@@ -845,6 +1075,71 @@ function parseSources(raw: string): SourceItem[] {
   return items;
 }
 
+function parseEvidenceItems(value: unknown): SourceItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => ensureRecord(item))
+    .map((payload) => ({
+      sourceId: getString(payload.source_id, ""),
+      title: getString(payload.title, ""),
+      url: getString(payload.url, ""),
+      snippet: getString(payload.snippet, ""),
+      raw: getString(payload.full_content, ""),
+      domain: getString(payload.domain, ""),
+      sourceType: getString(payload.source_type, ""),
+      qualityLabel: getString(payload.quality_label, ""),
+      freshnessLabel: getString(payload.freshness_label, ""),
+      publishedAt: getString(payload.published_at, ""),
+      providerCount: getNumber(payload.provider_count)
+    }))
+    .filter((item) => Boolean(item.sourceId || item.title || item.url));
+}
+
+function parseReviewIssues(value: unknown): ReviewIssue[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => ensureRecord(item))
+    .map((payload) => ({
+      task_id:
+        typeof payload.task_id === "number"
+          ? payload.task_id
+          : typeof payload.task_id === "string" && Number.isFinite(Number(payload.task_id))
+          ? Number(payload.task_id)
+          : null,
+      severity: getString(payload.severity, "medium"),
+      check: getString(payload.check, "review"),
+      message: getString(payload.message, ""),
+      source_ids: Array.isArray(payload.source_ids)
+        ? payload.source_ids.filter((item): item is string => typeof item === "string")
+        : [],
+      origin: getString(payload.origin, "")
+    }))
+    .filter((item) => Boolean(item.message));
+}
+
+function parseClaims(value: unknown): ClaimItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => ensureRecord(item))
+    .map((payload) => ({
+      text: getString(payload.text, ""),
+      source_ids: Array.isArray(payload.source_ids)
+        ? payload.source_ids.filter((item): item is string => typeof item === "string")
+        : [],
+      support_status: getString(payload.support_status, "unknown")
+    }))
+    .filter((item) => Boolean(item.text));
+}
+
 function mapHistoryTasks(value: unknown): TodoTaskView[] {
   if (!Array.isArray(value)) {
     return [];
@@ -861,6 +1156,7 @@ function mapHistoryTasks(value: unknown): TodoTaskView[] {
     const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
     const sourcesSummary =
       typeof payload.sources_summary === "string" ? payload.sources_summary.trim() : "";
+    const evidenceItems = parseEvidenceItems(payload.evidence_items);
 
     return {
       id,
@@ -885,13 +1181,26 @@ function mapHistoryTasks(value: unknown): TodoTaskView[] {
           ? payload.summary.trim()
           : "暂无可用信息",
       sourcesSummary,
-      sourceItems: parseSources(sourcesSummary),
+      sourceItems: evidenceItems.length ? evidenceItems : parseSources(sourcesSummary),
       notices: Array.isArray(payload.notices)
         ? payload.notices.filter((notice): notice is string => typeof notice === "string")
         : [],
+      claims: parseClaims(payload.claims),
+      reviewIssues: parseReviewIssues(payload.review_issues),
+      reviewStatus: getString(payload.review_status, "pending"),
       noteId: extractOptionalString(payload.note_id),
       notePath: extractOptionalString(payload.note_path),
-      toolCalls: []
+      toolCalls: [],
+      origin:
+        typeof payload.origin === "string" && payload.origin.trim()
+          ? payload.origin.trim()
+          : "planned",
+      round:
+        typeof payload.round === "number" && Number.isFinite(payload.round)
+          ? payload.round
+          : typeof payload.round === "string" && Number.isFinite(Number(payload.round))
+          ? Number(payload.round)
+          : 1
     };
   });
 }
@@ -975,6 +1284,39 @@ async function refreshGlobalMetrics(signal?: AbortSignal) {
   }
 }
 
+async function refreshPersistedHistory(signal?: AbortSignal) {
+  try {
+    const items = await fetchPersistedRequests(20, { signal });
+    persistedHistory.value = items
+      .map((entry) => ensureRecord(entry))
+      .map((entry, index) => {
+        const topic = getString(entry.topic, "");
+        if (!topic) {
+          return null;
+        }
+        return {
+          requestId: getString(entry.request_id, `persisted-${index}`),
+          topic,
+          status: getString(entry.status, "unknown"),
+          elapsedMs: getNumber(entry.elapsed_ms),
+          searchApi: getString(entry.search_api, ""),
+          reportMarkdown: getString(entry.report_markdown, ""),
+          todoItems: mapHistoryTasks(entry.todo_items),
+          requestMetrics: entry,
+          canViewContent:
+            Boolean(entry.report_markdown) ||
+            (Array.isArray(entry.todo_items) && entry.todo_items.length > 0),
+          canResume: Boolean(entry.can_resume),
+          phase: getString(entry.phase, ""),
+          updatedAt: getString(entry.updated_at, "")
+        };
+      })
+      .filter((entry) => entry !== null) as RecentResearchView[];
+  } catch (error) {
+    console.warn("获取持久化历史失败", error);
+  }
+}
+
 function resetWorkflowState() {
   todoTasks.value = [];
   activeTaskId.value = null;
@@ -999,6 +1341,50 @@ async function repeatResearch(item: RecentResearchView) {
   await handleSubmit();
 }
 
+async function resumePersistedResearch(item: RecentResearchView) {
+  if (loading.value || !item.canResume) {
+    return;
+  }
+
+  if (currentController) {
+    currentController.abort();
+    currentController = null;
+  }
+
+  loading.value = true;
+  error.value = "";
+  isExpanded.value = true;
+  resetWorkflowState();
+  selectedHistoryRequestId.value = item.requestId;
+  form.topic = item.topic;
+  form.searchApi = item.searchApi;
+
+  const controller = new AbortController();
+  currentController = controller;
+
+  try {
+    await resumeResearchStream(
+      item.requestId,
+      { search_api: item.searchApi || undefined },
+      handleResearchEvent,
+      { signal: controller.signal }
+    );
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      progressLogs.value.push("已取消恢复执行");
+    } else {
+      error.value = err instanceof Error ? err.message : "恢复执行失败";
+    }
+  } finally {
+    loading.value = false;
+    void refreshGlobalMetrics();
+    void refreshPersistedHistory();
+    if (currentController === controller) {
+      currentController = null;
+    }
+  }
+}
+
 function viewHistoryResearch(item: RecentResearchView) {
   if (loading.value) {
     return;
@@ -1012,6 +1398,8 @@ function viewHistoryResearch(item: RecentResearchView) {
     ...task,
     sourceItems: [...task.sourceItems],
     notices: [...task.notices],
+    claims: [...task.claims],
+    reviewIssues: [...task.reviewIssues],
     toolCalls: []
   }));
   activeTaskId.value = todoTasks.value[0]?.id ?? null;
@@ -1044,6 +1432,136 @@ function upsertTaskMetadata(task: TodoTaskView, payload: Record<string, unknown>
   if (typeof payload.query === "string" && payload.query.trim()) {
     task.query = payload.query.trim();
   }
+  if (typeof payload.origin === "string" && payload.origin.trim()) {
+    task.origin = payload.origin.trim();
+  }
+  const round =
+    typeof payload.round === "number"
+      ? payload.round
+      : typeof payload.round === "string"
+      ? Number(payload.round)
+      : NaN;
+  if (Number.isFinite(round) && round >= 1) {
+    task.round = Number(round);
+  }
+}
+
+function toTaskView(item: Record<string, unknown>, index: number): TodoTaskView {
+  const rawId =
+    typeof item.id === "number"
+      ? item.id
+      : typeof item.id === "string"
+      ? Number(item.id)
+      : index + 1;
+  const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
+  const noteId =
+    typeof item.note_id === "string" && item.note_id.trim()
+      ? item.note_id.trim()
+      : null;
+  const notePath =
+    typeof item.note_path === "string" && item.note_path.trim()
+      ? item.note_path.trim()
+      : null;
+  const summary =
+    typeof item.summary === "string" && item.summary.trim()
+      ? item.summary.trim()
+      : "";
+  const sourcesSummary =
+    typeof item.sources_summary === "string" && item.sources_summary.trim()
+      ? item.sources_summary.trim()
+      : "";
+  const evidenceItems = parseEvidenceItems(item.evidence_items);
+  const round =
+    typeof item.round === "number"
+      ? item.round
+      : typeof item.round === "string"
+      ? Number(item.round)
+      : NaN;
+
+  return {
+    id,
+    title:
+      typeof item.title === "string" && item.title.trim()
+        ? item.title.trim()
+        : `任务${id}`,
+    intent:
+      typeof item.intent === "string" && item.intent.trim()
+        ? item.intent.trim()
+        : "探索与主题相关的关键信息",
+    query:
+      typeof item.query === "string" && item.query.trim()
+        ? item.query.trim()
+        : form.topic.trim(),
+    status:
+      typeof item.status === "string" && item.status.trim()
+        ? item.status.trim()
+        : "pending",
+    summary,
+    sourcesSummary,
+    sourceItems: evidenceItems.length ? evidenceItems : parseSources(sourcesSummary),
+    notices: Array.isArray(item.notices)
+      ? item.notices.filter((notice): notice is string => typeof notice === "string")
+      : [],
+    claims: parseClaims(item.claims),
+    reviewIssues: parseReviewIssues(item.review_issues),
+    reviewStatus:
+      typeof item.review_status === "string" && item.review_status.trim()
+        ? item.review_status.trim()
+        : "pending",
+    noteId,
+    notePath,
+    toolCalls: [],
+    origin:
+      typeof item.origin === "string" && item.origin.trim()
+        ? item.origin.trim()
+        : "planned",
+    round: Number.isFinite(round) && round >= 1 ? Number(round) : 1
+  };
+}
+
+function mergeTodoList(tasks: Record<string, unknown>[]) {
+  const existingById = new Map(todoTasks.value.map((task) => [task.id, task]));
+  const merged = tasks.map((item, index) => {
+    const incoming = toTaskView(item, index);
+    const existing = existingById.get(incoming.id);
+    if (!existing) {
+      return incoming;
+    }
+
+    return {
+      ...existing,
+      ...incoming,
+      summary: incoming.summary || existing.summary,
+      sourcesSummary: incoming.sourcesSummary || existing.sourcesSummary,
+      sourceItems: incoming.sourceItems.length > 0
+        ? incoming.sourceItems
+        : existing.sourceItems,
+      notices:
+        incoming.notices.length > 0
+          ? Array.from(new Set([...existing.notices, ...incoming.notices]))
+          : existing.notices,
+      claims: incoming.claims.length > 0 ? incoming.claims : existing.claims,
+      reviewIssues:
+        incoming.reviewIssues.length > 0
+          ? incoming.reviewIssues
+          : existing.reviewIssues,
+      reviewStatus:
+        incoming.reviewStatus !== "pending"
+          ? incoming.reviewStatus
+          : existing.reviewStatus,
+      noteId: incoming.noteId ?? existing.noteId,
+      notePath: incoming.notePath ?? existing.notePath,
+      toolCalls: existing.toolCalls
+    } as TodoTaskView;
+  });
+
+  todoTasks.value = merged;
+  if (
+    activeTaskId.value === null ||
+    !todoTasks.value.some((task) => task.id === activeTaskId.value)
+  ) {
+    activeTaskId.value = todoTasks.value[0]?.id ?? null;
+  }
 }
 
 function formatElapsed(value: number): string {
@@ -1065,6 +1583,8 @@ function formatStageLabel(stage: string): string {
     planning: "规划",
     search: "搜索",
     summarization: "总结",
+    reflection: "反思补充",
+    review: "质量审查",
     report: "报告"
   };
   return labels[stage] ?? stage;
@@ -1102,6 +1622,307 @@ async function toggleLogsVisibility() {
   });
 }
 
+function applyDemoScenario(scenario: DemoScenario) {
+  form.topic = scenario.topic;
+  form.searchApi = scenario.searchApi;
+  error.value = "";
+}
+
+function handleResearchEvent(event: ResearchStreamEvent) {
+  if (event.type === "status") {
+    const message =
+      typeof event.message === "string" && event.message.trim()
+        ? event.message
+        : "流程状态更新";
+    progressLogs.value.push(message);
+
+    const payload = event as Record<string, unknown>;
+    const task = findTask(payload.task_id);
+    if (task && message) {
+      task.notices.push(message);
+      applyNoteMetadata(task, payload);
+    }
+    return;
+  }
+
+  if (event.type === "todo_list") {
+    const tasks = Array.isArray(event.tasks)
+      ? (event.tasks as Record<string, unknown>[])
+      : [];
+
+    const previousCount = todoTasks.value.length;
+    mergeTodoList(tasks);
+
+    if (todoTasks.value.length) {
+      progressLogs.value.push(
+        previousCount > 0 ? "已更新任务清单" : "已生成任务清单"
+      );
+    } else {
+      progressLogs.value.push("未生成任务清单，使用默认任务继续");
+    }
+    return;
+  }
+
+  if (event.type === "task_status") {
+    const payload = event as Record<string, unknown>;
+    const task = findTask(event.task_id);
+    if (!task) {
+      return;
+    }
+
+    upsertTaskMetadata(task, payload);
+    applyNoteMetadata(task, payload);
+    const status =
+      typeof event.status === "string" && event.status.trim()
+        ? event.status.trim()
+        : task.status;
+    task.status = status;
+    task.reviewIssues = parseReviewIssues(payload.review_issues);
+    task.reviewStatus = getString(payload.review_status, task.reviewStatus);
+    task.claims = parseClaims(payload.claims);
+    const evidenceItems = parseEvidenceItems(payload.evidence_items);
+    if (evidenceItems.length > 0) {
+      task.sourceItems = evidenceItems;
+    }
+
+    if (Array.isArray(payload.notices)) {
+      task.notices = payload.notices.filter((notice): notice is string => typeof notice === "string");
+    }
+
+    if (status === "in_progress") {
+      task.summary = "";
+      task.sourcesSummary = "";
+      task.sourceItems = [];
+      task.notices = [];
+      task.claims = [];
+      task.reviewIssues = [];
+      task.reviewStatus = "pending";
+      activeTaskId.value = task.id;
+      progressLogs.value.push(`开始执行任务：${task.title}`);
+    } else if (status === "completed") {
+      if (typeof event.summary === "string" && event.summary.trim()) {
+        task.summary = event.summary.trim();
+      }
+      if (
+        typeof event.sources_summary === "string" &&
+        event.sources_summary.trim()
+      ) {
+        task.sourcesSummary = event.sources_summary.trim();
+        if (task.sourceItems.length === 0) {
+          task.sourceItems = parseSources(task.sourcesSummary);
+        }
+      }
+      progressLogs.value.push(`完成任务：${task.title}`);
+      if (activeTaskId.value === task.id) {
+        pulse(summaryHighlight);
+        pulse(sourcesHighlight);
+      }
+    } else if (status === "skipped") {
+      progressLogs.value.push(`任务跳过：${task.title}`);
+    } else if (status === "failed") {
+      progressLogs.value.push(`任务失败：${task.title}`);
+    }
+    return;
+  }
+
+  if (event.type === "sources") {
+    const payload = event as Record<string, unknown>;
+    const task = findTask(event.task_id);
+    if (!task) {
+      return;
+    }
+
+    const evidenceItems = parseEvidenceItems(payload.evidence_items);
+    if (evidenceItems.length > 0) {
+      task.sourceItems = evidenceItems;
+    }
+
+    const textCandidates = [
+      payload.latest_sources,
+      payload.sources_summary,
+      payload.raw_context
+    ];
+    const latestText = textCandidates
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .find((value) => value);
+
+    if (latestText) {
+      task.sourcesSummary = latestText;
+      if (task.sourceItems.length === 0) {
+        task.sourceItems = parseSources(latestText);
+      }
+      if (activeTaskId.value === task.id) {
+        pulse(sourcesHighlight);
+      }
+      progressLogs.value.push(`已更新任务来源：${task.title}`);
+    }
+
+    if (typeof payload.backend === "string") {
+      progressLogs.value.push(`当前使用搜索后端：${payload.backend}`);
+    }
+
+    applyNoteMetadata(task, payload);
+    return;
+  }
+
+  if (event.type === "task_summary_chunk") {
+    const payload = event as Record<string, unknown>;
+    const task = findTask(event.task_id);
+    if (!task) {
+      return;
+    }
+    const chunk =
+      typeof event.content === "string" ? event.content : "";
+    task.summary += chunk;
+    applyNoteMetadata(task, payload);
+    if (activeTaskId.value === task.id) {
+      pulse(summaryHighlight);
+    }
+    return;
+  }
+
+  if (event.type === "tool_call") {
+    const payload = event as Record<string, unknown>;
+    const eventId =
+      typeof payload.event_id === "number"
+        ? payload.event_id
+        : Date.now();
+    const agent =
+      typeof payload.agent === "string" && payload.agent.trim()
+        ? payload.agent.trim()
+        : "Agent";
+    const tool =
+      typeof payload.tool === "string" && payload.tool.trim()
+        ? payload.tool.trim()
+        : "tool";
+    const parameters = ensureRecord(payload.parameters);
+    const result =
+      typeof payload.result === "string" ? payload.result : "";
+    const noteId = extractOptionalString(payload.note_id);
+    const notePath = extractOptionalString(payload.note_path);
+
+    const task = findTask(payload.task_id);
+    if (task) {
+      task.toolCalls.push({
+        eventId,
+        agent,
+        tool,
+        parameters,
+        result,
+        noteId,
+        notePath,
+        timestamp: Date.now()
+      });
+      if (noteId) {
+        task.noteId = noteId;
+      }
+      if (notePath) {
+        task.notePath = notePath;
+      }
+      const logSummary = noteId
+        ? `${agent} 调用了 ${tool}（任务 ${task.id}，笔记 ${noteId}）`
+        : `${agent} 调用了 ${tool}（任务 ${task.id}）`;
+      progressLogs.value.push(logSummary);
+      if (activeTaskId.value === task.id) {
+        pulse(toolHighlight);
+      }
+    } else {
+      progressLogs.value.push(`${agent} 调用了 ${tool}`);
+    }
+    return;
+  }
+
+  if (event.type === "review_summary") {
+    const payload = event as UnknownRecord;
+    const tasks = Array.isArray(payload.tasks)
+      ? (payload.tasks as Record<string, unknown>[])
+      : [];
+    if (tasks.length > 0) {
+      mergeTodoList(tasks);
+    }
+    const summary = ensureRecord(payload.summary);
+    const reviewStatus = getString(summary.overall_status, "unknown");
+    const issueCount = getNumber(summary.issue_count);
+    progressLogs.value.push(`审查阶段完成：${reviewStatus}，发现 ${issueCount} 个问题`);
+    return;
+  }
+
+  if (event.type === "stage_started") {
+    const payload = event as UnknownRecord;
+    const stage = formatStageLabel(getString(payload.stage, "stage"));
+    const taskId = getNumber(payload.task_id);
+    progressLogs.value.push(
+      taskId ? `阶段开始：${stage}（任务 ${taskId}）` : `阶段开始：${stage}`
+    );
+    return;
+  }
+
+  if (event.type === "stage_completed") {
+    const payload = event as UnknownRecord;
+    const stage = formatStageLabel(getString(payload.stage, "stage"));
+    const taskId = getNumber(payload.task_id);
+    const elapsed = formatElapsed(getNumber(payload.elapsed_ms));
+    const status = getString(payload.status, "unknown");
+    progressLogs.value.push(
+      taskId
+        ? `阶段完成：${stage}（任务 ${taskId}，${status}，${elapsed}）`
+        : `阶段完成：${stage}（${status}，${elapsed}）`
+    );
+    return;
+  }
+
+  if (event.type === "fallback_triggered") {
+    const payload = event as UnknownRecord;
+    progressLogs.value.push(
+      `触发兜底流程：${getString(payload.reason, "unknown")}`
+    );
+    return;
+  }
+
+  if (event.type === "degraded_response") {
+    const payload = event as UnknownRecord;
+    progressLogs.value.push(
+      `降级响应：${getString(payload.reason, "unknown")}`
+    );
+    return;
+  }
+
+  if (event.type === "metrics_snapshot") {
+    const payload = event as UnknownRecord;
+    latestRequestMetrics.value = ensureRecord(payload.request_metrics);
+    const nextAggregate = ensureRecord(payload.aggregate_metrics);
+    const previousAggregate = ensureRecord(latestAggregateMetrics.value);
+    if (
+      !Array.isArray(nextAggregate.recent_requests) &&
+      Array.isArray(previousAggregate.recent_requests)
+    ) {
+      nextAggregate.recent_requests = previousAggregate.recent_requests;
+    }
+    latestAggregateMetrics.value = nextAggregate;
+    return;
+  }
+
+  if (event.type === "final_report") {
+    const report =
+      typeof event.report === "string" && event.report.trim()
+        ? event.report.trim()
+        : "";
+    reportMarkdown.value = report || "报告生成失败，未获得有效内容";
+    pulse(reportHighlight);
+    progressLogs.value.push("最终报告已生成");
+    return;
+  }
+
+  if (event.type === "error") {
+    const detail =
+      typeof event.detail === "string" && event.detail.trim()
+        ? event.detail
+        : "研究过程中发生错误";
+    error.value = detail;
+    progressLogs.value.push("研究失败，已停止流程");
+  }
+}
+
 const handleSubmit = async () => {
   if (!form.topic.trim()) {
     error.value = "请输入研究主题";
@@ -1129,304 +1950,7 @@ const handleSubmit = async () => {
   try {
     await runResearchStream(
       payload,
-      (event: ResearchStreamEvent) => {
-        if (event.type === "status") {
-          const message =
-            typeof event.message === "string" && event.message.trim()
-              ? event.message
-              : "流程状态更新";
-          progressLogs.value.push(message);
-
-          const payload = event as Record<string, unknown>;
-          const task = findTask(payload.task_id);
-          if (task && message) {
-            task.notices.push(message);
-            applyNoteMetadata(task, payload);
-          }
-          return;
-        }
-
-        if (event.type === "todo_list") {
-          const tasks = Array.isArray(event.tasks)
-            ? (event.tasks as Record<string, unknown>[])
-            : [];
-
-          todoTasks.value = tasks.map((item, index) => {
-            const rawId =
-              typeof item.id === "number"
-                ? item.id
-                : typeof item.id === "string"
-                ? Number(item.id)
-                : index + 1;
-            const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
-            const noteId =
-              typeof item.note_id === "string" && item.note_id.trim()
-                ? item.note_id.trim()
-                : null;
-            const notePath =
-              typeof item.note_path === "string" && item.note_path.trim()
-                ? item.note_path.trim()
-                : null;
-
-            return {
-              id,
-              title:
-                typeof item.title === "string" && item.title.trim()
-                  ? item.title.trim()
-                  : `任务${id}`,
-              intent:
-                typeof item.intent === "string" && item.intent.trim()
-                  ? item.intent.trim()
-                  : "探索与主题相关的关键信息",
-              query:
-                typeof item.query === "string" && item.query.trim()
-                  ? item.query.trim()
-                  : form.topic.trim(),
-              status:
-                typeof item.status === "string" && item.status.trim()
-                  ? item.status.trim()
-                  : "pending",
-              summary: "",
-              sourcesSummary: "",
-              sourceItems: [],
-              notices: [],
-              noteId,
-              notePath,
-              toolCalls: []
-            } as TodoTaskView;
-          });
-
-          if (todoTasks.value.length) {
-            activeTaskId.value = todoTasks.value[0].id;
-            progressLogs.value.push("已生成任务清单");
-          } else {
-            progressLogs.value.push("未生成任务清单，使用默认任务继续");
-          }
-          return;
-        }
-
-        if (event.type === "task_status") {
-          const payload = event as Record<string, unknown>;
-          const task = findTask(event.task_id);
-          if (!task) {
-            return;
-          }
-
-          upsertTaskMetadata(task, payload);
-          applyNoteMetadata(task, payload);
-          const status =
-            typeof event.status === "string" && event.status.trim()
-              ? event.status.trim()
-              : task.status;
-          task.status = status;
-
-          if (status === "in_progress") {
-            task.summary = "";
-            task.sourcesSummary = "";
-            task.sourceItems = [];
-            task.notices = [];
-            activeTaskId.value = task.id;
-            progressLogs.value.push(`开始执行任务：${task.title}`);
-          } else if (status === "completed") {
-            if (typeof event.summary === "string" && event.summary.trim()) {
-              task.summary = event.summary.trim();
-            }
-            if (
-              typeof event.sources_summary === "string" &&
-              event.sources_summary.trim()
-            ) {
-              task.sourcesSummary = event.sources_summary.trim();
-              task.sourceItems = parseSources(task.sourcesSummary);
-            }
-            progressLogs.value.push(`完成任务：${task.title}`);
-            if (activeTaskId.value === task.id) {
-              pulse(summaryHighlight);
-              pulse(sourcesHighlight);
-            }
-          } else if (status === "skipped") {
-            progressLogs.value.push(`任务跳过：${task.title}`);
-          }
-          return;
-        }
-
-        if (event.type === "sources") {
-          const payload = event as Record<string, unknown>;
-          const task = findTask(event.task_id);
-          if (!task) {
-            return;
-          }
-
-          const textCandidates = [
-            payload.latest_sources,
-            payload.sources_summary,
-            payload.raw_context
-          ];
-          const latestText = textCandidates
-            .map((value) => (typeof value === "string" ? value.trim() : ""))
-            .find((value) => value);
-
-          if (latestText) {
-            task.sourcesSummary = latestText;
-            task.sourceItems = parseSources(latestText);
-            if (activeTaskId.value === task.id) {
-              pulse(sourcesHighlight);
-            }
-            progressLogs.value.push(`已更新任务来源：${task.title}`);
-          }
-
-          if (typeof payload.backend === "string") {
-            progressLogs.value.push(
-              `当前使用搜索后端：${payload.backend}`
-            );
-          }
-
-          applyNoteMetadata(task, payload);
-
-          return;
-        }
-
-        if (event.type === "task_summary_chunk") {
-          const payload = event as Record<string, unknown>;
-          const task = findTask(event.task_id);
-          if (!task) {
-            return;
-          }
-          const chunk =
-            typeof event.content === "string" ? event.content : "";
-          task.summary += chunk;
-          applyNoteMetadata(task, payload);
-          if (activeTaskId.value === task.id) {
-            pulse(summaryHighlight);
-          }
-          return;
-        }
-
-        if (event.type === "tool_call") {
-          const payload = event as Record<string, unknown>;
-          const eventId =
-            typeof payload.event_id === "number"
-              ? payload.event_id
-              : Date.now();
-          const agent =
-            typeof payload.agent === "string" && payload.agent.trim()
-              ? payload.agent.trim()
-              : "Agent";
-          const tool =
-            typeof payload.tool === "string" && payload.tool.trim()
-              ? payload.tool.trim()
-              : "tool";
-          const parameters = ensureRecord(payload.parameters);
-          const result =
-            typeof payload.result === "string" ? payload.result : "";
-          const noteId = extractOptionalString(payload.note_id);
-          const notePath = extractOptionalString(payload.note_path);
-
-          const task = findTask(payload.task_id);
-          if (task) {
-            task.toolCalls.push({
-              eventId,
-              agent,
-              tool,
-              parameters,
-              result,
-              noteId,
-              notePath,
-              timestamp: Date.now()
-            });
-            if (noteId) {
-              task.noteId = noteId;
-            }
-            if (notePath) {
-              task.notePath = notePath;
-            }
-            const logSummary = noteId
-              ? `${agent} 调用了 ${tool}（任务 ${task.id}，笔记 ${noteId}）`
-              : `${agent} 调用了 ${tool}（任务 ${task.id}）`;
-            progressLogs.value.push(logSummary);
-            if (activeTaskId.value === task.id) {
-              pulse(toolHighlight);
-            }
-          } else {
-            progressLogs.value.push(`${agent} 调用了 ${tool}`);
-          }
-          return;
-        }
-
-        if (event.type === "stage_started") {
-          const payload = event as UnknownRecord;
-          const stage = formatStageLabel(getString(payload.stage, "stage"));
-          const taskId = getNumber(payload.task_id);
-          progressLogs.value.push(
-            taskId ? `阶段开始：${stage}（任务 ${taskId}）` : `阶段开始：${stage}`
-          );
-          return;
-        }
-
-        if (event.type === "stage_completed") {
-          const payload = event as UnknownRecord;
-          const stage = formatStageLabel(getString(payload.stage, "stage"));
-          const taskId = getNumber(payload.task_id);
-          const elapsed = formatElapsed(getNumber(payload.elapsed_ms));
-          const status = getString(payload.status, "unknown");
-          progressLogs.value.push(
-            taskId
-              ? `阶段完成：${stage}（任务 ${taskId}，${status}，${elapsed}）`
-              : `阶段完成：${stage}（${status}，${elapsed}）`
-          );
-          return;
-        }
-
-        if (event.type === "fallback_triggered") {
-          const payload = event as UnknownRecord;
-          progressLogs.value.push(
-            `触发兜底流程：${getString(payload.reason, "unknown")}`
-          );
-          return;
-        }
-
-        if (event.type === "degraded_response") {
-          const payload = event as UnknownRecord;
-          progressLogs.value.push(
-            `降级响应：${getString(payload.reason, "unknown")}`
-          );
-          return;
-        }
-
-        if (event.type === "metrics_snapshot") {
-          const payload = event as UnknownRecord;
-          latestRequestMetrics.value = ensureRecord(payload.request_metrics);
-          const nextAggregate = ensureRecord(payload.aggregate_metrics);
-          const previousAggregate = ensureRecord(latestAggregateMetrics.value);
-          if (
-            !Array.isArray(nextAggregate.recent_requests) &&
-            Array.isArray(previousAggregate.recent_requests)
-          ) {
-            nextAggregate.recent_requests = previousAggregate.recent_requests;
-          }
-          latestAggregateMetrics.value = nextAggregate;
-          return;
-        }
-
-        if (event.type === "final_report") {
-          const report =
-            typeof event.report === "string" && event.report.trim()
-              ? event.report.trim()
-              : "";
-          reportMarkdown.value = report || "报告生成失败，未获得有效内容";
-          pulse(reportHighlight);
-          progressLogs.value.push("最终报告已生成");
-          return;
-        }
-
-        if (event.type === "error") {
-          const detail =
-            typeof event.detail === "string" && event.detail.trim()
-              ? event.detail
-              : "研究过程中发生错误";
-          error.value = detail;
-          progressLogs.value.push("研究失败，已停止流程");
-        }
-      },
+      handleResearchEvent,
       { signal: controller.signal }
     );
 
@@ -1442,6 +1966,7 @@ const handleSubmit = async () => {
   } finally {
     loading.value = false;
     void refreshGlobalMetrics();
+    void refreshPersistedHistory();
     if (currentController === controller) {
       currentController = null;
     }
@@ -1475,8 +2000,10 @@ const startNewResearch = () => {
 
 onMounted(() => {
   void refreshGlobalMetrics();
+  void refreshPersistedHistory();
   globalMetricsTimer = window.setInterval(() => {
     void refreshGlobalMetrics();
+    void refreshPersistedHistory();
   }, 15000);
 });
 
@@ -1704,6 +2231,114 @@ select:focus {
   display: flex;
   gap: 16px;
   flex-wrap: wrap;
+}
+
+.demo-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.demo-presets-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.demo-presets-head h3 {
+  margin: 0;
+  font-size: 15px;
+  color: #0f172a;
+}
+
+.demo-presets-head p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.demo-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(191, 219, 254, 0.34);
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.demo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.demo-card {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(255, 255, 255, 0.95);
+  color: #0f172a;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.demo-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+  border-color: rgba(59, 130, 246, 0.28);
+}
+
+.demo-card.active {
+  border-color: rgba(59, 130, 246, 0.42);
+  box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.12);
+  background: rgba(239, 246, 255, 0.92);
+}
+
+.demo-card strong {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.demo-card p {
+  margin: 0;
+  font-size: 12px;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.demo-card-label,
+.demo-card-meta {
+  font-size: 12px;
+  color: #2563eb;
+  font-weight: 600;
+}
+
+.demo-note {
+  margin: 0;
+  font-size: 12px;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.demo-note code {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular,
+    Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  background: rgba(224, 231, 255, 0.65);
+  padding: 2px 6px;
+  border-radius: 6px;
 }
 
 .option {
@@ -1953,9 +2588,31 @@ select:focus {
   gap: 10px;
 }
 
+.planning-title-wrap,
+.task-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .planning-card-head strong {
   font-size: 14px;
   color: #0f172a;
+}
+
+.task-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.16);
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  color: #b45309;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .planning-intent,
@@ -2211,6 +2868,11 @@ select:focus {
   color: #b91c1c;
 }
 
+.task-status.failed {
+  background: rgba(249, 115, 22, 0.18);
+  color: #c2410c;
+}
+
 .task-intent {
   margin: 0;
   padding: 0 14px 12px 14px;
@@ -2268,6 +2930,12 @@ select:focus {
   background: rgba(34, 197, 94, 0.2);
   border-color: rgba(34, 197, 94, 0.35);
   color: #15803d;
+}
+
+.task-label.origin-chip {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.3);
+  color: #b45309;
 }
 
 .task-label.path-chip {
@@ -2335,6 +3003,11 @@ select:focus {
 
 .task-notices li {
   font-size: 13px;
+}
+
+.review-notices {
+  background: rgba(254, 240, 138, 0.22);
+  border-color: rgba(245, 158, 11, 0.3);
 }
 
 .report-block {
@@ -2795,6 +3468,23 @@ select:focus {
   color: #64748b;
 }
 
+.source-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.source-meta-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(219, 234, 254, 0.75);
+  color: #1e3a8a;
+  font-size: 11px;
+  font-weight: 600;
+}
+
 .source-item:hover .source-tooltip,
 .source-item:focus-within .source-tooltip {
   display: block;
@@ -2979,6 +3669,25 @@ select:focus {
   font-size: 14px;
   color: #1f2937;
   line-height: 1.6;
+}
+
+.demo-focus-card {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(239, 246, 255, 0.85);
+  border: 1px solid rgba(59, 130, 246, 0.18);
+}
+
+.demo-focus-card strong {
+  display: block;
+  color: #0f172a;
+  font-size: 14px;
+}
+
+.demo-focus-card p {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #475569;
 }
 
 .topic-display {

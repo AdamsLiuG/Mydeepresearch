@@ -117,6 +117,8 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "average_section_completeness": 0.0,
             "average_keyword_coverage": 0.0,
             "average_citation_count": 0.0,
+            "average_reference_match_rate": 0.0,
+            "average_grounded_bullet_ratio": 0.0,
             "average_latency_ms": 0.0,
             "total_estimated_cost": 0.0,
             "error_cases": 0,
@@ -147,6 +149,8 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "average_section_completeness": average("section_completeness"),
         "average_keyword_coverage": average("keyword_coverage"),
         "average_citation_count": average("citation_count"),
+        "average_reference_match_rate": average("reference_match_rate"),
+        "average_grounded_bullet_ratio": average("grounded_bullet_ratio"),
         "average_latency_ms": average("total_latency_ms"),
         "total_estimated_cost": total_estimated_cost,
     }

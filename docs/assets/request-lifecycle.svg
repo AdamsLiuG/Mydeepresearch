@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="400" viewBox="0 0 1080 400" role="img" aria-labelledby="title desc">
+  <title id="title">DeepResearch Agent request lifecycle</title>
+  <desc id="desc">A request flows through planning, search, summarization, reporting, metrics, and completion, with fallback and degraded paths.</desc>
+  <defs>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 16px Arial, sans-serif; fill: #475569; }
+      .step-title { font: 700 18px Arial, sans-serif; fill: #0f172a; }
+      .step-text { font: 500 13px Arial, sans-serif; fill: #334155; }
+      .arrow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#marker); }
+    </style>
+    <marker id="marker" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="400" fill="#f8fafc"/>
+  <text x="56" y="58" class="title">Request Lifecycle</text>
+  <text x="56" y="88" class="subtitle">典型请求从流式接入到最终报告的阶段事件和降级路径</text>
+
+  <g transform="translate(56,150)">
+    <rect width="148" height="118" rx="20" fill="#dbeafe"/>
+    <text x="24" y="42" class="step-title">1. Request In</text>
+    <text x="24" y="70" class="step-text">POST /research/stream</text>
+    <text x="24" y="94" class="step-text">X-Request-ID</text>
+  </g>
+
+  <g transform="translate(252,150)">
+    <rect width="148" height="118" rx="20" fill="#e0f2fe"/>
+    <text x="24" y="42" class="step-title">2. Planning</text>
+    <text x="24" y="70" class="step-text">todo_list</text>
+    <text x="24" y="94" class="step-text">fallback if empty</text>
+  </g>
+
+  <g transform="translate(448,150)">
+    <rect width="148" height="118" rx="20" fill="#dcfce7"/>
+    <text x="24" y="42" class="step-title">3. Search</text>
+    <text x="24" y="70" class="step-text">tool calls</text>
+    <text x="24" y="94" class="step-text">exact / semantic cache</text>
+  </g>
+
+  <g transform="translate(644,150)">
+    <rect width="148" height="118" rx="20" fill="#ede9fe"/>
+    <text x="24" y="42" class="step-title">4. Summary</text>
+    <text x="24" y="70" class="step-text">task_summary_chunk</text>
+    <text x="24" y="94" class="step-text">degraded if failed</text>
+  </g>
+
+  <g transform="translate(840,150)">
+    <rect width="184" height="118" rx="20" fill="#fee2e2"/>
+    <text x="24" y="42" class="step-title">5. Report + Metrics</text>
+    <text x="24" y="70" class="step-text">final_report</text>
+    <text x="24" y="94" class="step-text">metrics_snapshot / done</text>
+  </g>
+
+  <path d="M204 209 H236" class="arrow"/>
+  <path d="M400 209 H432" class="arrow"/>
+  <path d="M596 209 H628" class="arrow"/>
+  <path d="M792 209 H824" class="arrow"/>
+
+  <path d="M326 290 C326 336, 726 336, 726 290" class="arrow"/>
+  <text x="428" y="360" class="step-text">fallback_triggered / degraded_response keeps the request observable instead of failing blindly</text>
+</svg>

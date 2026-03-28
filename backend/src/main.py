@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI
 from metrics import metrics_registry
+from services.request_state import RequestStateStore
 
 DeepResearchAgent: Any | None = None
 
@@ -53,6 +54,15 @@ class ResearchRequest(BaseModel):
     """Payload for triggering a research run."""
 
     topic: str = Field(..., description="Research topic supplied by the user")
+    search_api: SearchAPI | None = Field(
+        default=None,
+        description="Override the default search backend configured via env",
+    )
+
+
+class ResumeRequest(BaseModel):
+    """Optional payload used when resuming a persisted request."""
+
     search_api: SearchAPI | None = Field(
         default=None,
         description="Override the default search backend configured via env",
@@ -142,7 +152,9 @@ def create_app(
 
         logger.info(
             "DeepResearch configuration loaded: provider=%s model=%s base_url=%s search_api=%s "
-            "max_loops=%s fetch_full_page=%s tool_calling=%s strip_thinking=%s api_key=%s "
+            "max_loops=%s fetch_full_page=%s tool_calling=%s strip_thinking=%s "
+            "request_reflection_enabled=%s reflection_max_additional_tasks=%s "
+            "review_stage_enabled=%s review_agent_enabled=%s request_state_enabled=%s api_key=%s "
             "notes_workspace=%s cors_origins=%s search_cache_enabled=%s search_cache_ttl_seconds=%s "
             "benchmark_stub_enabled=%s benchmark_profile=%s",
             config.llm_provider,
@@ -153,6 +165,11 @@ def create_app(
             config.fetch_full_page,
             config.use_tool_calling,
             config.strip_thinking_tokens,
+            config.request_reflection_enabled,
+            config.reflection_max_additional_tasks,
+            config.review_stage_enabled,
+            config.review_agent_enabled,
+            config.request_state_enabled,
             _mask_secret(config.llm_api_key),
             config.notes_workspace,
             ",".join(config.cors_origins),
@@ -167,6 +184,14 @@ def create_app(
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
     app.state.base_config = base_config
     app.state.agent_factory = resolved_agent_factory
+    app.state.request_state_store = (
+        RequestStateStore(
+            base_config.request_state_dir,
+            recent_limit=base_config.request_state_recent_limit,
+        )
+        if base_config.request_state_enabled
+        else None
+    )
 
     app.add_middleware(
         CORSMiddleware,
@@ -253,12 +278,90 @@ def create_app(
                 "status": item.status,
                 "summary": item.summary,
                 "sources_summary": item.sources_summary,
+                "notices": getattr(item, "notices", []),
+                "evidence_items": getattr(item, "evidence_items", []),
+                "claims": getattr(item, "claims", []),
+                "review_issues": getattr(item, "review_issues", []),
+                "review_status": getattr(item, "review_status", "pending"),
                 "note_id": item.note_id,
                 "note_path": item.note_path,
+                "origin": getattr(item, "origin", "planned"),
+                "round": getattr(item, "round", 1),
             }
             for item in result.todo_items
         ]
 
+        return ResearchResponse(
+            report_markdown=(result.report_markdown or result.running_summary or ""),
+            todo_items=todo_payload,
+        )
+
+    @app.get("/requests")
+    def list_persisted_requests(limit: int | None = None) -> Dict[str, Any]:
+        store = app.state.request_state_store
+        if store is None:
+            return {"items": []}
+        return {"items": store.list_recent(limit=limit)}
+
+    @app.get("/requests/{request_id}")
+    def get_persisted_request(request_id: str) -> Dict[str, Any]:
+        store = app.state.request_state_store
+        if store is None:
+            raise HTTPException(status_code=404, detail="request state store is disabled")
+
+        payload = store.load(request_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
+        return payload
+
+    @app.post("/requests/{request_id}/resume", response_model=ResearchResponse)
+    def resume_research(
+        request_id: str,
+        payload: ResumeRequest | None = None,
+    ) -> ResearchResponse:
+        try:
+            config = _build_config(
+                ResearchRequest(
+                    topic="resume",
+                    search_api=payload.search_api if payload else None,
+                )
+            )
+            agent = app.state.agent_factory(config=config, request_id=request_id)
+            result = agent.run_resume(request_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            logger.exception(
+                "Resume research failed request_id=%s",
+                request_id,
+                extra={"request_id": request_id},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Resume failed (request_id={request_id})",
+            ) from exc
+
+        todo_payload = [
+            {
+                "id": item.id,
+                "title": item.title,
+                "intent": item.intent,
+                "query": item.query,
+                "status": item.status,
+                "summary": item.summary,
+                "sources_summary": item.sources_summary,
+                "notices": getattr(item, "notices", []),
+                "evidence_items": getattr(item, "evidence_items", []),
+                "claims": getattr(item, "claims", []),
+                "review_issues": getattr(item, "review_issues", []),
+                "review_status": getattr(item, "review_status", "pending"),
+                "note_id": item.note_id,
+                "note_path": item.note_path,
+                "origin": getattr(item, "origin", "planned"),
+                "round": getattr(item, "round", 1),
+            }
+            for item in result.todo_items
+        ]
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
@@ -291,6 +394,58 @@ def create_app(
                 logger.exception(
                     "Streaming research failed topic=%s",
                     payload.topic,
+                    extra={"request_id": request_id},
+                )
+                error_payload = {
+                    "type": "error",
+                    "detail": f"{exc} (request_id={request_id})",
+                }
+                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_iterator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    @app.post("/requests/{request_id}/resume/stream")
+    def stream_resume_research(
+        request_id: str,
+        payload: ResumeRequest | None = None,
+    ) -> StreamingResponse:
+        try:
+            config = _build_config(
+                ResearchRequest(
+                    topic="resume",
+                    search_api=payload.search_api if payload else None,
+                )
+            )
+            agent = app.state.agent_factory(config=config, request_id=request_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            logger.exception(
+                "Failed to initialise streaming resume request_id=%s",
+                request_id,
+                extra={"request_id": request_id},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Resume failed to start (request_id={request_id})",
+            ) from exc
+
+        def event_iterator() -> Iterator[str]:
+            try:
+                for event in agent.run_stream_resume(request_id):
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                logger.exception(
+                    "Streaming resume failed request_id=%s",
+                    request_id,
                     extra={"request_id": request_id},
                 )
                 error_payload = {

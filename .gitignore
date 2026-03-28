@@ -19,6 +19,9 @@ __pycache__/
 .venv/
 venv/
 backend/.venv/
+backend/.cache/
+backend/.state/
+backend/=*
 backend/build/
 backend/*.egg-info/
 backend/src/*.egg-info/

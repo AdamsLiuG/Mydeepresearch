@@ -120,6 +120,11 @@ class MetricsRegistry:
             "cache_exact_hit_total": 0,
             "cache_semantic_hit_total": 0,
             "cache_miss_total": 0,
+            "reflection_call_total": 0,
+            "reflection_replan_total": 0,
+            "reflection_skipped_total": 0,
+            "review_call_total": 0,
+            "review_issue_total": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -129,6 +134,8 @@ class MetricsRegistry:
             "planning_latency_ms": LatencyStats(),
             "search_latency_ms": LatencyStats(),
             "summarization_latency_ms": LatencyStats(),
+            "reflection_latency_ms": LatencyStats(),
+            "review_latency_ms": LatencyStats(),
             "report_latency_ms": LatencyStats(),
             "total_latency_ms": LatencyStats(),
         }
@@ -151,6 +158,8 @@ class MetricsRegistry:
                 "planning_latency_ms": LatencyStats(),
                 "search_latency_ms": LatencyStats(),
                 "summarization_latency_ms": LatencyStats(),
+                "reflection_latency_ms": LatencyStats(),
+                "review_latency_ms": LatencyStats(),
                 "report_latency_ms": LatencyStats(),
                 "total_latency_ms": LatencyStats(),
             }
@@ -400,6 +409,11 @@ class RequestTrace:
         self.report_note_id: str | None = None
         self.report_note_path: str | None = None
         self.token_sources: set[str] = set()
+        self.reflection_triggered = False
+        self.reflection_reason: str | None = None
+        self.reflection_gap_signals: list[str] = []
+        self.reflection_added_tasks = 0
+        self.review_summary: dict[str, Any] = {}
         metrics_registry.increment("request_total")
 
     def start_stage(
@@ -521,6 +535,36 @@ class RequestTrace:
             "degraded": True,
         }
 
+    def record_reflection_call(
+        self,
+        *,
+        reason: str,
+        gap_signals: list[str] | None = None,
+        added_tasks: int = 0,
+    ) -> None:
+        metrics_registry.increment("reflection_call_total")
+        if added_tasks > 0:
+            metrics_registry.increment("reflection_replan_total")
+
+        with self._lock:
+            self.reflection_triggered = True
+            self.reflection_reason = reason.strip() or reason
+            self.reflection_gap_signals = list(gap_signals or [])
+            self.reflection_added_tasks = max(0, int(added_tasks or 0))
+
+    def record_reflection_skip(
+        self,
+        *,
+        reason: str,
+        gap_signals: list[str] | None = None,
+    ) -> None:
+        metrics_registry.increment("reflection_skipped_total")
+        with self._lock:
+            self.reflection_triggered = True
+            self.reflection_reason = reason.strip() or reason
+            self.reflection_gap_signals = list(gap_signals or [])
+            self.reflection_added_tasks = 0
+
     def set_task_totals(self, *, total_tasks: int) -> None:
         with self._lock:
             self.total_tasks = total_tasks
@@ -530,6 +574,12 @@ class RequestTrace:
             self.completed_tasks += completed
             self.skipped_tasks += skipped
             self.failed_tasks += failed
+
+    def record_review_summary(self, summary: dict[str, Any]) -> None:
+        metrics_registry.increment("review_call_total")
+        metrics_registry.increment("review_issue_total", int(summary.get("issue_count") or 0))
+        with self._lock:
+            self.review_summary = _clone_dict(summary)
 
     def attach_result(
         self,
@@ -600,6 +650,11 @@ class RequestTrace:
                 "total_tokens": self.total_tokens,
                 "token_source": token_source,
                 "estimated_cost": round(self.estimated_cost, 6),
+                "reflection_triggered": self.reflection_triggered,
+                "reflection_reason": self.reflection_reason,
+                "reflection_gap_signals": list(self.reflection_gap_signals),
+                "reflection_added_tasks": self.reflection_added_tasks,
+                "review_summary": _clone_dict(self.review_summary),
                 "report_markdown": self.report_markdown,
                 "todo_items": _clone_dict({"items": self.todo_items}).get("items", []),
                 "report_note_id": self.report_note_id,
@@ -639,6 +694,8 @@ class RequestTrace:
             "planning": "planning_latency_ms",
             "search": "search_latency_ms",
             "summarization": "summarization_latency_ms",
+            "reflection": "reflection_latency_ms",
+            "review": "review_latency_ms",
             "report": "report_latency_ms",
         }.get(stage.stage)
         if metric_name:

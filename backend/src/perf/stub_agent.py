@@ -155,6 +155,8 @@ class BenchmarkStubAgent:
             sources_summary="* Benchmark Stub Source : https://example.com/benchmark-stub",
             note_id=None,
             note_path=None,
+            origin="planned",
+            round=1,
         )
 
     def _todo_payload(self, todo_item: SimpleNamespace) -> dict[str, Any]:
@@ -168,6 +170,8 @@ class BenchmarkStubAgent:
             "sources_summary": todo_item.sources_summary,
             "note_id": todo_item.note_id,
             "note_path": todo_item.note_path,
+            "origin": getattr(todo_item, "origin", "planned"),
+            "round": getattr(todo_item, "round", 1),
         }
 
     def _build_report(self, topic: str) -> str:
@@ -222,4 +226,3 @@ class BenchmarkStubAgent:
         time.sleep(0.01)
         completed = span.complete(status="success", metadata=metadata)
         return started, completed
-

@@ -17,11 +17,18 @@ class TodoItem:
     query: str
     status: str = field(default="pending")
     summary: str | None = field(default=None)
+    summary_payload: dict | None = field(default=None)
     sources_summary: str | None = field(default=None)
     notices: list[str] = field(default_factory=list)
+    evidence_items: list[dict] = field(default_factory=list)
+    claims: list[dict] = field(default_factory=list)
+    review_issues: list[dict] = field(default_factory=list)
+    review_status: str = field(default="pending")
     note_id: str | None = field(default=None)
     note_path: str | None = field(default=None)
     stream_token: str | None = field(default=None)
+    origin: str = field(default="planned")
+    round: int = field(default=1)
 
 
 @dataclass(kw_only=True)
@@ -36,6 +43,9 @@ class SummaryState:
     structured_report: str | None = field(default=None)
     report_note_id: str | None = field(default=None)
     report_note_path: str | None = field(default=None)
+    review_summary: dict = field(default_factory=dict)
+    reflection_completed: bool = field(default=False)
+    review_completed: bool = field(default=False)
 
 
 @dataclass(kw_only=True)
@@ -48,4 +58,3 @@ class SummaryStateOutput:
     running_summary: str = field(default=None)  # Backward-compatible文本
     report_markdown: str | None = field(default=None)
     todo_items: List[TodoItem] = field(default_factory=list)
-

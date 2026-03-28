@@ -32,6 +32,13 @@ class ConfigurationTests(unittest.TestCase):
                     "port": "9001",
                     "cors_origins": "http://localhost:5174, http://localhost:3000",
                     "semantic_cache_lexical_threshold": "0.81",
+                    "max_agent_tasks": "3",
+                    "request_reflection_enabled": "true",
+                    "reflection_max_additional_tasks": "2",
+                    "task_query_rewrite_enabled": "false",
+                    "search_tool_timeout_seconds": "4.5",
+                    "search_tool_retry_attempts": "2",
+                    "search_tool_retry_backoff_seconds": "0.2",
                 },
                 load_env_file=False,
             )
@@ -44,6 +51,13 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.log_level, "DEBUG")
         self.assertEqual(cfg.port, 9001)
         self.assertEqual(cfg.semantic_cache_lexical_threshold, 0.81)
+        self.assertEqual(cfg.max_agent_tasks, 3)
+        self.assertTrue(cfg.request_reflection_enabled)
+        self.assertEqual(cfg.reflection_max_additional_tasks, 2)
+        self.assertFalse(cfg.task_query_rewrite_enabled)
+        self.assertEqual(cfg.search_tool_timeout_seconds, 4.5)
+        self.assertEqual(cfg.search_tool_retry_attempts, 2)
+        self.assertEqual(cfg.search_tool_retry_backoff_seconds, 0.2)
         self.assertEqual(
             cfg.cors_origins,
             [
@@ -75,6 +89,7 @@ class ConfigurationTests(unittest.TestCase):
                     "benchmark_profile": "STUB",
                     "perf_thresholds_path": "perf/baselines/stub_baseline.json",
                     "perf_sample_interval_seconds": "0.25",
+                    "request_state_dir": ".state/requests",
                 },
                 load_env_file=False,
             )
@@ -82,9 +97,13 @@ class ConfigurationTests(unittest.TestCase):
         expected_thresholds = str(
             (config.backend_root() / "perf/baselines/stub_baseline.json").resolve(strict=False)
         )
+        expected_state_dir = str(
+            (config.backend_root() / ".state/requests").resolve(strict=False)
+        )
         self.assertEqual(cfg.benchmark_profile, "stub")
         self.assertEqual(cfg.perf_thresholds_path, expected_thresholds)
         self.assertEqual(cfg.perf_sample_interval_seconds, 0.25)
+        self.assertEqual(cfg.request_state_dir, expected_state_dir)
 
 
 if __name__ == "__main__":

@@ -1,36 +1,19 @@
-# HelloAgents DeepResearch Engineering Demo
+# DeepResearch Agent
 
-基于 `helloagents-deepresearch` 示例做的二次工程化升级，目标不是重写框架，而是在保留原有 API 和前后端协作方式的前提下，把项目补齐为“可本地复现、可观察、可评测、可交付”的 Demo。
+联网研究型 Agent 应用工程项目，强调 `任务规划 + 工具调用 + 流式交互 + 失败降级 + 可观测性 + benchmark / CI` 的完整闭环。
 
-## 项目简介
+这个仓库的定位不是知识库 RAG，也不承担向量检索主线；它更适合在简历里展示 Agent 产品化和工程落地能力。金融研报项目负责讲 RAG，这个项目负责讲开放互联网研究 Agent。
 
-- 后端：FastAPI + HelloAgents，多阶段执行 `planning -> search -> summarization -> report`
-- 前端：Vue + Vite，消费 `/research/stream` SSE 事件展示研究进度
-- 工程化增强：请求级追踪、进程内 metrics、搜索缓存、部分失败降级、离线 benchmark、Docker、CI
+## 项目亮点
 
-## 架构概览
+- 后端：FastAPI + HelloAgents，串联 `planning -> search -> summarization -> report`
+- 前端：Vue + Vite，消费 `/research/stream` SSE 事件，展示任务卡片、流程记录、工具调用痕迹和最终报告
+- 工程闭环：request trace、`X-Request-ID`、exact / semantic cache、fallback / degraded、offline benchmark、perf smoke / regression / load、CI
+- 演示保底：支持 `BENCHMARK_STUB_ENABLED=True`，在网络或模型不稳定时依然可以稳定演示完整 Agent 流程
 
-```text
-frontend (Vue)
-  -> POST /research/stream
-backend/src/main.py
-  -> DeepResearchAgent
-     -> PlanningService
-     -> SearchTool / search cache
-     -> SummarizationService
-     -> ReportingService
-  -> metrics_registry + RequestTrace
-backend/evals
-  -> benchmark loader
-  -> heuristic judge
-  -> batch runner
-```
+## 5 分钟跑通
 
-## 快速启动
-
-### 1. 后端
-
-在项目根目录执行：
+### 1. 启动后端
 
 ```bash
 cd backend
@@ -38,9 +21,9 @@ cp .env.example .env
 /media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python src/main.py
 ```
 
-启动后默认监听 `http://localhost:8000`。
+默认监听 `http://localhost:8000`。
 
-### 2. 前端
+### 2. 启动前端
 
 ```bash
 cd frontend
@@ -50,6 +33,22 @@ npm run dev
 
 前端默认开发端口是 `5174`，会调用 `http://localhost:8000`。
 
+### 3. 打开固定演示场景
+
+首页已经内置 3 个固定 demo 题目，优先使用：
+
+- `探索多模态大模型在 2025 年的关键突破`
+- `AI 搜索 Agent 在互联网信息研究中的工程化实践`
+- `开源大模型推理服务的部署、监控与成本控制`
+
+## 架构图
+
+![DeepResearch Agent Architecture](docs/assets/agent-architecture.svg)
+
+## 典型请求生命周期
+
+![DeepResearch Agent Lifecycle](docs/assets/request-lifecycle.svg)
+
 ## API
 
 - `GET /healthz`
@@ -57,70 +56,81 @@ npm run dev
 - `POST /research`
 - `POST /research/stream`
 
-## 环境变量说明
+## Agent 工程能力
 
-当前代码实际消费的核心变量如下，完整示例见 [backend/.env.example](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env.example)。
+### 状态机与事件
+
+- Planner 先生成结构化任务清单，前端按任务卡片和时间线实时展示
+- SSE 会逐步推送 `status`、`todo_list`、`task_status`、`tool_call`、`stage_started`、`stage_completed`、`metrics_snapshot`、`final_report`
+- 任务状态包含 `pending / in_progress / completed / skipped`
+
+### fallback / degraded
+
+- planner 没有产出任务时，自动退化为单个兜底任务继续执行
+- 任务数超过预算时，会自动截断为前 `MAX_AGENT_TASKS` 个任务继续执行，避免演示时链路过长
+- 首轮任务存在明显缺口时，会在报告前插入一次轻量 `reflection / replan`，按预算补充 1~2 个任务
+- 搜索工具调用会受 `SEARCH_TOOL_TIMEOUT_SECONDS` 保护，避免单次外部调用无限阻塞
+- 搜索工具失败或超时后，会按 `SEARCH_TOOL_RETRY_ATTEMPTS` 和 `SEARCH_TOOL_RETRY_BACKOFF_SECONDS` 执行可配置重试
+- 单个任务搜索失败或总结失败时，不会直接让整条请求 500，而是保留已有结果并打上降级标记
+- 请求级状态会根据任务结果和降级原因落到 `success / partial_success / failed`
+
+### 可观测性
+
+- 每次请求都有 `X-Request-ID`
+- `/metrics/json` 提供 counters、latencies、recent request trace、estimated cost
+- 搜索缓存区分 exact hit、semantic hit、miss，便于解释命中策略
+- 泛化任务检索词会自动重写为 `topic + title + intent` 风格，减少 planner 生成短 query 时的空检索
+
+## 固定 demo 题目
+
+| 场景 | 题目 | 建议讲解重点 |
+| --- | --- | --- |
+| 开放信息研究 | `探索多模态大模型在 2025 年的关键突破` | planner 拆任务、结构化总结、最终报告 |
+| Agent 工程实践 | `AI 搜索 Agent 在互联网信息研究中的工程化实践` | tool call、阶段事件、metrics、SSE 体验 |
+| 推理服务工程 | `开源大模型推理服务的部署、监控与成本控制` | 多任务研究、来源引用、性能与成本叙事 |
+
+更详细的现场演示脚本见 [docs/DEMO_PLAYBOOK.md](docs/DEMO_PLAYBOOK.md)。
+
+## 已验证的证据
+
+以下结果为本地实际跑过的结果，日期为 `2026-03-25`：
+
+| 项目 | 结果 |
+| --- | --- |
+| 后端单测 | `51 passed` |
+| 前端构建 | `npm run build` 通过 |
+| Perf smoke | `stub benchmark` 下 `p95 49.04ms`、`20.60 RPS` |
+| Perf baseline | `perf.run_smoke --profile stub` baseline comparison `passed` |
+| CI | backend lint / test / build + perf smoke / load + frontend build |
+
+说明：perf 证据中的延迟和 RPS 来自 `stub benchmark`，用于稳定展示工程链路，不代表真实线上模型吞吐。
+
+## 环境变量入口
+
+实际配置入口是 `backend/.env`；[backend/.env.example](backend/.env.example) 只作为模板和字段参考。常用字段如下：
 
 | 分类 | 变量 |
 | --- | --- |
 | LLM | `LLM_PROVIDER`, `LLM_MODEL_ID`, `LLM_API_KEY`, `LLM_BASE_URL`, `LOCAL_LLM`, `LMSTUDIO_BASE_URL`, `OLLAMA_BASE_URL` |
+| Agent Runtime | `MAX_WEB_RESEARCH_LOOPS`, `MAX_AGENT_TASKS`, `REQUEST_REFLECTION_ENABLED`, `REFLECTION_MAX_ADDITIONAL_TASKS`, `TASK_QUERY_REWRITE_ENABLED`, `ENABLE_NOTES`, `NOTES_WORKSPACE` |
+| Tool Guardrails | `SEARCH_TOOL_TIMEOUT_SECONDS`, `SEARCH_TOOL_RETRY_ATTEMPTS`, `SEARCH_TOOL_RETRY_BACKOFF_SECONDS` |
 | Search | `SEARCH_API`, `FETCH_FULL_PAGE`, `SEARCH_CACHE_ENABLED`, `SEARCH_CACHE_TTL_SECONDS` |
-| Runtime | `HOST`, `PORT`, `LOG_LEVEL`, `CORS_ORIGINS` |
-| Notes | `ENABLE_NOTES`, `NOTES_WORKSPACE` |
+| Cache | `SEMANTIC_CACHE_ENABLED`, `SEMANTIC_CACHE_SIMILARITY_THRESHOLD`, `SEMANTIC_CACHE_LEXICAL_THRESHOLD` |
+| Perf | `BENCHMARK_STUB_ENABLED`, `BENCHMARK_PROFILE`, `PERF_SAMPLE_INTERVAL_SECONDS` |
 | Metrics | `METRICS_RECENT_REQUESTS_LIMIT`, `LLM_PRICING_JSON` |
 
-## Fallback / Degrade 机制
+## Benchmark / Perf / CI
 
-- planner 没有产出任务时，会退化为单个兜底任务继续执行
-- 单个任务的搜索失败或总结失败，不再直接让整条同步请求 500，而是标记任务为 `failed`
-- 请求级结果会根据 fallback、degraded 原因和任务状态被标记为 `success` / `partial_success` / `failed`
-- SSE 流会发出 `fallback_triggered`、`degraded_response`、`metrics_snapshot` 事件，方便前端展示和排障
+### Offline benchmark
 
-## Metrics 说明
-
-后端暴露 `GET /metrics/json`，包含：
-
-- counters：请求总量、成功率、fallback 次数、搜索缓存命中等
-- latencies：planning / search / summarization / report / total 的进程内耗时统计
-- recent_requests：最近 N 次请求 trace
-- estimated_cost：基于 `LLM_PRICING_JSON` 的静态成本估算
-
-## Eval / Benchmark
-
-Phase 3 新增了 `backend/evals/`，提供：
-
-- `json` / `jsonl` benchmark 读取
-- heuristic judge：`report_generated`、`degraded_flag`、`section_completeness`、`keyword_coverage`、`citation_count`、`total_latency_ms`、`estimated_cost`
-- 批量运行脚本，默认会把结果输出到 `backend/evals/results/latest_results.json`
-
-### benchmark 运行命令
+`backend/evals/` 提供 benchmark loader、heuristic judge 和批量运行脚本：
 
 ```bash
 cd backend
 /media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python evals/run_benchmark.py --input evals/benchmarks/sample_benchmark.jsonl --output evals/results/sample_results.json
 ```
 
-快速 smoke run：
-
-```bash
-cd backend
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python evals/run_benchmark.py --limit 2
-```
-
-> 说明：即使某些 case 因本地 LLM / Search 不可用而失败，runner 也会继续执行并产出结果文件，便于离线排查与比较。
-
-## Engineering Perf
-
-除了 `backend/evals/` 的质量 benchmark 外，仓库现在还提供了独立的工程化性能基准：
-
-- `python -m perf.run_smoke`：轻量 smoke benchmark，默认适合 PR / CI
-- `python -m perf.run_regression`：回归基线对比，可选择 `--write-baseline`
-- `python -m perf.run_load`：基于 Locust 的 load/stress benchmark
-- `python -m perf.run_profile`：请求延迟 + CPU/RSS profiling
-
-场景和基线文件位于 `backend/perf/scenarios/` 与 `backend/perf/baselines/`，运行结果默认输出到 `backend/perf/results/`。
-
-### perf 运行命令
+### Engineering perf
 
 ```bash
 cd backend
@@ -130,40 +140,28 @@ cd backend
 /media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_profile --profile real_local
 ```
 
-## Docker
+### CI
 
-后端提供了 [backend/Dockerfile](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/Dockerfile) 和根目录 [docker-compose.yml](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/docker-compose.yml)。
+CI 位于 `.github/workflows/ci.yml`，覆盖：
 
-### Docker 启动命令
+- backend lint
+- backend test
+- backend build check
+- perf smoke / load
+- frontend build
 
-```bash
-cp backend/.env.example backend/.env
-docker compose up --build
-```
+另外还有 `.github/workflows/perf-regression.yml`，用于手动或定时运行 regression / load / profile。
 
-容器默认暴露 `8000`，并内置 `GET /healthz` 健康检查。环境变量通过 `backend/.env` 注入，任务笔记会落到挂载的 `backend/notes`。
+## 项目边界
 
-## CI
-
-CI 配置位于 [.github/workflows/ci.yml](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/.github/workflows/ci.yml)，包含：
-
-- backend lint：`ruff check`
-- backend test：`pytest`
-- backend build check：`pip wheel ./backend --no-deps`
-- perf smoke：`python -m perf.run_smoke` + `python -m perf.run_load`
-- frontend build check：`npm run build`
-
-重型 benchmark 还提供了单独的 [.github/workflows/perf-regression.yml](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/.github/workflows/perf-regression.yml)，支持手动和定时运行 regression / load / profile。
-
-## 已知限制
-
-- benchmark 目前是 deterministic / heuristic 版本，还没有接入 LLM-as-a-judge
-- 真实 benchmark 数据依赖你本地可用的 LLM / Search Provider，默认结果应视为“待 benchmark 实测”
-- 后端代码仍然保留了示例项目的顶层模块布局，虽然 Phase 3 已补齐 wheel 构建检查，但后续仍建议继续收敛为更标准的包结构
-- Docker 当前只覆盖后端，前端仍建议在本地 Node 环境启动
+- 这个项目不扩展知识库、向量库、chunk pipeline 或 rerank 主链路
+- 它的价值在于 Agent 编排、SSE 交互、降级策略、可观测性和工程化闭环
+- 金融研报项目负责承载 RAG 检索系统叙事，这个项目负责承载 Agent 应用工程叙事
 
 ## 更多文档
 
-- 版本差异分析见 [CODEBASE_DIFF_ANALYSIS.md](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/CODEBASE_DIFF_ANALYSIS.md)
-- 工程设计说明见 [ENGINEERING.md](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/ENGINEERING.md)
-- 后端补充说明见 [backend/README.md](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/README.md)
+- [backend/README.md](backend/README.md)
+- [docs/DEMO_PLAYBOOK.md](docs/DEMO_PLAYBOOK.md)
+- [docs/INTERVIEW_GUIDE.md](docs/INTERVIEW_GUIDE.md)
+- [ENGINEERING.md](ENGINEERING.md)
+- [CODEBASE_DIFF_ANALYSIS.md](CODEBASE_DIFF_ANALYSIS.md)

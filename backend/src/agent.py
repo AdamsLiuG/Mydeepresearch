@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Semaphore, Thread
+from time import sleep
 from typing import Any, Callable, Iterator
 
 from hello_agents import HelloAgentsLLM, ToolAwareSimpleAgent
@@ -18,20 +19,43 @@ from metrics import RequestTrace
 from models import SummaryState, SummaryStateOutput, TodoItem
 from prompts import (
     report_writer_instructions,
+    request_reflection_system_prompt,
+    request_reviewer_system_prompt,
     task_summarizer_instructions,
     todo_planner_system_prompt,
 )
+from services.evidence import (
+    EvidenceLookupTool,
+    EvidenceStore,
+    FetchPageTool,
+    SearchWebTool,
+    build_task_context,
+    extract_citation_ids,
+    format_evidence_sources,
+)
 from services.planner import PlanningService
+from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
-from services.search import dispatch_search, prepare_research_context
-from services.summarizer import SummarizationService
+from services.request_state import RequestStateStore
+from services.reviewer import ReviewService
+from services.search import dispatch_search
+from services.summarizer import SummarizationService, TaskSummaryResult
+from services.text_processing import strip_citation_markers
 from services.tool_events import ToolCallTracker
 
 logger = logging.getLogger(__name__)
 
 
+class ToolExecutionTimeoutError(TimeoutError):
+    """Raised when a guarded external tool invocation exceeds its timeout budget."""
+
+
 class SafeHelloAgentsLLM(HelloAgentsLLM):
     """Provide safer local-vLLM response handling for sync and streaming calls."""
+
+    def __init__(self, *args: Any, allow_reasoning_fallback: bool = True, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.allow_reasoning_fallback = allow_reasoning_fallback
 
     @staticmethod
     def _coerce_text(value: Any) -> str:
@@ -157,11 +181,11 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 visible_parts.append(content)
-            elif reasoning:
+            elif reasoning and self.allow_reasoning_fallback:
                 reasoning_parts.append(reasoning)
 
         final_text = "".join(visible_parts) or "".join(reasoning_parts)
-        if not visible_parts and reasoning_parts:
+        if not visible_parts and reasoning_parts and self.allow_reasoning_fallback:
             logger.info(
                 "LLM response fell back to reasoning text provider=%s model=%s",
                 getattr(self, "provider", "unknown"),
@@ -184,10 +208,10 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
             if content:
                 saw_visible_content = True
                 yield content
-            elif not saw_visible_content and reasoning:
+            elif self.allow_reasoning_fallback and not saw_visible_content and reasoning:
                 buffered_reasoning.append(reasoning)
 
-        if not saw_visible_content and buffered_reasoning:
+        if not saw_visible_content and buffered_reasoning and self.allow_reasoning_fallback:
             logger.info(
                 "Streaming LLM response fell back to reasoning text provider=%s model=%s",
                 getattr(self, "provider", "unknown"),
@@ -222,18 +246,44 @@ class DeepResearchAgent:
         self.config = config or Configuration.from_env()
         self.request_id = request_id or "local-request"
         self.llm = self._init_llm()
+        self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
         self._summary_slots = Semaphore(self.config.task_summary_max_concurrency)
+        self._evidence_store = EvidenceStore(
+            freshness_reference_days=self.config.freshness_reference_days,
+        )
+        self._request_state_store = (
+            RequestStateStore(
+                self.config.request_state_dir,
+                recent_limit=self.config.request_state_recent_limit,
+            )
+            if self.config.request_state_enabled
+            else None
+        )
 
         self.note_tool = (
             NoteTool(workspace=self.config.notes_workspace)
             if self.config.enable_notes
             else None
         )
-        self.tools_registry: ToolRegistry | None = None
+        self.tools_registry: ToolRegistry | None = ToolRegistry()
+        self.tools_registry.register_tool(
+            SearchWebTool(
+                config=self.config,
+                evidence_store=self._evidence_store,
+                observer_getter=lambda: self._request_trace,
+            )
+        )
+        self.tools_registry.register_tool(
+            FetchPageTool(
+                evidence_store=self._evidence_store,
+                timeout_seconds=float(self.config.search_tool_timeout_seconds or 10.0),
+            )
+        )
+        self.tools_registry.register_tool(
+            EvidenceLookupTool(evidence_store=self._evidence_store)
+        )
         if self.note_tool:
-            registry = ToolRegistry()
-            registry.register_tool(self.note_tool)
-            self.tools_registry = registry
+            self.tools_registry.register_tool(self.note_tool)
 
         self._tool_tracker = ToolCallTracker(
             self.config.notes_workspace if self.config.enable_notes else None
@@ -248,23 +298,47 @@ class DeepResearchAgent:
         self.report_agent = self._create_tool_aware_agent(
             name="报告撰写专家",
             system_prompt=report_writer_instructions.strip(),
+            llm=self._content_only_llm,
+        )
+        self.reflection_agent = self._create_tool_aware_agent(
+            name="研究覆盖评估专家",
+            system_prompt=request_reflection_system_prompt.strip(),
+        )
+        self.review_agent = self._create_tool_aware_agent(
+            name="研究质量审查专家",
+            system_prompt=request_reviewer_system_prompt.strip(),
+            llm=self._content_only_llm,
         )
 
         self._summarizer_factory: Callable[[], ToolAwareSimpleAgent] = lambda: self._create_tool_aware_agent(  # noqa: E501
             name="任务总结专家",
             system_prompt=task_summarizer_instructions.strip(),
+            llm=self._content_only_llm,
         )
 
         self.planner = PlanningService(self.todo_agent, self.config)
-        self.summarizer = SummarizationService(self._summarizer_factory, self.config)
-        self.reporting = ReportingService(self.report_agent, self.config)
+        self.reflection = ReflectionService(self.reflection_agent, self.config)
+        self.reviewer = ReviewService(
+            self.review_agent if self.config.review_agent_enabled else None,
+            self.config,
+        )
+        self.summarizer = SummarizationService(
+            self._summarizer_factory,
+            self.config,
+            evidence_store=self._evidence_store,
+        )
+        self.reporting = ReportingService(
+            self.report_agent,
+            self.config,
+            evidence_store=self._evidence_store,
+        )
         self._last_search_notices: list[str] = []
         self._request_trace: RequestTrace | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def _init_llm(self) -> HelloAgentsLLM:
+    def _init_llm(self, *, allow_reasoning_fallback: bool = True) -> HelloAgentsLLM:
         """Instantiate HelloAgentsLLM following configuration preferences."""
         llm_kwargs: dict[str, Any] = {"temperature": 0.0}
 
@@ -292,15 +366,22 @@ class DeepResearchAgent:
             if self.config.llm_api_key:
                 llm_kwargs["api_key"] = self.config.llm_api_key
 
+        llm_kwargs["allow_reasoning_fallback"] = allow_reasoning_fallback
         return SafeHelloAgentsLLM(**llm_kwargs)
 
-    def _create_tool_aware_agent(self, *, name: str, system_prompt: str) -> ToolAwareSimpleAgent:
+    def _create_tool_aware_agent(
+        self,
+        *,
+        name: str,
+        system_prompt: str,
+        llm: HelloAgentsLLM | None = None,
+    ) -> ToolAwareSimpleAgent:
         """Instantiate a ToolAwareSimpleAgent sharing tool registry and tracker."""
         return ToolAwareSimpleAgent(
             name=name,
-            llm=self.llm,
+            llm=llm or self.llm,
             system_prompt=system_prompt,
-            enable_tool_calling=self.tools_registry is not None,
+            enable_tool_calling=self.config.use_tool_calling and self.tools_registry is not None,
             tool_registry=self.tools_registry,
             tool_call_listener=self._tool_tracker.record,
         )
@@ -336,7 +417,13 @@ class DeepResearchAgent:
             return "success"
 
         has_incomplete_tasks = any(task.status in {"skipped", "failed"} for task in state.todo_items)
-        if self._request_trace.fallback_count or self._request_trace.degraded_reasons or has_incomplete_tasks:
+        review_blocked = str(state.review_summary.get("overall_status") or "").strip() == "blocked"
+        if (
+            self._request_trace.fallback_count
+            or self._request_trace.degraded_reasons
+            or has_incomplete_tasks
+            or review_blocked
+        ):
             return "partial_success"
 
         return "success"
@@ -346,24 +433,446 @@ class DeepResearchAgent:
             return None
         return self._request_trace.metrics_event()
 
-    def run(self, topic: str) -> SummaryStateOutput:
+    def _restore_task_counters(self, observer: RequestTrace, state: SummaryState) -> None:
+        """Replay persisted task counts into a fresh request trace."""
+
+        observer.set_task_totals(total_tasks=len(state.todo_items))
+        observer.update_task_status_counts(
+            completed=sum(1 for task in state.todo_items if task.status == "completed"),
+            skipped=sum(1 for task in state.todo_items if task.status == "skipped"),
+            failed=sum(1 for task in state.todo_items if task.status == "failed"),
+        )
+
+    def _persist_request_state(
+        self,
+        state: SummaryState,
+        *,
+        phase: str,
+        status: str = "in_progress",
+        report_markdown: str | None = None,
+    ) -> None:
+        """Persist the latest request snapshot for history and resume."""
+
+        if self._request_state_store is None:
+            return
+
+        observer_snapshot = self._request_trace.snapshot() if self._request_trace else {}
+        payload = {
+            "snapshot_version": 1,
+            "request_id": self.request_id,
+            "topic": state.research_topic,
+            "phase": phase,
+            "status": status,
+            "search_api": observer_snapshot.get("search_api"),
+            "elapsed_ms": observer_snapshot.get("elapsed_ms"),
+            "report_markdown": report_markdown or state.structured_report or state.running_summary or "",
+            "report_note_id": state.report_note_id,
+            "report_note_path": state.report_note_path,
+            "todo_items": [self._serialize_task(task) for task in state.todo_items],
+            "review_summary": dict(state.review_summary or {}),
+            "reflection_completed": bool(state.reflection_completed),
+            "review_completed": bool(state.review_completed),
+            "request_metrics": observer_snapshot,
+        }
+        self._request_state_store.save(self.request_id, payload)
+
+    def _load_resume_snapshot(self, request_id: str) -> dict[str, Any]:
+        if self._request_state_store is None:
+            raise ValueError("request_state store is disabled")
+        payload = self._request_state_store.load(request_id)
+        if not payload:
+            raise ValueError(f"resume snapshot not found: {request_id}")
+        return payload
+
+    @staticmethod
+    def _task_from_payload(payload: dict[str, Any]) -> TodoItem:
+        """Deserialize a persisted task payload into TodoItem."""
+
+        return TodoItem(
+            id=int(payload.get("id") or 0),
+            title=str(payload.get("title") or "").strip() or "任务",
+            intent=str(payload.get("intent") or "").strip() or "恢复执行任务",
+            query=str(payload.get("query") or "").strip(),
+            status=str(payload.get("status") or "pending").strip() or "pending",
+            summary=str(payload.get("summary") or "").strip() or None,
+            summary_payload=(
+                dict(payload.get("summary_payload") or {})
+                if isinstance(payload.get("summary_payload"), dict)
+                else None
+            ),
+            sources_summary=str(payload.get("sources_summary") or "").strip() or None,
+            notices=[
+                str(item).strip()
+                for item in payload.get("notices") or []
+                if str(item).strip()
+            ],
+            evidence_items=list(payload.get("evidence_items") or []),
+            claims=list(payload.get("claims") or []),
+            review_issues=list(payload.get("review_issues") or []),
+            review_status=str(payload.get("review_status") or "pending").strip() or "pending",
+            note_id=str(payload.get("note_id") or "").strip() or None,
+            note_path=str(payload.get("note_path") or "").strip() or None,
+            stream_token=str(payload.get("stream_token") or "").strip() or None,
+            origin=str(payload.get("origin") or "planned").strip() or "planned",
+            round=max(1, int(payload.get("round") or 1)),
+        )
+
+    def _state_from_snapshot(self, payload: dict[str, Any]) -> tuple[SummaryState, str]:
+        """Restore SummaryState and phase from a persisted snapshot."""
+
+        todo_items = []
+        for item in payload.get("todo_items") or []:
+            if isinstance(item, dict):
+                todo_items.append(self._task_from_payload(item))
+
+        report_markdown = str(payload.get("report_markdown") or "").strip() or None
+        state = SummaryState(
+            research_topic=str(payload.get("topic") or "").strip() or None,
+            running_summary=report_markdown,
+            todo_items=todo_items,
+            structured_report=report_markdown,
+            report_note_id=str(payload.get("report_note_id") or "").strip() or None,
+            report_note_path=str(payload.get("report_note_path") or "").strip() or None,
+            review_summary=dict(payload.get("review_summary") or {}),
+            reflection_completed=bool(payload.get("reflection_completed")),
+            review_completed=bool(payload.get("review_completed")),
+        )
+        self._evidence_store.hydrate_from_tasks(state.todo_items)
+        for task in state.todo_items:
+            if not task.sources_summary and task.id > 0:
+                evidence_items = self._evidence_store.list_task_evidence(task.id)
+                if evidence_items:
+                    task.evidence_items = evidence_items
+                    task.sources_summary = format_evidence_sources(evidence_items)
+        return state, str(payload.get("phase") or "planning").strip() or "planning"
+
+    def _execute_task_batch_sync(
+        self,
+        state: SummaryState,
+        tasks: list[TodoItem],
+    ) -> None:
+        """Execute a task batch for the synchronous request path."""
+
+        for task in tasks:
+            for _ in self._execute_task(state, task, emit_stream=False):
+                pass
+
+    def _assign_stream_channels(
+        self,
+        tasks: list[TodoItem],
+        channel_map: dict[int, dict[str, Any]],
+        *,
+        start_step: int,
+    ) -> int:
+        """Assign step and stream-token metadata for streamable tasks."""
+
+        step = start_step
+        for task in tasks:
+            token = task.stream_token or f"task_{task.id}"
+            task.stream_token = token
+            channel_map[task.id] = {"step": step, "token": token}
+            step += 1
+        return step
+
+    @staticmethod
+    def _coerce_summary_result(value: Any) -> TaskSummaryResult:
+        """Normalize legacy summary strings into the structured summary result shape."""
+
+        if isinstance(value, TaskSummaryResult):
+            return value
+
+        markdown = str(value or "").strip() or "暂无可用信息"
+        key_findings: list[dict[str, Any]] = []
+        evidence_gaps: list[str] = []
+        for raw_line in markdown.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            citation_ids = extract_citation_ids(line)
+            text = strip_citation_markers(line).strip("-* ").strip()
+            if citation_ids and text:
+                key_findings.append({"text": text, "source_ids": citation_ids})
+                continue
+            if any(token in text for token in ("证据不足", "暂无可用信息", "待补充")) and text:
+                evidence_gaps.append(text)
+
+        payload = {"key_findings": key_findings, "evidence_gaps": evidence_gaps}
+        claims = [
+            {
+                "text": item["text"],
+                "source_ids": list(item["source_ids"]),
+                "support_status": "unreviewed",
+            }
+            for item in key_findings
+        ]
+        return TaskSummaryResult(markdown=markdown, payload=payload, claims=claims)
+
+    def _execute_task_batch_stream(
+        self,
+        state: SummaryState,
+        tasks: list[TodoItem],
+        channel_map: dict[int, dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
+        """Execute a batch of tasks for the streaming request path."""
+
+        observer = self._request_trace
+        if not tasks or observer is None:
+            return
+
+        event_queue: Queue[dict[str, Any]] = Queue()
+
+        def enqueue(
+            event: dict[str, Any],
+            *,
+            task: TodoItem | None = None,
+            step_override: int | None = None,
+        ) -> None:
+            payload = dict(event)
+            target_task_id = payload.get("task_id")
+            if task is not None:
+                target_task_id = task.id
+                payload["task_id"] = task.id
+
+            channel = channel_map.get(target_task_id) if target_task_id is not None else None
+            if channel:
+                payload.setdefault("step", channel["step"])
+                payload["stream_token"] = channel["token"]
+            if step_override is not None:
+                payload["step"] = step_override
+            event_queue.put(payload)
+
+        def tool_event_sink(event: dict[str, Any]) -> None:
+            enqueue(event)
+
+        self._set_tool_event_sink(tool_event_sink)
+        threads: list[Thread] = []
+
+        def worker(task: TodoItem) -> None:
+            step = channel_map.get(task.id, {}).get("step", 0)
+            try:
+                enqueue(
+                    {
+                        "type": "task_status",
+                        "task_id": task.id,
+                        "status": "in_progress",
+                        "title": task.title,
+                        "intent": task.intent,
+                        "query": task.query,
+                        "note_id": task.note_id,
+                        "note_path": task.note_path,
+                    },
+                    task=task,
+                )
+                for event in self._execute_task(state, task, emit_stream=True, step=step):
+                    enqueue(event, task=task)
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                logger.exception("Task execution failed", exc_info=exc)
+                task.status = "failed"
+                observer.update_task_status_counts(failed=1)
+                enqueue(observer.record_degraded(f"task_failed:{task.id}"), task=task)
+                enqueue(
+                    {
+                        "type": "task_status",
+                        "task_id": task.id,
+                        "status": "failed",
+                        "detail": str(exc),
+                        "title": task.title,
+                        "intent": task.intent,
+                        "query": task.query,
+                        "note_id": task.note_id,
+                        "note_path": task.note_path,
+                        "notices": list(task.notices),
+                    },
+                    task=task,
+                )
+                enqueue(observer.metrics_event(), task=task)
+            finally:
+                enqueue({"type": "__task_done__", "task_id": task.id})
+
+        for task in tasks:
+            thread = Thread(target=worker, args=(task,), daemon=True)
+            threads.append(thread)
+            thread.start()
+
+        active_workers = len(tasks)
+        finished_workers = 0
+
+        try:
+            while finished_workers < active_workers:
+                event = event_queue.get()
+                if event.get("type") == "__task_done__":
+                    finished_workers += 1
+                    continue
+                yield event
+
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                except Empty:
+                    break
+                if event.get("type") != "__task_done__":
+                    yield event
+        finally:
+            self._set_tool_event_sink(None)
+            for thread in threads:
+                thread.join()
+
+    def _reflection_gap_signals(self, state: SummaryState) -> list[str]:
+        """Return request-level signals that justify running reflection."""
+
+        signals: list[str] = []
+        observer = self._request_trace
+
+        if observer and (observer.fallback_count or observer.degraded_reasons):
+            signals.append("request_has_fallback_or_degraded")
+
+        for task in state.todo_items:
+            if task.status == "failed":
+                signals.append(f"task_{task.id}_failed")
+            elif task.status == "skipped":
+                signals.append(f"task_{task.id}_skipped")
+
+            if task.status == "completed":
+                summary = (task.summary or "").strip()
+                sources = (task.sources_summary or "").strip()
+                if not summary or summary == "暂无可用信息":
+                    signals.append(f"task_{task.id}_summary_missing")
+                if not sources:
+                    signals.append(f"task_{task.id}_sources_missing")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for signal in signals:
+            if signal in seen:
+                continue
+            seen.add(signal)
+            deduped.append(signal)
+        return deduped
+
+    def _remaining_task_budget(self, state: SummaryState) -> int:
+        """Return how many additional tasks can still be appended."""
+
+        max_tasks = max(int(self.config.max_agent_tasks or 1), 1)
+        return max(0, max_tasks - len(state.todo_items))
+
+    def _run_reflection_cycle(
+        self,
+        state: SummaryState,
+        observer: RequestTrace,
+    ) -> tuple[list[TodoItem], str | None, ReflectionAssessment | None, list[str]]:
+        """Run the shared reflection/replan logic without emitting stream events."""
+
+        if not self.config.request_reflection_enabled:
+            return [], None, None, []
+
+        gap_signals = self._reflection_gap_signals(state)
+        if not gap_signals:
+            return [], None, None, []
+
+        remaining_budget = self._remaining_task_budget(state)
+        max_additional_tasks = min(
+            remaining_budget,
+            max(int(self.config.reflection_max_additional_tasks or 1), 1),
+        )
+        if max_additional_tasks <= 0:
+            reason = "发现覆盖缺口，但任务预算已满，直接生成报告。"
+            observer.record_reflection_skip(reason=reason, gap_signals=gap_signals)
+            return [], reason, None, gap_signals
+
+        assessment = self.reflection.assess_request(
+            state,
+            gap_signals=gap_signals,
+            observer=observer,
+        )
+
+        additional_tasks: list[TodoItem] = []
+        if assessment.needs_more_research:
+            additional_tasks = self.planner.plan_additional_tasks(
+                state,
+                missing_angles=assessment.missing_angles,
+                existing_tasks=list(state.todo_items),
+                max_additional_tasks=max_additional_tasks,
+                observer=observer,
+            )
+            if additional_tasks:
+                state.todo_items.extend(additional_tasks)
+
+        reason = assessment.reason
+        if assessment.needs_more_research:
+            if additional_tasks:
+                reason = f"{assessment.reason} 已补充 {len(additional_tasks)} 个任务继续研究。"
+            else:
+                reason = f"{assessment.reason} 但未生成有效补充任务，直接生成报告。"
+
+        observer.record_reflection_call(
+            reason=reason,
+            gap_signals=assessment.gap_signals or gap_signals,
+            added_tasks=len(additional_tasks),
+        )
+        return additional_tasks, reason, assessment, gap_signals
+
+    def _run_review_stage(
+        self,
+        state: SummaryState,
+        observer: RequestTrace,
+    ) -> dict[str, Any]:
+        """Run request-level review checks and persist the resulting summary."""
+
+        if not self.config.review_stage_enabled or not hasattr(self, "reviewer"):
+            state.review_summary = {
+                "overall_status": "skipped",
+                "reason": "review stage disabled",
+                "issue_count": 0,
+                "severity_counts": {"high": 0, "medium": 0, "low": 0},
+                "issues": [],
+            }
+            state.review_completed = True
+            return state.review_summary
+
+        review_summary = self.reviewer.review_request(
+            state,
+            observer=observer,
+        )
+
+        if review_summary.get("overall_status") == "blocked":
+            observer.record_degraded("review_blocked")
+        elif review_summary.get("overall_status") == "warning":
+            observer.record_degraded("review_warning")
+
+        return review_summary
+
+    def run(
+        self,
+        topic: str,
+        *,
+        initial_state: SummaryState | None = None,
+        resume_phase: str | None = None,
+    ) -> SummaryStateOutput:
         """Execute the research workflow and return the final report."""
         observer = self._start_request_trace(topic)
-        state = SummaryState(research_topic=topic)
-        report = ""
+        state = initial_state or SummaryState(research_topic=topic)
+        report = state.structured_report or ""
         try:
-            planning_span = observer.start_stage("planning", scope="request")
-            try:
-                state.todo_items = self.planner.plan_todo_list(state, observer=observer)
-                planning_span.complete(
-                    status="success",
-                    metadata={"task_count": len(state.todo_items)},
-                )
-            except Exception as exc:
-                planning_span.complete(status="failed", error=exc)
-                raise
+            resumed = initial_state is not None
 
-            self._drain_tool_events(state)
+            if resumed and resume_phase:
+                self._restore_task_counters(observer, state)
+                self._persist_request_state(state, phase=resume_phase, status="in_progress")
+
+            if not resumed or not state.todo_items:
+                planning_span = observer.start_stage("planning", scope="request")
+                try:
+                    state.todo_items = self.planner.plan_todo_list(state, observer=observer)
+                    planning_span.complete(
+                        status="success",
+                        metadata={"task_count": len(state.todo_items)},
+                    )
+                except Exception as exc:
+                    planning_span.complete(status="failed", error=exc)
+                    raise
+
+                self._drain_tool_events(state)
+                self._persist_request_state(state, phase="planned", status="in_progress")
 
             if not state.todo_items:
                 logger.info("No TODO items generated; falling back to single task")
@@ -371,22 +880,87 @@ class DeepResearchAgent:
                 observer.record_degraded("fallback_task_used")
                 state.todo_items = [self.planner.create_fallback_task(state)]
 
+            self._apply_task_budget(state, observer)
             observer.set_task_totals(total_tasks=len(state.todo_items))
 
-            for task in state.todo_items:
-                for _ in self._execute_task(state, task, emit_stream=False):
-                    pass
+            pending_tasks = [
+                task for task in state.todo_items if task.status not in {"completed"}
+            ]
+            if pending_tasks:
+                self._execute_task_batch_sync(state, pending_tasks)
+                self._persist_request_state(state, phase="task_execution", status="in_progress")
 
-            report_span = observer.start_stage("report", scope="request")
-            try:
-                report = self.reporting.generate_report(state, observer=observer)
-                report_span.complete(
-                    status="success",
-                    metadata={"report_length": len(report or "")},
-                )
-            except Exception as exc:
-                report_span.complete(status="failed", error=exc)
-                raise
+            if not state.reflection_completed:
+                reflection_gap_signals = self._reflection_gap_signals(state)
+                if self.config.request_reflection_enabled and reflection_gap_signals:
+                    remaining_budget = self._remaining_task_budget(state)
+                    if remaining_budget <= 0:
+                        observer.record_reflection_skip(
+                            reason="发现覆盖缺口，但任务预算已满，直接生成报告。",
+                            gap_signals=reflection_gap_signals,
+                        )
+                    else:
+                        reflection_span = observer.start_stage(
+                            "reflection",
+                            scope="request",
+                            metadata={
+                                "gap_signal_count": len(reflection_gap_signals),
+                                "remaining_budget": remaining_budget,
+                            },
+                        )
+                        try:
+                            additional_tasks, _, assessment, _ = self._run_reflection_cycle(state, observer)
+                            reflection_span.complete(
+                                status="success",
+                                metadata={
+                                    "coverage_status": assessment.coverage_status if assessment else "sufficient",
+                                    "added_tasks": len(additional_tasks),
+                                },
+                            )
+                            self._drain_tool_events(state)
+                            if additional_tasks:
+                                observer.set_task_totals(total_tasks=len(state.todo_items))
+                                self._execute_task_batch_sync(state, additional_tasks)
+                        except Exception as exc:
+                            reflection_span.complete(status="failed", error=exc)
+                            observer.record_reflection_call(
+                                reason=f"反思阶段失败：{exc}",
+                                gap_signals=reflection_gap_signals,
+                                added_tasks=0,
+                            )
+                            logger.warning("Reflection stage failed topic=%s error=%s", topic, exc)
+                state.reflection_completed = True
+                self._persist_request_state(state, phase="reflection", status="in_progress")
+
+            if not state.review_completed:
+                review_span = observer.start_stage("review", scope="request")
+                try:
+                    review_summary = self._run_review_stage(state, observer)
+                    if hasattr(observer, "record_review_summary"):
+                        observer.record_review_summary(review_summary)
+                    review_span.complete(
+                        status="success",
+                        metadata={
+                            "issue_count": int(review_summary.get("issue_count") or 0),
+                            "overall_status": review_summary.get("overall_status"),
+                        },
+                    )
+                except Exception as exc:
+                    review_span.complete(status="failed", error=exc)
+                    raise
+                self._persist_request_state(state, phase="review", status="in_progress")
+
+            if not report:
+                report_span = observer.start_stage("report", scope="request")
+                try:
+                    report = self.reporting.generate_report(state, observer=observer)
+                    report_span.complete(
+                        status="success",
+                        metadata={"report_length": len(report or "")},
+                    )
+                except Exception as exc:
+                    report_span.complete(status="failed", error=exc)
+                    raise
 
             self._drain_tool_events(state)
             state.structured_report = report
@@ -401,6 +975,12 @@ class DeepResearchAgent:
 
             status = self._request_status(state, report)
             observer.complete_request(status=status)
+            self._persist_request_state(
+                state,
+                phase="completed",
+                status=status,
+                report_markdown=report,
+            )
 
             return SummaryStateOutput(
                 running_summary=report,
@@ -409,33 +989,66 @@ class DeepResearchAgent:
             )
         except Exception as exc:
             observer.complete_request(status="failed", error=exc)
+            self._persist_request_state(
+                state,
+                phase="failed",
+                status="failed",
+                report_markdown=report,
+            )
             raise
 
-    def run_stream(self, topic: str) -> Iterator[dict[str, Any]]:
+    def run_resume(self, request_id: str) -> SummaryStateOutput:
+        """Resume a persisted request snapshot."""
+
+        snapshot = self._load_resume_snapshot(request_id)
+        state, phase = self._state_from_snapshot(snapshot)
+        topic = state.research_topic or str(snapshot.get("topic") or "").strip()
+        return self.run(topic, initial_state=state, resume_phase=phase)
+
+    def run_stream(
+        self,
+        topic: str,
+        *,
+        initial_state: SummaryState | None = None,
+        resume_phase: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
         """Execute the workflow yielding incremental progress events."""
         observer = self._start_request_trace(topic)
-        state = SummaryState(research_topic=topic)
+        state = initial_state or SummaryState(research_topic=topic)
+        report = state.structured_report or ""
         logger.debug("Starting streaming research: topic=%s", topic)
         yield {"type": "status", "message": "初始化研究流程"}
         try:
-            planning_span = observer.start_stage(
-                "planning",
-                scope="request",
-                metadata={"topic": topic},
-            )
-            yield planning_span.started_event()
+            resumed = initial_state is not None
+            if resumed and resume_phase:
+                self._restore_task_counters(observer, state)
+                self._persist_request_state(state, phase=resume_phase, status="in_progress")
+                yield {
+                    "type": "status",
+                    "message": f"已从持久化快照恢复请求：{self.request_id}",
+                }
 
-            try:
-                state.todo_items = self.planner.plan_todo_list(state, observer=observer)
-                yield planning_span.complete(
-                    status="success",
-                    metadata={"task_count": len(state.todo_items)},
+            if not resumed or not state.todo_items:
+                planning_span = observer.start_stage(
+                    "planning",
+                    scope="request",
+                    metadata={"topic": topic},
                 )
-            except Exception as exc:
-                yield planning_span.complete(status="failed", error=exc)
-                yield observer.metrics_event()
-                observer.complete_request(status="failed", error=exc)
-                raise
+                yield planning_span.started_event()
+
+                try:
+                    state.todo_items = self.planner.plan_todo_list(state, observer=observer)
+                    yield planning_span.complete(
+                        status="success",
+                        metadata={"task_count": len(state.todo_items)},
+                    )
+                except Exception as exc:
+                    yield planning_span.complete(status="failed", error=exc)
+                    yield observer.metrics_event()
+                    observer.complete_request(status="failed", error=exc)
+                    self._persist_request_state(state, phase="failed", status="failed")
+                    raise
+                self._persist_request_state(state, phase="planned", status="in_progress")
 
             metrics_event = self._metrics_event()
             if metrics_event:
@@ -448,13 +1061,23 @@ class DeepResearchAgent:
                 yield observer.record_fallback("planning_returned_no_tasks")
                 yield observer.record_degraded("fallback_task_used")
 
+            budget_notice = self._apply_task_budget(state, observer)
+            if budget_notice:
+                yield {
+                    "type": "status",
+                    "message": budget_notice,
+                    "step": 0,
+                }
+                yield observer.metrics_event()
+
             observer.set_task_totals(total_tasks=len(state.todo_items))
 
             channel_map: dict[int, dict[str, Any]] = {}
-            for index, task in enumerate(state.todo_items, start=1):
-                token = f"task_{task.id}"
-                task.stream_token = token
-                channel_map[task.id] = {"step": index, "token": token}
+            next_step = self._assign_stream_channels(
+                state.todo_items,
+                channel_map,
+                start_step=1,
+            )
 
             yield {
                 "type": "todo_list",
@@ -462,127 +1085,183 @@ class DeepResearchAgent:
                 "step": 0,
             }
 
-            event_queue: Queue[dict[str, Any]] = Queue()
-
-            def enqueue(
-                event: dict[str, Any],
-                *,
-                task: TodoItem | None = None,
-                step_override: int | None = None,
-            ) -> None:
-                payload = dict(event)
-                target_task_id = payload.get("task_id")
-                if task is not None:
-                    target_task_id = task.id
-                    payload["task_id"] = task.id
-
-                channel = channel_map.get(target_task_id) if target_task_id is not None else None
-                if channel:
-                    payload.setdefault("step", channel["step"])
-                    payload["stream_token"] = channel["token"]
-                if step_override is not None:
-                    payload["step"] = step_override
-                event_queue.put(payload)
-
-            def tool_event_sink(event: dict[str, Any]) -> None:
-                enqueue(event)
-
-            self._set_tool_event_sink(tool_event_sink)
-
-            threads: list[Thread] = []
-
-            def worker(task: TodoItem, step: int) -> None:
-                try:
-                    enqueue(
-                        {
-                            "type": "task_status",
-                            "task_id": task.id,
-                            "status": "in_progress",
-                            "title": task.title,
-                            "intent": task.intent,
-                            "note_id": task.note_id,
-                            "note_path": task.note_path,
-                        },
-                        task=task,
-                    )
-
-                    for event in self._execute_task(state, task, emit_stream=True, step=step):
-                        enqueue(event, task=task)
-                except Exception as exc:  # pragma: no cover - defensive guardrail
-                    logger.exception("Task execution failed", exc_info=exc)
-                    task.status = "failed"
-                    observer.update_task_status_counts(failed=1)
-                    enqueue(observer.record_degraded(f"task_failed:{task.id}"), task=task)
-                    enqueue(
-                        {
-                            "type": "task_status",
-                            "task_id": task.id,
-                            "status": "failed",
-                            "detail": str(exc),
-                            "title": task.title,
-                            "intent": task.intent,
-                            "note_id": task.note_id,
-                            "note_path": task.note_path,
-                        },
-                        task=task,
-                    )
-                    enqueue(observer.metrics_event(), task=task)
-                finally:
-                    enqueue({"type": "__task_done__", "task_id": task.id})
-
-            for task in state.todo_items:
-                step = channel_map.get(task.id, {}).get("step", 0)
-                thread = Thread(target=worker, args=(task, step), daemon=True)
-                threads.append(thread)
-                thread.start()
-
-            active_workers = len(state.todo_items)
-            finished_workers = 0
-
-            try:
-                while finished_workers < active_workers:
-                    event = event_queue.get()
-                    if event.get("type") == "__task_done__":
-                        finished_workers += 1
-                        continue
+            pending_tasks = [
+                task for task in state.todo_items if task.status not in {"completed"}
+            ]
+            if pending_tasks:
+                for event in self._execute_task_batch_stream(state, pending_tasks, channel_map):
                     yield event
+                self._persist_request_state(state, phase="task_execution", status="in_progress")
 
-                while True:
+            reflection_gap_signals = self._reflection_gap_signals(state)
+            if (
+                not state.reflection_completed
+                and self.config.request_reflection_enabled
+                and reflection_gap_signals
+            ):
+                reflection_step = next_step
+                remaining_budget = self._remaining_task_budget(state)
+                if remaining_budget <= 0:
+                    observer.record_reflection_skip(
+                        reason="发现覆盖缺口，但任务预算已满，直接生成报告。",
+                        gap_signals=reflection_gap_signals,
+                    )
+                    yield {
+                        "type": "status",
+                        "message": "发现覆盖缺口，但任务预算已满，直接生成报告。",
+                        "step": reflection_step,
+                    }
+                    yield observer.metrics_event()
+                    next_step = reflection_step + 1
+                else:
+                    reflection_span = observer.start_stage(
+                        "reflection",
+                        scope="request",
+                        metadata={
+                            "gap_signal_count": len(reflection_gap_signals),
+                            "remaining_budget": remaining_budget,
+                        },
+                    )
+                    reflection_started = reflection_span.started_event()
+                    reflection_started["step"] = reflection_step
+                    yield reflection_started
                     try:
-                        event = event_queue.get_nowait()
-                    except Empty:
-                        break
-                    if event.get("type") != "__task_done__":
-                        yield event
-            finally:
-                self._set_tool_event_sink(None)
-                for thread in threads:
-                    thread.join()
+                        additional_tasks, reflection_notice, assessment, _ = self._run_reflection_cycle(
+                            state,
+                            observer,
+                        )
+                        completed_event = reflection_span.complete(
+                            status="success",
+                            metadata={
+                                "coverage_status": assessment.coverage_status if assessment else "sufficient",
+                                "added_tasks": len(additional_tasks),
+                            },
+                        )
+                        completed_event["step"] = reflection_step
+                        yield completed_event
+                        for event in self._drain_tool_events(state, step=reflection_step):
+                            yield event
+                        if reflection_notice:
+                            yield {
+                                "type": "status",
+                                "message": reflection_notice,
+                                "step": reflection_step,
+                            }
+                        yield observer.metrics_event()
 
-            final_step = len(state.todo_items) + 1
-            report_span = observer.start_stage(
-                "report",
-                scope="request",
-                metadata={"task_count": len(state.todo_items)},
-            )
-            report_started = report_span.started_event()
-            report_started["step"] = final_step
-            yield report_started
-            try:
-                report = self.reporting.generate_report(state, observer=observer)
-                completed_event = report_span.complete(
-                    status="success",
-                    metadata={"report_length": len(report or "")},
+                        next_step = reflection_step + 1
+                        if additional_tasks:
+                            observer.set_task_totals(total_tasks=len(state.todo_items))
+                            next_step = self._assign_stream_channels(
+                                additional_tasks,
+                                channel_map,
+                                start_step=next_step,
+                            )
+                            yield {
+                                "type": "todo_list",
+                                "tasks": [self._serialize_task(t) for t in state.todo_items],
+                                "step": reflection_step,
+                            }
+                            yield observer.metrics_event()
+                            for event in self._execute_task_batch_stream(
+                                state,
+                                additional_tasks,
+                                channel_map,
+                            ):
+                                yield event
+                    except Exception as exc:
+                        completed_event = reflection_span.complete(status="failed", error=exc)
+                        completed_event["step"] = reflection_step
+                        yield completed_event
+                        observer.record_reflection_call(
+                            reason=f"反思阶段失败：{exc}",
+                            gap_signals=reflection_gap_signals,
+                            added_tasks=0,
+                        )
+                        yield {
+                            "type": "status",
+                            "message": "反思阶段失败，直接进入报告生成。",
+                            "step": reflection_step,
+                        }
+                        yield observer.metrics_event()
+                        next_step = reflection_step + 1
+                state.reflection_completed = True
+                self._persist_request_state(state, phase="reflection", status="in_progress")
+            else:
+                state.reflection_completed = True
+
+            if not state.review_completed:
+                review_step = next_step
+                review_span = observer.start_stage(
+                    "review",
+                    scope="request",
+                    metadata={"task_count": len(state.todo_items)},
                 )
-                completed_event["step"] = final_step
-                yield completed_event
-            except Exception as exc:
-                completed_event = report_span.complete(status="failed", error=exc)
-                completed_event["step"] = final_step
-                yield completed_event
-                yield observer.metrics_event()
-                observer.complete_request(status="failed", error=exc)
-                raise
+                review_started = review_span.started_event()
+                review_started["step"] = review_step
+                yield review_started
+                try:
+                    review_summary = self._run_review_stage(state, observer)
+                    if hasattr(observer, "record_review_summary"):
+                        observer.record_review_summary(review_summary)
+                    completed_event = review_span.complete(
+                        status="success",
+                        metadata={
+                            "issue_count": int(review_summary.get("issue_count") or 0),
+                            "overall_status": review_summary.get("overall_status"),
+                        },
+                    )
+                    completed_event["step"] = review_step
+                    yield completed_event
+                    yield {
+                        "type": "review_summary",
+                        "step": review_step,
+                        "summary": review_summary,
+                        "tasks": [self._serialize_task(task) for task in state.todo_items],
+                    }
+                    yield observer.metrics_event()
+                except Exception as exc:
+                    completed_event = review_span.complete(status="failed", error=exc)
+                    completed_event["step"] = review_step
+                    yield completed_event
+                    observer.complete_request(status="failed", error=exc)
+                    self._persist_request_state(state, phase="failed", status="failed")
+                    raise
+                next_step = review_step + 1
+                self._persist_request_state(state, phase="review", status="in_progress")
+
+            final_step = next_step
+            if not report:
+                report_span = observer.start_stage(
+                    "report",
+                    scope="request",
+                    metadata={"task_count": len(state.todo_items)},
+                )
+                report_started = report_span.started_event()
+                report_started["step"] = final_step
+                yield report_started
+                try:
+                    report = self.reporting.generate_report(state, observer=observer)
+                    completed_event = report_span.complete(
+                        status="success",
+                        metadata={"report_length": len(report or "")},
+                    )
+                    completed_event["step"] = final_step
+                    yield completed_event
+                except Exception as exc:
+                    completed_event = report_span.complete(status="failed", error=exc)
+                    completed_event["step"] = final_step
+                    yield completed_event
+                    yield observer.metrics_event()
+                    observer.complete_request(status="failed", error=exc)
+                    self._persist_request_state(state, phase="failed", status="failed")
+                    raise
+            else:
+                yield {
+                    "type": "status",
+                    "message": "检测到已持久化的报告内容，直接恢复最终结果。",
+                    "step": final_step,
+                }
 
             for event in self._drain_tool_events(state, step=final_step):
                 yield event
@@ -604,6 +1283,12 @@ class DeepResearchAgent:
                 report_note_path=state.report_note_path,
             )
             observer.complete_request(status=request_status)
+            self._persist_request_state(
+                state,
+                phase="completed",
+                status=request_status,
+                report_markdown=report,
+            )
             yield observer.metrics_event()
 
             yield {
@@ -614,37 +1299,232 @@ class DeepResearchAgent:
             }
             yield {"type": "done"}
         except Exception:
+            self._persist_request_state(state, phase="failed", status="failed", report_markdown=report)
             raise
+
+    def run_stream_resume(self, request_id: str) -> Iterator[dict[str, Any]]:
+        """Resume a persisted request snapshot in streaming mode."""
+
+        snapshot = self._load_resume_snapshot(request_id)
+        state, phase = self._state_from_snapshot(snapshot)
+        topic = state.research_topic or str(snapshot.get("topic") or "").strip()
+        yield from self.run_stream(topic, initial_state=state, resume_phase=phase)
 
     # ------------------------------------------------------------------
     # Execution helpers
     # ------------------------------------------------------------------
-    def _task_search_queries(self, state: SummaryState, task: TodoItem) -> list[str]:
+    def _run_with_timeout(
+        self,
+        operation: Callable[[], Any],
+        *,
+        timeout_seconds: float | None,
+        operation_name: str,
+    ) -> Any:
+        """Run an operation with a best-effort timeout guard."""
+
+        if timeout_seconds is None or timeout_seconds <= 0:
+            return operation()
+
+        result_queue: Queue[tuple[str, Any]] = Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                result_queue.put(("result", operation()))
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                result_queue.put(("error", exc))
+
+        thread = Thread(target=worker, daemon=True)
+        thread.start()
+
+        try:
+            outcome, payload = result_queue.get(timeout=timeout_seconds)
+        except Empty as exc:
+            raise ToolExecutionTimeoutError(
+                f"{operation_name} 超时（>{timeout_seconds:.2f}s）"
+            ) from exc
+
+        if outcome == "error":
+            raise payload
+
+        return payload
+
+    def _dispatch_search_with_guardrails(
+        self,
+        candidate: str,
+        *,
+        state: SummaryState,
+        task: TodoItem,
+        observer: RequestTrace | None,
+        notices: list[str],
+    ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool, str]:
+        """Execute a search invocation with timeout and retry guardrails."""
+
+        retry_attempts = max(int(self.config.search_tool_retry_attempts or 0), 0)
+        retry_backoff_seconds = max(float(self.config.search_tool_retry_backoff_seconds or 0.0), 0.0)
+        timeout_seconds = self.config.search_tool_timeout_seconds
+        operation_name = f"搜索工具调用[{candidate}]"
+
+        for retry_index in range(retry_attempts + 1):
+            try:
+                return self._run_with_timeout(
+                    lambda: dispatch_search(
+                        candidate,
+                        self.config,
+                        state.research_loop_count,
+                        observer=observer,
+                        cache_context={
+                            "research_topic": state.research_topic,
+                            "task_title": task.title,
+                            "task_intent": task.intent,
+                        },
+                    ),
+                    timeout_seconds=timeout_seconds,
+                    operation_name=operation_name,
+                )
+            except Exception as exc:
+                timed_out = isinstance(exc, ToolExecutionTimeoutError)
+                logger.warning(
+                    "Search tool call failed task_id=%s title=%s query=%s retry=%s/%s error=%s",
+                    task.id,
+                    task.title,
+                    candidate,
+                    retry_index,
+                    retry_attempts,
+                    exc,
+                )
+
+                if observer:
+                    reason = (
+                        f"search_tool_timeout:{task.id}"
+                        if timed_out
+                        else f"search_tool_error:{task.id}"
+                    )
+                    observer.record_degraded(reason)
+
+                if retry_index >= retry_attempts:
+                    raise
+
+                retry_notice = (
+                    f"搜索工具调用超时，准备第 {retry_index + 1} 次重试：{candidate}"
+                    if timed_out
+                    else f"搜索工具调用失败，准备第 {retry_index + 1} 次重试：{candidate}"
+                )
+                if retry_notice not in notices:
+                    notices.append(retry_notice)
+
+                if observer:
+                    observer.record_degraded(f"search_tool_retry:{task.id}:{retry_index + 1}")
+
+                if retry_backoff_seconds > 0:
+                    sleep(retry_backoff_seconds)
+
+    def _normalize_query_candidate(self, value: str) -> str:
+        """Normalize whitespace in a candidate search query."""
+
+        return " ".join((value or "").strip().split())
+
+    def _should_rewrite_task_query(
+        self,
+        *,
+        original_query: str,
+        title: str,
+        intent: str,
+    ) -> bool:
+        """Return whether the task query is generic enough to benefit from rewriting."""
+
+        if not self.config.task_query_rewrite_enabled:
+            return False
+
+        normalized_query = self._normalize_query_candidate(original_query).casefold()
+        normalized_title = self._normalize_query_candidate(title).casefold()
+        normalized_intent = self._normalize_query_candidate(intent).casefold()
+
+        if not normalized_query:
+            return True
+        if normalized_query in {normalized_title, normalized_intent}:
+            return True
+        if len(normalized_query) <= 12:
+            return True
+        if len(normalized_query.split()) <= 2:
+            return True
+        return False
+
+    def _rewritten_task_query(self, state: SummaryState, task: TodoItem) -> str:
+        """Return a richer query candidate combining topic, title and intent."""
+
+        topic = (state.research_topic or "").strip()
+        title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
+        intent = (task.intent or "").strip()
+        return self._normalize_query_candidate(" ".join(part for part in [topic, title, intent] if part))
+
+    def _task_search_queries(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+    ) -> list[tuple[str, str]]:
         """Return progressively broader queries for a task-level search retry."""
 
         topic = (state.research_topic or "").strip()
         title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
         intent = (task.intent or "").strip()
+        original_query = (task.query or "").strip()
 
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
         seen: set[str] = set()
 
-        def add(value: str) -> None:
-            normalized = " ".join((value or "").strip().split())
+        def add(value: str, strategy: str) -> None:
+            normalized = self._normalize_query_candidate(value)
             if not normalized or normalized in seen:
                 return
             seen.add(normalized)
-            candidates.append(normalized)
+            candidates.append((normalized, strategy))
 
-        add(task.query or "")
+        add(original_query, "original")
+        if self._should_rewrite_task_query(
+            original_query=original_query,
+            title=title,
+            intent=intent,
+        ):
+            add(self._rewritten_task_query(state, task), "rewrite")
         if topic and title:
-            add(f"{topic} {title}")
-            add(f"{topic} {title} 最新进展")
+            add(f"{topic} {title}", "expand")
+            add(f"{topic} {title} 最新进展", "expand")
         if topic and intent:
-            add(f"{topic} {intent}")
-        add(topic)
+            add(f"{topic} {intent}", "expand")
+        add(topic, "expand")
 
-        return candidates or [" ".join(part for part in [title, intent] if part).strip()]
+        fallback = self._normalize_query_candidate(" ".join(part for part in [title, intent] if part))
+        return candidates or [(fallback, "rewrite")]
+
+    def _apply_task_budget(
+        self,
+        state: SummaryState,
+        observer: RequestTrace | None,
+    ) -> str | None:
+        """Trim planned tasks to the configured execution budget."""
+
+        max_tasks = max(int(self.config.max_agent_tasks or 1), 1)
+        if len(state.todo_items) <= max_tasks:
+            return None
+
+        dropped = len(state.todo_items) - max_tasks
+        state.todo_items = state.todo_items[:max_tasks]
+        notice = f"任务数超过预算，已仅保留前 {max_tasks} 个任务继续执行（截断 {dropped} 个）"
+
+        logger.info(
+            "Applied task budget limit max_tasks=%s dropped=%s topic=%s",
+            max_tasks,
+            dropped,
+            state.research_topic,
+        )
+
+        if observer:
+            observer.record_degraded(f"task_budget_applied:{max_tasks}")
+
+        if state.todo_items and notice not in state.todo_items[0].notices:
+            state.todo_items[0].notices.append(notice)
+
+        return notice
 
     def _search_with_fallback_queries(
         self,
@@ -661,8 +1541,10 @@ class DeepResearchAgent:
         cache_strategy = "miss"
         notices: list[str] = []
         original_query = (task.query or "").strip()
+        candidates = self._task_search_queries(state, task)
 
-        for attempt_index, candidate in enumerate(self._task_search_queries(state, task)):
+        for attempt_index, (candidate, strategy) in enumerate(candidates):
+            task.query = candidate
             (
                 current_result,
                 current_notices,
@@ -670,20 +1552,20 @@ class DeepResearchAgent:
                 current_backend,
                 current_cache_hit,
                 current_cache_strategy,
-            ) = dispatch_search(
+            ) = self._dispatch_search_with_guardrails(
                 candidate,
-                self.config,
-                state.research_loop_count,
+                state=state,
+                task=task,
                 observer=observer,
-                cache_context={
-                    "research_topic": state.research_topic,
-                    "task_title": task.title,
-                    "task_intent": task.intent,
-                },
+                notices=notices,
             )
 
             if attempt_index > 0:
-                retry_notice = f"原检索词未命中，改用更宽泛检索词：{candidate}"
+                retry_notice = (
+                    f"原检索词未命中，改用重写检索词：{candidate}"
+                    if strategy == "rewrite"
+                    else f"原检索词未命中，改用更宽泛检索词：{candidate}"
+                )
                 if retry_notice not in notices:
                     notices.append(retry_notice)
 
@@ -696,7 +1578,6 @@ class DeepResearchAgent:
             backend = current_backend
             cache_hit = current_cache_hit
             cache_strategy = current_cache_strategy
-            task.query = candidate
 
             if current_result and current_result.get("results"):
                 if attempt_index > 0 and original_query and original_query != candidate:
@@ -781,6 +1662,7 @@ class DeepResearchAgent:
                 step=step,
             ):
                 yield event
+            self._persist_request_state(state, phase="task_execution", status="in_progress")
             return
 
         self._last_search_notices = notices
@@ -837,6 +1719,9 @@ class DeepResearchAgent:
                     "status": "skipped",
                     "title": task.title,
                     "intent": task.intent,
+                    "query": task.query,
+                    "sources_summary": task.sources_summary,
+                    "evidence_items": list(task.evidence_items),
                     "note_id": task.note_id,
                     "note_path": task.note_path,
                     "step": step,
@@ -845,25 +1730,39 @@ class DeepResearchAgent:
                     yield observer.metrics_event()
             else:
                 self._drain_tool_events(state)
+            self._persist_request_state(state, phase="task_execution", status="in_progress")
             return
         else:
             if not emit_stream:
                 self._drain_tool_events(state)
 
-        sources_summary, context = prepare_research_context(
-            search_result,
-            answer_text,
-            self.config,
+        evidence_store = getattr(self, "_evidence_store", None)
+        if evidence_store is None:
+            evidence_store = EvidenceStore()
+            self._evidence_store = evidence_store
+
+        evidence_items = evidence_store.record_search_results(
+            task_id=task.id,
+            query=task.query,
+            search_payload=search_result,
+            backend=backend,
+        )
+        sources_summary = format_evidence_sources(evidence_items)
+        context = build_task_context(
+            evidence_items,
+            answer_text=answer_text,
+            config=self.config,
         )
 
         task.sources_summary = sources_summary
+        task.evidence_items = evidence_items
 
         with self._state_lock:
             state.web_research_results.append(context)
             state.sources_gathered.append(sources_summary)
             state.research_loop_count += 1
 
-        summary_text: str | None = None
+        summary_result: TaskSummaryResult | None = None
         summary_slots = getattr(self, "_summary_slots", None)
         if summary_slots is None:
             summary_slots = Semaphore(self.config.task_summary_max_concurrency)
@@ -901,6 +1800,7 @@ class DeepResearchAgent:
                     "task_id": task.id,
                     "latest_sources": sources_summary,
                     "raw_context": context,
+                    "evidence_items": list(task.evidence_items),
                     "step": step,
                     "backend": backend,
                     "note_id": task.note_id,
@@ -927,6 +1827,7 @@ class DeepResearchAgent:
                             }
                         for event in self._drain_tool_events(state, step=step):
                             yield event
+                    summary_result = self._coerce_summary_result(summary_getter())
                 except Exception as exc:
                     if summary_span:
                         completed = summary_span.complete(status="failed", error=exc)
@@ -951,13 +1852,12 @@ class DeepResearchAgent:
                         step=step,
                     ):
                         yield event
+                    self._persist_request_state(state, phase="task_execution", status="in_progress")
                     return
-                finally:
-                    summary_text = summary_getter()
                 if summary_span:
                     completed = summary_span.complete(
                         status="success",
-                        metadata={"summary_length": len(summary_text or "")},
+                        metadata={"summary_length": len(summary_result.markdown or "")},
                     )
                     completed["step"] = step
                     yield completed
@@ -965,12 +1865,15 @@ class DeepResearchAgent:
                         yield observer.metrics_event()
             else:
                 try:
-                    summary_text = self.summarizer.summarize_task(
-                        state,
-                        task,
-                        context,
-                        observer=observer,
+                    summary_result = self._coerce_summary_result(
+                        self.summarizer.summarize_task(
+                            state,
+                            task,
+                            context,
+                            observer=observer,
+                        )
                     )
+                    
                 except Exception as exc:
                     if summary_span:
                         summary_span.complete(status="failed", error=exc)
@@ -988,18 +1891,22 @@ class DeepResearchAgent:
                         summary="总结阶段失败，请参考已收集来源。",
                         emit_stream=False,
                     )
+                    self._persist_request_state(state, phase="task_execution", status="in_progress")
                     return
                 else:
                     if summary_span:
                         summary_span.complete(
                             status="success",
-                            metadata={"summary_length": len(summary_text or "")},
+                            metadata={"summary_length": len(summary_result.markdown or "")},
                         )
                 self._drain_tool_events(state)
         finally:
             release_summary_slot()
 
-        task.summary = summary_text.strip() if summary_text else "暂无可用信息"
+        task.evidence_items = evidence_store.list_task_evidence(task.id)
+        task.summary = (summary_result.markdown or "").strip() if summary_result else "暂无可用信息"
+        task.summary_payload = dict(summary_result.payload or {}) if summary_result else None
+        task.claims = list(summary_result.claims or []) if summary_result else []
         task.status = "completed"
         if observer:
             observer.update_task_status_counts(completed=1)
@@ -1013,12 +1920,18 @@ class DeepResearchAgent:
                 "status": "completed",
                 "summary": task.summary,
                 "sources_summary": task.sources_summary,
+                "evidence_items": list(task.evidence_items),
+                "claims": list(task.claims),
+                "review_issues": list(task.review_issues),
+                "review_status": task.review_status,
+                "notices": list(task.notices),
                 "note_id": task.note_id,
                 "note_path": task.note_path,
                 "step": step,
             }
         else:
             self._drain_tool_events(state)
+        self._persist_request_state(state, phase="task_execution", status="in_progress")
 
     def _record_task_failure(
         self,
@@ -1034,6 +1947,8 @@ class DeepResearchAgent:
         """Update task state for a recoverable failure and emit stream events when needed."""
         task.status = "failed"
         task.summary = summary
+        task.summary_payload = None
+        task.claims = []
         if detail and detail not in task.notices:
             task.notices.append(detail)
 
@@ -1057,6 +1972,11 @@ class DeepResearchAgent:
                     "sources_summary": task.sources_summary,
                     "title": task.title,
                     "intent": task.intent,
+                    "query": task.query,
+                    "evidence_items": list(task.evidence_items),
+                    "review_issues": list(task.review_issues),
+                    "review_status": task.review_status,
+                    "notices": list(task.notices),
                     "note_id": task.note_id,
                     "note_path": task.note_path,
                     "step": step,
@@ -1093,10 +2013,18 @@ class DeepResearchAgent:
             "query": task.query,
             "status": task.status,
             "summary": task.summary,
+            "summary_payload": dict(task.summary_payload or {}) if task.summary_payload else None,
             "sources_summary": task.sources_summary,
+            "notices": list(task.notices),
+            "evidence_items": list(task.evidence_items),
+            "claims": list(task.claims),
+            "review_issues": list(task.review_issues),
+            "review_status": task.review_status,
             "note_id": task.note_id,
             "note_path": task.note_path,
             "stream_token": task.stream_token,
+            "origin": task.origin,
+            "round": task.round,
         }
 
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:

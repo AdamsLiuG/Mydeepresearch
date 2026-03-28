@@ -144,7 +144,7 @@ class Configuration(BaseModel):
         description="Whether to strip <think> tokens from model responses",
     )
     use_tool_calling: bool = Field(
-        default=False,
+        default=True,
         title="Use Tool Calling",
         description="Use tool calling instead of JSON mode for structured output",
     )
@@ -243,6 +243,74 @@ class Configuration(BaseModel):
         title="Task Summary Max Concurrency",
         description="Maximum number of task summarization LLM calls allowed to run at once",
     )
+    max_agent_tasks: int = Field(
+        default=5,
+        ge=1,
+        title="Max Agent Tasks",
+        description="Maximum number of planned tasks the agent will execute for a single request",
+    )
+    request_reflection_enabled: bool = Field(
+        default=True,
+        title="Request Reflection Enabled",
+        description="Whether to run a single request-level reflection step before report generation",
+    )
+    reflection_max_additional_tasks: int = Field(
+        default=2,
+        ge=1,
+        title="Reflection Max Additional Tasks",
+        description="Maximum number of supplemental tasks that request-level reflection may add",
+    )
+    review_stage_enabled: bool = Field(
+        default=True,
+        title="Review Stage Enabled",
+        description="Whether to run a request-level review stage before report generation",
+    )
+    review_agent_enabled: bool = Field(
+        default=True,
+        title="Review Agent Enabled",
+        description="Whether to allow the reviewer LLM agent to augment deterministic checks",
+    )
+    review_min_sources_per_task: int = Field(
+        default=2,
+        ge=1,
+        title="Review Min Sources Per Task",
+        description="Minimum evidence item count expected for a completed task",
+    )
+    review_min_domains_per_task: int = Field(
+        default=2,
+        ge=1,
+        title="Review Min Domains Per Task",
+        description="Minimum unique domain count expected for a completed task",
+    )
+    freshness_reference_days: int = Field(
+        default=365,
+        ge=1,
+        title="Freshness Reference Days",
+        description="Reference window used to classify evidence freshness",
+    )
+    task_query_rewrite_enabled: bool = Field(
+        default=True,
+        title="Task Query Rewrite Enabled",
+        description="Whether to add a rewritten search query candidate for generic or underspecified task queries",
+    )
+    search_tool_timeout_seconds: float | None = Field(
+        default=8.0,
+        gt=0.0,
+        title="Search Tool Timeout Seconds",
+        description="Timeout guard applied to a single search tool invocation",
+    )
+    search_tool_retry_attempts: int = Field(
+        default=1,
+        ge=0,
+        title="Search Tool Retry Attempts",
+        description="How many retries to allow for a failed or timed-out search tool invocation",
+    )
+    search_tool_retry_backoff_seconds: float = Field(
+        default=0.0,
+        ge=0.0,
+        title="Search Tool Retry Backoff Seconds",
+        description="Fixed backoff between search tool retries",
+    )
     direct_answer_char_limit: int | None = Field(
         default=None,
         title="Direct Answer Character Limit",
@@ -262,6 +330,22 @@ class Configuration(BaseModel):
         default=25,
         title="Recent Request Limit",
         description="How many completed request traces to keep in memory",
+    )
+    request_state_enabled: bool = Field(
+        default=True,
+        title="Request State Enabled",
+        description="Persist request snapshots to disk for history inspection and resume",
+    )
+    request_state_dir: str = Field(
+        default="./.state/requests",
+        title="Request State Directory",
+        description="Directory used to persist request snapshots",
+    )
+    request_state_recent_limit: int = Field(
+        default=50,
+        ge=1,
+        title="Request State Recent Limit",
+        description="How many persisted request snapshots to surface via the API",
     )
     benchmark_stub_enabled: bool = Field(
         default=False,
@@ -399,6 +483,13 @@ class Configuration(BaseModel):
             if not perf_path.is_absolute():
                 perf_path = backend_root() / perf_path
             self.perf_thresholds_path = str(perf_path.resolve(strict=False))
+
+        request_state_dir = (self.request_state_dir or "").strip()
+        if request_state_dir:
+            state_path = Path(request_state_dir).expanduser()
+            if not state_path.is_absolute():
+                state_path = backend_root() / state_path
+            self.request_state_dir = str(state_path.resolve(strict=False))
         return self
 
     @classmethod
@@ -452,10 +543,25 @@ class Configuration(BaseModel):
             "max_tokens_per_source": os.getenv("MAX_TOKENS_PER_SOURCE"),
             "task_context_char_limit": os.getenv("TASK_CONTEXT_CHAR_LIMIT"),
             "task_summary_max_concurrency": os.getenv("TASK_SUMMARY_MAX_CONCURRENCY"),
+            "max_agent_tasks": os.getenv("MAX_AGENT_TASKS"),
+            "request_reflection_enabled": os.getenv("REQUEST_REFLECTION_ENABLED"),
+            "reflection_max_additional_tasks": os.getenv("REFLECTION_MAX_ADDITIONAL_TASKS"),
+            "review_stage_enabled": os.getenv("REVIEW_STAGE_ENABLED"),
+            "review_agent_enabled": os.getenv("REVIEW_AGENT_ENABLED"),
+            "review_min_sources_per_task": os.getenv("REVIEW_MIN_SOURCES_PER_TASK"),
+            "review_min_domains_per_task": os.getenv("REVIEW_MIN_DOMAINS_PER_TASK"),
+            "freshness_reference_days": os.getenv("FRESHNESS_REFERENCE_DAYS"),
+            "task_query_rewrite_enabled": os.getenv("TASK_QUERY_REWRITE_ENABLED"),
+            "search_tool_timeout_seconds": os.getenv("SEARCH_TOOL_TIMEOUT_SECONDS"),
+            "search_tool_retry_attempts": os.getenv("SEARCH_TOOL_RETRY_ATTEMPTS"),
+            "search_tool_retry_backoff_seconds": os.getenv("SEARCH_TOOL_RETRY_BACKOFF_SECONDS"),
             "direct_answer_char_limit": os.getenv("DIRECT_ANSWER_CHAR_LIMIT"),
             "report_summary_char_limit": os.getenv("REPORT_SUMMARY_CHAR_LIMIT"),
             "report_sources_char_limit": os.getenv("REPORT_SOURCES_CHAR_LIMIT"),
             "metrics_recent_requests_limit": os.getenv("METRICS_RECENT_REQUESTS_LIMIT"),
+            "request_state_enabled": os.getenv("REQUEST_STATE_ENABLED"),
+            "request_state_dir": os.getenv("REQUEST_STATE_DIR"),
+            "request_state_recent_limit": os.getenv("REQUEST_STATE_RECENT_LIMIT"),
             "benchmark_stub_enabled": os.getenv("BENCHMARK_STUB_ENABLED"),
             "benchmark_profile": os.getenv("BENCHMARK_PROFILE"),
             "perf_sample_interval_seconds": os.getenv("PERF_SAMPLE_INTERVAL_SECONDS"),

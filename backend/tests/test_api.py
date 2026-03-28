@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import contextmanager
@@ -25,6 +26,12 @@ class ImportSafeAgent:
         raise NotImplementedError
 
     def run_stream(self, topic: str):
+        raise NotImplementedError
+
+    def run_resume(self, request_id: str):
+        raise NotImplementedError
+
+    def run_stream_resume(self, request_id: str):
         raise NotImplementedError
 
 
@@ -62,6 +69,8 @@ def _build_stub_result() -> SimpleNamespace:
         sources_summary="* 示例来源 : https://example.com",
         note_id="note_1",
         note_path="/tmp/note_1.md",
+        origin="planned",
+        round=1,
     )
     return SimpleNamespace(
         report_markdown="# 最终报告",
@@ -76,6 +85,9 @@ class StubAgent:
         self.request_id = request_id
 
     def run(self, topic: str):
+        return _build_stub_result()
+
+    def run_resume(self, request_id: str):
         return _build_stub_result()
 
     def run_stream(self, topic: str):
@@ -100,6 +112,10 @@ class StubAgent:
                 "total_tokens": 120,
                 "estimated_cost": 0.0012,
                 "token_source": "estimated",
+                "reflection_triggered": False,
+                "reflection_reason": None,
+                "reflection_gap_signals": [],
+                "reflection_added_tasks": 0,
             },
             "aggregate_metrics": {
                 "success_rate": 1.0,
@@ -107,6 +123,9 @@ class StubAgent:
                     "fallback_trigger_total": 0,
                     "cache_exact_hit_total": 0,
                     "cache_semantic_hit_total": 0,
+                    "reflection_call_total": 1,
+                    "reflection_replan_total": 1,
+                    "reflection_skipped_total": 0,
                 },
                 "cache_exact_hit_total": 0,
                 "cache_semantic_hit_total": 0,
@@ -123,14 +142,56 @@ class StubAgent:
                     "status": "pending",
                     "note_id": "note_1",
                     "note_path": "/tmp/note_1.md",
+                    "origin": "planned",
+                    "round": 1,
                 }
             ],
             "step": 0,
         }
         yield {"type": "fallback_triggered", "reason": "planner_returned_no_tasks"}
         yield {"type": "degraded_response", "reason": "fallback_task_used"}
+        yield {"type": "stage_started", "stage": "reflection", "scope": "request"}
+        yield {
+            "type": "stage_completed",
+            "stage": "reflection",
+            "scope": "request",
+            "status": "success",
+            "elapsed_ms": 8,
+        }
+        yield {"type": "status", "message": "发现覆盖缺口，补充 1 个任务继续研究。"}
+        yield {
+            "type": "todo_list",
+            "tasks": [
+                {
+                    "id": 1,
+                    "title": "任务1",
+                    "intent": "梳理主题背景",
+                    "query": topic,
+                    "status": "completed",
+                    "note_id": "note_1",
+                    "note_path": "/tmp/note_1.md",
+                    "origin": "planned",
+                    "round": 1,
+                },
+                {
+                    "id": 2,
+                    "title": "补充任务",
+                    "intent": "补充工程实践",
+                    "query": f"{topic} 工程实践",
+                    "status": "pending",
+                    "note_id": "note_2",
+                    "note_path": "/tmp/note_2.md",
+                    "origin": "replanned",
+                    "round": 2,
+                },
+            ],
+            "step": 2,
+        }
         yield {"type": "final_report", "report": "# 最终报告"}
         yield {"type": "done"}
+
+    def run_stream_resume(self, request_id: str):
+        yield from self.run_stream("resume topic")
 
 
 class FailingAgent:
@@ -143,6 +204,12 @@ class FailingAgent:
 
     def run_stream(self, topic: str):
         raise RuntimeError("stream failure")
+
+    def run_resume(self, request_id: str):
+        raise RuntimeError("resume failure")
+
+    def run_stream_resume(self, request_id: str):
+        raise RuntimeError("resume stream failure")
 
 
 class InitFailingAgent:
@@ -184,8 +251,15 @@ class ApiTests(unittest.TestCase):
                         "status": "completed",
                         "summary": "这是任务总结。",
                         "sources_summary": "* 示例来源 : https://example.com",
+                        "notices": [],
+                        "evidence_items": [],
+                        "claims": [],
+                        "review_issues": [],
+                        "review_status": "pending",
                         "note_id": "note_1",
                         "note_path": "/tmp/note_1.md",
+                        "origin": "planned",
+                        "round": 1,
                     }
                 ],
             },
@@ -243,6 +317,10 @@ class ApiTests(unittest.TestCase):
                 "todo_list",
                 "fallback_triggered",
                 "degraded_response",
+                "stage_started",
+                "stage_completed",
+                "status",
+                "todo_list",
                 "final_report",
                 "done",
             ],
@@ -250,6 +328,7 @@ class ApiTests(unittest.TestCase):
         metrics_event = next(event for event in events if event["type"] == "metrics_snapshot")
         self.assertIn("cache_exact_hits", metrics_event["request_metrics"])
         self.assertIn("cache_semantic_hits", metrics_event["request_metrics"])
+        self.assertIn("reflection_added_tasks", metrics_event["request_metrics"])
         self.assertIn("cache_exact_hit_total", metrics_event["aggregate_metrics"])
         self.assertIn("cache_semantic_hit_total", metrics_event["aggregate_metrics"])
 
@@ -336,6 +415,44 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["type"], "error")
         self.assertIn("request_id=", events[0]["detail"])
+
+    def test_request_state_endpoints_return_saved_snapshots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_config = main.Configuration.from_env(
+                overrides={
+                    "request_state_enabled": True,
+                    "request_state_dir": temp_dir,
+                },
+                load_env_file=False,
+            )
+            with isolated_configuration():
+                with TestClient(main.create_app(base_config=base_config)) as client:
+                    client.app.state.request_state_store.save(
+                        "req-persisted",
+                        {
+                            "topic": "persisted topic",
+                            "status": "in_progress",
+                            "phase": "review",
+                            "todo_items": [{"id": 1, "title": "任务1"}],
+                            "report_markdown": "",
+                        },
+                    )
+                    list_response = client.get("/requests")
+                    detail_response = client.get("/requests/req-persisted")
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertEqual(list_response.json()["items"][0]["request_id"], "req-persisted")
+        self.assertEqual(detail_response.json()["topic"], "persisted topic")
+
+    def test_resume_endpoint_uses_resume_agent_method(self):
+        with isolated_configuration():
+            with patch.object(main, "DeepResearchAgent", StubAgent):
+                with TestClient(main.create_app()) as client:
+                    response = client.post("/requests/req-123/resume", json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["report_markdown"], "# 最终报告")
 
 
 if __name__ == "__main__":

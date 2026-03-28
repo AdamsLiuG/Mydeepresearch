@@ -1,31 +1,39 @@
-# HelloAgents Deep Researcher Backend
+# DeepResearch Agent Backend
 
-后端服务基于 FastAPI，保留现有四个接口：
+后端是一个面向开放互联网研究任务的 FastAPI Agent 服务，核心目标是把长链路研究请求做成：
+
+- 可流式展示
+- 可降级恢复
+- 可观测
+- 可 benchmark
+
+## 对外接口
 
 - `GET /healthz`
 - `POST /research`
 - `POST /research/stream`
 - `GET /metrics/json`
 
-本轮工程化升级保持了原有接口语义和前端 SSE 协作方式，补充了以下能力：
+## 核心能力
 
 - 自动加载 [`.env`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env)
 - 请求级 `X-Request-ID` 追踪
-- 统一标准库日志输出
-- 将相对 `NOTES_WORKSPACE` 解析到后端目录下，减少启动目录差异带来的不确定性
-- 最小回归测试，覆盖健康检查、同步研究接口、流式研究接口和配置解析
-- Phase 2 新增进程内 metrics、request/task trace、搜索缓存、成本估算接口
+- request / task trace
+- 任务预算控制，避免 planner 一次生成过多任务拖慢演示
+- 泛化 query 自动重写，降低短 query 空检索概率
+- 搜索工具调用超时保护，避免外部 provider 长时间卡住任务
+- 搜索工具失败重试参数化，可按本地环境调节容错策略
+- 搜索 exact / semantic cache
+- fallback / degraded 响应标记
+- 估算 token / cost 指标
+- benchmark stub agent，用于稳定演示和 CI perf
 
-## 运行环境
-
-- Python 3.12
-- 推荐使用仓库内现有虚拟环境：`/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv`
-
-## 启动后端
+## 启动方式
 
 在后端目录执行：
 
 ```bash
+cp .env.example .env
 /media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python src/main.py
 ```
 
@@ -35,15 +43,40 @@
 uv run python src/main.py
 ```
 
-默认会读取 [`.env`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env) 配置；可以参考 [`.env.example`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env.example) 里的字段，并使用其中的 `HOST`、`PORT`、`LOG_LEVEL`、`CORS_ORIGINS` 等参数。
+实际配置入口是 [`.env`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env)；[`.env.example`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env.example) 只是模板。
 
-## Phase 2 观测点
+和这两个轻量 Agent 能力直接相关的配置项：
 
-- `/metrics/json` 返回进程内聚合统计与最近请求 trace
-- SSE 新增事件：`stage_started`、`stage_completed`、`fallback_triggered`、`degraded_response`、`metrics_snapshot`
-- 搜索缓存默认开启，命中率会体现在 `/metrics/json`
-- token 默认基于 prompt/response 文本长度估算；后续可继续接入真实 usage
-- `estimated_cost` 基于 `LLM_PRICING_JSON` 静态单价配置估算；未配置时默认是 `0`
+- `MAX_AGENT_TASKS`：限制单次请求最多执行多少个任务
+- `REQUEST_REFLECTION_ENABLED`：是否在首轮任务后做一次请求级覆盖反思
+- `REFLECTION_MAX_ADDITIONAL_TASKS`：反思命中缺口后最多再补多少个任务
+- `TASK_QUERY_REWRITE_ENABLED`：对过短或过泛的任务 query 自动拼接 `topic + title + intent`
+- `SEARCH_TOOL_TIMEOUT_SECONDS`：限制单次搜索工具调用最长等待时间
+- `SEARCH_TOOL_RETRY_ATTEMPTS`：搜索工具失败或超时后的重试次数
+- `SEARCH_TOOL_RETRY_BACKOFF_SECONDS`：两次重试之间的固定等待时间
+
+## 重点观测点
+
+- `/metrics/json` 返回进程内 counters、latencies、recent request trace
+- SSE 事件覆盖 `stage_started`、`stage_completed`、`fallback_triggered`、`degraded_response`、`metrics_snapshot`
+- 搜索缓存会区分 exact hit、semantic hit、miss
+- `estimated_cost` 基于 `LLM_PRICING_JSON` 估算；未配置时默认是 `0`
+
+## 演示保底模式
+
+如果你需要稳定展示流程，而不是依赖现场网络 / provider：
+
+```bash
+BENCHMARK_STUB_ENABLED=True
+BENCHMARK_PROFILE=stub
+```
+
+这个模式适合演示：
+
+- SSE 事件流
+- 任务状态切换
+- metrics snapshot
+- 前端流程可视化
 
 ## 运行测试
 
@@ -51,13 +84,10 @@ uv run python src/main.py
 /media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m unittest discover -s tests -v
 ```
 
-## 手工验证
+## 最短验证路径
 
-1. 启动后端服务。
-2. 访问 `http://localhost:<PORT>/healthz`；默认 `PORT=8000`，确认返回 `{"status":"ok"}`。
-3. 访问 `http://localhost:<PORT>/metrics/json`，确认能看到 counters、latencies、recent_requests。
-4. 用前端发起一次研究，或直接调用 `POST /research/stream`。
-5. 检查响应头里是否包含 `X-Request-ID`，并确认前端流程区出现阶段事件和 metrics 卡片。
-6. 再次用完全相同的主题和搜索引擎发起请求，然后重新访问 `/metrics/json`，确认 `cache_hit_total` 增长。
-7. 让 planner 返回空任务列表，确认会出现 `fallback_triggered`，并看到 `request_partial_success_total` 或 `fallback_trigger_total` 增长。
-8. 若配置了 `LLM_PRICING_JSON`，确认 `/metrics/json` 中 `estimated_cost` 和每次请求的 `total_tokens` 非零。
+1. 启动后端。
+2. 访问 `http://localhost:8000/healthz`。
+3. 访问 `http://localhost:8000/metrics/json`。
+4. 用前端或直接调用 `POST /research/stream` 发起一个固定 demo 题目。
+5. 检查是否出现任务规划、阶段事件、工具调用、最终报告和 metrics 卡片。

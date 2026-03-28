@@ -18,6 +18,10 @@ export interface ResearchRequest {
   search_api?: string;
 }
 
+export interface ResumeRequest {
+  search_api?: string;
+}
+
 export interface ResearchStreamEvent {
   type: string;
   [key: string]: unknown;
@@ -41,9 +45,32 @@ export async function runResearchStream(
   onEvent: (event: ResearchStreamEvent) => void,
   options: StreamOptions = {}
 ): Promise<void> {
+  return streamFromEndpoint("/research/stream", payload, onEvent, options);
+}
+
+export async function resumeResearchStream(
+  requestId: string,
+  payload: ResumeRequest,
+  onEvent: (event: ResearchStreamEvent) => void,
+  options: StreamOptions = {}
+): Promise<void> {
+  return streamFromEndpoint(
+    `/requests/${encodeURIComponent(requestId)}/resume/stream`,
+    payload,
+    onEvent,
+    options
+  );
+}
+
+async function streamFromEndpoint(
+  endpoint: string,
+  payload: unknown,
+  onEvent: (event: ResearchStreamEvent) => void,
+  options: StreamOptions = {}
+): Promise<void> {
   let response: Response;
   try {
-    response = await fetch(`${baseURL}/research/stream`, {
+    response = await fetch(`${baseURL}${endpoint}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -146,4 +173,26 @@ export async function fetchMetricsSnapshot(
 
   const payload = (await response.json().catch(() => ({}))) as MetricsSnapshot;
   return payload && typeof payload === "object" ? payload : {};
+}
+
+export async function fetchPersistedRequests(
+  limit?: number,
+  options: StreamOptions = {}
+): Promise<Record<string, unknown>[]> {
+  const search = typeof limit === "number" && Number.isFinite(limit) ? `?limit=${limit}` : "";
+  const response = await fetch(`${baseURL}/requests${search}`, {
+    method: "GET",
+    headers: {
+      Accept: "application/json"
+    },
+    signal: options.signal
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `获取持久化请求失败，状态码：${response.status}`);
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  return Array.isArray(payload.items) ? (payload.items as Record<string, unknown>[]) : [];
 }

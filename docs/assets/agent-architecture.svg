@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="620" viewBox="0 0 1080 620" role="img" aria-labelledby="title desc">
+  <title id="title">DeepResearch Agent architecture</title>
+  <desc id="desc">Frontend sends streaming research requests to a FastAPI backend, which orchestrates planning, search, summarization, reporting, metrics, and benchmark modules.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#eff6ff"/>
+      <stop offset="100%" stop-color="#f8fafc"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <style>
+      .title { font: 700 32px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 16px Arial, sans-serif; fill: #475569; }
+      .box-title { font: 700 20px Arial, sans-serif; fill: #0f172a; }
+      .box-text { font: 500 14px Arial, sans-serif; fill: #334155; }
+      .chip { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 18; }
+      .panel { fill: #ffffff; stroke: #bfdbfe; stroke-width: 2; rx: 26; }
+      .panel-accent { fill: #ffffff; stroke: #c4b5fd; stroke-width: 2; rx: 26; }
+      .arrow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#marker); }
+    </style>
+    <marker id="marker" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="620" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">DeepResearch Agent Architecture</text>
+  <text x="56" y="92" class="subtitle">联网研究型 Agent 应用工程项目，重点展示编排、流式交互、降级与可观测性</text>
+
+  <rect x="56" y="132" width="250" height="180" class="panel"/>
+  <text x="82" y="176" class="box-title">Frontend</text>
+  <text x="82" y="210" class="box-text">Vue + Vite</text>
+  <text x="82" y="238" class="box-text">SSE event timeline</text>
+  <text x="82" y="266" class="box-text">Task cards + report view</text>
+  <text x="82" y="294" class="box-text">Demo presets + metrics strip</text>
+
+  <rect x="412" y="132" width="318" height="340" class="panel"/>
+  <rect x="436" y="164" width="270" height="52" fill="url(#accent)" rx="18"/>
+  <text x="458" y="198" style="font:700 22px Arial, sans-serif; fill:#ffffff;">FastAPI / DeepResearchAgent</text>
+  <rect x="446" y="238" width="250" height="44" class="chip"/>
+  <text x="464" y="266" class="box-text">PlanningService</text>
+  <rect x="446" y="294" width="250" height="44" class="chip"/>
+  <text x="464" y="322" class="box-text">Search tool + exact / semantic cache</text>
+  <rect x="446" y="350" width="250" height="44" class="chip"/>
+  <text x="464" y="378" class="box-text">SummarizationService</text>
+  <rect x="446" y="406" width="250" height="44" class="chip"/>
+  <text x="464" y="434" class="box-text">ReportingService</text>
+
+  <rect x="788" y="132" width="236" height="160" class="panel-accent"/>
+  <text x="812" y="176" class="box-title">Observability</text>
+  <text x="812" y="210" class="box-text">RequestTrace / X-Request-ID</text>
+  <text x="812" y="238" class="box-text">metrics.json snapshot</text>
+  <text x="812" y="266" class="box-text">fallback / degraded markers</text>
+
+  <rect x="788" y="324" width="236" height="148" class="panel-accent"/>
+  <text x="812" y="368" class="box-title">Quality &amp; Perf</text>
+  <text x="812" y="402" class="box-text">offline benchmark</text>
+  <text x="812" y="430" class="box-text">smoke / regression / load</text>
+  <text x="812" y="458" class="box-text">CI artifacts</text>
+
+  <rect x="412" y="512" width="318" height="70" class="panel"/>
+  <text x="438" y="554" class="box-title">Public API</text>
+  <text x="600" y="554" class="box-text">GET /healthz · GET /metrics/json · POST /research · POST /research/stream</text>
+
+  <path d="M306 222 H392" class="arrow"/>
+  <path d="M730 222 H768" class="arrow"/>
+  <path d="M730 398 H768" class="arrow"/>
+  <path d="M571 472 V500" class="arrow"/>
+</svg>

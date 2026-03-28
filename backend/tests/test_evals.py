@@ -77,6 +77,42 @@ class HeuristicJudgeTests(unittest.TestCase):
         self.assertEqual(metrics["citation_count"], 2)
         self.assertEqual(metrics["total_latency_ms"], 123.4)
 
+    def test_heuristic_judge_tracks_grounded_citations_and_reference_match(self):
+        case = BenchmarkCase(
+            id="judge-grounded",
+            topic="AI agent",
+            expected_keywords=["agent"],
+            expected_sections=["背景", "核心洞见", "参考来源"],
+            freshness_sensitive=False,
+        )
+        report = (
+            "# 背景\n"
+            "AI agent 系统需要 grounded report。\n"
+            "## 核心洞见\n"
+            "- 关键结论 A [T1-S1]\n"
+            "- 关键结论 B [T1-S2]\n"
+            "## 证据与数据\n"
+            "- 事实数据 [T1-S1]\n"
+            "## 风险与挑战\n"
+            "- 风险提示 [T1-S2]\n"
+            "## 参考来源\n"
+            "- [T1-S1] Source One - https://example.com/1\n"
+            "- [T1-S2] Source Two - https://example.com/2\n"
+        )
+
+        metrics = HeuristicJudge().evaluate(
+            case=case,
+            report_markdown=report,
+            todo_items=[SimpleNamespace(id=1, status="completed")],
+            trace_snapshot={"elapsed_ms": 88.0, "estimated_cost": 0.001, "status": "success"},
+        )
+
+        self.assertTrue(metrics["reference_section_present"])
+        self.assertEqual(metrics["citation_marker_count"], 2)
+        self.assertEqual(metrics["reference_match_rate"], 1.0)
+        self.assertEqual(metrics["grounded_bullet_ratio"], 1.0)
+        self.assertEqual(metrics["completed_task_count"], 1)
+
 
 class EvalRunnerTests(unittest.TestCase):
     def test_run_benchmark_suite_writes_output_payload(self):

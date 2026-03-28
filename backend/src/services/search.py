@@ -789,6 +789,7 @@ def dispatch_search(
     loop_count: int,
     observer: RequestTrace | None = None,
     cache_context: dict[str, Any] | None = None,
+    max_results: int = 5,
 ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool, str]:
     """Execute configured search backend and normalise response payload."""
 
@@ -798,8 +799,6 @@ def dispatch_search(
     topic_scope = _build_topic_scope(normalized_cache_context)
     semantic_text = _build_semantic_text(query, normalized_cache_context)
     semantic_embedding: list[float] | None = None
-    max_results = 5
-
     if config.search_cache_enabled:
         exact_cached = _read_exact_cache(cache_key, config.search_cache_ttl_seconds, config)
         if exact_cached:

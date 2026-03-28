@@ -12,7 +12,11 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace
 from models import SummaryState, TodoItem
-from prompts import get_current_date, todo_planner_instructions
+from prompts import (
+    get_current_date,
+    supplemental_planner_instructions,
+    todo_planner_instructions,
+)
 from utils import strip_thinking_tokens
 
 logger = logging.getLogger(__name__)
@@ -119,6 +123,8 @@ class PlanningService:
                 title=title,
                 intent=intent,
                 query=query,
+                origin="planned",
+                round=1,
             )
             todo_items.append(task)
 
@@ -127,6 +133,68 @@ class PlanningService:
         titles = [task.title for task in todo_items]
         logger.info("Planner produced %d tasks: %s", len(todo_items), titles)
         return todo_items
+
+    def plan_additional_tasks(
+        self,
+        state: SummaryState,
+        *,
+        missing_angles: list[str],
+        existing_tasks: list[TodoItem],
+        max_additional_tasks: int,
+        observer: RequestTrace | None = None,
+    ) -> List[TodoItem]:
+        """Generate supplemental tasks that cover missing angles without duplicating existing work."""
+
+        if max_additional_tasks <= 0:
+            return []
+
+        next_id = max((task.id for task in existing_tasks), default=0) + 1
+        prompt = supplemental_planner_instructions.format(
+            current_date=get_current_date(),
+            research_topic=state.research_topic,
+            starting_task_id=next_id,
+            existing_tasks="\n".join(
+                f"- 任务 {task.id}: {task.title} | 目标：{task.intent} | 状态：{task.status}"
+                for task in existing_tasks
+            )
+            or "- 暂无已规划任务",
+            missing_angles="\n".join(f"- {angle}" for angle in missing_angles)
+            or "- 无明确缺失维度",
+            max_additional_tasks=max_additional_tasks,
+        )
+        response = self._invoke_planner(prompt, observer=observer)
+        logger.info("Supplemental planner raw output (truncated): %s", response[:500])
+
+        raw_tasks = self._extract_tasks(response)
+        sanitized_tasks, _ = self._sanitize_tasks(raw_tasks, research_topic=state.research_topic)
+        unique_tasks = self._filter_duplicate_candidates(sanitized_tasks, existing_tasks=existing_tasks)
+
+        supplemental_items: List[TodoItem] = []
+        for item in unique_tasks[:max_additional_tasks]:
+            title = str(item.get("title") or f"任务{next_id}").strip()
+            intent = str(item.get("intent") or "聚焦主题的关键问题").strip()
+            query = str(item.get("query") or "").strip()
+
+            if not query:
+                query = self._default_query_for_task(
+                    research_topic=state.research_topic,
+                    title=title,
+                    intent=intent,
+                )
+
+            supplemental_items.append(
+                TodoItem(
+                    id=next_id,
+                    title=title,
+                    intent=intent,
+                    query=query,
+                    origin="replanned",
+                    round=2,
+                )
+            )
+            next_id += 1
+
+        return supplemental_items
 
     def _default_query_for_task(
         self,
@@ -157,6 +225,8 @@ class PlanningService:
             title="基础背景梳理",
             intent="收集主题的核心背景与最新动态",
             query=f"{state.research_topic} 最新进展" if state.research_topic else "基础背景梳理",
+            origin="planned",
+            round=1,
         )
 
     # ------------------------------------------------------------------
@@ -541,6 +611,94 @@ class PlanningService:
         cleaned = re.sub(r"\s+", " ", cleaned)
         cleaned = cleaned.strip(" -:：|/").strip()
         return cleaned.strip()
+
+    def _filter_duplicate_candidates(
+        self,
+        tasks: List[dict[str, Any]],
+        *,
+        existing_tasks: list[TodoItem],
+    ) -> List[dict[str, Any]]:
+        """Drop supplemental tasks that substantially overlap with existing work."""
+
+        unique_tasks: list[dict[str, Any]] = []
+        seen_titles = {self._normalize_task_title(task.title).casefold() for task in existing_tasks}
+
+        for item in tasks:
+            title = self._normalize_task_title(str(item.get("title") or ""))
+            intent = str(item.get("intent") or "").strip()
+            title_key = title.casefold()
+            if not title or title_key in seen_titles:
+                continue
+
+            if any(
+                self._is_similar_task(
+                    title=title,
+                    intent=intent,
+                    existing_title=task.title,
+                    existing_intent=task.intent,
+                )
+                for task in existing_tasks
+            ):
+                continue
+
+            seen_titles.add(title_key)
+            unique_tasks.append(
+                {
+                    "title": title,
+                    "intent": intent or "聚焦主题的关键问题",
+                    "query": str(item.get("query") or "").strip(),
+                }
+            )
+
+        return unique_tasks
+
+    def _is_similar_task(
+        self,
+        *,
+        title: str,
+        intent: str,
+        existing_title: str,
+        existing_intent: str,
+    ) -> bool:
+        """Heuristic duplicate check for supplemental tasks."""
+
+        normalized_title = self._normalize_similarity_text(title)
+        normalized_existing_title = self._normalize_similarity_text(existing_title)
+
+        if normalized_title == normalized_existing_title:
+            return True
+        if normalized_title and normalized_existing_title:
+            if normalized_title in normalized_existing_title or normalized_existing_title in normalized_title:
+                return True
+
+        title_similarity = self._char_jaccard_similarity(normalized_title, normalized_existing_title)
+        if title_similarity >= 0.75:
+            return True
+
+        normalized_intent = self._normalize_similarity_text(intent)
+        normalized_existing_intent = self._normalize_similarity_text(existing_intent)
+        intent_similarity = self._char_jaccard_similarity(normalized_intent, normalized_existing_intent)
+        return title_similarity >= 0.5 and intent_similarity >= 0.6
+
+    def _normalize_similarity_text(self, value: str) -> str:
+        cleaned = self._normalize_task_title(value).casefold()
+        return re.sub(r"[\s\-_/:：|，,。；;（）()]+", "", cleaned)
+
+    def _char_jaccard_similarity(self, left: str, right: str) -> float:
+        if not left or not right:
+            return 0.0
+
+        def grams(text: str) -> set[str]:
+            if len(text) <= 2:
+                return {text}
+            return {text[index : index + 2] for index in range(len(text) - 1)}
+
+        left_grams = grams(left)
+        right_grams = grams(right)
+        union = left_grams | right_grams
+        if not union:
+            return 0.0
+        return len(left_grams & right_grams) / len(union)
 
     def _extract_intent_from_text(self, text: str) -> str:
         """Extract a concise intent line from free-form task text."""

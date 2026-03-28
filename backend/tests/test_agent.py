@@ -1,4 +1,5 @@
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -79,6 +80,8 @@ import agent as agent_module
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from models import SummaryState, TodoItem
+from services.evidence import EvidenceStore
+from services.reflection import ReflectionAssessment
 
 
 class StubTracker:
@@ -99,12 +102,19 @@ class AgentExecutionTests(unittest.TestCase):
     def _build_agent(self):
         instance = agent_module.DeepResearchAgent.__new__(agent_module.DeepResearchAgent)
         instance.config = Configuration.from_env(
-            overrides={"enable_notes": False},
+            overrides={
+                "enable_notes": False,
+                "request_reflection_enabled": False,
+                "review_stage_enabled": False,
+                "request_state_enabled": False,
+            },
             load_env_file=False,
         )
         instance.request_id = "req-test"
         instance.note_tool = None
         instance.tools_registry = None
+        instance._request_state_store = None
+        instance._evidence_store = EvidenceStore()
         instance._tool_tracker = StubTracker()
         instance._tool_event_sink_enabled = False
         instance._state_lock = Lock()
@@ -114,12 +124,16 @@ class AgentExecutionTests(unittest.TestCase):
             plan_todo_list=lambda state, observer=None: [
                 TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
             ],
+            plan_additional_tasks=lambda state, **kwargs: [],
             create_fallback_task=lambda state: TodoItem(
                 id=1,
                 title="兜底任务",
                 intent="收集背景",
                 query=state.research_topic,
             ),
+        )
+        instance.reflection = SimpleNamespace(
+            assess_request=lambda state, gap_signals, observer=None: None
         )
         instance.reporting = SimpleNamespace(
             generate_report=lambda state, observer=None: "# report"
@@ -148,6 +162,44 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertEqual(calls, [1])
         self.assertEqual(result.todo_items[0].status, "completed")
         self.assertEqual(result.todo_items[0].summary, "summary")
+
+    def test_run_applies_task_budget_limit(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={"enable_notes": False, "max_agent_tasks": 2},
+            load_env_file=False,
+        )
+        agent.planner = SimpleNamespace(
+            plan_todo_list=lambda state, observer=None: [
+                TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent background"),
+                TodoItem(id=2, title="任务2", intent="梳理挑战", query="AI agent challenges"),
+                TodoItem(id=3, title="任务3", intent="梳理案例", query="AI agent case studies"),
+            ],
+            create_fallback_task=lambda state: TodoItem(
+                id=99,
+                title="兜底任务",
+                intent="收集背景",
+                query=state.research_topic,
+            ),
+        )
+
+        calls = []
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            calls.append(task.id)
+            task.status = "completed"
+            task.summary = "summary"
+            task.sources_summary = "* Example : https://example.com"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+
+        result = agent.run("AI agent")
+
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual([task.id for task in result.todo_items], [1, 2])
+        self.assertTrue(any("任务数超过预算" in notice for notice in result.todo_items[0].notices))
 
     def test_execute_task_marks_search_failures_without_raising(self):
         agent = self._build_agent()
@@ -234,6 +286,135 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertTrue(task.sources_summary)
         self.assertEqual(observer.snapshot()["failed_tasks"], 1)
 
+    def test_execute_task_retries_search_tool_failures_before_recovering(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "search_tool_retry_attempts": 1,
+                "search_tool_retry_backoff_seconds": 0.0,
+            },
+            load_env_file=False,
+        )
+        observer = RequestTrace(
+            request_id="req-search-retry",
+            topic="AI agent",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        agent._request_trace = observer
+
+        state = SummaryState(research_topic="AI agent")
+        task = TodoItem(
+            id=1,
+            title="任务1",
+            intent="梳理背景",
+            query="AI agent system design",
+        )
+
+        responses = iter(
+            [
+                RuntimeError("provider offline"),
+                (
+                    {
+                        "results": [
+                            {
+                                "title": "Example",
+                                "url": "https://example.com",
+                                "content": "content",
+                            }
+                        ]
+                    },
+                    [],
+                    None,
+                    "duckduckgo",
+                    False,
+                    "miss",
+                ),
+            ]
+        )
+
+        def flaky_dispatch(*args, **kwargs):
+            outcome = next(responses)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(agent_module, "dispatch_search", side_effect=flaky_dispatch) as mock_dispatch:
+            events = list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    task,
+                    emit_stream=False,
+                )
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(task.status, "completed")
+        self.assertTrue(any("搜索工具调用失败，准备第 1 次重试" in notice for notice in task.notices))
+        self.assertEqual(mock_dispatch.call_count, 2)
+        self.assertEqual(observer.snapshot()["completed_tasks"], 1)
+
+    def test_execute_task_marks_search_timeout_after_retry_budget_exhausted(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "task_query_rewrite_enabled": False,
+                "search_tool_timeout_seconds": 0.01,
+                "search_tool_retry_attempts": 1,
+                "search_tool_retry_backoff_seconds": 0.0,
+            },
+            load_env_file=False,
+        )
+        observer = RequestTrace(
+            request_id="req-search-timeout",
+            topic="",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        agent._request_trace = observer
+
+        state = SummaryState(research_topic="")
+        task = TodoItem(
+            id=1,
+            title="任务1",
+            intent="梳理背景",
+            query="AI agent system design architecture",
+        )
+
+        def slow_dispatch(*args, **kwargs):
+            time.sleep(0.05)
+            return (
+                {"results": []},
+                [],
+                None,
+                "duckduckgo",
+                False,
+                "miss",
+            )
+
+        with patch.object(agent_module, "dispatch_search", side_effect=slow_dispatch) as mock_dispatch:
+            events = list(
+                agent_module.DeepResearchAgent._execute_task(
+                    agent,
+                    state,
+                    task,
+                    emit_stream=False,
+                )
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(task.status, "failed")
+        self.assertTrue(any("超时" in notice for notice in task.notices))
+        self.assertEqual(mock_dispatch.call_count, 2)
+        self.assertEqual(observer.snapshot()["failed_tasks"], 1)
+
     def test_execute_task_retries_with_broader_query_before_skipping(self):
         agent = self._build_agent()
         observer = RequestTrace(
@@ -285,9 +466,9 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertEqual(task.status, "completed")
         self.assertEqual(
             task.query,
-            "探索多模态大模型在2025年的关键进展 性能基准对比",
+            "探索多模态大模型在2025年的关键进展 性能基准对比 评估主流模型能力水平与资源消耗",
         )
-        self.assertTrue(any("更宽泛检索词" in notice for notice in task.notices))
+        self.assertTrue(any("重写检索词" in notice for notice in task.notices))
         self.assertEqual(mock_dispatch.call_count, 2)
         self.assertEqual(observer.snapshot()["completed_tasks"], 1)
 
@@ -400,6 +581,219 @@ class AgentExecutionTests(unittest.TestCase):
         ]
         self.assertTrue(search_stages)
         self.assertEqual(search_stages[-1]["metadata"]["cache_strategy"], "semantic")
+
+    def test_run_triggers_reflection_and_executes_additional_tasks(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "request_reflection_enabled": True,
+                "max_agent_tasks": 3,
+                "reflection_max_additional_tasks": 2,
+            },
+            load_env_file=False,
+        )
+        calls = []
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            calls.append(task.id)
+            task.status = "completed"
+            if task.id == 1:
+                task.summary = "暂无可用信息"
+                task.sources_summary = ""
+            else:
+                task.summary = "supplemental summary"
+                task.sources_summary = "* Example : https://example.com/replan"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+        agent.reflection = SimpleNamespace(
+            assess_request=lambda state, gap_signals, observer=None: ReflectionAssessment(
+                coverage_status="needs_more_research",
+                reason="首轮研究仍缺少工程实践维度。",
+                gap_signals=gap_signals,
+                missing_angles=["工程实践与部署经验"],
+            )
+        )
+        agent.planner = SimpleNamespace(
+            plan_todo_list=lambda state, observer=None: [
+                TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
+            ],
+            plan_additional_tasks=lambda state, **kwargs: [
+                TodoItem(
+                    id=2,
+                    title="工程实践",
+                    intent="补充部署与监控维度",
+                    query="AI agent deployment monitoring",
+                    origin="replanned",
+                    round=2,
+                )
+            ],
+            create_fallback_task=lambda state: TodoItem(
+                id=1,
+                title="兜底任务",
+                intent="收集背景",
+                query=state.research_topic,
+            ),
+        )
+
+        result = agent.run("AI agent")
+
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(len(result.todo_items), 2)
+        self.assertEqual(result.todo_items[1].origin, "replanned")
+        self.assertEqual(result.todo_items[1].round, 2)
+        self.assertTrue(agent._request_trace.snapshot()["reflection_triggered"])
+        self.assertEqual(agent._request_trace.snapshot()["reflection_added_tasks"], 1)
+
+    def test_run_skips_reflection_when_task_budget_is_exhausted(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "request_reflection_enabled": True,
+                "max_agent_tasks": 1,
+            },
+            load_env_file=False,
+        )
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            task.status = "completed"
+            task.summary = "暂无可用信息"
+            task.sources_summary = ""
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+        agent.reflection = SimpleNamespace(
+            assess_request=lambda state, gap_signals, observer=None: (_ for _ in ()).throw(
+                AssertionError("reflection should not run when budget is exhausted")
+            )
+        )
+
+        result = agent.run("AI agent")
+
+        self.assertEqual(len(result.todo_items), 1)
+        self.assertTrue(agent._request_trace.snapshot()["reflection_triggered"])
+        self.assertEqual(agent._request_trace.snapshot()["reflection_added_tasks"], 0)
+        self.assertIn("预算已满", agent._request_trace.snapshot()["reflection_reason"])
+
+    def test_run_stream_emits_reflection_stage_and_updated_todo_list(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "request_reflection_enabled": True,
+                "max_agent_tasks": 3,
+                "reflection_max_additional_tasks": 2,
+            },
+            load_env_file=False,
+        )
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            task.status = "completed"
+            if task.id == 1:
+                task.summary = "暂无可用信息"
+                task.sources_summary = ""
+            else:
+                task.summary = "补充任务总结"
+                task.sources_summary = "* Example : https://example.com/replan"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+        agent.reflection = SimpleNamespace(
+            assess_request=lambda state, gap_signals, observer=None: ReflectionAssessment(
+                coverage_status="needs_more_research",
+                reason="需要补充落地视角。",
+                gap_signals=gap_signals,
+                missing_angles=["落地与监控"],
+            )
+        )
+        agent.planner = SimpleNamespace(
+            plan_todo_list=lambda state, observer=None: [
+                TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
+            ],
+            plan_additional_tasks=lambda state, **kwargs: [
+                TodoItem(
+                    id=2,
+                    title="落地监控",
+                    intent="补充部署与监控实践",
+                    query="AI agent observability",
+                    origin="replanned",
+                    round=2,
+                )
+            ],
+            create_fallback_task=lambda state: TodoItem(
+                id=1,
+                title="兜底任务",
+                intent="收集背景",
+                query=state.research_topic,
+            ),
+        )
+
+        events = list(agent.run_stream("AI agent"))
+
+        reflection_started = [
+            event for event in events if event.get("type") == "stage_started" and event.get("stage") == "reflection"
+        ]
+        reflection_completed = [
+            event for event in events if event.get("type") == "stage_completed" and event.get("stage") == "reflection"
+        ]
+        todo_lists = [event for event in events if event.get("type") == "todo_list"]
+        metrics_events = [event for event in events if event.get("type") == "metrics_snapshot"]
+
+        self.assertTrue(reflection_started)
+        self.assertTrue(reflection_completed)
+        self.assertEqual(len(todo_lists), 2)
+        self.assertEqual(len(todo_lists[-1]["tasks"]), 2)
+        self.assertEqual(metrics_events[-1]["request_metrics"]["reflection_added_tasks"], 1)
+
+    def test_state_from_snapshot_hydrates_evidence_store_and_sources_summary(self):
+        agent = self._build_agent()
+        payload = {
+            "topic": "resume topic",
+            "phase": "reporting",
+            "todo_items": [
+                {
+                    "id": 2,
+                    "title": "任务2",
+                    "intent": "恢复引用",
+                    "query": "resume grounding",
+                    "status": "completed",
+                    "summary": "# 任务总结\n\n## 关键发现\n1. resume 必须恢复 evidence [T2-S2]",
+                    "summary_payload": {
+                        "key_findings": [
+                            {"text": "resume 必须恢复 evidence", "source_ids": ["T2-S2"]}
+                        ],
+                        "evidence_gaps": [],
+                    },
+                    "sources_summary": "",
+                    "evidence_items": [
+                        {
+                            "source_id": "T2-S2",
+                            "title": "Recovered Resume Source",
+                            "url": "https://example.com/resume",
+                            "snippet": "resume snapshot evidence",
+                            "domain": "example.com",
+                            "source_type": "web",
+                            "quality_label": "medium",
+                            "freshness_label": "recent",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        state, phase = agent._state_from_snapshot(payload)
+        refs = agent._evidence_store.build_reference_map(["T2-S2", "T2-S9"])
+
+        self.assertEqual(phase, "reporting")
+        self.assertEqual(state.todo_items[0].evidence_items[0]["source_id"], "T2-S2")
+        self.assertIn("[T2-S2]", state.todo_items[0].sources_summary)
+        self.assertEqual(refs[0]["title"], "Recovered Resume Source")
+        self.assertEqual(refs[0]["url"], "https://example.com/resume")
 
 
 if __name__ == "__main__":
