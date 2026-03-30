@@ -215,13 +215,13 @@ def _normalize_cache_context(cache_context: dict[str, Any] | None) -> dict[str, 
         return {}
 
     normalized: dict[str, str] = {}
-    for field in ("research_topic", "task_title", "task_intent"):
-        value = cache_context.get(field)
+    for field_name in ("research_topic", "task_title", "task_intent"):
+        value = cache_context.get(field_name)
         if value is None:
             continue
         text = str(value).strip()
         if text:
-            normalized[field] = text
+            normalized[field_name] = text
     return normalized
 
 
@@ -1044,11 +1044,11 @@ def _merge_fused_result(
     existing["_backend_order"] = min(int(existing.get("_backend_order", backend_order)), backend_order)
     existing["_best_rank"] = min(int(existing.get("_best_rank", result_rank)), result_rank)
 
-    for field in ("title", "content", "raw_content"):
-        current = str(existing.get(field) or "")
-        replacement = str(candidate.get(field) or "")
+    for field_name in ("title", "content", "raw_content"):
+        current = str(existing.get(field_name) or "")
+        replacement = str(candidate.get(field_name) or "")
         if len(replacement) > len(current):
-            existing[field] = candidate.get(field)
+            existing[field_name] = candidate.get(field_name)
 
     if not existing.get("url") and candidate.get("url"):
         existing["url"] = candidate["url"]
