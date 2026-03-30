@@ -28,6 +28,13 @@ class ConfigurationTests(unittest.TestCase):
                 overrides={
                     "search_api": "advanced",
                     "advanced_search_backends": " searxng, tavily, serpapi, searxng ",
+                    "advanced_search_max_concurrency": "2",
+                    "advanced_search_fetch_full_page_override": "false",
+                    "advanced_rerank_enabled": "true",
+                    "advanced_rerank_model": "qwen-rerank",
+                    "advanced_rerank_candidate_pool": "12",
+                    "advanced_rerank_timeout_seconds": "1.75",
+                    "advanced_rerank_max_content_chars": "800",
                     "log_level": "debug",
                     "port": "9001",
                     "cors_origins": "http://localhost:5174, http://localhost:3000",
@@ -48,6 +55,13 @@ class ConfigurationTests(unittest.TestCase):
             cfg.advanced_search_backends,
             ["searxng", "tavily", "serpapi"],
         )
+        self.assertEqual(cfg.advanced_search_max_concurrency, 2)
+        self.assertFalse(cfg.advanced_search_fetch_full_page_override)
+        self.assertTrue(cfg.advanced_rerank_enabled)
+        self.assertEqual(cfg.advanced_rerank_model, "qwen-rerank")
+        self.assertEqual(cfg.advanced_rerank_candidate_pool, 12)
+        self.assertEqual(cfg.advanced_rerank_timeout_seconds, 1.75)
+        self.assertEqual(cfg.advanced_rerank_max_content_chars, 800)
         self.assertEqual(cfg.log_level, "DEBUG")
         self.assertEqual(cfg.port, 9001)
         self.assertEqual(cfg.semantic_cache_lexical_threshold, 0.81)
@@ -104,6 +118,55 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.perf_thresholds_path, expected_thresholds)
         self.assertEqual(cfg.perf_sample_interval_seconds, 0.25)
         self.assertEqual(cfg.request_state_dir, expected_state_dir)
+
+    def test_semanticscholar_search_api_and_key_are_supported(self):
+        with patch.dict(os.environ, {"SEMANTIC_SCHOLAR_API_KEY": "secret-key"}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={"search_api": "semanticscholar"},
+                load_env_file=False,
+            )
+
+        self.assertEqual(cfg.search_api, config.SearchAPI.SEMANTICSCHOLAR)
+        self.assertEqual(cfg.semantic_scholar_api_key, "secret-key")
+
+    def test_advanced_backends_reject_semanticscholar(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "Unsupported advanced_search_backends"):
+                config.Configuration.from_env(
+                    overrides={
+                        "search_api": "advanced",
+                        "advanced_search_backends": ["searxng", "semanticscholar"],
+                    },
+                    load_env_file=False,
+                )
+
+    def test_advanced_rerank_settings_fall_back_to_global_llm_config(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={
+                    "llm_provider": "custom",
+                    "llm_base_url": "http://localhost:8001/v1",
+                    "llm_api_key": "secret-token",
+                    "llm_model_id": "Qwen/Qwen3-32B",
+                    "search_api": "advanced",
+                    "advanced_rerank_enabled": True,
+                },
+                load_env_file=False,
+            )
+
+        self.assertEqual(cfg.resolved_advanced_rerank_base_url(), "http://localhost:8001/v1")
+        self.assertEqual(cfg.resolved_advanced_rerank_api_key(), "secret-token")
+        self.assertEqual(cfg.resolved_advanced_rerank_model(), "Qwen/Qwen3-32B")
+        self.assertEqual(
+            cfg.resolved_search_cache_signature("advanced"),
+            {
+                "advanced_search_backends": ["searxng", "tavily", "serpapi", "duckduckgo"],
+                "advanced_search_fetch_full_page_override": None,
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_model": "Qwen/Qwen3-32B",
+                "advanced_rerank_candidate_pool": 20,
+            },
+        )
 
 
 if __name__ == "__main__":

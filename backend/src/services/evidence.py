@@ -168,6 +168,8 @@ def _extract_published_at(result: dict[str, Any]) -> str | None:
     for key in (
         "published_at",
         "published_date",
+        "publicationDate",
+        "publication_date",
         "date",
         "datetime",
         "time",
@@ -176,6 +178,19 @@ def _extract_published_at(result: dict[str, Any]) -> str | None:
         parsed = _parse_datetime(result.get(key))
         if parsed is not None:
             return parsed.date().isoformat()
+
+        raw_value = str(result.get(key) or "").strip()
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", raw_value):
+            return raw_value
+
+    year = result.get("year")
+    try:
+        if year is not None and str(year).strip():
+            normalized_year = int(year)
+            if 1900 <= normalized_year <= 2100:
+                return f"{normalized_year:04d}-01-01"
+    except (TypeError, ValueError):
+        pass
 
     combined_text = " ".join(
         str(result.get(field) or "").strip()

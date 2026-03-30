@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import tempfile
 import time
@@ -85,6 +86,43 @@ class DummySearchTool:
             "answer": None,
             "notices": [],
         }
+
+
+class MockHTTPResponse:
+    def __init__(self, status_code=200, payload=None, text=None):
+        self.status_code = status_code
+        self._payload = deepcopy(payload)
+        self.text = text if text is not None else json.dumps(payload or {}, ensure_ascii=False)
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("missing json payload")
+        return deepcopy(self._payload)
+
+
+def rerank_completion_payload(ranked_ids):
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps({"ranked_ids": ranked_ids}, ensure_ascii=False),
+                }
+            }
+        ]
+    }
+
+
+def rerank_api_payload(ranked_indices):
+    return {
+        "results": [
+            {
+                "index": index,
+                "document": {"text": f"document-{index}"},
+                "relevance_score": 1.0 / (position + 1),
+            }
+            for position, index in enumerate(ranked_indices)
+        ]
+    }
 
 
 diskcache_stub = types.ModuleType("diskcache")
@@ -234,6 +272,16 @@ class SearchCacheTests(unittest.TestCase):
             payload["results"][0]["content"],
             "much longer alpha content from tavily",
         )
+        self.assertEqual(
+            payload["ranking"],
+            {
+                "strategy": "rules",
+                "rerank_applied": False,
+                "candidate_count": 3,
+                "model": None,
+                "fallback_reason": None,
+            },
+        )
         self.assertTrue(any("searxng:" in notice for notice in notices))
         self.assertTrue(any("serpapi 搜索失败" in notice for notice in notices))
         self.assertEqual(
@@ -293,6 +341,543 @@ class SearchCacheTests(unittest.TestCase):
         self.assertFalse(notices)
         self.assertEqual(backend_label, "advanced[searxng, tavily, serpapi]")
         self.assertEqual(len(payload["results"]), 3)
+        self.assertEqual(payload["ranking"]["strategy"], "rules")
+        self.assertFalse(payload["ranking"]["rerank_applied"])
+
+    def test_private_rerank_endpoints_bypass_proxy_env(self):
+        self.assertTrue(services_search._should_bypass_proxy_for_url("http://127.0.0.1:8082/v1/rerank"))
+        self.assertTrue(services_search._should_bypass_proxy_for_url("http://192.168.1.136:8082/v1/rerank"))
+        self.assertFalse(services_search._should_bypass_proxy_for_url("https://api.example.com/v1/rerank"))
+
+    def test_dispatch_search_reranks_after_deduplication_and_reorders_candidate_pool(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha from SearXNG",
+                        "url": "https://example.com/a?utm_source=feed",
+                        "content": "alpha short",
+                    },
+                    {
+                        "title": "Beta from SearXNG",
+                        "url": "https://example.com/b",
+                        "content": "beta content",
+                    },
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+            "tavily": {
+                "results": [
+                    {
+                        "title": "Alpha from Tavily",
+                        "url": "https://example.com/a",
+                        "content": "alpha much longer content from tavily",
+                    },
+                    {
+                        "title": "Gamma from Tavily",
+                        "url": "https://example.com/c",
+                        "content": "gamma content",
+                    },
+                    {
+                        "title": "Delta from Tavily",
+                        "url": "https://example.com/d",
+                        "content": "delta content",
+                    },
+                ],
+                "backend": "tavily",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng", "tavily"],
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1",
+                "advanced_rerank_model": "qwen-rerank",
+                "advanced_rerank_candidate_pool": 3,
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            return_value=MockHTTPResponse(status_code=200, payload=rerank_api_payload([1, 0, 2])),
+        ) as mock_post:
+            payload, notices, answer_text, backend_label, cache_hit, cache_strategy = services_search.dispatch_search(
+                "rerank query",
+                config,
+                0,
+                max_results=2,
+            )
+
+        self.assertFalse(cache_hit)
+        self.assertEqual(cache_strategy, "miss")
+        self.assertEqual(answer_text, None)
+        self.assertEqual(backend_label, "advanced[searxng, tavily]")
+        self.assertFalse(notices)
+        self.assertEqual(
+            [item["url"] for item in payload["results"]],
+            ["https://example.com/b", "https://example.com/a?utm_source=feed"],
+        )
+        self.assertEqual(
+            payload["ranking"],
+            {
+                "strategy": "rules+llm_rerank",
+                "rerank_applied": True,
+                "candidate_count": 4,
+                "model": "qwen-rerank",
+                "fallback_reason": None,
+            },
+        )
+        self.assertEqual(mock_post.call_args.args[0], "http://rerank.local/v1/rerank")
+        rerank_documents = mock_post.call_args.kwargs["json"]["documents"]
+        self.assertEqual(mock_post.call_args.kwargs["json"]["query"], "rerank query")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["top_n"], 3)
+        self.assertEqual(len(rerank_documents), 3)
+        self.assertTrue(any("https://example.com/a?utm_source=feed" in document for document in rerank_documents))
+        self.assertTrue(any("https://example.com/b" in document for document in rerank_documents))
+        self.assertTrue(any("https://example.com/c" in document for document in rerank_documents))
+
+    def test_dispatch_search_falls_back_to_chat_completions_when_rerank_endpoint_is_unsupported(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    },
+                    {
+                        "title": "Beta",
+                        "url": "https://example.com/b",
+                        "content": "beta",
+                    },
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng"],
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1",
+                "advanced_rerank_model": "qwen-rerank",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        def _mock_post(url, **kwargs):
+            if url.endswith("/v1/rerank"):
+                return MockHTTPResponse(status_code=404, payload={"detail": "Not Found"}, text="Not Found")
+            if url.endswith("/v1/chat/completions"):
+                return MockHTTPResponse(status_code=200, payload=rerank_completion_payload(["doc-2", "doc-1"]))
+            raise AssertionError(f"unexpected rerank URL: {url}")
+
+        with patch.object(services_search.requests, "post", side_effect=_mock_post) as mock_post:
+            payload, notices, _, _, _, _ = services_search.dispatch_search(
+                "fallback rerank query",
+                config,
+                0,
+            )
+
+        self.assertFalse(notices)
+        self.assertEqual(
+            [item["url"] for item in payload["results"]],
+            ["https://example.com/b", "https://example.com/a"],
+        )
+        self.assertTrue(payload["ranking"]["rerank_applied"])
+        self.assertEqual(
+            [call.args[0] for call in mock_post.call_args_list],
+            ["http://rerank.local/v1/rerank", "http://rerank.local/v1/chat/completions"],
+        )
+
+    def test_dispatch_search_rerank_invalid_results_falls_back_to_rule_order(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    },
+                    {
+                        "title": "Beta",
+                        "url": "https://example.com/b",
+                        "content": "beta",
+                    },
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng"],
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1",
+                "advanced_rerank_model": "qwen-rerank",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            return_value=MockHTTPResponse(status_code=200, payload=rerank_api_payload([0])),
+        ):
+            payload, notices, _, _, _, _ = services_search.dispatch_search(
+                "invalid rerank indices",
+                config,
+                0,
+            )
+
+        self.assertEqual([item["url"] for item in payload["results"]], [
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+        self.assertEqual(payload["ranking"]["strategy"], "rules")
+        self.assertFalse(payload["ranking"]["rerank_applied"])
+        self.assertEqual(payload["ranking"]["fallback_reason"], "rerank_invalid_results")
+        self.assertTrue(any("advanced rerank 回退" in notice for notice in notices))
+
+    def test_dispatch_search_rerank_timeout_falls_back_without_failing_advanced_search(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    }
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+            "tavily": {
+                "results": [
+                    {
+                        "title": "Beta",
+                        "url": "https://example.com/b",
+                        "content": "beta",
+                    }
+                ],
+                "backend": "tavily",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng", "tavily"],
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1/chat/completions",
+                "advanced_rerank_model": "qwen-rerank",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            side_effect=services_search.requests.Timeout("timed out"),
+        ):
+            payload, notices, _, _, _, _ = services_search.dispatch_search(
+                "rerank timeout",
+                config,
+                0,
+            )
+
+        self.assertEqual([item["url"] for item in payload["results"]], [
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+        self.assertEqual(payload["ranking"]["fallback_reason"], "rerank_timeout")
+        self.assertTrue(any("advanced rerank 回退" in notice for notice in notices))
+
+    def test_dispatch_search_rerank_http_error_falls_back_to_rule_order(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    },
+                    {
+                        "title": "Beta",
+                        "url": "https://example.com/b",
+                        "content": "beta",
+                    },
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng"],
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1/chat/completions",
+                "advanced_rerank_model": "qwen-rerank",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            return_value=MockHTTPResponse(status_code=500, payload={"error": "backend failed"}, text="backend failed"),
+        ):
+            payload, notices, _, _, _, _ = services_search.dispatch_search(
+                "rerank http error",
+                config,
+                0,
+            )
+
+        self.assertEqual(payload["ranking"]["fallback_reason"], "rerank_http_error")
+        self.assertTrue(any("advanced rerank 回退" in notice for notice in notices))
+        self.assertEqual([item["url"] for item in payload["results"]], [
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+
+    def test_dispatch_search_rerank_invalid_json_falls_back_to_rule_order(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    },
+                    {
+                        "title": "Beta",
+                        "url": "https://example.com/b",
+                        "content": "beta",
+                    },
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng"],
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1/chat/completions",
+                "advanced_rerank_model": "qwen-rerank",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            return_value=MockHTTPResponse(
+                status_code=200,
+                payload={"choices": [{"message": {"content": "not valid json"}}]},
+            ),
+        ):
+            payload, notices, _, _, _, _ = services_search.dispatch_search(
+                "rerank invalid json",
+                config,
+                0,
+            )
+
+        self.assertEqual(payload["ranking"]["fallback_reason"], "rerank_response_invalid_json")
+        self.assertTrue(any("advanced rerank 回退" in notice for notice in notices))
+        self.assertEqual([item["url"] for item in payload["results"]], [
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+
+    def test_dispatch_search_exact_cache_isolated_by_rerank_signature(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    }
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        base_overrides = {
+            "search_api": "advanced",
+            "advanced_search_backends": ["searxng"],
+            "search_cache_enabled": True,
+            "search_cache_ttl_seconds": 900,
+            "search_cache_dir": self.temp_dir.name,
+            "semantic_cache_enabled": False,
+        }
+        config_without_rerank = Configuration.from_env(
+            overrides=base_overrides,
+            load_env_file=False,
+        )
+        config_with_rerank = Configuration.from_env(
+            overrides={
+                **base_overrides,
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1",
+                "advanced_rerank_model": "qwen-rerank",
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            return_value=MockHTTPResponse(status_code=200, payload=rerank_api_payload([0])),
+        ):
+            first = services_search.dispatch_search("same advanced query", config_without_rerank, 0)
+            second = services_search.dispatch_search("same advanced query", config_with_rerank, 1)
+
+        self.assertEqual(DummySearchTool.call_count, 2)
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(first[5], "miss")
+        self.assertEqual(second[5], "miss")
+
+    def test_dispatch_search_semantic_cache_isolated_by_rerank_signature(self):
+        DummySentenceTransformer.embeddings = {
+            "advanced cache query one": [1.0, 0.0, 0.0],
+            "advanced cache query two": [1.0, 0.0, 0.0],
+        }
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    }
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        base_overrides = {
+            "search_api": "advanced",
+            "advanced_search_backends": ["searxng"],
+            "search_cache_enabled": True,
+            "search_cache_ttl_seconds": 900,
+            "search_cache_dir": self.temp_dir.name,
+            "semantic_cache_enabled": True,
+            "semantic_cache_embedding_model": "dummy-minilm",
+            "semantic_cache_similarity_threshold": 0.90,
+        }
+        config_a = Configuration.from_env(
+            overrides={
+                **base_overrides,
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1",
+                "advanced_rerank_model": "qwen-rerank",
+                "advanced_rerank_candidate_pool": 5,
+            },
+            load_env_file=False,
+        )
+        config_b = Configuration.from_env(
+            overrides={
+                **base_overrides,
+                "advanced_rerank_enabled": True,
+                "advanced_rerank_base_url": "http://rerank.local/v1",
+                "advanced_rerank_model": "qwen-rerank",
+                "advanced_rerank_candidate_pool": 6,
+            },
+            load_env_file=False,
+        )
+
+        with patch.object(
+            services_search.requests,
+            "post",
+            return_value=MockHTTPResponse(status_code=200, payload=rerank_api_payload([0])),
+        ):
+            first = services_search.dispatch_search("advanced cache query one", config_a, 0)
+            second = services_search.dispatch_search("advanced cache query two", config_b, 1)
+
+        self.assertEqual(DummySearchTool.call_count, 2)
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(second[5], "miss")
+
+    def test_dispatch_search_advanced_fetch_full_page_override_is_applied_to_backend_calls(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    }
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+            "tavily": {
+                "results": [
+                    {
+                        "title": "Beta",
+                        "url": "https://example.com/b",
+                        "content": "beta",
+                    }
+                ],
+                "backend": "tavily",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng", "tavily"],
+                "fetch_full_page": True,
+                "advanced_search_fetch_full_page_override": False,
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        services_search.dispatch_search("advanced fetch override", config, 0)
+
+        self.assertEqual(
+            [call["fetch_full_page"] for call in DummySearchTool.calls],
+            [False, False],
+        )
 
     def test_dispatch_search_uses_semantic_cache_for_similar_queries(self):
         DummySentenceTransformer.embeddings = {
@@ -446,6 +1031,143 @@ class SearchCacheTests(unittest.TestCase):
         self.assertFalse(second[4])
         self.assertEqual(second[5], "miss")
         self.assertEqual(DummySearchTool.call_count, 2)
+
+    def test_dispatch_search_normalizes_semanticscholar_results_without_fetching_full_page(self):
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "semanticscholar",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+                "fetch_full_page": True,
+                "semantic_scholar_api_key": "test-semantic-key",
+            },
+            load_env_file=False,
+        )
+        response_payload = {
+            "total": 1,
+            "data": [
+                {
+                    "paperId": "paper-1",
+                    "url": "https://www.semanticscholar.org/paper/paper-1",
+                    "title": "Semantic Scholar Powered Research",
+                    "abstract": "This paper evaluates grounded research workflows.",
+                    "year": 2025,
+                    "publicationDate": "2025-02-14",
+                    "citationCount": 321,
+                    "authors": [{"name": "Ada Lovelace"}, {"name": "Alan Turing"}],
+                    "venue": "Journal of Agent Systems",
+                    "publicationTypes": ["JournalArticle"],
+                    "openAccessPdf": {"url": "https://example.com/paper.pdf"},
+                    "tldr": {"text": "A concise overview of the paper."},
+                }
+            ],
+        }
+
+        with patch.object(
+            services_search.requests,
+            "get",
+            return_value=MockHTTPResponse(status_code=200, payload=response_payload),
+        ) as mock_get:
+            payload, notices, answer_text, backend_label, cache_hit, cache_strategy = services_search.dispatch_search(
+                "grounded research papers",
+                config,
+                0,
+            )
+
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertFalse(cache_hit)
+        self.assertEqual(cache_strategy, "miss")
+        self.assertEqual(notices, [])
+        self.assertIsNone(answer_text)
+        self.assertEqual(backend_label, "semanticscholar")
+        self.assertEqual(len(payload["results"]), 1)
+        first = payload["results"][0]
+        self.assertEqual(first["url"], "https://www.semanticscholar.org/paper/paper-1")
+        self.assertEqual(first["paper_id"], "paper-1")
+        self.assertEqual(first["published_at"], "2025-02-14")
+        self.assertEqual(first["citation_count"], 321)
+        self.assertEqual(first["open_access_pdf_url"], "https://example.com/paper.pdf")
+        self.assertIn("Semantic Scholar Powered Research", first["content"])
+        self.assertIn("Ada Lovelace", first["content"])
+        self.assertIn("This paper evaluates grounded research workflows.", first["content"])
+        self.assertIn("https://example.com/paper.pdf", first["raw_content"])
+        self.assertIn("x-api-key", mock_get.call_args.kwargs["headers"] or {})
+
+    def test_dispatch_search_semanticscholar_reuses_cache_only_with_same_backend(self):
+        config_duckduckgo = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+        config_semanticscholar = Configuration.from_env(
+            overrides={
+                "search_api": "semanticscholar",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        response_payload = {
+            "total": 1,
+            "data": [
+                {
+                    "paperId": "paper-2",
+                    "title": "Cache Isolation for Semantic Scholar",
+                    "abstract": "Testing backend-specific cache namespaces.",
+                    "year": 2024,
+                }
+            ],
+        }
+
+        services_search.dispatch_search("same query", config_duckduckgo, 0)
+        with patch.object(
+            services_search.requests,
+            "get",
+            return_value=MockHTTPResponse(status_code=200, payload=response_payload),
+        ) as mock_get:
+            first = services_search.dispatch_search("same query", config_semanticscholar, 0)
+            second = services_search.dispatch_search("same query", config_semanticscholar, 1)
+
+        self.assertEqual(DummySearchTool.call_count, 1)
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertFalse(first[4])
+        self.assertTrue(second[4])
+        self.assertEqual(second[5], "exact")
+
+    def test_dispatch_search_semanticscholar_raises_clear_auth_and_rate_limit_errors(self):
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "semanticscholar",
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        status_expectations = {
+            401: "SEMANTIC_SCHOLAR_API_KEY 是否有效",
+            403: "SEMANTIC_SCHOLAR_API_KEY 权限",
+            429: "SEMANTIC_SCHOLAR_API_KEY",
+            500: "服务暂时不可用",
+        }
+
+        for status_code, message in status_expectations.items():
+            with self.subTest(status_code=status_code):
+                with patch.object(
+                    services_search.requests,
+                    "get",
+                    return_value=MockHTTPResponse(status_code=status_code, payload={"code": status_code}),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        services_search.dispatch_search("same query", config, 0)
 
 
 if __name__ == "__main__":

@@ -90,6 +90,48 @@ class EvidenceStoreTests(unittest.TestCase):
         self.assertTrue(payload["has_full_content"])
         self.assertEqual(payload["source_id"], "T2-S1")
 
+    def test_record_search_results_handles_semanticscholar_publication_fields(self):
+        evidence = self.store.record_search_results(
+            task_id=5,
+            query="semantic scholar",
+            search_payload={
+                "results": [
+                    {
+                        "title": "Semantic Scholar Paper",
+                        "url": "https://www.semanticscholar.org/paper/abc123",
+                        "content": "paper abstract",
+                        "publicationDate": "2025-02-14",
+                        "year": 2025,
+                        "citation_count": 42,
+                    }
+                ]
+            },
+            backend="semanticscholar",
+        )
+
+        self.assertEqual(evidence[0]["source_type"], "paper")
+        self.assertEqual(evidence[0]["published_at"], "2025-02-14")
+        self.assertEqual(evidence[0]["quality_label"], "high")
+
+    def test_record_search_results_falls_back_to_year_when_publication_date_is_missing(self):
+        evidence = self.store.record_search_results(
+            task_id=6,
+            query="semantic scholar year fallback",
+            search_payload={
+                "results": [
+                    {
+                        "title": "Semantic Scholar Year Only",
+                        "url": "https://www.semanticscholar.org/paper/xyz456",
+                        "content": "paper abstract",
+                        "year": 2024,
+                    }
+                ]
+            },
+            backend="semanticscholar",
+        )
+
+        self.assertEqual(evidence[0]["published_at"], "2024-01-01")
+
     def test_search_web_tool_records_structured_evidence(self):
         tool = SearchWebTool(
             config=Configuration.from_env(load_env_file=False),

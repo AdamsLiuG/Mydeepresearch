@@ -46,6 +46,38 @@ from services.tool_events import ToolCallTracker
 logger = logging.getLogger(__name__)
 
 
+_LEADING_SEARCH_QUERY_PATTERNS = (
+    re.compile(
+        r"^(?:请问|请你|请先|请帮我|请帮忙|请|麻烦你|麻烦|帮我|帮忙)\s*"
+        r"(?:简要|简单|简明|详细|系统地|系统性地|深入地)?\s*"
+        r"(?:研究|分析|介绍|说明|梳理|总结|评估|对比|调研|看看|看下|看一看)"
+        r"(?:一下|一遍|一轮)?[:：,，、-]*\s*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:简要|简单|简明|详细|系统地|系统性地|深入地)\s*"
+        r"(?:研究|分析|介绍|说明|梳理|总结|评估|对比|调研)"
+        r"(?:一下|一遍|一轮)?[:：,，、-]*\s*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:please|can you|could you|would you|help me)\s+"
+        r"(?:(?:briefly|quickly)\s+)?"
+        r"(?:research|analyze|analyse|explain|summarize|summarise|compare)\s*[:,-]*\s*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:briefly|quickly)\s+"
+        r"(?:research|analyze|analyse|explain|summarize|summarise|compare)\s*[:,-]*\s*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:research|analyze|analyse|explain|summarize|summarise|compare)\s*[:,-]\s*",
+        re.IGNORECASE,
+    ),
+)
+
+
 class ToolExecutionTimeoutError(TimeoutError):
     """Raised when a guarded external tool invocation exceeds its timeout budget."""
 
@@ -1419,9 +1451,19 @@ class DeepResearchAgent:
                     sleep(retry_backoff_seconds)
 
     def _normalize_query_candidate(self, value: str) -> str:
-        """Normalize whitespace in a candidate search query."""
+        """Normalize a candidate search query and strip request-style boilerplate."""
 
-        return " ".join((value or "").strip().split())
+        cleaned = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (value or "").strip())
+
+        while cleaned:
+            previous = cleaned
+            for pattern in _LEADING_SEARCH_QUERY_PATTERNS:
+                cleaned = pattern.sub("", cleaned, count=1)
+            cleaned = cleaned.lstrip("：:,，。！？、；;[]【】()（）- ")
+            if cleaned == previous:
+                break
+
+        return " ".join(cleaned.strip().split())
 
     def _should_rewrite_task_query(
         self,

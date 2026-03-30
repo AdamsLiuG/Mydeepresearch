@@ -217,6 +217,14 @@ class InitFailingAgent:
         raise RuntimeError("init failure")
 
 
+class CapturingAgent(StubAgent):
+    last_config = None
+
+    def __init__(self, config, request_id=None):
+        type(self).last_config = config
+        super().__init__(config, request_id=request_id)
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         metrics_registry.reset()
@@ -263,6 +271,24 @@ class ApiTests(unittest.TestCase):
                     }
                 ],
             },
+        )
+
+    def test_research_accepts_semanticscholar_override(self):
+        CapturingAgent.last_config = None
+
+        with isolated_configuration():
+            with patch.object(main, "DeepResearchAgent", CapturingAgent):
+                with TestClient(main.create_app()) as client:
+                    response = client.post(
+                        "/research",
+                        json={"topic": "AI agent", "search_api": "semanticscholar"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(CapturingAgent.last_config)
+        self.assertEqual(
+            CapturingAgent.last_config.search_api,
+            main.SearchAPI.SEMANTICSCHOLAR,
         )
 
     def test_research_returns_400_for_invalid_config(self):

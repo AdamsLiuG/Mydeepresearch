@@ -722,6 +722,7 @@ const demoScenarios: DemoScenario[] = [
 
 const searchOptions = [
   "advanced",
+  "semanticscholar",
   "duckduckgo",
   "tavily",
   "perplexity",

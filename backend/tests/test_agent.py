@@ -415,6 +415,45 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertEqual(mock_dispatch.call_count, 2)
         self.assertEqual(observer.snapshot()["failed_tasks"], 1)
 
+    def test_normalize_query_candidate_strips_request_style_prefixes(self):
+        agent = self._build_agent()
+
+        self.assertEqual(
+            agent._normalize_query_candidate("请简要研究 vLLM PagedAttention 论文 原理"),
+            "vLLM PagedAttention 论文 原理",
+        )
+        self.assertEqual(
+            agent._normalize_query_candidate("请分析：Transformer 推理优化"),
+            "Transformer 推理优化",
+        )
+        self.assertEqual(
+            agent._normalize_query_candidate("briefly research TensorRT-LLM deployment"),
+            "TensorRT-LLM deployment",
+        )
+        self.assertEqual(
+            agent._normalize_query_candidate("研究方法 对比"),
+            "研究方法 对比",
+        )
+
+    def test_task_search_queries_clean_request_style_original_query(self):
+        agent = self._build_agent()
+        state = SummaryState(research_topic="探索大模型推理服务的关键优化")
+        task = TodoItem(
+            id=1,
+            title="PagedAttention 原理",
+            intent="说明其在推理服务中的作用",
+            query="请简要研究 vLLM PagedAttention 论文与其在推理服务中的作用 PagedAttention 原理",
+        )
+
+        candidates = agent._task_search_queries(state, task)
+
+        self.assertTrue(candidates)
+        self.assertEqual(
+            candidates[0],
+            ("vLLM PagedAttention 论文与其在推理服务中的作用 PagedAttention 原理", "original"),
+        )
+        self.assertTrue(all("请简要研究" not in query for query, _ in candidates))
+
     def test_execute_task_retries_with_broader_query_before_skipping(self):
         agent = self._build_agent()
         observer = RequestTrace(

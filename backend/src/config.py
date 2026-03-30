@@ -77,12 +77,19 @@ class SearchAPI(Enum):
     SERPAPI = "serpapi"
     DUCKDUCKGO = "duckduckgo"
     SEARXNG = "searxng"
+    SEMANTICSCHOLAR = "semanticscholar"
     ADVANCED = "advanced"
 
     @classmethod
     def fusion_backends(cls) -> set[str]:
         """Return the concrete search backends allowed in fusion mode."""
-        return {member.value for member in cls if member is not cls.ADVANCED}
+        return {
+            cls.PERPLEXITY.value,
+            cls.TAVILY.value,
+            cls.SERPAPI.value,
+            cls.DUCKDUCKGO.value,
+            cls.SEARXNG.value,
+        }
 
 
 class Configuration(BaseModel):
@@ -112,6 +119,60 @@ class Configuration(BaseModel):
         default_factory=lambda: ["searxng", "tavily", "serpapi", "duckduckgo"],
         title="Advanced Search Backends",
         description="Ordered backends to query and fuse when search_api=advanced",
+    )
+    advanced_search_max_concurrency: int = Field(
+        default=4,
+        ge=1,
+        title="Advanced Search Max Concurrency",
+        description="Maximum number of advanced search backends to execute in parallel",
+    )
+    advanced_search_fetch_full_page_override: bool | None = Field(
+        default=None,
+        title="Advanced Search Fetch Full Page Override",
+        description="Optional override for fetch_full_page applied only to advanced search fan-out requests",
+    )
+    advanced_rerank_enabled: bool = Field(
+        default=False,
+        title="Advanced Rerank Enabled",
+        description="Whether to rerank fused advanced search candidates using an OpenAI-compatible LLM",
+    )
+    advanced_rerank_base_url: str | None = Field(
+        default=None,
+        title="Advanced Rerank Base URL",
+        description="Optional OpenAI-compatible base URL used for advanced search reranking",
+    )
+    advanced_rerank_api_key: str | None = Field(
+        default=None,
+        title="Advanced Rerank API Key",
+        description="Optional API key used for advanced search reranking requests",
+    )
+    advanced_rerank_model: str | None = Field(
+        default=None,
+        title="Advanced Rerank Model",
+        description="Optional model identifier used for advanced search reranking",
+    )
+    advanced_rerank_candidate_pool: int = Field(
+        default=20,
+        ge=1,
+        title="Advanced Rerank Candidate Pool",
+        description="How many fused advanced results are eligible for reranking before final truncation",
+    )
+    advanced_rerank_timeout_seconds: float = Field(
+        default=3.0,
+        gt=0.0,
+        title="Advanced Rerank Timeout Seconds",
+        description="Timeout for a single advanced search reranking request",
+    )
+    advanced_rerank_max_content_chars: int = Field(
+        default=1200,
+        ge=100,
+        title="Advanced Rerank Max Content Characters",
+        description="Maximum document content characters included for each rerank candidate",
+    )
+    semantic_scholar_api_key: str | None = Field(
+        default=None,
+        title="Semantic Scholar API Key",
+        description="Optional API key used for the Semantic Scholar Academic Graph API",
     )
     enable_notes: bool = Field(
         default=True,
@@ -527,6 +588,16 @@ class Configuration(BaseModel):
             "use_tool_calling": os.getenv("USE_TOOL_CALLING"),
             "search_api": os.getenv("SEARCH_API"),
             "advanced_search_backends": os.getenv("ADVANCED_SEARCH_BACKENDS"),
+            "advanced_search_max_concurrency": os.getenv("ADVANCED_SEARCH_MAX_CONCURRENCY"),
+            "advanced_search_fetch_full_page_override": os.getenv("ADVANCED_SEARCH_FETCH_FULL_PAGE_OVERRIDE"),
+            "advanced_rerank_enabled": os.getenv("ADVANCED_RERANK_ENABLED"),
+            "advanced_rerank_base_url": os.getenv("ADVANCED_RERANK_BASE_URL"),
+            "advanced_rerank_api_key": os.getenv("ADVANCED_RERANK_API_KEY"),
+            "advanced_rerank_model": os.getenv("ADVANCED_RERANK_MODEL"),
+            "advanced_rerank_candidate_pool": os.getenv("ADVANCED_RERANK_CANDIDATE_POOL"),
+            "advanced_rerank_timeout_seconds": os.getenv("ADVANCED_RERANK_TIMEOUT_SECONDS"),
+            "advanced_rerank_max_content_chars": os.getenv("ADVANCED_RERANK_MAX_CONTENT_CHARS"),
+            "semantic_scholar_api_key": os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
             "host": os.getenv("HOST"),
@@ -602,6 +673,67 @@ class Configuration(BaseModel):
     def resolved_advanced_search_backends(self) -> list[str]:
         """Return the ordered concrete backends used for fused search."""
         return list(self.advanced_search_backends or ["searxng", "tavily", "serpapi", "duckduckgo"])
+
+    def resolved_advanced_search_max_concurrency(self) -> int:
+        """Return the bounded worker count used by advanced fan-out search."""
+        requested = int(self.advanced_search_max_concurrency or 1)
+        return max(1, min(requested, len(self.resolved_advanced_search_backends()) or 1))
+
+    def resolved_advanced_fetch_full_page(self) -> bool:
+        """Return the fetch_full_page flag used by advanced fan-out requests."""
+        if self.advanced_search_fetch_full_page_override is not None:
+            return bool(self.advanced_search_fetch_full_page_override)
+        return bool(self.fetch_full_page)
+
+    def resolved_advanced_rerank_model(self) -> str | None:
+        """Return the model identifier used for advanced search reranking."""
+        return (self.advanced_rerank_model or self.resolved_model() or "").strip() or None
+
+    def resolved_advanced_rerank_base_url(self) -> str | None:
+        """Return the OpenAI-compatible base URL used for advanced reranking."""
+        explicit = (self.advanced_rerank_base_url or "").strip()
+        if explicit:
+            return explicit
+
+        provider = (self.llm_provider or "").strip()
+        if provider == "ollama":
+            return self.sanitized_ollama_url()
+        if provider == "lmstudio":
+            return self.lmstudio_base_url
+        return (self.llm_base_url or "").strip() or None
+
+    def resolved_advanced_rerank_api_key(self) -> str | None:
+        """Return the API key used for advanced reranking, when required."""
+        explicit = (self.advanced_rerank_api_key or "").strip()
+        if explicit:
+            return explicit
+        return (self.llm_api_key or "").strip() or None
+
+    def resolved_advanced_rerank_candidate_pool(self) -> int:
+        """Return the candidate pool size used before final truncation."""
+        return max(1, int(self.advanced_rerank_candidate_pool or 1))
+
+    def resolved_advanced_rerank_timeout_seconds(self) -> float:
+        """Return the timeout budget for a single reranking request."""
+        return max(0.1, float(self.advanced_rerank_timeout_seconds or 0.1))
+
+    def resolved_advanced_rerank_max_content_chars(self) -> int:
+        """Return the content budget included per rerank candidate."""
+        return max(100, int(self.advanced_rerank_max_content_chars or 100))
+
+    def resolved_search_cache_signature(self, search_api: str) -> dict[str, Any]:
+        """Return cache-isolating configuration knobs for the requested search mode."""
+        normalized_api = str(search_api or "").strip().lower()
+        if normalized_api != SearchAPI.ADVANCED.value:
+            return {}
+
+        return {
+            "advanced_search_backends": self.resolved_advanced_search_backends(),
+            "advanced_search_fetch_full_page_override": self.advanced_search_fetch_full_page_override,
+            "advanced_rerank_enabled": bool(self.advanced_rerank_enabled),
+            "advanced_rerank_model": self.resolved_advanced_rerank_model(),
+            "advanced_rerank_candidate_pool": self.resolved_advanced_rerank_candidate_pool(),
+        }
 
     @staticmethod
     def _clamp(value: int, minimum: int, maximum: int) -> int:

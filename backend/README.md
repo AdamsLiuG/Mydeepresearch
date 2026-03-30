@@ -54,6 +54,8 @@ uv run python src/main.py
 - `SEARCH_TOOL_TIMEOUT_SECONDS`：限制单次搜索工具调用最长等待时间
 - `SEARCH_TOOL_RETRY_ATTEMPTS`：搜索工具失败或超时后的重试次数
 - `SEARCH_TOOL_RETRY_BACKOFF_SECONDS`：两次重试之间的固定等待时间
+- `SEARCH_API`：搜索后端，可选 `duckduckgo / tavily / perplexity / searxng / semanticscholar / advanced`
+- `SEMANTIC_SCHOLAR_API_KEY`：当 `SEARCH_API=semanticscholar` 时建议配置，避免共享限流
 
 ## 重点观测点
 

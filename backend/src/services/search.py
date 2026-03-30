@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import math
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import requests
 from hello_agents.tools import SearchTool
 
 from config import Configuration
@@ -52,6 +54,22 @@ _TRACKING_QUERY_PARAMS = {
     "ref_src",
 }
 _CJK_CHAR_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+_SEMANTIC_SCHOLAR_USER_AGENT = "helloagents-deepresearch/1.0"
+_SEMANTIC_SCHOLAR_FIELDS = ",".join(
+    [
+        "title",
+        "url",
+        "abstract",
+        "year",
+        "publicationDate",
+        "citationCount",
+        "authors",
+        "venue",
+        "publicationTypes",
+        "openAccessPdf",
+    ]
+)
 
 _MEMORY_CACHE: dict[str, SearchCacheEntry] = {}
 _MEMORY_SCOPE_INDEX: dict[str, list[str]] = {}
@@ -71,6 +89,7 @@ class SearchCacheEntry:
     topic_scope: str
     search_api: str
     fetch_full_page: bool
+    cache_signature: dict[str, Any] | None
     payload: dict[str, Any]
     notices: list[str]
     answer_text: str | None
@@ -88,6 +107,7 @@ class SearchCacheEntry:
             topic_scope=self.topic_scope,
             search_api=self.search_api,
             fetch_full_page=self.fetch_full_page,
+            cache_signature=deepcopy(self.cache_signature) if self.cache_signature else None,
             payload=deepcopy(self.payload),
             notices=list(self.notices),
             answer_text=self.answer_text,
@@ -106,6 +126,7 @@ class SearchCacheEntry:
             "topic_scope": self.topic_scope,
             "search_api": self.search_api,
             "fetch_full_page": self.fetch_full_page,
+            "cache_signature": deepcopy(self.cache_signature) if self.cache_signature else None,
             "payload": deepcopy(self.payload),
             "notices": list(self.notices),
             "answer_text": self.answer_text,
@@ -125,6 +146,7 @@ class SearchCacheEntry:
             topic_scope=str(record.get("topic_scope") or ""),
             search_api=str(record.get("search_api") or ""),
             fetch_full_page=bool(record.get("fetch_full_page", False)),
+            cache_signature=deepcopy(record.get("cache_signature") or None),
             payload=deepcopy(record.get("payload") or {}),
             notices=list(record.get("notices") or []),
             answer_text=record.get("answer_text"),
@@ -132,6 +154,36 @@ class SearchCacheEntry:
             created_at=float(record.get("created_at") or 0.0),
             embedding=_coerce_embedding(record.get("embedding")),
         )
+
+
+@dataclass
+class AdvancedBackendOutcome:
+    backend_order: int
+    requested_backend: str
+    duration_ms: float
+    payload: dict[str, Any] | None = None
+    notices: list[str] = field(default_factory=list)
+    answer_text: str | None = None
+    backend_label: str | None = None
+    error: str | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None and self.payload is not None
+
+    @property
+    def result_count(self) -> int:
+        if not isinstance(self.payload, dict):
+            return 0
+        return len(self.payload.get("results") or [])
+
+
+class AdvancedRerankError(RuntimeError):
+    """Raised when optional advanced reranking cannot produce a valid ordering."""
+
+    def __init__(self, reason: str, message: str | None = None) -> None:
+        super().__init__(message or reason)
+        self.reason = reason
 
 
 def clear_search_cache() -> None:
@@ -266,10 +318,36 @@ def _coerce_embedding(value: Any) -> list[float] | None:
         return None
 
 
-def _build_scope_key(search_api: str, fetch_full_page: bool, topic_scope: str = "") -> str:
+def _canonical_cache_signature(cache_signature: dict[str, Any] | None) -> str:
+    """Return a stable JSON string for cache-isolating search settings."""
+
+    if not cache_signature:
+        return ""
+    return json.dumps(cache_signature, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _resolved_search_fetch_full_page(search_api: str, config: Configuration) -> bool:
+    """Return the effective fetch_full_page flag for the requested search mode."""
+
+    if str(search_api or "").strip().lower() == "advanced":
+        return config.resolved_advanced_fetch_full_page()
+    return bool(config.fetch_full_page)
+
+
+def _build_scope_key(
+    search_api: str,
+    fetch_full_page: bool,
+    cache_signature: dict[str, Any] | None = None,
+    topic_scope: str = "",
+) -> str:
     """Return the namespace key used to group semantically comparable entries."""
 
     base = f"scope::{search_api}::{int(fetch_full_page)}"
+    signature_text = _canonical_cache_signature(cache_signature)
+    if signature_text:
+        signature_digest = hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
+        base = f"{base}::{signature_digest}"
+
     normalized_topic_scope = _normalize_query(topic_scope)
     if not normalized_topic_scope:
         return base
@@ -281,14 +359,16 @@ def _build_scope_key(search_api: str, fetch_full_page: bool, topic_scope: str = 
 def _build_cache_key(query: str, search_api: str, config: Configuration) -> str:
     """Return the persistent key for an exact query match."""
 
+    fetch_full_page = _resolved_search_fetch_full_page(search_api, config)
     payload = {
         "query": _normalize_query(query),
         "search_api": search_api,
-        "fetch_full_page": config.fetch_full_page,
+        "fetch_full_page": fetch_full_page,
+        "cache_signature": config.resolved_search_cache_signature(search_api),
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return f"search::{search_api}::{int(config.fetch_full_page)}::{digest}"
+    return f"search::{search_api}::{int(fetch_full_page)}::{digest}"
 
 
 def _emit_diskcache_warning_once() -> None:
@@ -385,7 +465,12 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
     """Persist a search cache entry to disk or memory."""
 
     disk_cache = _get_disk_cache(config)
-    scope_key = _build_scope_key(entry.search_api, entry.fetch_full_page, entry.topic_scope)
+    scope_key = _build_scope_key(
+        entry.search_api,
+        entry.fetch_full_page,
+        entry.cache_signature,
+        entry.topic_scope,
+    )
     if disk_cache is not None:
         disk_cache.set(key, entry.to_record(), expire=config.search_cache_ttl_seconds)
     else:
@@ -486,7 +571,12 @@ def _read_semantic_cache(
     if query_embedding is None and not semantic_text:
         return None, 0.0, 0.0
 
-    scope_key = _build_scope_key(search_api, config.fetch_full_page, topic_scope)
+    scope_key = _build_scope_key(
+        search_api,
+        _resolved_search_fetch_full_page(search_api, config),
+        config.resolved_search_cache_signature(search_api),
+        topic_scope,
+    )
     candidate_keys = _get_scope_keys(config, scope_key)
     if not candidate_keys:
         return None, 0.0, 0.0
@@ -573,6 +663,230 @@ def _normalize_search_payload(
     return payload, notices, answer_text, backend_label
 
 
+def _semantic_scholar_timeout_seconds(config: Configuration) -> float:
+    """Return the HTTP timeout used for Semantic Scholar requests."""
+
+    configured = float(config.search_tool_timeout_seconds or 10.0)
+    return max(1.0, configured)
+
+
+def _semantic_scholar_headers(config: Configuration) -> dict[str, str]:
+    """Build the Semantic Scholar request headers."""
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": _SEMANTIC_SCHOLAR_USER_AGENT,
+    }
+    api_key = str(config.semantic_scholar_api_key or "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    return headers
+
+
+def _semantic_scholar_text(value: Any) -> str:
+    """Normalize a Semantic Scholar field into a trimmed string."""
+
+    return " ".join(str(value or "").strip().split())
+
+
+def _semantic_scholar_author_names(value: Any) -> list[str]:
+    """Return the normalized author names from a Semantic Scholar paper payload."""
+
+    if not isinstance(value, list):
+        return []
+
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = _semantic_scholar_text(item.get("name"))
+        if name:
+            names.append(name)
+    return names
+
+
+def _semantic_scholar_publication_types(value: Any) -> list[str]:
+    """Return publication types as a normalized string list."""
+
+    if not isinstance(value, list):
+        return []
+
+    publication_types: list[str] = []
+    for item in value:
+        normalized = _semantic_scholar_text(item)
+        if normalized:
+            publication_types.append(normalized)
+    return publication_types
+
+
+def _semantic_scholar_paper_url(result: dict[str, Any]) -> str:
+    """Return a stable Semantic Scholar paper URL."""
+
+    url = _semantic_scholar_text(result.get("url"))
+    if url:
+        return url
+
+    paper_id = _semantic_scholar_text(result.get("paperId") or result.get("paper_id"))
+    if paper_id:
+        return f"https://www.semanticscholar.org/paper/{paper_id}"
+    return ""
+
+
+def _semantic_scholar_published_at(result: dict[str, Any]) -> str | None:
+    """Return a normalized publication date when available."""
+
+    publication_date = _semantic_scholar_text(result.get("publicationDate"))
+    if publication_date:
+        return publication_date
+
+    year = result.get("year")
+    try:
+        if year is not None and str(year).strip():
+            normalized_year = int(year)
+            if 1900 <= normalized_year <= 2100:
+                return f"{normalized_year:04d}-01-01"
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _semantic_scholar_tldr_text(result: dict[str, Any]) -> str:
+    """Return a normalized TL;DR string when available."""
+
+    value = result.get("tldr")
+    if isinstance(value, dict):
+        return _semantic_scholar_text(value.get("text"))
+    return _semantic_scholar_text(value)
+
+
+def _normalize_semantic_scholar_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Semantic Scholar paper into the repo's search result shape."""
+
+    paper_id = _semantic_scholar_text(result.get("paperId"))
+    url = _semantic_scholar_paper_url(result)
+    title = _semantic_scholar_text(result.get("title")) or url or paper_id or "Semantic Scholar Paper"
+    authors = _semantic_scholar_author_names(result.get("authors"))
+    year = result.get("year")
+    try:
+        normalized_year = int(year) if year is not None and str(year).strip() else None
+    except (TypeError, ValueError):
+        normalized_year = None
+
+    venue = _semantic_scholar_text(result.get("venue"))
+    citation_count = result.get("citationCount")
+    try:
+        normalized_citation_count = (
+            int(citation_count) if citation_count is not None and str(citation_count).strip() else None
+        )
+    except (TypeError, ValueError):
+        normalized_citation_count = None
+
+    publication_types = _semantic_scholar_publication_types(result.get("publicationTypes"))
+    open_access_pdf = result.get("openAccessPdf")
+    open_access_pdf_url = ""
+    if isinstance(open_access_pdf, dict):
+        open_access_pdf_url = _semantic_scholar_text(open_access_pdf.get("url"))
+
+    abstract = _semantic_scholar_text(result.get("abstract"))
+    tldr_text = _semantic_scholar_tldr_text(result)
+    published_at = _semantic_scholar_published_at(result)
+
+    lines = [f"论文标题: {title}"]
+    if authors:
+        lines.append(f"作者: {', '.join(authors)}")
+    if normalized_year is not None:
+        lines.append(f"年份: {normalized_year}")
+    if published_at:
+        lines.append(f"发布时间: {published_at}")
+    if venue:
+        lines.append(f"期刊/会议: {venue}")
+    if normalized_citation_count is not None:
+        lines.append(f"引用数: {normalized_citation_count}")
+    if publication_types:
+        lines.append(f"发表类型: {', '.join(publication_types)}")
+    if tldr_text:
+        lines.append(f"TL;DR: {tldr_text}")
+    if abstract:
+        lines.append(f"摘要: {abstract}")
+    if open_access_pdf_url:
+        lines.append(f"开放 PDF: {open_access_pdf_url}")
+
+    content = "\n".join(lines).strip()
+    return {
+        "title": title,
+        "url": url,
+        "content": content,
+        "raw_content": content,
+        "paper_id": paper_id or None,
+        "authors": authors,
+        "year": normalized_year,
+        "citation_count": normalized_citation_count,
+        "venue": venue or None,
+        "publication_types": publication_types,
+        "open_access_pdf_url": open_access_pdf_url or None,
+        "published_at": published_at,
+        "provider_count": 1,
+    }
+
+
+def _execute_semantic_scholar_backend(
+    query: str,
+    config: Configuration,
+    *,
+    max_results: int,
+) -> tuple[dict[str, Any], list[str], str | None, str]:
+    """Execute the local Semantic Scholar provider without relying on hello-agents."""
+
+    try:
+        response = requests.get(
+            _SEMANTIC_SCHOLAR_SEARCH_URL,
+            params={
+                "query": query,
+                "fields": _SEMANTIC_SCHOLAR_FIELDS,
+                "limit": max(1, int(max_results or 1)),
+            },
+            headers=_semantic_scholar_headers(config),
+            timeout=_semantic_scholar_timeout_seconds(config),
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Semantic Scholar 请求失败: {exc}") from exc
+
+    if response.status_code == 401:
+        raise RuntimeError("Semantic Scholar 认证失败（401），请检查 SEMANTIC_SCHOLAR_API_KEY 是否有效。")
+    if response.status_code == 403:
+        raise RuntimeError("Semantic Scholar 拒绝访问（403），请检查 SEMANTIC_SCHOLAR_API_KEY 权限。")
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Semantic Scholar 请求触发限流（429），请稍后重试或配置 SEMANTIC_SCHOLAR_API_KEY。"
+        )
+    if response.status_code >= 500:
+        raise RuntimeError(
+            f"Semantic Scholar 服务暂时不可用（{response.status_code}），请稍后重试。"
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Semantic Scholar 请求失败（{response.status_code}）：{_semantic_scholar_text(response.text)}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Semantic Scholar 返回了无法解析的 JSON 响应。") from exc
+
+    results = [
+        _normalize_semantic_scholar_result(item)
+        for item in list(payload.get("data") or [])
+        if isinstance(item, dict)
+    ]
+    normalized_payload = {
+        "results": results,
+        "backend": "semanticscholar",
+        "answer": None,
+        "notices": [],
+    }
+    return normalized_payload, [], None, "semanticscholar"
+
+
 def _execute_search_backend(
     query: str,
     backend: str,
@@ -580,21 +894,73 @@ def _execute_search_backend(
     loop_count: int,
     *,
     max_results: int,
+    fetch_full_page: bool | None = None,
 ) -> tuple[dict[str, Any], list[str], str | None, str]:
     """Execute a single backend through HelloAgents SearchTool."""
 
+    if backend == "semanticscholar":
+        return _execute_semantic_scholar_backend(
+            query,
+            config,
+            max_results=max_results,
+        )
+
+    resolved_fetch_full_page = config.fetch_full_page if fetch_full_page is None else bool(fetch_full_page)
     raw_response = _GLOBAL_SEARCH_TOOL.run(
         {
             "input": query,
             "backend": backend,
             "mode": "structured",
-            "fetch_full_page": config.fetch_full_page,
+            "fetch_full_page": resolved_fetch_full_page,
             "max_results": max_results,
             "max_tokens_per_source": config.resolved_max_tokens_per_source(),
             "loop_count": loop_count,
         }
     )
     return _normalize_search_payload(raw_response, requested_backend=backend)
+
+
+def _execute_advanced_backend(
+    query: str,
+    backend: str,
+    config: Configuration,
+    loop_count: int,
+    *,
+    backend_order: int,
+    max_results: int,
+    fetch_full_page: bool,
+) -> AdvancedBackendOutcome:
+    """Execute one advanced backend and capture timing and failure details."""
+
+    started_at = time.perf_counter()
+    try:
+        payload, notices, answer_text, backend_label = _execute_search_backend(
+            query,
+            backend,
+            config,
+            loop_count,
+            max_results=max_results,
+            fetch_full_page=fetch_full_page,
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        error_text = str(exc).strip() or exc.__class__.__name__
+        return AdvancedBackendOutcome(
+            backend_order=backend_order,
+            requested_backend=backend,
+            backend_label=backend,
+            duration_ms=(time.perf_counter() - started_at) * 1000.0,
+            error=error_text,
+        )
+
+    return AdvancedBackendOutcome(
+        backend_order=backend_order,
+        requested_backend=backend,
+        backend_label=backend_label,
+        duration_ms=(time.perf_counter() - started_at) * 1000.0,
+        payload=payload,
+        notices=notices,
+        answer_text=answer_text,
+    )
 
 
 def _normalize_result_url(url: str) -> str:
@@ -688,6 +1054,467 @@ def _merge_fused_result(
         existing["url"] = candidate["url"]
 
 
+def _sort_fused_results_by_rules(merged_results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply the baseline rule-based ordering for fused advanced results."""
+
+    return sorted(
+        merged_results.values(),
+        key=lambda item: (
+            -int(item.get("provider_count", 1)),
+            int(item.get("_backend_order", 10_000)),
+            int(item.get("_best_rank", 10_000)),
+            -len(str(item.get("content") or "")),
+        ),
+    )
+
+
+def _build_advanced_ranking_metadata(
+    *,
+    strategy: str,
+    rerank_applied: bool,
+    candidate_count: int,
+    model: str | None,
+    fallback_reason: str | None,
+) -> dict[str, Any]:
+    """Build ranking metadata returned with advanced fused payloads."""
+
+    return {
+        "strategy": strategy,
+        "rerank_applied": rerank_applied,
+        "candidate_count": candidate_count,
+        "model": model,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _coerce_openai_text(value: Any) -> str:
+    """Best-effort extraction of text from OpenAI-compatible response content."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_coerce_openai_text(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            text = value.get(key)
+            if isinstance(text, str):
+                return text
+        return "".join(_coerce_openai_text(item) for item in value.values())
+    return ""
+
+
+def _extract_openai_completion_text(payload: dict[str, Any]) -> str:
+    """Return the visible content from an OpenAI-compatible chat completion payload."""
+
+    choices = payload.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        return ""
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+
+    for field_name in ("message", "delta"):
+        field_value = choice.get(field_name)
+        if field_value is not None:
+            text = _coerce_openai_text(field_value)
+            if text:
+                return text
+
+    return _coerce_openai_text(choice.get("text"))
+
+
+def _normalize_advanced_rerank_base_url(base_url: str) -> str:
+    """Return the normalized advanced rerank base URL."""
+
+    normalized = str(base_url or "").rstrip("/")
+    if not normalized:
+        raise AdvancedRerankError("rerank_not_configured", "advanced rerank base_url is not configured")
+    return normalized
+
+
+def _advanced_chat_completions_endpoint(base_url: str) -> str:
+    """Return the OpenAI-compatible chat completions endpoint."""
+
+    normalized = _normalize_advanced_rerank_base_url(base_url)
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    if normalized.endswith("/rerank"):
+        return f"{normalized[: -len('/rerank')]}/chat/completions"
+    return f"{normalized}/chat/completions"
+
+
+def _advanced_vllm_rerank_endpoint(base_url: str) -> str:
+    """Return the vLLM-compatible rerank endpoint."""
+
+    normalized = _normalize_advanced_rerank_base_url(base_url)
+    if normalized.endswith("/rerank"):
+        return normalized
+    if normalized.endswith("/chat/completions"):
+        return f"{normalized[: -len('/chat/completions')]}/rerank"
+    return f"{normalized}/rerank"
+
+
+def _should_bypass_proxy_for_url(url: str) -> bool:
+    """Return whether rerank requests should bypass environment proxy settings."""
+
+    hostname = (urlsplit(str(url or "")).hostname or "").strip().lower()
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+
+    return bool(address.is_private or address.is_loopback or address.is_link_local)
+
+
+def _post_advanced_rerank_request(
+    endpoint: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+) -> requests.Response:
+    """Post a rerank request, bypassing proxy env for local/private endpoints."""
+
+    if _should_bypass_proxy_for_url(endpoint):
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.post(endpoint, headers=headers, json=payload, timeout=timeout)
+    return requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+
+
+def _advanced_rerank_candidates(
+    ranked_results: list[dict[str, Any]],
+    config: Configuration,
+) -> list[dict[str, Any]]:
+    """Prepare the top fused candidates sent to the optional reranker."""
+
+    content_limit = config.resolved_advanced_rerank_max_content_chars()
+    candidate_pool = min(len(ranked_results), config.resolved_advanced_rerank_candidate_pool())
+    candidates: list[dict[str, Any]] = []
+
+    for index, item in enumerate(ranked_results[:candidate_pool], start=1):
+        content_source = str(item.get("raw_content") or item.get("content") or "")
+        candidates.append(
+            {
+                "id": f"doc-{index}",
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "content": truncate_text(content_source, content_limit),
+                "backend_sources": list(item.get("backend_sources") or []),
+                "provider_count": int(item.get("provider_count", 1)),
+            }
+        )
+
+    return candidates
+
+
+def _parse_rerank_ids(text: str, candidate_ids: list[str]) -> list[str]:
+    """Validate reranker output as a strict permutation of candidate ids."""
+
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise AdvancedRerankError("rerank_response_invalid_json", str(exc)) from exc
+
+    ranked_ids = payload.get("ranked_ids")
+    if not isinstance(ranked_ids, list) or not all(isinstance(item, str) for item in ranked_ids):
+        raise AdvancedRerankError("rerank_invalid_ranked_ids", "reranker must return ranked_ids as a string list")
+
+    if len(ranked_ids) != len(candidate_ids):
+        raise AdvancedRerankError("rerank_invalid_ranked_ids", "reranker must return every candidate exactly once")
+    if len(set(ranked_ids)) != len(ranked_ids):
+        raise AdvancedRerankError("rerank_invalid_ranked_ids", "reranker returned duplicate candidate ids")
+    if set(ranked_ids) != set(candidate_ids):
+        raise AdvancedRerankError("rerank_invalid_ranked_ids", "reranker returned unknown or missing candidate ids")
+
+    return ranked_ids
+
+
+def _build_vllm_rerank_documents(candidates: list[dict[str, Any]]) -> list[str]:
+    """Serialize candidates into text documents accepted by the vLLM rerank API."""
+
+    documents: list[str] = []
+    for candidate in candidates:
+        parts: list[str] = []
+
+        title = str(candidate.get("title") or "").strip()
+        if title:
+            parts.append(f"Title: {title}")
+
+        url = str(candidate.get("url") or "").strip()
+        if url:
+            parts.append(f"URL: {url}")
+
+        backend_sources = [str(item).strip() for item in candidate.get("backend_sources") or [] if str(item).strip()]
+        if backend_sources:
+            parts.append(f"Sources: {', '.join(backend_sources)}")
+
+        content = str(candidate.get("content") or "").strip()
+        if content:
+            parts.append(f"Content: {content}")
+
+        documents.append("\n".join(parts) or title or url or candidate["id"])
+
+    return documents
+
+
+def _parse_vllm_rerank_ids(payload: dict[str, Any], candidates: list[dict[str, Any]]) -> list[str]:
+    """Validate vLLM rerank results and convert returned indices into candidate ids."""
+
+    results = payload.get("results")
+    if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
+        raise AdvancedRerankError("rerank_invalid_results", "reranker must return results as an object list")
+
+    candidate_count = len(candidates)
+    ranked_indices: list[int] = []
+    for item in results:
+        index = item.get("index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise AdvancedRerankError("rerank_invalid_results", "reranker must return integer result indices")
+        if index < 0 or index >= candidate_count:
+            raise AdvancedRerankError("rerank_invalid_results", "reranker returned an out-of-range result index")
+        ranked_indices.append(index)
+
+    if len(ranked_indices) != candidate_count:
+        raise AdvancedRerankError("rerank_invalid_results", "reranker must return every candidate exactly once")
+    if len(set(ranked_indices)) != len(ranked_indices):
+        raise AdvancedRerankError("rerank_invalid_results", "reranker returned duplicate result indices")
+
+    return [candidates[index]["id"] for index in ranked_indices]
+
+
+def _invoke_vllm_reranker(
+    query: str,
+    candidates: list[dict[str, Any]],
+    *,
+    endpoint: str,
+    model: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> list[str]:
+    """Call the vLLM rerank API and return the ordered candidate ids."""
+
+    payload = {
+        "model": model,
+        "query": query,
+        "documents": _build_vllm_rerank_documents(candidates),
+        "top_n": len(candidates),
+    }
+
+    try:
+        response = _post_advanced_rerank_request(
+            endpoint,
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        raise AdvancedRerankError("rerank_timeout", str(exc) or "advanced rerank request timed out") from exc
+    except requests.RequestException as exc:
+        raise AdvancedRerankError("rerank_request_failed", str(exc) or "advanced rerank request failed") from exc
+
+    if response.status_code in {404, 405}:
+        raise AdvancedRerankError(
+            "rerank_endpoint_unsupported",
+            f"advanced rerank endpoint unsupported HTTP {response.status_code}: {str(response.text or '').strip()}",
+        )
+    if response.status_code >= 400:
+        raise AdvancedRerankError(
+            "rerank_http_error",
+            f"advanced rerank HTTP {response.status_code}: {str(response.text or '').strip()}",
+        )
+
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise AdvancedRerankError("rerank_response_not_json", "advanced rerank returned invalid JSON") from exc
+
+    return _parse_vllm_rerank_ids(response_payload, candidates)
+
+
+def _invoke_chat_completion_reranker(
+    query: str,
+    candidates: list[dict[str, Any]],
+    *,
+    endpoint: str,
+    model: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> list[str]:
+    """Call a chat-completions reranker and return the ordered candidate ids."""
+
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 256,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You rerank deduplicated web search candidates for relevance to a user query. "
+                    "Return JSON only with the exact schema {\"ranked_ids\": [\"doc-1\", \"doc-2\"]}. "
+                    "Use every candidate id exactly once. Do not add commentary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "query": query,
+                        "candidates": candidates,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    }
+
+    try:
+        response = _post_advanced_rerank_request(
+            endpoint,
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        raise AdvancedRerankError("rerank_timeout", str(exc) or "advanced rerank request timed out") from exc
+    except requests.RequestException as exc:
+        raise AdvancedRerankError("rerank_request_failed", str(exc) or "advanced rerank request failed") from exc
+
+    if response.status_code >= 400:
+        raise AdvancedRerankError(
+            "rerank_http_error",
+            f"advanced rerank HTTP {response.status_code}: {str(response.text or '').strip()}",
+        )
+
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise AdvancedRerankError("rerank_response_not_json", "advanced rerank returned invalid JSON") from exc
+
+    text = _extract_openai_completion_text(response_payload).strip()
+    if not text:
+        raise AdvancedRerankError("rerank_response_missing_content", "advanced rerank returned no message content")
+
+    return _parse_rerank_ids(text, [candidate["id"] for candidate in candidates])
+
+
+def _invoke_advanced_reranker(
+    query: str,
+    candidates: list[dict[str, Any]],
+    config: Configuration,
+) -> list[str]:
+    """Call the optional reranker and return the ordered candidate ids."""
+
+    model = config.resolved_advanced_rerank_model()
+    base_url = config.resolved_advanced_rerank_base_url()
+    if not model or not base_url:
+        raise AdvancedRerankError("rerank_not_configured", "advanced rerank model or base_url is not configured")
+
+    headers = {"Content-Type": "application/json"}
+    api_key = config.resolved_advanced_rerank_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    normalized_base_url = _normalize_advanced_rerank_base_url(base_url)
+    timeout = config.resolved_advanced_rerank_timeout_seconds()
+
+    if normalized_base_url.endswith("/chat/completions"):
+        return _invoke_chat_completion_reranker(
+            query,
+            candidates,
+            endpoint=normalized_base_url,
+            model=model,
+            headers=headers,
+            timeout=timeout,
+        )
+
+    try:
+        return _invoke_vllm_reranker(
+            query,
+            candidates,
+            endpoint=_advanced_vllm_rerank_endpoint(normalized_base_url),
+            model=model,
+            headers=headers,
+            timeout=timeout,
+        )
+    except AdvancedRerankError as exc:
+        if exc.reason != "rerank_endpoint_unsupported":
+            raise
+
+    return _invoke_chat_completion_reranker(
+        query,
+        candidates,
+        endpoint=_advanced_chat_completions_endpoint(normalized_base_url),
+        model=model,
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+def _rerank_advanced_results(
+    query: str,
+    ranked_results: list[dict[str, Any]],
+    config: Configuration,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    """Optionally rerank the top fused advanced candidates and fall back safely."""
+
+    ranking = _build_advanced_ranking_metadata(
+        strategy="rules",
+        rerank_applied=False,
+        candidate_count=len(ranked_results),
+        model=config.resolved_advanced_rerank_model() if config.advanced_rerank_enabled else None,
+        fallback_reason=None,
+    )
+
+    if not config.advanced_rerank_enabled or len(ranked_results) <= 1:
+        return ranked_results, ranking, []
+
+    candidates = _advanced_rerank_candidates(ranked_results, config)
+    if len(candidates) <= 1:
+        return ranked_results, ranking, []
+
+    started_at = time.perf_counter()
+    try:
+        ranked_ids = _invoke_advanced_reranker(query, candidates, config)
+    except AdvancedRerankError as exc:
+        duration_ms = (time.perf_counter() - started_at) * 1000.0
+        ranking["fallback_reason"] = exc.reason
+        logger.warning(
+            "Advanced rerank fallback reason=%s model=%s candidates=%s duration_ms=%.2f",
+            exc.reason,
+            ranking["model"] or "<unset>",
+            len(candidates),
+            duration_ms,
+        )
+        return ranked_results, ranking, [f"advanced rerank 回退: {exc.reason}"]
+
+    reranked_pool = [ranked_results[int(doc_id.split("-", 1)[1]) - 1] for doc_id in ranked_ids]
+    remaining_results = ranked_results[len(candidates) :]
+    ranking["strategy"] = "rules+llm_rerank"
+    ranking["rerank_applied"] = True
+    logger.info(
+        "Advanced rerank applied model=%s candidates=%s duration_ms=%.2f",
+        ranking["model"] or "<unset>",
+        len(candidates),
+        (time.perf_counter() - started_at) * 1000.0,
+    )
+    return reranked_pool + remaining_results, ranking, []
+
+
 def _fuse_advanced_search_results(
     query: str,
     config: Configuration,
@@ -702,65 +1529,78 @@ def _fuse_advanced_search_results(
     successful_backends: list[str] = []
     answer_text: str | None = None
     backends = config.resolved_advanced_search_backends()
+    effective_fetch_full_page = config.resolved_advanced_fetch_full_page()
+    outcomes: dict[int, AdvancedBackendOutcome] = {}
 
     with ThreadPoolExecutor(
-        max_workers=max(1, len(backends)),
+        max_workers=config.resolved_advanced_search_max_concurrency(),
         thread_name_prefix="advanced-search",
     ) as executor:
-        future_plan = [
-            (
-                backend_order,
+        future_map = {
+            executor.submit(
+                _execute_advanced_backend,
+                query,
                 backend,
-                executor.submit(
-                    _execute_search_backend,
-                    query,
-                    backend,
-                    config,
-                    loop_count,
-                    max_results=max_results,
-                ),
-            )
+                config,
+                loop_count,
+                backend_order=backend_order,
+                max_results=max_results,
+                fetch_full_page=effective_fetch_full_page,
+            ): backend
             for backend_order, backend in enumerate(backends)
-        ]
+        }
 
-        for backend_order, backend, future in future_plan:
-            try:
-                payload, backend_notices, backend_answer, backend_label = future.result()
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.warning("Advanced search backend %s failed: %s", backend, exc)
-                notices.append(f"{backend} 搜索失败: {exc}")
-                continue
+        for future in as_completed(future_map):
+            outcome = future.result()
+            outcomes[outcome.backend_order] = outcome
+            log_payload = {
+                "requested_backend": outcome.requested_backend,
+                "resolved_backend": outcome.backend_label or outcome.requested_backend,
+                "success": outcome.success,
+                "duration_ms": round(outcome.duration_ms, 2),
+                "result_count": outcome.result_count,
+                "notice_count": len(outcome.notices),
+            }
+            if outcome.success:
+                logger.info("Advanced search backend completed %s", log_payload)
+            else:
+                logger.warning("Advanced search backend failed %s error=%s", log_payload, outcome.error)
 
-            successful_backends.append(backend_label)
-            if backend_answer and not answer_text:
-                answer_text = backend_answer
+    for backend_order, backend in enumerate(backends):
+        outcome = outcomes.get(backend_order)
+        if outcome is None:
+            notices.append(f"{backend} 搜索失败: backend worker did not return")
+            continue
 
-            notices.extend(
-                f"{backend_label}: {notice}"
-                for notice in backend_notices
-                if str(notice or "").strip()
-            )
+        if not outcome.success or not isinstance(outcome.payload, dict):
+            notices.append(f"{backend} 搜索失败: {outcome.error}")
+            continue
 
-            results = payload.get("results") or []
-            for result_rank, item in enumerate(results):
-                if isinstance(item, dict):
-                    _merge_fused_result(
-                        merged_results,
-                        item,
-                        backend_label=backend_label,
-                        backend_order=backend_order,
-                        result_rank=result_rank,
-                    )
+        backend_label = outcome.backend_label or backend
+        successful_backends.append(backend_label)
+        if outcome.answer_text and not answer_text:
+            answer_text = outcome.answer_text
 
-    ranked_results = sorted(
-        merged_results.values(),
-        key=lambda item: (
-            -int(item.get("provider_count", 1)),
-            int(item.get("_backend_order", 10_000)),
-            int(item.get("_best_rank", 10_000)),
-            -len(str(item.get("content") or "")),
-        ),
-    )
+        notices.extend(
+            f"{backend_label}: {notice}"
+            for notice in outcome.notices
+            if str(notice or "").strip()
+        )
+
+        results = outcome.payload.get("results") or []
+        for result_rank, item in enumerate(results):
+            if isinstance(item, dict):
+                _merge_fused_result(
+                    merged_results,
+                    item,
+                    backend_label=backend_label,
+                    backend_order=backend_order,
+                    result_rank=result_rank,
+                )
+
+    ranked_results = _sort_fused_results_by_rules(merged_results)
+    ranked_results, ranking, rerank_notices = _rerank_advanced_results(query, ranked_results, config)
+    notices.extend(rerank_notices)
 
     fused_results: list[dict[str, Any]] = []
     for item in ranked_results[:max_results]:
@@ -779,6 +1619,7 @@ def _fuse_advanced_search_results(
         "backend": backend_label,
         "answer": answer_text,
         "notices": notices,
+        "ranking": ranking,
     }
     return payload, notices, answer_text, backend_label
 
@@ -794,6 +1635,8 @@ def dispatch_search(
     """Execute configured search backend and normalise response payload."""
 
     search_api = get_config_value(config.search_api)
+    effective_fetch_full_page = _resolved_search_fetch_full_page(search_api, config)
+    cache_signature = config.resolved_search_cache_signature(search_api)
     cache_key = _build_cache_key(query, search_api, config)
     normalized_cache_context = _normalize_cache_context(cache_context)
     topic_scope = _build_topic_scope(normalized_cache_context)
@@ -889,7 +1732,8 @@ def dispatch_search(
             semantic_text=semantic_text,
             topic_scope=topic_scope,
             search_api=search_api,
-            fetch_full_page=config.fetch_full_page,
+            fetch_full_page=effective_fetch_full_page,
+            cache_signature=cache_signature or None,
             payload=payload,
             notices=notices,
             answer_text=answer_text,
