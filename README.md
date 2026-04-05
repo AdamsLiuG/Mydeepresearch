@@ -6,7 +6,7 @@
 
 ## 项目亮点
 
-- 后端：FastAPI + HelloAgents，串联 `planning -> search -> summarization -> report`
+- 后端：FastAPI + HelloAgents，串联 `planning -> research -> review -> report`，并在任务级和报告级引入受控 ReAct 闭环
 - 前端：Vue + Vite，消费 `/research/stream` SSE 事件，展示任务卡片、流程记录、工具调用痕迹和最终报告
 - 工程闭环：request trace、`X-Request-ID`、exact / semantic cache、fallback / degraded、offline benchmark、perf smoke / regression / load、CI
 - 演示保底：支持 `BENCHMARK_STUB_ENABLED=True`，在网络或模型不稳定时依然可以稳定演示完整 Agent 流程
@@ -61,7 +61,7 @@ npm run dev
 ### 状态机与事件
 
 - Planner 先生成结构化任务清单，前端按任务卡片和时间线实时展示
-- SSE 会逐步推送 `status`、`todo_list`、`task_status`、`tool_call`、`stage_started`、`stage_completed`、`metrics_snapshot`、`final_report`
+- SSE 会逐步推送 `status`、`todo_list`、`task_status`、`task_iteration_started`、`task_gap_detected`、`repair_cycle_started`、`tool_call`、`stage_started`、`stage_completed`、`metrics_snapshot`、`final_report`
 - 任务状态包含 `pending / in_progress / completed / skipped`
 
 ### fallback / degraded
@@ -69,6 +69,8 @@ npm run dev
 - planner 没有产出任务时，自动退化为单个兜底任务继续执行
 - 任务数超过预算时，会自动截断为前 `MAX_AGENT_TASKS` 个任务继续执行，避免演示时链路过长
 - 首轮任务存在明显缺口时，会在报告前插入一次轻量 `reflection / replan`，按预算补充 1~2 个任务
+- 单任务执行支持 `TASK_REACT_ENABLED=True` 的受控 ReAct 小循环：先观察证据缺口，再决定是否改写 query、补多样化来源或抓取网页正文
+- 报告生成前支持一次 `report repair loop`：仅针对高优先级 review issue 补 0~2 个 targeted tasks，再重新 review 后输出报告
 - 搜索工具调用会受 `SEARCH_TOOL_TIMEOUT_SECONDS` 保护，避免单次外部调用无限阻塞
 - 搜索工具失败或超时后，会按 `SEARCH_TOOL_RETRY_ATTEMPTS` 和 `SEARCH_TOOL_RETRY_BACKOFF_SECONDS` 执行可配置重试
 - 单个任务搜索失败或总结失败时，不会直接让整条请求 500，而是保留已有结果并打上降级标记
@@ -78,6 +80,7 @@ npm run dev
 
 - 每次请求都有 `X-Request-ID`
 - `/metrics/json` 提供 counters、latencies、recent request trace、estimated cost
+- ReAct 相关观测包含 `task_react_round_total`、`task_react_continue_total`、`task_react_stop_total`、`task_react_stop_reason_counts`、`report_repair_trigger_total`
 - 搜索缓存区分 exact hit、semantic hit、miss，便于解释命中策略
 - 泛化任务检索词会自动重写为 `topic + title + intent` 风格，减少 planner 生成短 query 时的空检索
 
@@ -112,7 +115,7 @@ npm run dev
 | 分类 | 变量 |
 | --- | --- |
 | LLM | `LLM_PROVIDER`, `LLM_MODEL_ID`, `LLM_API_KEY`, `LLM_BASE_URL`, `LOCAL_LLM`, `LMSTUDIO_BASE_URL`, `OLLAMA_BASE_URL` |
-| Agent Runtime | `MAX_WEB_RESEARCH_LOOPS`, `MAX_AGENT_TASKS`, `REQUEST_REFLECTION_ENABLED`, `REFLECTION_MAX_ADDITIONAL_TASKS`, `TASK_QUERY_REWRITE_ENABLED`, `ENABLE_NOTES`, `NOTES_WORKSPACE` |
+| Agent Runtime | `MAX_WEB_RESEARCH_LOOPS`, `MAX_AGENT_TASKS`, `REQUEST_REFLECTION_ENABLED`, `REFLECTION_MAX_ADDITIONAL_TASKS`, `TASK_QUERY_REWRITE_ENABLED`, `TASK_REACT_ENABLED`, `TASK_REACT_MAX_ROUNDS`, `TASK_REACT_MAX_FETCHES_PER_TASK`, `TASK_REACT_MAX_ADDITIONAL_SEARCHES_PER_TASK`, `REPORT_REPAIR_ENABLED`, `REPORT_REPAIR_MAX_TASKS`, `REPORT_REPAIR_MAX_CYCLES`, `ENABLE_NOTES`, `NOTES_WORKSPACE` |
 | Tool Guardrails | `SEARCH_TOOL_TIMEOUT_SECONDS`, `SEARCH_TOOL_RETRY_ATTEMPTS`, `SEARCH_TOOL_RETRY_BACKOFF_SECONDS` |
 | Search | `SEARCH_API`, `FETCH_FULL_PAGE`, `SEARCH_CACHE_ENABLED`, `SEARCH_CACHE_TTL_SECONDS`, `SEMANTIC_SCHOLAR_API_KEY` |
 | Cache | `SEMANTIC_CACHE_ENABLED`, `SEMANTIC_CACHE_SIMILARITY_THRESHOLD`, `SEMANTIC_CACHE_LEXICAL_THRESHOLD` |

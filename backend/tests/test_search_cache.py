@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -137,11 +138,25 @@ tools_stub = types.ModuleType("hello_agents.tools")
 tools_stub.SearchTool = DummySearchTool
 sys.modules["hello_agents.tools"] = tools_stub
 
+importlib.reload(importlib.import_module("services.embeddings"))
 services_search = importlib.reload(importlib.import_module("services.search"))
 
 
 class SearchCacheTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ADVANCED_RERANK_ENABLED": "false",
+                "ADVANCED_RERANK_BASE_URL": "",
+                "ADVANCED_RERANK_API_KEY": "",
+                "ADVANCED_RERANK_MODEL": "",
+                "ADVANCED_RERANK_CANDIDATE_POOL": "3",
+                "ADVANCED_RERANK_TIMEOUT_SECONDS": "0.1",
+                "ADVANCED_RERANK_MAX_CONTENT_CHARS": "100",
+            },
+        )
+        self.env_patcher.start()
         DummySearchTool.call_count = 0
         DummySearchTool.calls = []
         DummySearchTool.responses = {}
@@ -153,6 +168,7 @@ class SearchCacheTests(unittest.TestCase):
     def tearDown(self) -> None:
         services_search.clear_search_cache()
         self.temp_dir.cleanup()
+        self.env_patcher.stop()
 
     def test_dispatch_search_uses_cache_and_updates_metrics(self):
         observer = RequestTrace(
@@ -343,6 +359,97 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(len(payload["results"]), 3)
         self.assertEqual(payload["ranking"]["strategy"], "rules")
         self.assertFalse(payload["ranking"]["rerank_applied"])
+
+    def test_advanced_search_defaults_to_snippet_mode_without_override(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "url": "https://example.com/a",
+                        "content": "alpha",
+                    }
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            },
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng"],
+                "fetch_full_page": True,
+                "advanced_search_fetch_full_page_override": None,
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        services_search.dispatch_search("snippet mode query", config, 0)
+
+        self.assertEqual(len(DummySearchTool.calls), 1)
+        self.assertFalse(DummySearchTool.calls[0]["fetch_full_page"])
+
+    def test_advanced_search_skips_slow_backend_after_deadline(self):
+        def _slow_response(payload):
+            time.sleep(0.35)
+            return {
+                "results": [
+                    {
+                        "title": "Slow result",
+                        "url": "https://example.com/slow",
+                        "content": "slow",
+                    }
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            }
+
+        def _fast_response(payload):
+            time.sleep(0.02)
+            return {
+                "results": [
+                    {
+                        "title": "Fast result",
+                        "url": "https://example.com/fast",
+                        "content": "fast",
+                    }
+                ],
+                "backend": "tavily",
+                "answer": None,
+                "notices": [],
+            }
+
+        DummySearchTool.responses = {
+            "searxng": _slow_response,
+            "tavily": _fast_response,
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng", "tavily"],
+                "advanced_backend_timeout_seconds": 0.1,
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        started_at = time.perf_counter()
+        payload, notices, _, backend_label, _, _ = services_search.dispatch_search(
+            "deadline query",
+            config,
+            0,
+        )
+        duration = time.perf_counter() - started_at
+
+        self.assertLess(duration, 0.32)
+        self.assertEqual(backend_label, "advanced[tavily]")
+        self.assertEqual([item["url"] for item in payload["results"]], ["https://example.com/fast"])
+        self.assertTrue(any("searxng 搜索超时" in notice for notice in notices))
 
     def test_private_rerank_endpoints_bypass_proxy_env(self):
         self.assertTrue(services_search._should_bypass_proxy_for_url("http://127.0.0.1:8082/v1/rerank"))

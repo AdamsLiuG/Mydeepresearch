@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from config import Configuration, SearchAPI
+from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
 from services.request_state import RequestStateStore
 
@@ -101,9 +101,90 @@ def _build_config(payload: ResearchRequest) -> Configuration:
     return Configuration.from_env(overrides=overrides)
 
 
+def _warmup_semantic_cache_model(config: Configuration) -> None:
+    """Warm up the semantic-cache embedding model without blocking startup on failure."""
+
+    if not config.semantic_cache_enabled:
+        logger.info(
+            "Semantic cache warmup skipped: semantic cache disabled",
+            extra={"request_id": "startup"},
+        )
+        return
+
+    if not config.semantic_cache_warmup_enabled:
+        logger.info(
+            "Semantic cache warmup skipped: startup warmup disabled",
+            extra={"request_id": "startup"},
+        )
+        return
+
+    model_name = str(config.semantic_cache_embedding_model or "").strip()
+    if not model_name:
+        logger.info(
+            "Semantic cache warmup skipped: embedding model unset",
+            extra={"request_id": "startup"},
+        )
+        return
+
+    from services.embeddings import embeddings_available, load_sentence_transformer
+
+    if not embeddings_available():
+        logger.info(
+            "Semantic cache warmup skipped: sentence-transformers unavailable model=%s",
+            model_name,
+            extra={"request_id": "startup"},
+        )
+        return
+
+    started_at = time.perf_counter()
+    try:
+        model = load_sentence_transformer(model_name)
+    except Exception as exc:  # pragma: no cover - depends on local runtime state
+        logger.warning(
+            "Semantic cache warmup failed model=%s error=%s",
+            model_name,
+            exc,
+            extra={"request_id": "startup"},
+        )
+        return
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    if model is None:
+        logger.info(
+            "Semantic cache warmup skipped: model unavailable model=%s elapsed_ms=%.2f",
+            model_name,
+            elapsed_ms,
+            extra={"request_id": "startup"},
+        )
+        return
+
+    logger.info(
+        "Semantic cache warmup completed model=%s elapsed_ms=%.2f",
+        model_name,
+        elapsed_ms,
+        extra={"request_id": "startup"},
+    )
+
+
 def _request_id(request: Request) -> str:
     """Fetch the request identifier assigned by middleware."""
     return getattr(request.state, "request_id", "-")
+
+
+def _build_dev_reload_kwargs(config: Configuration) -> dict[str, Any]:
+    """Restrict dev reload watchers to source files to avoid runtime-output loops.
+
+    The backend writes notes, request snapshots, caches, and vector-memory artifacts
+    underneath the backend project root while serving a request. Watching the whole
+    backend directory would make those runtime writes look like source edits and
+    trigger a hot-reload loop before planning/execution can finish.
+    """
+
+    source_dir = (backend_root() / "src").resolve(strict=False)
+    return {
+        "reload": True,
+        "reload_dirs": [str(source_dir)],
+    }
 
 
 def _resolve_agent_factory(
@@ -154,8 +235,11 @@ def create_app(
             "DeepResearch configuration loaded: provider=%s model=%s base_url=%s search_api=%s "
             "max_loops=%s fetch_full_page=%s tool_calling=%s strip_thinking=%s "
             "request_reflection_enabled=%s reflection_max_additional_tasks=%s "
-            "review_stage_enabled=%s review_agent_enabled=%s request_state_enabled=%s api_key=%s "
+            "review_stage_enabled=%s review_agent_enabled=%s "
+            "task_react_enabled=%s task_react_max_rounds=%s "
+            "report_repair_enabled=%s report_repair_max_tasks=%s request_state_enabled=%s api_key=%s "
             "notes_workspace=%s cors_origins=%s search_cache_enabled=%s search_cache_ttl_seconds=%s "
+            "semantic_cache_enabled=%s semantic_cache_warmup_enabled=%s semantic_cache_embedding_model=%s "
             "benchmark_stub_enabled=%s benchmark_profile=%s",
             config.llm_provider,
             config.resolved_model() or "unset",
@@ -169,16 +253,24 @@ def create_app(
             config.reflection_max_additional_tasks,
             config.review_stage_enabled,
             config.review_agent_enabled,
+            config.task_react_enabled,
+            config.task_react_max_rounds,
+            config.report_repair_enabled,
+            config.report_repair_max_tasks,
             config.request_state_enabled,
             _mask_secret(config.llm_api_key),
             config.notes_workspace,
             ",".join(config.cors_origins),
             config.search_cache_enabled,
             config.search_cache_ttl_seconds,
+            config.semantic_cache_enabled,
+            config.semantic_cache_warmup_enabled,
+            config.semantic_cache_embedding_model,
             config.benchmark_stub_enabled,
             config.benchmark_profile,
             extra={"request_id": "startup"},
         )
+        _warmup_semantic_cache_model(config)
         yield
 
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
@@ -478,7 +570,6 @@ if __name__ == "__main__":
         "main:app",
         host=runtime_config.host,
         port=runtime_config.port,
-        reload=True,
-        reload_dirs=["./"],
         log_level=runtime_config.log_level.lower(),
+        **_build_dev_reload_kwargs(runtime_config),
     )

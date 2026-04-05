@@ -81,6 +81,47 @@
             </p>
           </section>
 
+          <section class="history-entry-card">
+            <div class="history-entry-head">
+              <div>
+                <h3>历史研究内容</h3>
+                <p>
+                  {{
+                    homeHistoryEntry
+                      ? "快速查看最近一次研究的报告、任务和缓存指标。"
+                      : "完成后的研究会自动保存在这里，方便随时回看。"
+                  }}
+                </p>
+              </div>
+              <span class="history-entry-count">
+                {{ recentResearchHistory.length }} 条
+              </span>
+            </div>
+
+            <div v-if="homeHistoryEntry" class="history-entry-preview">
+              <strong>{{ homeHistoryEntry.topic }}</strong>
+              <div class="history-entry-meta">
+                <span class="history-status-chip" :class="homeHistoryEntry.status">
+                  {{ formatRequestStatus(homeHistoryEntry.status) }}
+                </span>
+                <span>{{ formatElapsed(homeHistoryEntry.elapsedMs) }}</span>
+                <span>{{ homeHistoryEntry.searchApi || "沿用后端配置" }}</span>
+              </div>
+            </div>
+            <p v-else class="history-entry-empty">
+              暂无历史研究记录
+            </p>
+
+            <button
+              type="button"
+              class="secondary-btn history-entry-btn"
+              @click="openHomeHistoryEntry"
+              :disabled="loading"
+            >
+              {{ homeHistoryEntry ? "查看历史研究" : "打开历史面板" }}
+            </button>
+          </section>
+
           <div class="form-actions">
             <button class="submit" type="submit" :disabled="loading">
               <span class="submit-label">
@@ -198,9 +239,9 @@
                   type="button"
                   class="history-view-btn"
                   @click="viewHistoryResearch(item)"
-                  :disabled="loading || !item.canViewContent"
+                  :disabled="loading || historyDetailLoadingRequestId === item.requestId || !item.canViewContent"
                 >
-                  查看内容
+                  {{ historyDetailLoadingRequestId === item.requestId ? "加载中..." : "查看内容" }}
                 </button>
                 <button
                   type="button"
@@ -230,8 +271,9 @@
       <section
         ref="resultPanelRef"
         class="panel panel-result"
-        v-if="todoTasks.length || reportMarkdown || progressLogs.length"
+        v-if="shouldRenderResultPanel"
       >
+        <template v-if="hasResearchContent">
         <header class="status-bar">
           <div class="status-main">
             <div class="status-chip" :class="{ active: loading }">
@@ -563,6 +605,53 @@
             v-html="reportMarkdownHtml"
           ></div>
         </div>
+        </template>
+
+        <section
+          v-else
+          class="result-placeholder"
+          :class="{ error: Boolean(error) }"
+          aria-live="polite"
+        >
+          <div class="result-placeholder-card">
+            <div class="status-chip" :class="{ active: loading }">
+              <span class="dot"></span>
+              {{
+                error
+                  ? "研究未启动"
+                  : loading
+                  ? "正在连接研究流程"
+                  : "等待研究内容"
+              }}
+            </div>
+            <h3>
+              {{
+                error
+                  ? "研究请求没有成功开始"
+                  : loading
+                  ? "正在等待第一条研究事件"
+                  : "这里会显示研究过程与最终报告"
+              }}
+            </h3>
+            <p v-if="error" class="result-placeholder-message">
+              {{ error }}
+            </p>
+            <p v-else class="result-placeholder-message">
+              {{
+                loading
+                  ? "后端一旦返回首条规划或状态事件，这里会立即出现任务清单、流程记录和报告内容。"
+                  : "选择一条历史研究，或重新提交一个新主题后，这里会显示过程和结果。"
+              }}
+            </p>
+            <p class="hint muted">
+              {{
+                loading
+                  ? "如果长时间停留在此状态，请打开浏览器 Network 面板查看 /research/stream 请求是否失败。"
+                  : "当前还没有可展示的研究数据。"
+              }}
+            </p>
+          </div>
+        </section>
       </section>
 
     </div>
@@ -574,6 +663,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 import { marked } from "marked";
 
 import {
+  fetchPersistedRequest,
   fetchPersistedRequests,
   fetchMetricsSnapshot,
   resumeResearchStream,
@@ -684,6 +774,7 @@ const latestRequestMetrics = ref<UnknownRecord | null>(null);
 const latestAggregateMetrics = ref<UnknownRecord | null>(null);
 const selectedHistoryRequestId = ref<string | null>(null);
 const persistedHistory = ref<RecentResearchView[]>([]);
+const historyDetailLoadingRequestId = ref<string | null>(null);
 
 const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
@@ -695,6 +786,7 @@ const timelineWrapperRef = ref<HTMLElement | null>(null);
 
 let currentController: AbortController | null = null;
 let globalMetricsTimer: number | null = null;
+let historyDetailController: AbortController | null = null;
 
 const demoScenarios: DemoScenario[] = [
   {
@@ -752,7 +844,7 @@ function formatRequestStatus(status: string): string {
 }
 
 function isSupplementalTask(task: Pick<TodoTaskView, "origin" | "round">): boolean {
-  return task.origin === "replanned" || task.round > 1;
+  return task.origin === "replanned" || task.origin === "repair" || task.round > 1;
 }
 
 const totalTasks = computed(() => todoTasks.value.length);
@@ -932,6 +1024,18 @@ const recentResearchHistory = computed<RecentResearchView[]>(() => {
   }
   return merged;
 });
+const homeHistoryEntry = computed<RecentResearchView | null>(() => {
+  return recentResearchHistory.value.find((item) => item.canViewContent) ?? recentResearchHistory.value[0] ?? null;
+});
+const hasResearchContent = computed(
+  () =>
+    todoTasks.value.length > 0 ||
+    Boolean(reportMarkdown.value) ||
+    progressLogs.value.length > 0
+);
+const shouldRenderResultPanel = computed(
+  () => loading.value || Boolean(error.value) || hasResearchContent.value
+);
 const aggregateSuccessRateText = computed(() => {
   const rate = getNumber(latestAggregateMetrics.value?.success_rate);
   return `${(rate * 100).toFixed(1)}%`;
@@ -1235,6 +1339,50 @@ function applyNoteMetadata(
   }
 }
 
+function cloneHistoryTask(task: TodoTaskView): TodoTaskView {
+  return {
+    ...task,
+    sourceItems: [...task.sourceItems],
+    notices: [...task.notices],
+    claims: [...task.claims],
+    reviewIssues: [...task.reviewIssues],
+    toolCalls: []
+  };
+}
+
+function updatePersistedHistoryDetail(
+  requestId: string,
+  payload: Record<string, unknown>,
+  requestMetrics: UnknownRecord
+): void {
+  persistedHistory.value = persistedHistory.value.map((entry) => {
+    if (entry.requestId !== requestId) {
+      return entry;
+    }
+
+    const reportMarkdown = getString(payload.report_markdown, entry.reportMarkdown);
+    const todoItems = Array.isArray(payload.todo_items)
+      ? mapHistoryTasks(payload.todo_items)
+      : entry.todoItems;
+    const nextSearchApi = getString(payload.search_api, entry.searchApi);
+
+    return {
+      ...entry,
+      topic: getString(payload.topic, entry.topic),
+      status: getString(payload.status, entry.status),
+      elapsedMs: getNumber(payload.elapsed_ms) || entry.elapsedMs,
+      searchApi: nextSearchApi === "-" ? entry.searchApi : nextSearchApi,
+      reportMarkdown: reportMarkdown === "-" ? entry.reportMarkdown : reportMarkdown,
+      todoItems,
+      requestMetrics,
+      canViewContent: Boolean(reportMarkdown && reportMarkdown !== "-") || todoItems.length > 0,
+      canResume: typeof payload.can_resume === "boolean" ? payload.can_resume : entry.canResume,
+      phase: getString(payload.phase, entry.phase || ""),
+      updatedAt: getString(payload.updated_at, entry.updatedAt || "")
+    };
+  });
+}
+
 function formatToolParameters(parameters: Record<string, unknown>): string {
   try {
     return JSON.stringify(parameters, null, 2);
@@ -1303,7 +1451,7 @@ async function refreshPersistedHistory(signal?: AbortSignal) {
           searchApi: getString(entry.search_api, ""),
           reportMarkdown: getString(entry.report_markdown, ""),
           todoItems: mapHistoryTasks(entry.todo_items),
-          requestMetrics: entry,
+          requestMetrics: {},
           canViewContent:
             Boolean(entry.report_markdown) ||
             (Array.isArray(entry.todo_items) && entry.todo_items.length > 0),
@@ -1324,12 +1472,20 @@ function resetWorkflowState() {
   reportMarkdown.value = "";
   progressLogs.value = [];
   latestRequestMetrics.value = null;
-   selectedHistoryRequestId.value = null;
+  selectedHistoryRequestId.value = null;
   summaryHighlight.value = false;
   sourcesHighlight.value = false;
   reportHighlight.value = false;
   toolHighlight.value = false;
   logsCollapsed.value = false;
+}
+
+function cancelHistoryDetailLoad() {
+  if (historyDetailController) {
+    historyDetailController.abort();
+    historyDetailController = null;
+  }
+  historyDetailLoadingRequestId.value = null;
 }
 
 async function repeatResearch(item: RecentResearchView) {
@@ -1342,11 +1498,44 @@ async function repeatResearch(item: RecentResearchView) {
   await handleSubmit();
 }
 
+async function openHomeHistoryEntry() {
+  if (loading.value) {
+    return;
+  }
+
+  error.value = "";
+
+  if (!recentResearchHistory.value.length) {
+    await refreshPersistedHistory();
+  }
+
+  const target = homeHistoryEntry.value;
+  if (!target) {
+    resetWorkflowState();
+    isExpanded.value = true;
+    progressLogs.value = ["暂无历史研究记录"];
+    return;
+  }
+
+  if (target.canViewContent) {
+    await viewHistoryResearch(target);
+    return;
+  }
+
+  resetWorkflowState();
+  selectedHistoryRequestId.value = target.requestId;
+  form.topic = target.topic;
+  form.searchApi = target.searchApi;
+  progressLogs.value = [`已打开历史研究列表：${target.topic}`];
+  isExpanded.value = true;
+}
+
 async function resumePersistedResearch(item: RecentResearchView) {
   if (loading.value || !item.canResume) {
     return;
   }
 
+  cancelHistoryDetailLoad();
   if (currentController) {
     currentController.abort();
     currentController = null;
@@ -1386,28 +1575,75 @@ async function resumePersistedResearch(item: RecentResearchView) {
   }
 }
 
-function viewHistoryResearch(item: RecentResearchView) {
+async function viewHistoryResearch(item: RecentResearchView) {
   if (loading.value) {
     return;
   }
 
+  cancelHistoryDetailLoad();
+
+  const controller = new AbortController();
+  historyDetailController = controller;
+  historyDetailLoadingRequestId.value = item.requestId;
+
   resetWorkflowState();
+  error.value = "";
   selectedHistoryRequestId.value = item.requestId;
   form.topic = item.topic;
   form.searchApi = item.searchApi;
-  todoTasks.value = item.todoItems.map((task) => ({
-    ...task,
-    sourceItems: [...task.sourceItems],
-    notices: [...task.notices],
-    claims: [...task.claims],
-    reviewIssues: [...task.reviewIssues],
-    toolCalls: []
-  }));
+  todoTasks.value = item.todoItems.map(cloneHistoryTask);
   activeTaskId.value = todoTasks.value[0]?.id ?? null;
   reportMarkdown.value = item.reportMarkdown || "该历史研究未保存最终报告";
-  latestRequestMetrics.value = { ...item.requestMetrics };
-  progressLogs.value = [`已载入历史研究：${item.topic}`];
+  latestRequestMetrics.value =
+    Object.keys(item.requestMetrics).length > 0 ? { ...item.requestMetrics } : null;
+  progressLogs.value = [`正在加载历史研究详情：${item.topic}`];
   isExpanded.value = true;
+
+  try {
+    const payload = ensureRecord(await fetchPersistedRequest(item.requestId, { signal: controller.signal }));
+    if (historyDetailController !== controller) {
+      return;
+    }
+
+    const detailMetrics = ensureRecord(payload.request_metrics);
+    const detailTopic = getString(payload.topic, item.topic);
+    const detailSearchApi = getString(payload.search_api, item.searchApi);
+    const detailTasks = Array.isArray(payload.todo_items)
+      ? mapHistoryTasks(payload.todo_items)
+      : item.todoItems;
+    const detailReport =
+      getString(payload.report_markdown, item.reportMarkdown) || "该历史研究未保存最终报告";
+    const nextRequestMetrics =
+      Object.keys(detailMetrics).length > 0 ? { ...detailMetrics } : null;
+
+    form.topic = detailTopic;
+    form.searchApi = detailSearchApi === "-" ? item.searchApi : detailSearchApi;
+    todoTasks.value = detailTasks.map(cloneHistoryTask);
+    activeTaskId.value = todoTasks.value[0]?.id ?? null;
+    reportMarkdown.value = detailReport;
+    latestRequestMetrics.value = nextRequestMetrics;
+    progressLogs.value = [`已载入历史研究：${detailTopic}`];
+
+    updatePersistedHistoryDetail(item.requestId, payload, detailMetrics);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return;
+    }
+    console.warn("获取历史研究详情失败", error);
+    latestRequestMetrics.value =
+      Object.keys(item.requestMetrics).length > 0 ? { ...item.requestMetrics } : null;
+    progressLogs.value = [
+      `已载入历史研究摘要：${item.topic}`,
+      "历史详情加载失败，已显示摘要内容"
+    ];
+  } finally {
+    if (historyDetailController === controller) {
+      historyDetailController = null;
+    }
+    if (historyDetailLoadingRequestId.value === item.requestId) {
+      historyDetailLoadingRequestId.value = null;
+    }
+  }
 }
 
 function findTask(taskId: unknown): TodoTaskView | undefined {
@@ -1589,6 +1825,29 @@ function formatStageLabel(stage: string): string {
     report: "报告"
   };
   return labels[stage] ?? stage;
+}
+
+function formatReactAction(action: string): string {
+  const labels: Record<string, string> = {
+    initial_search: "初始检索",
+    rewrite_query: "改写检索词",
+    broaden_query: "放宽检索",
+    diversify_source_query: "补充多样化来源",
+    fetch_page_for_top_source: "抓取来源正文",
+    stop: "停止补证据"
+  };
+  return labels[action] ?? action;
+}
+
+function formatReactStopReason(reason: string): string {
+  const labels: Record<string, string> = {
+    evidence_sufficient: "证据已足够",
+    max_rounds_reached: "达到最大轮次",
+    budget_exhausted: "预算耗尽",
+    low_repair_value: "继续收益有限",
+    no_gap_signals: "未发现明显缺口"
+  };
+  return labels[reason] ?? reason;
 }
 
 async function toggleLogsVisibility() {
@@ -1782,6 +2041,80 @@ function handleResearchEvent(event: ResearchStreamEvent) {
     return;
   }
 
+  if (event.type === "task_iteration_started") {
+    const payload = event as UnknownRecord;
+    const task = findTask(payload.task_id);
+    const round = getNumber(payload.round);
+    const action = formatReactAction(getString(payload.action, "initial_search"));
+    const message = task
+      ? `任务 ${task.title} 开始第 ${round || 1} 轮补证据：${action}`
+      : `开始第 ${round || 1} 轮补证据：${action}`;
+    progressLogs.value.push(message);
+    if (task) {
+      task.notices.push(message);
+    }
+    return;
+  }
+
+  if (event.type === "task_iteration_completed") {
+    const payload = event as UnknownRecord;
+    const task = findTask(payload.task_id);
+    const round = getNumber(payload.round);
+    const sourceCount = getNumber(payload.source_count);
+    const diversity = getNumber(payload.source_diversity);
+    const message = task
+      ? `任务 ${task.title} 第 ${round || 1} 轮完成：${sourceCount} 个来源，${diversity} 个域名`
+      : `补证据轮次完成：${sourceCount} 个来源，${diversity} 个域名`;
+    progressLogs.value.push(message);
+    return;
+  }
+
+  if (event.type === "task_gap_detected") {
+    const payload = event as UnknownRecord;
+    const task = findTask(payload.task_id);
+    const action = formatReactAction(getString(payload.next_action, "stop"));
+    const reason = getString(payload.continue_reason, "检测到证据缺口");
+    const message = task
+      ? `任务 ${task.title} 检测到证据缺口，准备执行：${action}`
+      : `检测到证据缺口，准备执行：${action}`;
+    progressLogs.value.push(message);
+    if (task) {
+      task.notices.push(`[react] ${reason}`);
+    }
+    return;
+  }
+
+  if (event.type === "task_react_stop") {
+    const payload = event as UnknownRecord;
+    const task = findTask(payload.task_id);
+    const stopReason = formatReactStopReason(getString(payload.stop_reason, "stop"));
+    const message = task
+      ? `任务 ${task.title} 结束补证据：${stopReason}`
+      : `结束补证据：${stopReason}`;
+    progressLogs.value.push(message);
+    if (task) {
+      task.notices.push(`[react-stop] ${stopReason}`);
+    }
+    return;
+  }
+
+  if (event.type === "repair_cycle_started") {
+    const payload = event as UnknownRecord;
+    const candidateCount = getNumber(payload.candidate_count);
+    progressLogs.value.push(`开始报告级证据修补：待处理 ${candidateCount} 个高优先级问题`);
+    return;
+  }
+
+  if (event.type === "repair_cycle_completed") {
+    const payload = event as UnknownRecord;
+    const addedTasks = getNumber(payload.added_tasks);
+    const overallStatus = getString(payload.overall_status, "unknown");
+    progressLogs.value.push(
+      `报告级证据修补完成：新增 ${addedTasks} 个任务，当前审查状态 ${overallStatus}`
+    );
+    return;
+  }
+
   if (event.type === "tool_call") {
     const payload = event as Record<string, unknown>;
     const eventId =
@@ -1930,6 +2263,7 @@ const handleSubmit = async () => {
     return;
   }
 
+  cancelHistoryDetailLoad();
   if (currentController) {
     currentController.abort();
     currentController = null;
@@ -1990,6 +2324,7 @@ const goBack = () => {
 };
 
 const startNewResearch = () => {
+  cancelHistoryDetailLoad();
   if (loading.value) {
     cancelResearch();
   }
@@ -2013,6 +2348,7 @@ onBeforeUnmount(() => {
     currentController.abort();
     currentController = null;
   }
+  cancelHistoryDetailLoad();
   if (globalMetricsTimer !== null) {
     window.clearInterval(globalMetricsTimer);
     globalMetricsTimer = null;
@@ -2342,6 +2678,90 @@ select:focus {
   border-radius: 6px;
 }
 
+.history-entry-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  background:
+    linear-gradient(135deg, rgba(239, 246, 255, 0.96), rgba(255, 255, 255, 0.94));
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+}
+
+.history-entry-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.history-entry-head h3 {
+  margin: 0;
+  font-size: 15px;
+  color: #0f172a;
+}
+
+.history-entry-head p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.history-entry-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(191, 219, 254, 0.42);
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.history-entry-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.history-entry-preview strong {
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.history-entry-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.history-entry-empty {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px dashed rgba(148, 163, 184, 0.28);
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.history-entry-btn {
+  align-self: flex-start;
+}
+
 .option {
   flex: 1;
   min-width: 140px;
@@ -2437,6 +2857,46 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 18px;
+}
+
+.result-placeholder {
+  flex: 1;
+  min-height: 320px;
+  display: grid;
+  place-items: center;
+}
+
+.result-placeholder-card {
+  width: min(100%, 560px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 28px;
+  border-radius: 26px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow:
+    0 24px 48px rgba(15, 23, 42, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.result-placeholder.error .result-placeholder-card {
+  border-color: rgba(239, 68, 68, 0.24);
+  background: rgba(254, 242, 242, 0.82);
+}
+
+.result-placeholder-card h3 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 24px;
+  line-height: 1.3;
+}
+
+.result-placeholder-message {
+  margin: 0;
+  color: #334155;
+  font-size: 15px;
+  line-height: 1.7;
 }
 
 .status-bar {

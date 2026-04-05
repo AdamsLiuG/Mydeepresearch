@@ -45,6 +45,8 @@ uv run python src/main.py
 
 实际配置入口是 [`.env`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env)；[`.env.example`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env.example) 只是模板。
 
+开发模式的热重载只监听 [`src`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/src) 源码目录，避免请求执行时写入 `notes / .state / .memory / .cache` 触发自重启；如果你修改了 [`.env`](/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.env)，请手动重启后端进程。
+
 和这两个轻量 Agent 能力直接相关的配置项：
 
 - `MAX_AGENT_TASKS`：限制单次请求最多执行多少个任务
@@ -55,6 +57,7 @@ uv run python src/main.py
 - `SEARCH_TOOL_RETRY_ATTEMPTS`：搜索工具失败或超时后的重试次数
 - `SEARCH_TOOL_RETRY_BACKOFF_SECONDS`：两次重试之间的固定等待时间
 - `SEARCH_API`：搜索后端，可选 `duckduckgo / tavily / perplexity / searxng / semanticscholar / advanced`
+- `SEMANTIC_CACHE_WARMUP_ENABLED`：是否在后端启动时预热 semantic cache embedding 模型，降低首轮搜索冷启动超时概率
 - `SEMANTIC_SCHOLAR_API_KEY`：当 `SEARCH_API=semanticscholar` 时建议配置，避免共享限流
 
 ## 重点观测点

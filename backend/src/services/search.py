@@ -9,7 +9,7 @@ import logging
 import math
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +22,7 @@ from hello_agents.tools import SearchTool
 
 from config import Configuration
 from metrics import RequestTrace
+from services.embeddings import embeddings_available, encode_text, load_sentence_transformer
 from utils import (
     deduplicate_and_format_sources,
     format_sources,
@@ -34,16 +35,10 @@ try:  # pragma: no cover - exercised through runtime fallback
 except ImportError:  # pragma: no cover - exercised through runtime fallback
     DiskCache = None
 
-try:  # pragma: no cover - exercised through runtime fallback
-    from sentence_transformers import SentenceTransformer
-except Exception:  # pragma: no cover - exercised through runtime fallback
-    SentenceTransformer = None
-
 logger = logging.getLogger(__name__)
 
 _GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
 _CACHE_LOCK = Lock()
-_MODEL_LOCK = Lock()
 _TRACKING_QUERY_PARAMS = {
     "fbclid",
     "gclid",
@@ -76,7 +71,6 @@ _MEMORY_SCOPE_INDEX: dict[str, list[str]] = {}
 _DISK_CACHE: Any | None = None
 _DISK_CACHE_DIR: str | None = None
 _DISK_CACHE_WARNING_EMITTED = False
-_EMBEDDING_MODEL: Any | None = None
 _EMBEDDING_MODEL_NAME: str | None = None
 _EMBEDDING_WARNING_EMITTED = False
 
@@ -486,61 +480,57 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
 def _load_embedding_model(config: Configuration) -> Any | None:
     """Lazily load the configured embedding model."""
 
-    global _EMBEDDING_MODEL
     global _EMBEDDING_MODEL_NAME
     global _EMBEDDING_WARNING_EMITTED
 
     if not config.semantic_cache_enabled:
         return None
 
-    if SentenceTransformer is None:
+    if not embeddings_available():
         _emit_embedding_warning_once(
             "sentence-transformers is not installed; semantic cache will fall back to exact-match persistence"
         )
         return None
 
     model_name = config.semantic_cache_embedding_model
-    with _MODEL_LOCK:
-        if _EMBEDDING_MODEL is not None and _EMBEDDING_MODEL_NAME == model_name:
-            return _EMBEDDING_MODEL
+    try:
+        model = load_sentence_transformer(model_name)
+    except Exception as exc:  # pragma: no cover - depends on local runtime state
+        _EMBEDDING_MODEL_NAME = model_name
+        _emit_embedding_warning_once(
+            "Failed to load semantic cache embedding model=%s; falling back to exact-match persistence error=%s",
+            model_name,
+            exc,
+        )
+        return None
 
-        try:
-            _EMBEDDING_MODEL = SentenceTransformer(model_name)
-            _EMBEDDING_MODEL_NAME = model_name
-            _EMBEDDING_WARNING_EMITTED = False
-        except Exception as exc:  # pragma: no cover - depends on local runtime state
-            _EMBEDDING_MODEL = None
-            _EMBEDDING_MODEL_NAME = model_name
-            _emit_embedding_warning_once(
-                "Failed to load semantic cache embedding model=%s; falling back to exact-match persistence error=%s",
-                model_name,
-                exc,
-            )
-            return None
-
+    if model is None:
+        return None
+    if _EMBEDDING_MODEL_NAME != model_name:
         logger.info("Loaded semantic cache embedding model=%s", model_name)
-        return _EMBEDDING_MODEL
+    _EMBEDDING_MODEL_NAME = model_name
+    _EMBEDDING_WARNING_EMITTED = False
+    return model
 
 
 def _embed_query(query: str, config: Configuration) -> list[float] | None:
     """Return the query embedding, or None if semantic cache is unavailable."""
 
-    model = _load_embedding_model(config)
-    if model is None:
+    if _load_embedding_model(config) is None:
         return None
 
     try:
-        embedding = model.encode(query.strip(), normalize_embeddings=True)
-    except TypeError:
-        embedding = model.encode(query.strip())
+        return encode_text(
+            query.strip(),
+            model_name=config.semantic_cache_embedding_model,
+            normalize_embeddings=True,
+        )
     except Exception as exc:  # pragma: no cover - depends on local runtime state
         _emit_embedding_warning_once(
             "Failed to encode semantic cache query; falling back to exact-match persistence error=%s",
             exc,
         )
         return None
-
-    return _coerce_embedding(embedding)
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -1530,45 +1520,85 @@ def _fuse_advanced_search_results(
     answer_text: str | None = None
     backends = config.resolved_advanced_search_backends()
     effective_fetch_full_page = config.resolved_advanced_fetch_full_page()
+    deadline_seconds = config.resolved_advanced_backend_timeout_seconds()
     outcomes: dict[int, AdvancedBackendOutcome] = {}
+    timed_out_backends: set[str] = set()
 
-    with ThreadPoolExecutor(
+    executor = ThreadPoolExecutor(
         max_workers=config.resolved_advanced_search_max_concurrency(),
         thread_name_prefix="advanced-search",
-    ) as executor:
-        future_map = {
-            executor.submit(
-                _execute_advanced_backend,
-                query,
-                backend,
-                config,
-                loop_count,
-                backend_order=backend_order,
-                max_results=max_results,
-                fetch_full_page=effective_fetch_full_page,
-            ): backend
-            for backend_order, backend in enumerate(backends)
-        }
+    )
+    future_map = {
+        executor.submit(
+            _execute_advanced_backend,
+            query,
+            backend,
+            config,
+            loop_count,
+            backend_order=backend_order,
+            max_results=max_results,
+            fetch_full_page=effective_fetch_full_page,
+        ): backend
+        for backend_order, backend in enumerate(backends)
+    }
+    pending = set(future_map.keys())
+    deadline_at = time.perf_counter() + deadline_seconds
 
-        for future in as_completed(future_map):
-            outcome = future.result()
-            outcomes[outcome.backend_order] = outcome
-            log_payload = {
-                "requested_backend": outcome.requested_backend,
-                "resolved_backend": outcome.backend_label or outcome.requested_backend,
-                "success": outcome.success,
-                "duration_ms": round(outcome.duration_ms, 2),
-                "result_count": outcome.result_count,
-                "notice_count": len(outcome.notices),
-            }
-            if outcome.success:
-                logger.info("Advanced search backend completed %s", log_payload)
-            else:
-                logger.warning("Advanced search backend failed %s error=%s", log_payload, outcome.error)
+    try:
+        while pending:
+            remaining = deadline_at - time.perf_counter()
+            if remaining <= 0:
+                break
+
+            done, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                break
+
+            for future in done:
+                try:
+                    outcome = future.result()
+                except Exception as exc:  # pragma: no cover - defensive guardrail
+                    backend = future_map[future]
+                    outcome = AdvancedBackendOutcome(
+                        backend_order=backends.index(backend),
+                        requested_backend=backend,
+                        backend_label=backend,
+                        duration_ms=(time.perf_counter() - (deadline_at - deadline_seconds)) * 1000.0,
+                        error=str(exc).strip() or exc.__class__.__name__,
+                    )
+
+                outcomes[outcome.backend_order] = outcome
+                log_payload = {
+                    "requested_backend": outcome.requested_backend,
+                    "resolved_backend": outcome.backend_label or outcome.requested_backend,
+                    "success": outcome.success,
+                    "duration_ms": round(outcome.duration_ms, 2),
+                    "result_count": outcome.result_count,
+                    "notice_count": len(outcome.notices),
+                }
+                if outcome.success:
+                    logger.info("Advanced search backend completed %s", log_payload)
+                else:
+                    logger.warning("Advanced search backend failed %s error=%s", log_payload, outcome.error)
+    finally:
+        for future in pending:
+            backend = future_map[future]
+            timed_out_backends.add(backend)
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
 
     for backend_order, backend in enumerate(backends):
         outcome = outcomes.get(backend_order)
         if outcome is None:
+            if backend in timed_out_backends:
+                notices.append(
+                    f"{backend} 搜索超时: advanced backend deadline exceeded ({deadline_seconds:.2f}s)"
+                )
+                continue
             notices.append(f"{backend} 搜索失败: backend worker did not return")
             continue
 

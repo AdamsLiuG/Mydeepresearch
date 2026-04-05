@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import tempfile
 import unittest
@@ -47,6 +48,32 @@ class RequestStateStoreTests(unittest.TestCase):
         self.assertTrue(recent_by_id["req-2"]["can_view_content"])
         self.assertFalse(recent_by_id["req-2"]["can_resume"])
         self.assertTrue(recent_by_id["req-1"]["can_resume"])
+
+    def test_save_allows_concurrent_updates_for_same_request(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RequestStateStore(temp_dir, recent_limit=10)
+
+            def save_snapshot(index: int):
+                return store.save(
+                    "req-1",
+                    {
+                        "topic": "AI agent",
+                        "status": "in_progress",
+                        "phase": "task_execution",
+                        "todo_items": [{"id": index, "title": f"任务{index}"}],
+                    },
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(save_snapshot, range(20)))
+
+            loaded = store.load("req-1")
+
+        self.assertEqual(len(results), 20)
+        self.assertTrue(all(item["request_id"] == "req-1" for item in results))
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["request_id"], "req-1")
+        self.assertEqual(loaded["topic"], "AI agent")
 
 
 if __name__ == "__main__":

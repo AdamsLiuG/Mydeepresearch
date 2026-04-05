@@ -14,6 +14,7 @@ from metrics import RequestTrace
 from models import SummaryState, TodoItem
 from prompts import (
     get_current_date,
+    report_repair_task_prompt,
     supplemental_planner_instructions,
     todo_planner_instructions,
 )
@@ -77,12 +78,16 @@ class PlanningService:
         self,
         state: SummaryState,
         observer: RequestTrace | None = None,
+        historical_memory_context: str | None = None,
+        strategy_memory_context: str | None = None,
     ) -> List[TodoItem]:
         """Ask the planner agent to break the topic into actionable tasks."""
         prompt = todo_planner_instructions.format(
             current_date=get_current_date(),
             research_topic=state.research_topic,
         )
+        prompt += self._historical_memory_block(historical_memory_context)
+        prompt += self._strategy_memory_block(strategy_memory_context)
         response = self._invoke_planner(prompt, observer=observer)
         logger.info("Planner raw output (truncated): %s", response[:500])
 
@@ -142,6 +147,7 @@ class PlanningService:
         existing_tasks: list[TodoItem],
         max_additional_tasks: int,
         observer: RequestTrace | None = None,
+        historical_memory_context: str | None = None,
     ) -> List[TodoItem]:
         """Generate supplemental tasks that cover missing angles without duplicating existing work."""
 
@@ -162,6 +168,7 @@ class PlanningService:
             or "- 无明确缺失维度",
             max_additional_tasks=max_additional_tasks,
         )
+        prompt += self._historical_memory_block(historical_memory_context)
         response = self._invoke_planner(prompt, observer=observer)
         logger.info("Supplemental planner raw output (truncated): %s", response[:500])
 
@@ -195,6 +202,112 @@ class PlanningService:
             next_id += 1
 
         return supplemental_items
+
+    def plan_repair_tasks(
+        self,
+        state: SummaryState,
+        *,
+        repair_candidates: list[dict[str, Any]],
+        existing_tasks: list[TodoItem],
+        max_additional_tasks: int,
+        observer: RequestTrace | None = None,
+        historical_memory_context: str | None = None,
+    ) -> List[TodoItem]:
+        """Generate targeted repair tasks from high-priority review findings."""
+
+        if max_additional_tasks <= 0 or not repair_candidates:
+            return []
+
+        next_id = max((task.id for task in existing_tasks), default=0) + 1
+        next_round = max((task.round for task in existing_tasks), default=1) + 1
+        review_summary = state.review_summary or {}
+        prompt = report_repair_task_prompt.format(
+            current_date=get_current_date(),
+            research_topic=state.research_topic,
+            starting_task_id=next_id,
+            existing_tasks="\n".join(
+                f"- 任务 {task.id}: {task.title} | 目标：{task.intent} | 状态：{task.status}"
+                for task in existing_tasks
+            )
+            or "- 暂无已执行任务",
+            review_summary=json.dumps(
+                {
+                    "overall_status": review_summary.get("overall_status"),
+                    "reason": review_summary.get("reason"),
+                    "issue_count": review_summary.get("issue_count"),
+                },
+                ensure_ascii=False,
+            ),
+            repair_candidates="\n".join(
+                (
+                    f"- task_id={item.get('task_id')}, severity={item.get('severity')}, "
+                    f"check={item.get('check')}, message={item.get('message')}"
+                )
+                for item in repair_candidates
+            )
+            or "- 无待修补问题",
+            max_additional_tasks=max_additional_tasks,
+        )
+        prompt += self._historical_memory_block(historical_memory_context)
+        response = self._invoke_planner(prompt, observer=observer)
+        logger.info("Repair planner raw output (truncated): %s", response[:500])
+
+        raw_tasks = self._extract_tasks(response)
+        sanitized_tasks, _ = self._sanitize_tasks(raw_tasks, research_topic=state.research_topic)
+        unique_tasks = self._filter_duplicate_candidates(sanitized_tasks, existing_tasks=existing_tasks)
+
+        repair_items: List[TodoItem] = []
+        for item in unique_tasks[:max_additional_tasks]:
+            title = str(item.get("title") or f"任务{next_id}").strip()
+            intent = str(item.get("intent") or "修补当前审查暴露的证据缺口").strip()
+            query = str(item.get("query") or "").strip()
+
+            if not query:
+                query = self._default_query_for_task(
+                    research_topic=state.research_topic,
+                    title=title,
+                    intent=intent,
+                )
+
+            repair_items.append(
+                TodoItem(
+                    id=next_id,
+                    title=title,
+                    intent=intent,
+                    query=query,
+                    origin="repair",
+                    round=next_round,
+                )
+            )
+            next_id += 1
+
+        return repair_items
+
+    @staticmethod
+    def _historical_memory_block(historical_memory_context: str | None) -> str:
+        context = str(historical_memory_context or "").strip()
+        if not context:
+            return ""
+        return (
+            "\n\n<HISTORICAL_MEMORY>\n"
+            "以下内容来自历史研究笔记，仅用于启发任务拆解与覆盖检查，不代表本轮已经验证过的事实。\n"
+            "你仍需要为当前研究主题独立规划任务，并通过本轮搜索重新获得证据。\n"
+            f"{context}\n"
+            "</HISTORICAL_MEMORY>\n"
+        )
+
+    @staticmethod
+    def _strategy_memory_block(strategy_memory_context: str | None) -> str:
+        context = str(strategy_memory_context or "").strip()
+        if not context:
+            return ""
+        return (
+            "\n\n<STRATEGY_MEMORY>\n"
+            "以下内容来自历史请求提炼出的策略记忆，只能作为任务拆解、检索构造、来源偏好和风险规避提示。\n"
+            "这些内容不是当前主题事实，不是本轮证据，也不能直接复用历史报告结论。\n"
+            f"{context}\n"
+            "</STRATEGY_MEMORY>\n"
+        )
 
     def _default_query_for_task(
         self,
@@ -419,15 +532,29 @@ class PlanningService:
             except (TypeError, ValueError):
                 continue
 
-            title = self._normalize_task_title(str(payload.get("title") or f"任务{normalized_id}"))
             content = str(payload.get("content") or "").strip()
-            intent = self._extract_intent_from_text(content) or "聚焦主题的关键问题"
+            raw_title = str(
+                payload.get("title")
+                or payload.get("task_title")
+                or payload.get("name")
+                or f"任务{normalized_id}"
+            ).strip()
+            title = self._normalize_task_title(raw_title)
+            if not title or self._is_placeholder_task_title(title):
+                title = self._extract_task_title_from_text(content, task_id=normalized_id) or title
+
+            intent = str(payload.get("intent") or payload.get("objective") or "").strip()
+            if not intent:
+                intent = self._extract_intent_from_text(content) or "聚焦主题的关键问题"
             query = str(
                 payload.get("query")
                 or payload.get("search_query")
                 or payload.get("search")
+                or payload.get("keywords")
                 or ""
             ).strip()
+            if not query:
+                query = self._extract_query_from_text(content)
 
             recovered[normalized_id] = {
                 "title": title or f"任务{normalized_id}",
@@ -612,6 +739,68 @@ class PlanningService:
         cleaned = cleaned.strip(" -:：|/").strip()
         return cleaned.strip()
 
+    def _is_placeholder_task_title(self, title: str) -> bool:
+        """Return whether the title is still a bare task placeholder."""
+
+        normalized = self._normalize_task_title(title)
+        return bool(re.fullmatch(r"(?:任务|task)\s*_?\s*\d+", normalized, flags=re.IGNORECASE))
+
+    def _extract_task_title_from_text(self, text: str, *, task_id: int | None = None) -> str:
+        """Recover a concrete task title from note-like free-form content."""
+
+        numbered_prefix = r"\d+" if task_id is None else re.escape(str(task_id))
+        inline_pattern = re.compile(
+            rf"^(?:任务|task)\s*_?\s*{numbered_prefix}\s*[:：\-]\s*(?P<title>.+)$",
+            flags=re.IGNORECASE,
+        )
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip().strip("-*#` ")
+            if not line:
+                continue
+
+            for label in ("任务标题", "任务名称", "标题", "名称"):
+                if line.startswith(label):
+                    _, _, suffix = line.partition("：")
+                    if suffix.strip():
+                        candidate = self._normalize_task_title(suffix)
+                        if candidate and not self._is_placeholder_task_title(candidate):
+                            return candidate
+                    _, _, suffix = line.partition(":")
+                    if suffix.strip():
+                        candidate = self._normalize_task_title(suffix)
+                        if candidate and not self._is_placeholder_task_title(candidate):
+                            return candidate
+
+            match = inline_pattern.match(line)
+            if not match:
+                continue
+
+            candidate = self._normalize_task_title(match.group("title"))
+            if candidate and not self._is_placeholder_task_title(candidate):
+                return candidate
+
+        return ""
+
+    def _extract_query_from_text(self, text: str) -> str:
+        """Extract a suggested search query from note-like free-form content."""
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip().strip("-*#` ")
+            if not line:
+                continue
+
+            for label in ("检索方向", "搜索方向", "检索关键词", "搜索关键词", "查询", "Query", "query"):
+                if line.startswith(label):
+                    _, _, suffix = line.partition("：")
+                    if suffix.strip():
+                        return suffix.strip()
+                    _, _, suffix = line.partition(":")
+                    if suffix.strip():
+                        return suffix.strip()
+
+        return ""
+
     def _filter_duplicate_candidates(
         self,
         tasks: List[dict[str, Any]],
@@ -707,7 +896,16 @@ class PlanningService:
             line = raw_line.strip().strip("-*#` ")
             if not line:
                 continue
+            if self._extract_task_title_from_text(line):
+                continue
             if line.startswith("任务目标"):
+                _, _, suffix = line.partition("：")
+                if suffix.strip():
+                    return suffix.strip()
+                _, _, suffix = line.partition(":")
+                if suffix.strip():
+                    return suffix.strip()
+            if line.startswith("目标意图"):
                 _, _, suffix = line.partition("：")
                 if suffix.strip():
                     return suffix.strip()

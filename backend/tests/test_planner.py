@@ -14,6 +14,7 @@ class DummyToolAwareSimpleAgent:
     responses = []
 
     def run(self, prompt: str):
+        self.last_prompt = prompt
         if self.responses:
             return self.responses.pop(0)
         return prompt
@@ -78,6 +79,41 @@ class PlannerParsingTests(unittest.TestCase):
         self.assertEqual(tasks[0]["title"], "技术架构演进")
         self.assertIn("核心技术创新", tasks[0]["intent"])
         self.assertEqual(tasks[1]["title"], "性能基准对比")
+
+    def test_extract_tasks_recovers_title_intent_and_query_from_tool_content_when_title_is_placeholder(self):
+        raw_response = """
+[TOOL_CALL:note:{"action":"create","task_id":1,"title":"任务1","note_type":"task_state","content":"任务1: 技术突破调研\\n目标意图: 梳理扩散模型的核心技术突破\\n检索方向: 扩散模型 架构突破 2025"}]
+[TOOL_CALL:note:{"action":"create","task_id":2,"title":"任务2","note_type":"task_state","content":"任务2: 应用场景突破\\n目标意图: 识别扩散模型在各垂直领域的商业化落地突破\\n检索方向: 扩散模型应用案例 行业解决方案 2025"}]
+"""
+
+        tasks = self.service._extract_tasks(raw_response)
+
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(tasks[0]["title"], "技术突破调研")
+        self.assertEqual(tasks[0]["intent"], "梳理扩散模型的核心技术突破")
+        self.assertEqual(tasks[0]["query"], "扩散模型 架构突破 2025")
+        self.assertEqual(tasks[1]["title"], "应用场景突破")
+        self.assertEqual(tasks[1]["intent"], "识别扩散模型在各垂直领域的商业化落地突破")
+        self.assertEqual(tasks[1]["query"], "扩散模型应用案例 行业解决方案 2025")
+
+    def test_extract_tasks_recovers_key_value_tool_payload_from_content_when_title_missing(self):
+        raw_response = """
+[TOOL_CALL:note:task_id=2,content="任务2: 应用场景突破\n目标意图: 识别扩散模型在各垂直领域的商业化落地突破\n检索方向: 扩散模型应用案例 行业解决方案 2025"]
+[TOOL_CALL:note:task_id=3,content="任务3: 性能效率突破\n目标意图: 分析扩散模型在训练和推理效率上的改进\n检索方向: diffusion model inference acceleration training optimization efficiency 2025"]
+"""
+
+        tasks = self.service._extract_tasks(raw_response)
+
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(tasks[0]["title"], "应用场景突破")
+        self.assertEqual(tasks[0]["intent"], "识别扩散模型在各垂直领域的商业化落地突破")
+        self.assertEqual(tasks[0]["query"], "扩散模型应用案例 行业解决方案 2025")
+        self.assertEqual(tasks[1]["title"], "性能效率突破")
+        self.assertEqual(tasks[1]["intent"], "分析扩散模型在训练和推理效率上的改进")
+        self.assertEqual(
+            tasks[1]["query"],
+            "diffusion model inference acceleration training optimization efficiency 2025",
+        )
 
     def test_extract_tasks_recovers_numbered_text(self):
         raw_response = """
@@ -227,6 +263,54 @@ class PlannerParsingTests(unittest.TestCase):
             todo_items[1].query,
             "探索多模态大模型在2025年的关键进展 应用场景落地",
         )
+
+    def test_plan_todo_list_includes_historical_memory_block(self):
+        agent = DummyToolAwareSimpleAgent()
+        agent.responses = [
+            """
+{"tasks":[
+  {"title":"技术背景","intent":"梳理协议背景","query":"mcp protocol background"}
+]}
+""",
+        ]
+        service = PlanningService(
+            agent,
+            Configuration.from_env(load_env_file=False),
+        )
+
+        state = types.SimpleNamespace(research_topic="MCP protocol")
+        todo_items = service.plan_todo_list(
+            state,
+            historical_memory_context="历史研究记忆：过去请求经常遗漏官方文档。",
+        )
+
+        self.assertEqual(len(todo_items), 1)
+        self.assertIn("HISTORICAL_MEMORY", agent.last_prompt)
+        self.assertIn("历史研究记忆", agent.last_prompt)
+
+    def test_plan_todo_list_includes_strategy_memory_block(self):
+        agent = DummyToolAwareSimpleAgent()
+        agent.responses = [
+            """
+{"tasks":[
+  {"title":"技术背景","intent":"梳理协议背景","query":"mcp protocol background"}
+]}
+""",
+        ]
+        service = PlanningService(
+            agent,
+            Configuration.from_env(load_env_file=False),
+        )
+
+        state = types.SimpleNamespace(research_topic="MCP protocol")
+        todo_items = service.plan_todo_list(
+            state,
+            strategy_memory_context="历史策略记忆：优先查官方文档，并规避仅看二手博客的反模式。",
+        )
+
+        self.assertEqual(len(todo_items), 1)
+        self.assertIn("STRATEGY_MEMORY", agent.last_prompt)
+        self.assertIn("历史策略记忆", agent.last_prompt)
 
     def test_normalize_task_title_prefers_arrow_suffix_and_strips_task_refs(self):
         title = "并行应用层+评估层**（任务2、3）→ 验证技术价值"

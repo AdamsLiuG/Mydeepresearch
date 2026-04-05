@@ -45,7 +45,7 @@ _ORIGINAL_FROM_ENV = main.Configuration.from_env
 
 
 @contextmanager
-def isolated_configuration():
+def isolated_configuration(*, patch_semantic_warmup: bool = True):
     with patch.dict(os.environ, {}, clear=True):
         with patch.object(
             main.Configuration,
@@ -55,7 +55,11 @@ def isolated_configuration():
                 load_env_file=False,
             ),
         ):
-            yield
+            if patch_semantic_warmup:
+                with patch.object(main, "_warmup_semantic_cache_model", return_value=None):
+                    yield
+            else:
+                yield
 
 
 def _build_stub_result() -> SimpleNamespace:
@@ -228,6 +232,20 @@ class CapturingAgent(StubAgent):
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         metrics_registry.reset()
+
+    def test_dev_reload_only_watches_backend_src(self):
+        with isolated_configuration():
+            cfg = main.Configuration.from_env(load_env_file=False)
+
+        reload_kwargs = main._build_dev_reload_kwargs(cfg)
+        expected_src_dir = str((main.backend_root() / "src").resolve(strict=False))
+
+        self.assertTrue(reload_kwargs["reload"])
+        self.assertEqual(reload_kwargs["reload_dirs"], [expected_src_dir])
+        self.assertNotIn(cfg.notes_workspace, reload_kwargs["reload_dirs"])
+        self.assertNotIn(cfg.request_state_dir, reload_kwargs["reload_dirs"])
+        self.assertNotIn(cfg.search_cache_dir, reload_kwargs["reload_dirs"])
+        self.assertNotIn(cfg.note_memory_dir, reload_kwargs["reload_dirs"])
 
     def test_healthz_returns_ok(self):
         with isolated_configuration():
@@ -479,6 +497,64 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["report_markdown"], "# 最终报告")
+
+    def test_startup_warms_semantic_cache_model_when_enabled(self):
+        base_config = main.Configuration.from_env(
+            overrides={
+                "semantic_cache_enabled": True,
+                "semantic_cache_warmup_enabled": True,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+
+        with isolated_configuration(patch_semantic_warmup=False):
+            with patch("services.embeddings.embeddings_available", return_value=True):
+                with patch("services.embeddings.load_sentence_transformer", return_value=object()) as mock_load:
+                    with TestClient(main.create_app(base_config=base_config)):
+                        pass
+
+        mock_load.assert_called_once_with("dummy-minilm")
+
+    def test_startup_skips_semantic_cache_warmup_when_disabled(self):
+        base_config = main.Configuration.from_env(
+            overrides={
+                "semantic_cache_enabled": True,
+                "semantic_cache_warmup_enabled": False,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+
+        with isolated_configuration(patch_semantic_warmup=False):
+            with patch("services.embeddings.embeddings_available", return_value=True):
+                with patch("services.embeddings.load_sentence_transformer") as mock_load:
+                    with TestClient(main.create_app(base_config=base_config)):
+                        pass
+
+        mock_load.assert_not_called()
+
+    def test_startup_continues_when_semantic_cache_warmup_fails(self):
+        base_config = main.Configuration.from_env(
+            overrides={
+                "semantic_cache_enabled": True,
+                "semantic_cache_warmup_enabled": True,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+
+        with isolated_configuration(patch_semantic_warmup=False):
+            with patch("services.embeddings.embeddings_available", return_value=True):
+                with patch(
+                    "services.embeddings.load_sentence_transformer",
+                    side_effect=RuntimeError("warmup failure"),
+                ):
+                    with TestClient(main.create_app(base_config=base_config)) as client:
+                        response = client.get("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
 
 
 if __name__ == "__main__":

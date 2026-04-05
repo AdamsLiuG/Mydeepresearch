@@ -125,10 +125,29 @@ class MetricsRegistry:
             "reflection_skipped_total": 0,
             "review_call_total": 0,
             "review_issue_total": 0,
+            "task_react_round_total": 0,
+            "task_react_continue_total": 0,
+            "task_react_stop_total": 0,
+            "report_repair_trigger_total": 0,
+            "report_repair_added_task_total": 0,
+            "note_memory_query_total": 0,
+            "note_memory_hit_total": 0,
+            "note_memory_miss_total": 0,
+            "note_memory_prompt_injection_total": 0,
+            "note_memory_refresh_total": 0,
+            "note_memory_refresh_failed_total": 0,
+            "strategy_memory_query_total": 0,
+            "strategy_memory_hit_total": 0,
+            "strategy_memory_miss_total": 0,
+            "strategy_memory_prompt_injection_total": 0,
+            "strategy_memory_refresh_total": 0,
+            "strategy_memory_refresh_failed_total": 0,
+            "strategy_memory_synthesized_card_total": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        self._task_react_stop_reason_counts: dict[str, int] = {}
         self._estimated_cost = 0.0
         self._latencies: dict[str, LatencyStats] = {
             "planning_latency_ms": LatencyStats(),
@@ -153,6 +172,7 @@ class MetricsRegistry:
             self._recent_requests = deque(maxlen=self._recent_request_limit)
             for key in list(self._counters.keys()):
                 self._counters[key] = 0
+            self._task_react_stop_reason_counts = {}
             self._estimated_cost = 0.0
             self._latencies = {
                 "planning_latency_ms": LatencyStats(),
@@ -188,6 +208,13 @@ class MetricsRegistry:
                 self._latencies[metric] = LatencyStats()
             self._latencies[metric].add(elapsed_ms)
 
+    def increment_task_react_stop_reason(self, reason: str) -> None:
+        normalized = str(reason or "").strip() or "unknown"
+        with self._lock:
+            self._task_react_stop_reason_counts[normalized] = (
+                self._task_react_stop_reason_counts.get(normalized, 0) + 1
+            )
+
     def store_request(self, payload: dict[str, Any]) -> None:
         with self._lock:
             self._recent_requests.appendleft(_clone_dict(payload))
@@ -198,6 +225,7 @@ class MetricsRegistry:
             latencies = {name: stats.to_dict() for name, stats in self._latencies.items()}
             estimated_cost = round(self._estimated_cost, 6)
             recent_requests = list(self._recent_requests) if include_recent_requests else []
+            stop_reason_counts = dict(self._task_react_stop_reason_counts)
 
         request_total = counters.get("request_total", 0)
         success_total = counters.get("request_success_total", 0)
@@ -208,6 +236,8 @@ class MetricsRegistry:
         cache_semantic_hits = counters.get("cache_semantic_hit_total", 0)
         cache_misses = counters.get("cache_miss_total", 0)
         cache_total = cache_hits + cache_misses
+        task_react_round_total = counters.get("task_react_round_total", 0)
+        task_react_stop_total = counters.get("task_react_stop_total", 0)
 
         return {
             "generated_at": _utc_now(),
@@ -223,6 +253,10 @@ class MetricsRegistry:
             "cache_hit_rate": round((cache_hits / cache_total), 4) if cache_total else 0.0,
             "latencies_ms": latencies,
             "estimated_cost": estimated_cost,
+            "task_react_stop_reason_counts": stop_reason_counts,
+            "avg_task_react_rounds": round(task_react_round_total / task_react_stop_total, 4)
+            if task_react_stop_total
+            else 0.0,
             "recent_requests": recent_requests,
         }
 
@@ -414,6 +448,21 @@ class RequestTrace:
         self.reflection_gap_signals: list[str] = []
         self.reflection_added_tasks = 0
         self.review_summary: dict[str, Any] = {}
+        self.task_react_rounds = 0
+        self.task_react_continue_count = 0
+        self.task_react_stop_count = 0
+        self.task_react_stop_reasons: dict[str, int] = {}
+        self.report_repair_triggered = False
+        self.report_repair_added_tasks = 0
+        self.report_repair_cycles = 0
+        self.note_memory_queries = 0
+        self.note_memory_hits = 0
+        self.note_memory_prompt_injections = 0
+        self.note_memory_last_match_types: list[str] = []
+        self.strategy_memory_queries = 0
+        self.strategy_memory_hits = 0
+        self.strategy_memory_prompt_injections = 0
+        self.strategy_memory_last_match_kinds: list[str] = []
         metrics_registry.increment("request_total")
 
     def start_stage(
@@ -581,6 +630,115 @@ class RequestTrace:
         with self._lock:
             self.review_summary = _clone_dict(summary)
 
+    def record_task_react_round(self) -> None:
+        metrics_registry.increment("task_react_round_total")
+        with self._lock:
+            self.task_react_rounds += 1
+
+    def record_task_react_continue(self) -> None:
+        metrics_registry.increment("task_react_continue_total")
+        with self._lock:
+            self.task_react_continue_count += 1
+
+    def record_task_react_stop(self, reason: str) -> None:
+        normalized = str(reason or "").strip() or "unknown"
+        metrics_registry.increment("task_react_stop_total")
+        metrics_registry.increment_task_react_stop_reason(normalized)
+        with self._lock:
+            self.task_react_stop_count += 1
+            self.task_react_stop_reasons[normalized] = (
+                self.task_react_stop_reasons.get(normalized, 0) + 1
+            )
+
+    def record_report_repair(self, *, added_tasks: int, triggered: bool = True) -> None:
+        if triggered:
+            metrics_registry.increment("report_repair_trigger_total")
+        if added_tasks > 0:
+            metrics_registry.increment("report_repair_added_task_total", added_tasks)
+        with self._lock:
+            self.report_repair_triggered = self.report_repair_triggered or triggered
+            self.report_repair_added_tasks += max(0, int(added_tasks or 0))
+            if triggered:
+                self.report_repair_cycles += 1
+
+    def record_note_memory_query(
+        self,
+        *,
+        hit_count: int,
+        match_types: list[str] | None = None,
+    ) -> None:
+        metrics_registry.increment("note_memory_query_total")
+        if hit_count > 0:
+            metrics_registry.increment("note_memory_hit_total", hit_count)
+        else:
+            metrics_registry.increment("note_memory_miss_total")
+
+        normalized_types = [
+            str(match_type).strip()
+            for match_type in match_types or []
+            if str(match_type).strip()
+        ]
+        with self._lock:
+            self.note_memory_queries += 1
+            self.note_memory_hits += max(0, int(hit_count or 0))
+            if normalized_types:
+                self.note_memory_last_match_types = normalized_types
+
+    def record_note_memory_prompt_injection(
+        self,
+        *,
+        match_types: list[str] | None = None,
+    ) -> None:
+        metrics_registry.increment("note_memory_prompt_injection_total")
+        normalized_types = [
+            str(match_type).strip()
+            for match_type in match_types or []
+            if str(match_type).strip()
+        ]
+        with self._lock:
+            self.note_memory_prompt_injections += 1
+            if normalized_types:
+                self.note_memory_last_match_types = normalized_types
+
+    def record_strategy_memory_query(
+        self,
+        *,
+        hit_count: int,
+        match_kinds: list[str] | None = None,
+    ) -> None:
+        metrics_registry.increment("strategy_memory_query_total")
+        if hit_count > 0:
+            metrics_registry.increment("strategy_memory_hit_total", hit_count)
+        else:
+            metrics_registry.increment("strategy_memory_miss_total")
+
+        normalized_kinds = [
+            str(match_kind).strip()
+            for match_kind in match_kinds or []
+            if str(match_kind).strip()
+        ]
+        with self._lock:
+            self.strategy_memory_queries += 1
+            self.strategy_memory_hits += max(0, int(hit_count or 0))
+            if normalized_kinds:
+                self.strategy_memory_last_match_kinds = normalized_kinds
+
+    def record_strategy_memory_prompt_injection(
+        self,
+        *,
+        match_kinds: list[str] | None = None,
+    ) -> None:
+        metrics_registry.increment("strategy_memory_prompt_injection_total")
+        normalized_kinds = [
+            str(match_kind).strip()
+            for match_kind in match_kinds or []
+            if str(match_kind).strip()
+        ]
+        with self._lock:
+            self.strategy_memory_prompt_injections += 1
+            if normalized_kinds:
+                self.strategy_memory_last_match_kinds = normalized_kinds
+
     def attach_result(
         self,
         *,
@@ -655,6 +813,27 @@ class RequestTrace:
                 "reflection_gap_signals": list(self.reflection_gap_signals),
                 "reflection_added_tasks": self.reflection_added_tasks,
                 "review_summary": _clone_dict(self.review_summary),
+                "task_react_rounds": self.task_react_rounds,
+                "task_react_continue_count": self.task_react_continue_count,
+                "task_react_stop_count": self.task_react_stop_count,
+                "task_react_stop_reasons": dict(self.task_react_stop_reasons),
+                "avg_task_react_rounds": round(
+                    self.task_react_rounds / self.task_react_stop_count,
+                    4,
+                )
+                if self.task_react_stop_count
+                else 0.0,
+                "report_repair_triggered": self.report_repair_triggered,
+                "report_repair_added_tasks": self.report_repair_added_tasks,
+                "report_repair_cycles": self.report_repair_cycles,
+                "note_memory_queries": self.note_memory_queries,
+                "note_memory_hits": self.note_memory_hits,
+                "note_memory_prompt_injections": self.note_memory_prompt_injections,
+                "note_memory_last_match_types": list(self.note_memory_last_match_types),
+                "strategy_memory_queries": self.strategy_memory_queries,
+                "strategy_memory_hits": self.strategy_memory_hits,
+                "strategy_memory_prompt_injections": self.strategy_memory_prompt_injections,
+                "strategy_memory_last_match_kinds": list(self.strategy_memory_last_match_kinds),
                 "report_markdown": self.report_markdown,
                 "todo_items": _clone_dict({"items": self.todo_items}).get("items", []),
                 "report_note_id": self.report_note_id,

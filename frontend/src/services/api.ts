@@ -196,3 +196,24 @@ export async function fetchPersistedRequests(
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   return Array.isArray(payload.items) ? (payload.items as Record<string, unknown>[]) : [];
 }
+
+export async function fetchPersistedRequest(
+  requestId: string,
+  options: StreamOptions = {}
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${baseURL}/requests/${encodeURIComponent(requestId)}`, {
+    method: "GET",
+    headers: {
+      Accept: "application/json"
+    },
+    signal: options.signal
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `获取历史请求详情失败，状态码：${response.status}`);
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  return payload && typeof payload === "object" ? payload : {};
+}

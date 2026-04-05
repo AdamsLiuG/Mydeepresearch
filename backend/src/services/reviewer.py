@@ -467,6 +467,42 @@ class ReviewService:
             merged.append(item)
         return merged
 
+    @staticmethod
+    def _normalize_repair_check(check: str) -> str | None:
+        normalized = str(check or "").strip().lower()
+        if normalized in {"missing_angle", "weak_evidence", "stale_evidence", "invalid_citation"}:
+            return normalized
+        if normalized in {"low_source_diversity", "low_quality_mix", "missing_citation"}:
+            return "weak_evidence"
+        return None
+
+    def _build_repair_candidates(self, issues: list[ReviewIssue]) -> list[dict[str, Any]]:
+        severity_rank = {"high": 0, "medium": 1, "low": 2}
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[int | None, str, str]] = set()
+
+        for issue in sorted(issues, key=lambda item: severity_rank.get(item.severity, 99)):
+            normalized_check = self._normalize_repair_check(issue.check)
+            if normalized_check is None:
+                continue
+
+            key = (issue.task_id, normalized_check, issue.message)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "task_id": issue.task_id,
+                    "severity": issue.severity,
+                    "check": normalized_check,
+                    "message": issue.message,
+                    "source_ids": list(issue.source_ids),
+                    "origin_check": issue.check,
+                }
+            )
+
+        return candidates
+
     def _apply_review_result(
         self,
         state: SummaryState,
@@ -524,6 +560,7 @@ class ReviewService:
             "issue_count": len(issues),
             "severity_counts": severity_counts,
             "issues": [issue.to_dict() for issue in issues],
+            "repair_candidates": self._build_repair_candidates(issues),
         }
         state.review_summary = summary
         state.review_completed = True

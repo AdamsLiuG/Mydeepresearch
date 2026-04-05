@@ -122,6 +122,45 @@ class SummarizationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no grounded findings"):
             finalize()
 
+    def test_summarize_task_rewrites_contaminated_executive_summary(self):
+        response = """
+{
+  "executive_summary": "扩散模型在可控生成上继续推进。需注意部分任务审查状态为blocked或warning，报告结论采取保守表述。",
+  "key_findings": [
+    {"text": "更强的条件控制让复杂场景生成更稳定", "source_ids": ["T1-S1"]},
+    {"text": "统一建模降低了多模态扩展时的系统割裂", "source_ids": ["T1-S2"]}
+  ],
+  "evidence_gaps": ["仍需补充更近期的官方评测或论文"]
+}
+"""
+        service = SummarizationService(
+            lambda: DummyAgent(response=response),
+            self.config,
+        )
+
+        result = service.summarize_task(self.state, self.task, "context")
+
+        self.assertIn("## 任务概述", result.markdown)
+        self.assertNotIn("审查状态为blocked或warning", result.markdown)
+        self.assertTrue(result.payload["executive_summary"].startswith("扩散模型在可控生成上继续推进"))
+        self.assertIn("更强的条件控制让复杂场景生成更稳定", result.markdown)
+
+    def test_build_prompt_includes_historical_memory_guardrails(self):
+        service = SummarizationService(
+            lambda: DummyAgent(response='{"key_findings":[{"text":"结论","source_ids":["T1-S1"]}],"evidence_gaps":[]}'),
+            self.config,
+        )
+
+        prompt = service._build_prompt(
+            self.state,
+            self.task,
+            "context",
+            historical_memory_context="历史研究记忆：过去任务常见遗漏是缺少官方文档。",
+        )
+
+        self.assertIn("历史研究记忆", prompt)
+        self.assertIn("不能作为当前任务的 `source_id` 证据", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

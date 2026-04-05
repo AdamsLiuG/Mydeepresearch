@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 def _utc_now() -> str:
@@ -35,12 +36,18 @@ class RequestStateStore:
         stored_payload = dict(payload)
         stored_payload.setdefault("request_id", request_id)
         stored_payload["updated_at"] = _utc_now()
-        temp_path = path.with_suffix(".json.tmp")
-        temp_path.write_text(
-            json.dumps(stored_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temp_path.replace(path)
+        # Use a unique temp file per save so concurrent task snapshots for the
+        # same request_id cannot clobber each other's atomic replace step.
+        temp_path = path.with_name(f"{path.stem}.{uuid4().hex}.json.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(stored_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
         return stored_payload
 
     def load(self, request_id: str) -> dict[str, Any] | None:

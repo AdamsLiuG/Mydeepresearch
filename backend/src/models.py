@@ -2,7 +2,7 @@
 
 import operator
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List
 
 from typing_extensions import Annotated
 
@@ -29,6 +29,13 @@ class TodoItem:
     stream_token: str | None = field(default=None)
     origin: str = field(default="planned")
     round: int = field(default=1)
+    react_rounds: int = field(default=0)
+    react_fetch_count: int = field(default=0)
+    react_additional_search_count: int = field(default=0)
+    react_gap_signals: list[str] = field(default_factory=list)
+    react_last_action: str | None = field(default=None)
+    react_stop_reason: str | None = field(default=None)
+    react_observation: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -46,6 +53,8 @@ class SummaryState:
     review_summary: dict = field(default_factory=dict)
     reflection_completed: bool = field(default=False)
     review_completed: bool = field(default=False)
+    report_repair_completed: bool = field(default=False)
+    report_repair_cycles: int = field(default=0)
 
 
 @dataclass(kw_only=True)

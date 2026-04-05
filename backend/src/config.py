@@ -131,6 +131,12 @@ class Configuration(BaseModel):
         title="Advanced Search Fetch Full Page Override",
         description="Optional override for fetch_full_page applied only to advanced search fan-out requests",
     )
+    advanced_backend_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0.0,
+        title="Advanced Backend Timeout Seconds",
+        description="Optional deadline for a single advanced search fusion round before slow backends are skipped",
+    )
     advanced_rerank_enabled: bool = Field(
         default=False,
         title="Advanced Rerank Enabled",
@@ -183,6 +189,72 @@ class Configuration(BaseModel):
         default="./notes",
         title="Notes Workspace",
         description="Directory for NoteTool to persist task notes",
+    )
+    note_memory_enabled: bool = Field(
+        default=False,
+        title="Note Memory Enabled",
+        description="Whether to build a persistent vector note memory for historical retrieval",
+    )
+    note_memory_dir: str = Field(
+        default="./.memory/notes",
+        title="Note Memory Directory",
+        description="Directory used by the local note memory vector store and manifest",
+    )
+    note_memory_embedding_model: str | None = Field(
+        default=None,
+        title="Note Memory Embedding Model",
+        description="Optional embedding model override for note memory retrieval",
+    )
+    note_memory_planning_top_k: int = Field(
+        default=3,
+        ge=1,
+        title="Note Memory Planning Top K",
+        description="How many historical note memories to inject during planning",
+    )
+    note_memory_execution_top_k: int = Field(
+        default=3,
+        ge=1,
+        title="Note Memory Execution Top K",
+        description="How many historical note memories to inject during task execution",
+    )
+    note_memory_prompt_char_limit: int = Field(
+        default=1800,
+        ge=200,
+        title="Note Memory Prompt Character Limit",
+        description="Maximum prompt characters reserved for injected historical note memory",
+    )
+    strategy_memory_enabled: bool = Field(
+        default=False,
+        title="Strategy Memory Enabled",
+        description="Whether to build a persistent cross-request strategy memory from terminal request snapshots",
+    )
+    strategy_memory_dir: str = Field(
+        default="./.memory/strategies",
+        title="Strategy Memory Directory",
+        description="Directory used by the local strategy memory vector store, cards, and manifest",
+    )
+    strategy_memory_embedding_model: str | None = Field(
+        default=None,
+        title="Strategy Memory Embedding Model",
+        description="Optional embedding model override for strategy memory retrieval",
+    )
+    strategy_memory_planning_top_k: int = Field(
+        default=3,
+        ge=1,
+        title="Strategy Memory Planning Top K",
+        description="How many historical strategy memories to inject during planning",
+    )
+    strategy_memory_reflection_top_k: int = Field(
+        default=3,
+        ge=1,
+        title="Strategy Memory Reflection Top K",
+        description="How many historical strategy memories to inject during reflection",
+    )
+    strategy_memory_prompt_char_limit: int = Field(
+        default=1600,
+        ge=200,
+        title="Strategy Memory Prompt Character Limit",
+        description="Maximum prompt characters reserved for injected historical strategy memory",
     )
     fetch_full_page: bool = Field(
         default=True,
@@ -269,6 +341,11 @@ class Configuration(BaseModel):
         title="Semantic Cache Enabled",
         description="Whether to use embedding similarity to reuse semantically similar search results",
     )
+    semantic_cache_warmup_enabled: bool = Field(
+        default=True,
+        title="Semantic Cache Warmup Enabled",
+        description="Whether to warm up the semantic-cache embedding model during API startup",
+    )
     semantic_cache_embedding_model: str = Field(
         default="sentence-transformers/all-MiniLM-L6-v2",
         title="Semantic Cache Embedding Model",
@@ -354,6 +431,29 @@ class Configuration(BaseModel):
         title="Task Query Rewrite Enabled",
         description="Whether to add a rewritten search query candidate for generic or underspecified task queries",
     )
+    task_react_enabled: bool = Field(
+        default=True,
+        title="Task ReAct Enabled",
+        description="Whether to run a bounded task-level evidence repair loop before summarization",
+    )
+    task_react_max_rounds: int = Field(
+        default=2,
+        ge=1,
+        title="Task ReAct Max Rounds",
+        description="Maximum evidence-repair rounds allowed for a single task",
+    )
+    task_react_max_fetches_per_task: int = Field(
+        default=2,
+        ge=0,
+        title="Task ReAct Max Fetches Per Task",
+        description="Maximum number of fetch-page enrichment actions allowed per task",
+    )
+    task_react_max_additional_searches_per_task: int = Field(
+        default=1,
+        ge=0,
+        title="Task ReAct Max Additional Searches Per Task",
+        description="Maximum number of extra search rounds allowed per task after the initial search",
+    )
     search_tool_timeout_seconds: float | None = Field(
         default=8.0,
         gt=0.0,
@@ -387,6 +487,11 @@ class Configuration(BaseModel):
         title="Report Sources Character Limit",
         description="Optional override for task source budget in the final report prompt",
     )
+    report_layout_mode: str = Field(
+        default="flexible",
+        title="Report Layout Mode",
+        description="Report layout strategy: flexible (core sections + optional custom sections) or fixed (legacy structure backup)",
+    )
     metrics_recent_requests_limit: int = Field(
         default=25,
         title="Recent Request Limit",
@@ -407,6 +512,23 @@ class Configuration(BaseModel):
         ge=1,
         title="Request State Recent Limit",
         description="How many persisted request snapshots to surface via the API",
+    )
+    report_repair_enabled: bool = Field(
+        default=True,
+        title="Report Repair Enabled",
+        description="Whether to run a bounded post-review evidence repair cycle before the final report",
+    )
+    report_repair_max_tasks: int = Field(
+        default=2,
+        ge=1,
+        title="Report Repair Max Tasks",
+        description="Maximum targeted repair tasks that may be added after the review stage",
+    )
+    report_repair_max_cycles: int = Field(
+        default=1,
+        ge=1,
+        title="Report Repair Max Cycles",
+        description="Maximum post-review repair cycles allowed per request",
     )
     benchmark_stub_enabled: bool = Field(
         default=False,
@@ -490,6 +612,20 @@ class Configuration(BaseModel):
             return value.strip().upper() or "INFO"
         return value
 
+    @field_validator("report_layout_mode", mode="before")
+    @classmethod
+    def _normalize_report_layout_mode(cls, value: Any) -> Any:
+        if value is None:
+            return "flexible"
+
+        if isinstance(value, str):
+            normalized = value.strip().lower() or "flexible"
+            if normalized not in {"flexible", "fixed"}:
+                raise ValueError("report_layout_mode must be either 'flexible' or 'fixed'")
+            return normalized
+
+        return value
+
     @field_validator("benchmark_profile", mode="before")
     @classmethod
     def _normalize_benchmark_profile(cls, value: Any) -> Any:
@@ -551,6 +687,20 @@ class Configuration(BaseModel):
             if not state_path.is_absolute():
                 state_path = backend_root() / state_path
             self.request_state_dir = str(state_path.resolve(strict=False))
+
+        note_memory_dir = (self.note_memory_dir or "").strip()
+        if note_memory_dir:
+            memory_path = Path(note_memory_dir).expanduser()
+            if not memory_path.is_absolute():
+                memory_path = backend_root() / memory_path
+            self.note_memory_dir = str(memory_path.resolve(strict=False))
+
+        strategy_memory_dir = (self.strategy_memory_dir or "").strip()
+        if strategy_memory_dir:
+            memory_path = Path(strategy_memory_dir).expanduser()
+            if not memory_path.is_absolute():
+                memory_path = backend_root() / memory_path
+            self.strategy_memory_dir = str(memory_path.resolve(strict=False))
         return self
 
     @classmethod
@@ -590,6 +740,7 @@ class Configuration(BaseModel):
             "advanced_search_backends": os.getenv("ADVANCED_SEARCH_BACKENDS"),
             "advanced_search_max_concurrency": os.getenv("ADVANCED_SEARCH_MAX_CONCURRENCY"),
             "advanced_search_fetch_full_page_override": os.getenv("ADVANCED_SEARCH_FETCH_FULL_PAGE_OVERRIDE"),
+            "advanced_backend_timeout_seconds": os.getenv("ADVANCED_BACKEND_TIMEOUT_SECONDS"),
             "advanced_rerank_enabled": os.getenv("ADVANCED_RERANK_ENABLED"),
             "advanced_rerank_base_url": os.getenv("ADVANCED_RERANK_BASE_URL"),
             "advanced_rerank_api_key": os.getenv("ADVANCED_RERANK_API_KEY"),
@@ -600,6 +751,18 @@ class Configuration(BaseModel):
             "semantic_scholar_api_key": os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
+            "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
+            "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
+            "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),
+            "note_memory_planning_top_k": os.getenv("NOTE_MEMORY_PLANNING_TOP_K"),
+            "note_memory_execution_top_k": os.getenv("NOTE_MEMORY_EXECUTION_TOP_K"),
+            "note_memory_prompt_char_limit": os.getenv("NOTE_MEMORY_PROMPT_CHAR_LIMIT"),
+            "strategy_memory_enabled": os.getenv("STRATEGY_MEMORY_ENABLED"),
+            "strategy_memory_dir": os.getenv("STRATEGY_MEMORY_DIR"),
+            "strategy_memory_embedding_model": os.getenv("STRATEGY_MEMORY_EMBEDDING_MODEL"),
+            "strategy_memory_planning_top_k": os.getenv("STRATEGY_MEMORY_PLANNING_TOP_K"),
+            "strategy_memory_reflection_top_k": os.getenv("STRATEGY_MEMORY_REFLECTION_TOP_K"),
+            "strategy_memory_prompt_char_limit": os.getenv("STRATEGY_MEMORY_PROMPT_CHAR_LIMIT"),
             "host": os.getenv("HOST"),
             "port": os.getenv("PORT"),
             "log_level": os.getenv("LOG_LEVEL"),
@@ -623,16 +786,26 @@ class Configuration(BaseModel):
             "review_min_domains_per_task": os.getenv("REVIEW_MIN_DOMAINS_PER_TASK"),
             "freshness_reference_days": os.getenv("FRESHNESS_REFERENCE_DAYS"),
             "task_query_rewrite_enabled": os.getenv("TASK_QUERY_REWRITE_ENABLED"),
+            "task_react_enabled": os.getenv("TASK_REACT_ENABLED"),
+            "task_react_max_rounds": os.getenv("TASK_REACT_MAX_ROUNDS"),
+            "task_react_max_fetches_per_task": os.getenv("TASK_REACT_MAX_FETCHES_PER_TASK"),
+            "task_react_max_additional_searches_per_task": os.getenv(
+                "TASK_REACT_MAX_ADDITIONAL_SEARCHES_PER_TASK"
+            ),
             "search_tool_timeout_seconds": os.getenv("SEARCH_TOOL_TIMEOUT_SECONDS"),
             "search_tool_retry_attempts": os.getenv("SEARCH_TOOL_RETRY_ATTEMPTS"),
             "search_tool_retry_backoff_seconds": os.getenv("SEARCH_TOOL_RETRY_BACKOFF_SECONDS"),
             "direct_answer_char_limit": os.getenv("DIRECT_ANSWER_CHAR_LIMIT"),
             "report_summary_char_limit": os.getenv("REPORT_SUMMARY_CHAR_LIMIT"),
             "report_sources_char_limit": os.getenv("REPORT_SOURCES_CHAR_LIMIT"),
+            "report_layout_mode": os.getenv("REPORT_LAYOUT_MODE"),
             "metrics_recent_requests_limit": os.getenv("METRICS_RECENT_REQUESTS_LIMIT"),
             "request_state_enabled": os.getenv("REQUEST_STATE_ENABLED"),
             "request_state_dir": os.getenv("REQUEST_STATE_DIR"),
             "request_state_recent_limit": os.getenv("REQUEST_STATE_RECENT_LIMIT"),
+            "report_repair_enabled": os.getenv("REPORT_REPAIR_ENABLED"),
+            "report_repair_max_tasks": os.getenv("REPORT_REPAIR_MAX_TASKS"),
+            "report_repair_max_cycles": os.getenv("REPORT_REPAIR_MAX_CYCLES"),
             "benchmark_stub_enabled": os.getenv("BENCHMARK_STUB_ENABLED"),
             "benchmark_profile": os.getenv("BENCHMARK_PROFILE"),
             "perf_sample_interval_seconds": os.getenv("PERF_SAMPLE_INTERVAL_SECONDS"),
@@ -670,6 +843,23 @@ class Configuration(BaseModel):
         """Return the persistent cache directory."""
         return self.search_cache_dir
 
+    def resolved_note_memory_embedding_model(self) -> str:
+        """Return the embedding model used by note memory retrieval."""
+
+        return (
+            str(self.note_memory_embedding_model or "").strip()
+            or str(self.semantic_cache_embedding_model or "").strip()
+            or "sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+    def resolved_strategy_memory_embedding_model(self) -> str:
+        """Return the embedding model used by strategy memory retrieval."""
+
+        return (
+            str(self.strategy_memory_embedding_model or "").strip()
+            or self.resolved_note_memory_embedding_model()
+        )
+
     def resolved_advanced_search_backends(self) -> list[str]:
         """Return the ordered concrete backends used for fused search."""
         return list(self.advanced_search_backends or ["searxng", "tavily", "serpapi", "duckduckgo"])
@@ -683,7 +873,20 @@ class Configuration(BaseModel):
         """Return the fetch_full_page flag used by advanced fan-out requests."""
         if self.advanced_search_fetch_full_page_override is not None:
             return bool(self.advanced_search_fetch_full_page_override)
-        return bool(self.fetch_full_page)
+        # Advanced fan-out already expands multiple providers, so defaulting to
+        # snippet-only results avoids slow per-result page fetches blowing past
+        # the outer search tool timeout. Teams can opt back in explicitly.
+        return False
+
+    def resolved_advanced_backend_timeout_seconds(self) -> float:
+        """Return the deadline used to stop waiting on slow advanced backends."""
+        if self.advanced_backend_timeout_seconds is not None:
+            return max(0.25, float(self.advanced_backend_timeout_seconds))
+
+        search_timeout = max(0.25, float(self.search_tool_timeout_seconds or 10.0))
+        if search_timeout <= 1.5:
+            return max(0.25, search_timeout * 0.75)
+        return max(0.25, search_timeout - 1.0)
 
     def resolved_advanced_rerank_model(self) -> str | None:
         """Return the model identifier used for advanced search reranking."""
@@ -779,3 +982,7 @@ class Configuration(BaseModel):
 
         window = self.resolved_context_window()
         return self._clamp((window // 96) * 4, 80, 3000)
+
+    def resolved_report_layout_mode(self) -> str:
+        """Return the normalized report layout mode."""
+        return str(self.report_layout_mode or "flexible").strip().lower() or "flexible"

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Callable
@@ -66,6 +67,324 @@ HTML_TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re
 DATE_PATTERN = re.compile(
     r"(?P<year>20\d{2})[./\-年](?P<month>\d{1,2})[./\-月](?P<day>\d{1,2})日?"
 )
+WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?")
+CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+URL_PATTERN = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
+DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.IGNORECASE)
+ARXIV_PATTERN = re.compile(r"\barxiv:\s*\d{4}\.\d{4,5}\b", re.IGNORECASE)
+NUMBERED_REFERENCE_PATTERN = re.compile(r"(?m)^\s*(?:\[\d+\]|\d+\.)\s+\S+")
+HEADING_PATTERN = re.compile(
+    r"(?m)^(?:#{1,6}\s+\S+|\d+(?:\.\d+)*\s+\S+|(?:references|reference|faq|conclusion|summary|overview)\s*:?)$",
+    re.IGNORECASE,
+)
+TITLE_CLAUSE_SPLIT_PATTERN = re.compile(r"\s*[\-|:|]\s*")
+SOCIAL_HANDLE_PATTERN = re.compile(r"^/?@?(?P<handle>[A-Za-z0-9_.-]{2,40})/?")
+
+SOURCE_TYPE_BONUS = {
+    "government": 4.0,
+    "education": 3.5,
+    "official_documentation": 3.5,
+    "official_product": 3.0,
+    "official_org": 3.0,
+    "peer_reviewed_paper": 3.5,
+    "preprint_paper": 2.5,
+    "standards_spec": 3.5,
+    "repository_official": 2.5,
+    "repository_unofficial": 1.5,
+    "reference_curated": 1.5,
+    "news_primary": 1.5,
+    "news_secondary": 1.0,
+    "technical_blog": 1.0,
+    "company_blog": 1.0,
+    "forum_expert": 0.5,
+    "forum_general": -0.5,
+    "social_official": 0.5,
+    "social_general": -1.0,
+    "content_farm_or_aggregator": -2.0,
+    "web_general": 0.0,
+}
+
+PROVIDER_BONUS = {
+    1: 0.0,
+    2: 0.8,
+    3: 1.5,
+}
+
+NEWS_PRIMARY_DOMAINS = {
+    "apnews.com",
+    "axios.com",
+    "bbc.com",
+    "bloomberg.com",
+    "cnbc.com",
+    "cnn.com",
+    "ft.com",
+    "nytimes.com",
+    "reuters.com",
+    "theverge.com",
+    "techcrunch.com",
+    "washingtonpost.com",
+    "wsj.com",
+}
+NEWS_SECONDARY_DOMAINS = {
+    "msn.com",
+    "newsbreak.com",
+    "news.google.com",
+    "smartnews.com",
+    "yahoo.com",
+}
+AGGREGATOR_DOMAINS = NEWS_SECONDARY_DOMAINS | {
+    "flipboard.com",
+    "feedly.com",
+}
+FORUM_DOMAINS = {
+    "reddit.com",
+    "news.ycombinator.com",
+    "stackoverflow.com",
+    "stackexchange.com",
+    "zhihu.com",
+    "quora.com",
+    "v2ex.com",
+}
+SOCIAL_DOMAINS = {
+    "x.com",
+    "twitter.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "threads.net",
+    "weibo.com",
+    "youtube.com",
+    "t.me",
+    "mastodon.social",
+}
+REFERENCE_DOMAINS = {
+    "baike.baidu.com",
+    "britannica.com",
+    "wikipedia.org",
+}
+PREPRINT_DOMAINS = {
+    "arxiv.org",
+    "biorxiv.org",
+    "medrxiv.org",
+}
+PAPER_DOMAINS = {
+    "acm.org",
+    "doi.org",
+    "ieeexplore.ieee.org",
+    "jmlr.org",
+    "nature.com",
+    "pubmed.ncbi.nlm.nih.gov",
+    "science.org",
+    "sciencedirect.com",
+    "semanticscholar.org",
+    "springer.com",
+}
+STANDARDS_DOMAINS = {
+    "ecma-international.org",
+    "ietf.org",
+    "iso.org",
+    "rfc-editor.org",
+    "w3.org",
+}
+COMMON_SUBDOMAIN_LABELS = {
+    "api",
+    "app",
+    "blog",
+    "cdn",
+    "developer",
+    "developers",
+    "docs",
+    "help",
+    "m",
+    "news",
+    "support",
+    "www",
+}
+GENERIC_DOMAIN_LABELS = {
+    "ac",
+    "co",
+    "com",
+    "edu",
+    "gov",
+    "net",
+    "org",
+}
+OFFICIAL_PATH_TOKENS = ("api", "developer", "developers", "docs", "help", "manual", "reference", "support")
+PRODUCT_PATH_TOKENS = ("changelog", "download", "platform", "pricing", "product", "products", "release", "releases")
+BLOG_PATH_TOKENS = ("blog", "engineering", "insights", "news", "posts", "stories")
+NAVIGATION_TOKENS = ("all", "archive", "archives", "category", "categories", "compare", "index", "list", "page", "search", "tag", "tags")
+CLICKBAIT_PATTERNS = (
+    "you won't believe",
+    "what happens next",
+    "top 10",
+    "top ten",
+    "best ever",
+    "shocking",
+    "must read",
+    "ultimate guide",
+)
+TEASER_PATTERNS = (
+    "learn more",
+    "read more",
+    "coming soon",
+    "stay tuned",
+    "click here",
+)
+AUTHOR_ATTRIBUTION_PATTERNS = (
+    "by ",
+    "published by",
+    "editor",
+    "author",
+    "source:",
+    "writer",
+    "作者",
+    "编辑",
+    "来源",
+)
+EXPERT_PATTERNS = (
+    "dr.",
+    "phd",
+    "md",
+    "prof.",
+    "professor",
+    "research scientist",
+    "staff engineer",
+    "maintainer",
+    "official answer",
+)
+AD_PATTERNS = (
+    "advertisement",
+    "affiliate",
+    "promo",
+    "promotion",
+    "shop now",
+    "sponsored",
+    "subscribe",
+)
+PRIMARY_SOURCE_HINTS = (
+    ".gov",
+    "/docs",
+    "/paper/",
+    "/pdf",
+    "acm.org",
+    "arxiv.org",
+    "doi.org",
+    "github.com",
+    "ieee.org",
+    "ietf.org",
+    "nature.com",
+    "pubmed.ncbi.nlm.nih.gov",
+    "rfc-editor.org",
+    "science.org",
+    "springer.com",
+    "w3.org",
+)
+
+
+def _domain_matches(domain: str, candidates: set[str]) -> bool:
+    return any(domain == candidate or domain.endswith(f".{candidate}") for candidate in candidates)
+
+
+def _normalize_signal_text(value: str) -> str:
+    cleaned = _clean_text(value or "").lower()
+    return re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", cleaned).strip()
+
+
+def _ev_get(ev: Any, key: str, default: Any = None) -> Any:
+    if isinstance(ev, dict):
+        return ev.get(key, default)
+    return getattr(ev, key, default)
+
+
+def _ev_str(ev: Any, key: str) -> str:
+    return str(_ev_get(ev, key, "") or "").strip()
+
+
+def _ev_list(ev: Any, key: str) -> list[Any]:
+    value = _ev_get(ev, key, [])
+    return list(value) if isinstance(value, list) else []
+
+
+def _record_tracking_updated_at(ev: Any) -> float | None:
+    value = _ev_get(ev, "updated_at")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _best_text(ev: Any) -> str:
+    for key in ("full_content", "raw_content", "content", "snippet"):
+        value = _ev_str(ev, key)
+        if value:
+            return _clean_text(value)
+    return ""
+
+
+def _combined_text(ev: Any) -> str:
+    parts = [
+        _ev_str(ev, "title"),
+        _ev_str(ev, "snippet"),
+        _ev_str(ev, "raw_content"),
+        _ev_str(ev, "full_content"),
+        _ev_str(ev, "content"),
+    ]
+    return _clean_text(" ".join(part for part in parts if part))
+
+
+def _root_domain_token(domain: str) -> str:
+    labels = [
+        label
+        for label in extract_domain(f"https://{domain}").split(".")
+        if label and label not in GENERIC_DOMAIN_LABELS
+    ]
+    if not labels:
+        return ""
+    for label in reversed(labels):
+        if label not in COMMON_SUBDOMAIN_LABELS:
+            return label
+    return labels[-1]
+
+
+def _title_subject(title: str) -> str:
+    if not title:
+        return ""
+    return TITLE_CLAUSE_SPLIT_PATTERN.split(title, maxsplit=1)[0].strip()
+
+
+def _append_unique(target: list[str], value: str) -> None:
+    cleaned = str(value or "").strip()
+    if cleaned and cleaned not in target:
+        target.append(cleaned)
+
+
+def _normalized_body_for_similarity(text: str) -> str:
+    normalized = _normalize_signal_text(text)
+    return " ".join(normalized.split())
+
+
+def _repetition_ratio(text: str) -> float:
+    blocks = [block.strip() for block in re.split(r"\n{2,}", text or "") if block.strip()]
+    if len(blocks) < 2:
+        return 0.0
+    normalized_blocks = [_normalized_body_for_similarity(block) for block in blocks]
+    seen: set[str] = set()
+    repeated = 0
+    for block in normalized_blocks:
+        if block in seen:
+            repeated += 1
+            continue
+        seen.add(block)
+    return repeated / max(len(normalized_blocks), 1)
+
+
+def _round_component_score(value: float) -> float:
+    return round(max(0.0, min(10.0, float(value))), 1)
+
+
+def _quality_components(ev: Any) -> dict[str, Any]:
+    if isinstance(ev, dict) and "source_type_v2" in ev and "word_count" in ev:
+        return dict(ev)
+    return _analyze_evidence_quality(ev).copy()
 
 
 def _normalize_url(url: str) -> str:
@@ -89,11 +408,25 @@ def _normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, urlencode(filtered_query, doseq=True), ""))
 
 
-def _domain(url: str) -> str:
+def extract_domain(url: str) -> str:
+    raw = (url or "").strip()
     try:
-        return (urlsplit(url).netloc or "").lower()
+        parsed = urlsplit(raw)
     except ValueError:
         return ""
+    if not parsed.netloc and (not parsed.scheme or " " in raw):
+        return ""
+    netloc = (parsed.netloc or "").lower().strip()
+    if not netloc:
+        return ""
+    netloc = netloc.split("@")[-1].split(":")[0].strip(".")
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+
+def _domain(url: str) -> str:
+    return extract_domain(url)
 
 
 def _clean_text(value: str) -> str:
@@ -173,7 +506,6 @@ def _extract_published_at(result: dict[str, Any]) -> str | None:
         "date",
         "datetime",
         "time",
-        "updated_at",
     ):
         parsed = _parse_datetime(result.get(key))
         if parsed is not None:
@@ -199,6 +531,25 @@ def _extract_published_at(result: dict[str, Any]) -> str | None:
     )
     parsed = _parse_datetime(combined_text)
     return parsed.date().isoformat() if parsed is not None else None
+
+
+def _extract_source_updated_at(result: dict[str, Any]) -> str | None:
+    for key in (
+        "source_updated_at",
+        "updated_at",
+        "updatedAt",
+        "last_modified",
+        "lastModified",
+        "modified_at",
+    ):
+        parsed = _parse_datetime(result.get(key))
+        if parsed is not None:
+            return parsed.date().isoformat()
+
+        raw_value = str(result.get(key) or "").strip()
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", raw_value):
+            return raw_value
+    return None
 
 
 def _classify_source_type(url: str, title: str) -> str:
@@ -228,29 +579,557 @@ def _classify_source_type(url: str, title: str) -> str:
     return "web"
 
 
+def is_official_owner_match(ev: Any) -> bool:
+    domain = extract_domain(_ev_str(ev, "url"))
+    if not domain:
+        return False
+    if domain.endswith(".gov") or ".gov." in domain or domain.endswith(".edu") or ".edu." in domain:
+        return True
+
+    parsed = urlsplit(_ev_str(ev, "url"))
+    path = parsed.path.lower()
+    labels = [label for label in domain.split(".") if label]
+    if labels and labels[0] in COMMON_SUBDOMAIN_LABELS:
+        return True
+    if any(f"/{token}" in path for token in OFFICIAL_PATH_TOKENS):
+        return True
+
+    root_token = _root_domain_token(domain)
+    if not root_token:
+        return False
+
+    title_subject = _normalize_signal_text(_title_subject(_ev_str(ev, "title")))
+    site_tokens = _normalize_signal_text(
+        " ".join(
+            value
+            for value in (
+                _ev_str(ev, "site_name"),
+                _ev_str(ev, "publisher"),
+                _ev_str(ev, "organization"),
+                _ev_str(ev, "org"),
+            )
+            if value
+        )
+    )
+    if root_token in title_subject or root_token in site_tokens:
+        return True
+
+    combined = _normalize_signal_text(_combined_text(ev))
+    if ("official" in combined or "官方" in combined or "verified" in combined) and root_token in combined:
+        return True
+    return False
+
+
+def is_navigation_or_listing_page(ev: Any) -> bool:
+    title = _normalize_signal_text(_ev_str(ev, "title"))
+    text = _best_text(ev)
+    word_count = estimate_word_count(text)
+    try:
+        parsed = urlsplit(_ev_str(ev, "url"))
+    except ValueError:
+        parsed = urlsplit("")
+    path = parsed.path.lower()
+    query = parsed.query.lower()
+    if any(token in title for token in NAVIGATION_TOKENS):
+        return True
+    if any(f"/{token}" in path for token in NAVIGATION_TOKENS):
+        return True
+    if any(f"{token}=" in query for token in ("page", "q", "query", "search")):
+        return True
+    link_count = len(set(URL_PATTERN.findall(text)))
+    line_count = len([line for line in text.splitlines() if line.strip()])
+    short_lines = sum(1 for line in text.splitlines() if 0 < len(line.strip()) <= 48)
+    if word_count < 220 and link_count >= 8 and short_lines >= max(6, line_count // 2):
+        return True
+    return False
+
+
+def has_author_or_org_attribution(ev: Any) -> bool:
+    for key in ("author", "authors", "byline", "publisher", "site_name", "org", "organization"):
+        value = _ev_get(ev, key)
+        if isinstance(value, list) and any(str(item).strip() for item in value):
+            return True
+        if str(value or "").strip():
+            return True
+    combined = _normalize_signal_text(_combined_text(ev))
+    return any(pattern in combined for pattern in AUTHOR_ATTRIBUTION_PATTERNS)
+
+
+def estimate_word_count(text: str) -> int:
+    cleaned = _clean_text(text or "")
+    if not cleaned:
+        return 0
+    english_count = len(WORD_PATTERN.findall(cleaned))
+    cjk_count = len(CJK_PATTERN.findall(cleaned))
+    return english_count + int(math.ceil(cjk_count / 2.0))
+
+
+def estimate_reference_count(ev: Any) -> int:
+    explicit_lists = []
+    for key in ("references", "citations"):
+        value = _ev_get(ev, key)
+        if isinstance(value, list):
+            explicit_lists.extend(str(item).strip() for item in value if str(item).strip())
+    if explicit_lists:
+        return len(dict.fromkeys(explicit_lists))
+
+    text = _combined_text(ev)
+    refs: set[str] = set()
+    refs.update(match.rstrip(".,)") for match in URL_PATTERN.findall(text))
+    refs.update(match.lower() for match in DOI_PATTERN.findall(text))
+    refs.update(match.lower() for match in ARXIV_PATTERN.findall(text))
+    refs.update(match.group(0) for match in NUMBERED_REFERENCE_PATTERN.finditer(text))
+    if re.search(r"\b(?:references|reference|bibliography|参考文献)\b", text, re.IGNORECASE):
+        refs.add("references_section")
+    return len(refs)
+
+
+def has_clear_headings_and_sections(ev: Any) -> bool:
+    text = ""
+    for key in ("full_content", "raw_content", "content", "snippet"):
+        value = _ev_str(ev, key)
+        if value:
+            text = HTML_SCRIPT_PATTERN.sub(" ", value)
+            text = HTML_TAG_PATTERN.sub(" ", text).replace("\xa0", " ")
+            break
+    if not text:
+        return False
+    heading_matches = HEADING_PATTERN.findall(text)
+    colon_headings = re.findall(r"(?m)^[A-Z][A-Za-z0-9 /&-]{2,40}:\s*$", text)
+    return (len(heading_matches) + len(colon_headings)) >= 2
+
+
+def estimate_extraction_quality(ev: Any) -> str:
+    text = _best_text(ev)
+    word_count = estimate_word_count(text)
+    if word_count == 0:
+        return "poor"
+    html_residue = len(re.findall(r"</?[a-z][^>]*>", text, re.IGNORECASE))
+    boilerplate_hits = sum(
+        text.lower().count(token)
+        for token in ("cookie", "privacy policy", "terms of service", "subscribe", "sign in", "menu")
+    )
+    repetition = _repetition_ratio(text)
+    if html_residue >= 8 or boilerplate_hits >= 4 or repetition >= 0.35:
+        return "poor"
+    if word_count < 120:
+        if word_count >= 20 and (
+            _ev_str(ev, "published_at")
+            or _classify_source_type(_ev_str(ev, "url"), _ev_str(ev, "title")) in {"documentation", "government", "education", "paper"}
+        ):
+            return "partial"
+        return "poor"
+    if word_count < 500 or html_residue >= 2 or boilerplate_hits >= 2 or repetition >= 0.2:
+        return "partial"
+    return "good"
+
+
+def is_duplicate_or_near_duplicate(ev: Any) -> bool:
+    for key in ("duplicate", "is_duplicate", "near_duplicate"):
+        if bool(_ev_get(ev, key)):
+            return True
+    full_text = _normalized_body_for_similarity(_ev_str(ev, "full_content"))
+    raw_text = _normalized_body_for_similarity(_ev_str(ev, "raw_content"))
+    snippet = _normalized_body_for_similarity(_ev_str(ev, "snippet"))
+    if full_text and snippet and full_text == snippet:
+        return True
+    if raw_text and snippet and raw_text == snippet:
+        return True
+    if _repetition_ratio(_best_text(ev)) >= 0.45:
+        return True
+    return False
+
+
+def is_aggregator_or_rehosted_copy(ev: Any) -> bool:
+    domain = extract_domain(_ev_str(ev, "url"))
+    if _domain_matches(domain, AGGREGATOR_DOMAINS):
+        return True
+    text = _normalize_signal_text(_combined_text(ev))
+    return any(pattern in text for pattern in ("originally published", "转载", "syndicated", "via "))
+
+
+def is_clickbait_or_low_information_page(ev: Any) -> bool:
+    title = _normalize_signal_text(_ev_str(ev, "title"))
+    text = _normalize_signal_text(_best_text(ev))
+    word_count = estimate_word_count(_best_text(ev))
+    if any(pattern in title for pattern in CLICKBAIT_PATTERNS):
+        return True
+    if word_count < 120 and any(pattern in text for pattern in TEASER_PATTERNS):
+        return True
+    if word_count < 80 and title.endswith("?"):
+        return True
+    return False
+
+
+def ad_ratio_high(ev: Any) -> bool:
+    text = _normalize_signal_text(_combined_text(ev))
+    word_count = max(estimate_word_count(text), 1)
+    ad_hits = sum(text.count(pattern) for pattern in AD_PATTERNS)
+    return ad_hits >= 3 or (ad_hits / word_count) > 0.03
+
+
+def has_expert_identity_signal(ev: Any) -> bool:
+    author_blob = _normalize_signal_text(
+        " ".join(
+            [
+                _ev_str(ev, "author"),
+                " ".join(str(item).strip() for item in _ev_list(ev, "authors")),
+                _ev_str(ev, "byline"),
+                _ev_str(ev, "title"),
+                _best_text(ev),
+            ]
+        )
+    )
+    return any(pattern in author_blob for pattern in EXPERT_PATTERNS)
+
+
+def links_to_primary_sources(ev: Any) -> bool:
+    for item in _ev_list(ev, "references") + _ev_list(ev, "citations"):
+        text = str(item).strip().lower()
+        if any(hint in text for hint in PRIMARY_SOURCE_HINTS):
+            return True
+    combined = _combined_text(ev).lower()
+    return any(hint in combined for hint in PRIMARY_SOURCE_HINTS)
+
+
+def is_social_official(ev: Any) -> bool:
+    domain = extract_domain(_ev_str(ev, "url"))
+    if not _domain_matches(domain, SOCIAL_DOMAINS):
+        return False
+    root_token = _root_domain_token(_ev_str(ev, "site_name") or _ev_str(ev, "organization") or extract_domain(_ev_str(ev, "url")))
+    title_blob = _normalize_signal_text(
+        " ".join(
+            value
+            for value in (
+                _ev_str(ev, "title"),
+                _ev_str(ev, "site_name"),
+                _ev_str(ev, "publisher"),
+                _ev_str(ev, "organization"),
+            )
+            if value
+        )
+    )
+    path_match = SOCIAL_HANDLE_PATTERN.match(urlsplit(_ev_str(ev, "url")).path)
+    handle = _normalize_signal_text(path_match.group("handle")) if path_match else ""
+    if root_token and (root_token in title_blob or root_token == handle):
+        return True
+    return "official" in title_blob or "verified organization" in title_blob
+
+
+def detect_source_type(ev: Any) -> str:
+    domain = extract_domain(_ev_str(ev, "url"))
+    url = _ev_str(ev, "url").lower()
+    coarse_type = _ev_str(ev, "source_type")
+    if is_aggregator_or_rehosted_copy(ev):
+        return "content_farm_or_aggregator"
+    if domain.endswith(".gov") or ".gov." in domain:
+        return "government"
+    if domain.endswith(".edu") or ".edu." in domain:
+        return "education"
+    if _domain_matches(domain, STANDARDS_DOMAINS):
+        return "standards_spec"
+    if _domain_matches(domain, PREPRINT_DOMAINS):
+        return "preprint_paper"
+    if _domain_matches(domain, PAPER_DOMAINS) or "/doi/" in url or url.endswith(".pdf"):
+        return "peer_reviewed_paper"
+    if coarse_type == "documentation" or is_official_owner_match(ev) and any(
+        token in url for token in OFFICIAL_PATH_TOKENS
+    ):
+        return "official_documentation"
+    if is_official_owner_match(ev) and any(token in url for token in PRODUCT_PATH_TOKENS):
+        return "official_product"
+    if is_official_owner_match(ev) and coarse_type == "official":
+        return "official_org"
+    if _domain_matches(domain, {"github.com", "gitlab.com"}):
+        return "repository_official" if is_official_owner_match(ev) else "repository_unofficial"
+    if _domain_matches(domain, REFERENCE_DOMAINS):
+        return "reference_curated"
+    if _domain_matches(domain, NEWS_PRIMARY_DOMAINS):
+        return "news_primary" if not is_navigation_or_listing_page(ev) else "news_secondary"
+    if _domain_matches(domain, NEWS_SECONDARY_DOMAINS) or ("news" in domain and not is_official_owner_match(ev)):
+        return "news_secondary"
+    if is_official_owner_match(ev) and any(token in url for token in BLOG_PATH_TOKENS):
+        return "company_blog"
+    if "blog" in domain or any(token in url for token in BLOG_PATH_TOKENS):
+        return "technical_blog"
+    if _domain_matches(domain, FORUM_DOMAINS):
+        return "forum_expert" if has_expert_identity_signal(ev) else "forum_general"
+    if _domain_matches(domain, SOCIAL_DOMAINS):
+        return "social_official" if is_social_official(ev) else "social_general"
+    if is_official_owner_match(ev):
+        return "official_org"
+    return "web_general"
+
+
+def _analyze_evidence_quality(ev: Any, now: datetime | None = None) -> dict[str, Any]:
+    best_text = _best_text(ev)
+    full_text = _combined_text(ev)
+    url = _ev_str(ev, "url")
+    domain = extract_domain(url)
+    provider_count = max(1, min(int(_ev_get(ev, "provider_count", 1) or 1), 3))
+    source_updated_at = _ev_str(ev, "source_updated_at")
+    if not source_updated_at:
+        source_updated_at = _extract_source_updated_at(ev if isinstance(ev, dict) else {})
+    published_at = _ev_str(ev, "published_at")
+    if not published_at and isinstance(ev, dict):
+        published_at = _extract_published_at(ev) or ""
+    if not source_updated_at and published_at:
+        source_updated_at = ""
+
+    extracted_word_count = estimate_word_count(best_text)
+    reference_count = estimate_reference_count(ev)
+    extraction_quality = estimate_extraction_quality(ev)
+    source_type_v2 = detect_source_type(ev)
+    official_match = is_official_owner_match(ev)
+    navigation_page = is_navigation_or_listing_page(ev)
+    expert_signal = has_expert_identity_signal(ev)
+    social_official = is_social_official(ev)
+    author_attribution = has_author_or_org_attribution(ev)
+    clear_sections = has_clear_headings_and_sections(ev)
+    duplicate = is_duplicate_or_near_duplicate(ev)
+    aggregator = is_aggregator_or_rehosted_copy(ev)
+    clickbait = is_clickbait_or_low_information_page(ev)
+    ad_heavy = ad_ratio_high(ev)
+    primary_links = links_to_primary_sources(ev)
+    age_days, freshness_label = compute_freshness_label(
+        {
+            "published_at": published_at or None,
+            "source_updated_at": source_updated_at or None,
+        },
+        now=now,
+    )
+
+    return {
+        "url": url,
+        "domain": domain,
+        "provider_count": provider_count,
+        "published_at": published_at or None,
+        "source_updated_at": source_updated_at or None,
+        "best_text": best_text,
+        "full_text": full_text,
+        "word_count": extracted_word_count,
+        "reference_count": reference_count,
+        "extraction_quality": extraction_quality,
+        "source_type_v2": source_type_v2,
+        "official_owner_match": official_match,
+        "navigation_page": navigation_page,
+        "author_attribution": author_attribution,
+        "clear_sections": clear_sections,
+        "duplicate_or_near_duplicate": duplicate,
+        "aggregator_or_rehosted": aggregator,
+        "clickbait_or_low_information": clickbait,
+        "ad_ratio_high": ad_heavy,
+        "links_to_primary_sources": primary_links,
+        "has_expert_identity_signal": expert_signal,
+        "is_social_official": social_official,
+        "freshness_days": age_days,
+        "freshness_label": freshness_label,
+    }
+
+
+def compute_source_reliability_score(ev: Any) -> float:
+    components = _quality_components(ev)
+    score = 3.0
+    score += SOURCE_TYPE_BONUS[components["source_type_v2"]]
+    score += PROVIDER_BONUS[components["provider_count"]]
+    if components["official_owner_match"]:
+        score += 1.0
+    if components["navigation_page"]:
+        score -= 1.5
+    if components["source_type_v2"].startswith("forum_") and components["has_expert_identity_signal"]:
+        score += 0.8
+    if components["source_type_v2"].startswith("social_") and components["is_social_official"]:
+        score += 0.8
+    return _round_component_score(score)
+
+
+def compute_content_quality_score(ev: Any) -> float:
+    components = _quality_components(ev)
+    score = 3.0
+    if components["published_at"]:
+        score += 0.8
+    if components["source_updated_at"] and components["source_updated_at"] != components["published_at"]:
+        score += 0.4
+    if components["author_attribution"]:
+        score += 0.8
+
+    word_count = components["word_count"]
+    if word_count >= 1200:
+        score += 1.2
+    elif word_count >= 500:
+        score += 0.8
+    elif word_count >= 200:
+        score += 0.3
+    else:
+        score -= 1.2
+
+    reference_count = components["reference_count"]
+    if reference_count >= 5:
+        score += 1.0
+    elif reference_count >= 1:
+        score += 0.5
+
+    if components["clear_sections"]:
+        score += 0.5
+
+    extraction_quality = components["extraction_quality"]
+    if extraction_quality == "good":
+        score += 0.8
+    elif extraction_quality == "partial":
+        score -= 0.5
+    else:
+        score -= 1.5
+
+    if components["duplicate_or_near_duplicate"]:
+        score -= 1.0
+    if components["aggregator_or_rehosted"]:
+        score -= 1.2
+    if components["clickbait_or_low_information"]:
+        score -= 1.5
+    if components["ad_ratio_high"]:
+        score -= 0.8
+    if components["links_to_primary_sources"]:
+        score += 0.8
+    return _round_component_score(score)
+
+
+def compute_freshness_label(ev: Any, now: datetime | None = None) -> tuple[int | None, str]:
+    published_at = _ev_str(ev, "published_at")
+    source_updated_at = _ev_str(ev, "source_updated_at")
+    candidate = published_at or source_updated_at
+    parsed = _parse_datetime(candidate)
+    if parsed is None:
+        return None, "unknown"
+    current_time = now or _safe_now()
+    age_days = max(int((current_time - parsed).total_seconds() // 86400), 0)
+    if age_days <= 30:
+        return age_days, "fresh"
+    if age_days <= 180:
+        return age_days, "recent"
+    return age_days, "stale"
+
+
+def compute_quality_score_and_label(
+    source_reliability_score: float,
+    content_quality_score: float,
+    ev: Any,
+) -> tuple[int, str]:
+    components = _quality_components(ev)
+    quality_score = int(round(_round_component_score(source_reliability_score) * 5.5 + _round_component_score(content_quality_score) * 4.5))
+    quality_score = max(0, min(100, quality_score))
+    if quality_score >= 75:
+        label = "high"
+    elif quality_score >= 45:
+        label = "medium"
+    else:
+        label = "low"
+    if label == "high" and (
+        components["extraction_quality"] == "poor"
+        or components["navigation_page"]
+        or components["word_count"] < 120
+    ):
+        label = "medium"
+    return quality_score, label
+
+
+def score_evidence_quality(ev: Any, now: datetime | None = None) -> dict[str, Any]:
+    components = _analyze_evidence_quality(ev, now=now)
+    reasons: list[str] = []
+    flags: list[str] = []
+
+    source_reliability_score = compute_source_reliability_score(components)
+    content_quality_score = compute_content_quality_score(components)
+    quality_score, quality_label = compute_quality_score_and_label(
+        source_reliability_score,
+        content_quality_score,
+        components,
+    )
+
+    _append_unique(reasons, f"source_type={components['source_type_v2']}")
+    _append_unique(reasons, f"provider_count={components['provider_count']}")
+    if components["official_owner_match"]:
+        _append_unique(flags, "official_owner_match")
+        _append_unique(reasons, "official owner match")
+    if components["navigation_page"]:
+        _append_unique(flags, "navigation_page")
+        _append_unique(reasons, "navigation or listing page")
+    if components["source_type_v2"].startswith("forum_") and components["has_expert_identity_signal"]:
+        _append_unique(flags, "forum_expert")
+        _append_unique(reasons, "forum has expert identity")
+    if components["source_type_v2"].startswith("social_") and components["is_social_official"]:
+        _append_unique(flags, "social_official")
+        _append_unique(reasons, "social account looks official")
+    if components["published_at"]:
+        _append_unique(reasons, "published date available")
+    if components["source_updated_at"] and components["source_updated_at"] != components["published_at"]:
+        _append_unique(flags, "updated_after_publish")
+        _append_unique(reasons, "updated date differs from publish date")
+    if components["author_attribution"]:
+        _append_unique(flags, "author_attribution")
+        _append_unique(reasons, "author or organization attribution found")
+    if components["word_count"] >= 1200:
+        _append_unique(flags, "long_form_content")
+        _append_unique(reasons, "long form content")
+    elif components["word_count"] < 200:
+        _append_unique(reasons, "content is short")
+    if components["reference_count"] >= 1:
+        _append_unique(flags, "has_references")
+        _append_unique(reasons, f"references={components['reference_count']}")
+    if components["clear_sections"]:
+        _append_unique(flags, "clear_sections")
+        _append_unique(reasons, "clear section structure")
+    _append_unique(flags, f"extraction_{components['extraction_quality']}")
+    _append_unique(reasons, f"extraction={components['extraction_quality']}")
+    if components["duplicate_or_near_duplicate"]:
+        _append_unique(flags, "duplicate_or_near_duplicate")
+        _append_unique(reasons, "duplicate or repeated content")
+    if components["aggregator_or_rehosted"]:
+        _append_unique(flags, "aggregator_or_rehosted")
+        _append_unique(reasons, "aggregator or rehosted copy")
+    if components["clickbait_or_low_information"]:
+        _append_unique(flags, "clickbait_or_low_information")
+        _append_unique(reasons, "clickbait or low information page")
+    if components["ad_ratio_high"]:
+        _append_unique(flags, "ad_ratio_high")
+        _append_unique(reasons, "ad ratio appears high")
+    if components["links_to_primary_sources"]:
+        _append_unique(flags, "links_to_primary_sources")
+        _append_unique(reasons, "links to primary sources")
+    if quality_label == "medium" and quality_score >= 75 and (
+        components["extraction_quality"] == "poor"
+        or components["navigation_page"]
+        or components["word_count"] < 120
+    ):
+        _append_unique(flags, "high_label_downgraded")
+        _append_unique(reasons, "high score downgraded by safety gate")
+
+    return {
+        "source_reliability_score": source_reliability_score,
+        "content_quality_score": content_quality_score,
+        "quality_score": quality_score,
+        "quality_label": quality_label,
+        "freshness_days": components["freshness_days"],
+        "freshness_label": components["freshness_label"],
+        "quality_reasons": reasons,
+        "quality_flags": flags,
+        "source_updated_at": components["source_updated_at"],
+        "published_at": components["published_at"],
+    }
+
+
 def _score_quality(
     *,
     source_type: str,
     provider_count: int,
     published_at: str | None,
 ) -> tuple[int, str]:
-    score = 3
-    if source_type in {"government", "education", "paper", "official", "documentation"}:
-        score += 4
-    elif source_type in {"repository", "reference", "news"}:
-        score += 2
-    elif source_type in {"forum", "social"}:
-        score -= 1
-
-    score += min(max(int(provider_count or 1), 1), 3) - 1
-    if published_at:
-        score += 1
-
-    if score >= 7:
-        return score, "high"
-    if score >= 4:
-        return score, "medium"
-    return score, "low"
+    payload = {
+        "source_type": source_type,
+        "provider_count": provider_count,
+        "published_at": published_at,
+    }
+    scored = score_evidence_quality(payload)
+    return int(scored["quality_score"]), str(scored["quality_label"])
 
 
 def _freshness_metadata(
@@ -258,20 +1137,8 @@ def _freshness_metadata(
     *,
     freshness_reference_days: int = 365,
 ) -> tuple[int | None, str]:
-    parsed = _parse_datetime(published_at)
-    if parsed is None:
-        return None, "unknown"
-
-    age_days = max(int((_safe_now() - parsed).total_seconds() // 86400), 0)
-    if age_days <= 30:
-        label = "fresh"
-    elif age_days <= max(90, freshness_reference_days // 4):
-        label = "recent"
-    elif age_days <= freshness_reference_days:
-        label = "current"
-    else:
-        label = "stale"
-    return age_days, label
+    del freshness_reference_days
+    return compute_freshness_label({"published_at": published_at})
 
 
 def extract_citation_ids(text: str) -> list[str]:
@@ -304,11 +1171,16 @@ class EvidenceRecord:
     provider_count: int = 1
     domain: str = ""
     source_type: str = "web"
+    source_reliability_score: float = 0.0
+    content_quality_score: float = 0.0
     quality_score: int = 0
     quality_label: str = "medium"
     published_at: str | None = None
+    source_updated_at: str | None = None
     freshness_days: int | None = None
     freshness_label: str = "unknown"
+    quality_reasons: list[str] = field(default_factory=list)
+    quality_flags: list[str] = field(default_factory=list)
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -330,16 +1202,36 @@ class EvidenceRecord:
             "backend_sources": list(self.backend_sources or []),
             "provider_count": self.provider_count,
             "source_type": self.source_type,
+            "source_reliability_score": self.source_reliability_score,
+            "content_quality_score": self.content_quality_score,
             "quality_score": self.quality_score,
             "quality_label": self.quality_label,
             "published_at": self.published_at,
+            "source_updated_at": self.source_updated_at,
             "freshness_days": self.freshness_days,
             "freshness_label": self.freshness_label,
+            "quality_reasons": list(self.quality_reasons),
+            "quality_flags": list(self.quality_flags),
             "has_full_content": bool(self.full_content),
         }
         if include_full_content and self.full_content:
             payload["full_content"] = truncate_text(self.full_content, excerpt_limit * 3)
         return payload
+
+
+def _apply_quality_metadata(record: EvidenceRecord) -> None:
+    scored = score_evidence_quality(record)
+    record.domain = record.domain or extract_domain(record.url)
+    record.source_reliability_score = float(scored["source_reliability_score"])
+    record.content_quality_score = float(scored["content_quality_score"])
+    record.quality_score = int(scored["quality_score"])
+    record.quality_label = str(scored["quality_label"])
+    record.published_at = scored["published_at"]
+    record.source_updated_at = scored["source_updated_at"]
+    record.freshness_days = scored["freshness_days"]
+    record.freshness_label = str(scored["freshness_label"])
+    record.quality_reasons = list(scored["quality_reasons"])
+    record.quality_flags = list(scored["quality_flags"])
 
 
 class EvidenceStore:
@@ -380,16 +1272,8 @@ class EvidenceStore:
                 snippet = str(result.get("content") or "").strip()
                 raw_content = str(result.get("raw_content") or "").strip()
                 published_at = _extract_published_at(result)
+                source_updated_at = _extract_source_updated_at(result)
                 source_type = _classify_source_type(url, title)
-                quality_score, quality_label = _score_quality(
-                    source_type=source_type,
-                    provider_count=int(result.get("provider_count") or 1),
-                    published_at=published_at,
-                )
-                freshness_days, freshness_label = _freshness_metadata(
-                    published_at,
-                    freshness_reference_days=self._freshness_reference_days,
-                )
                 dedup_key = _normalize_url(url) or f"title::{title.casefold()}"
                 existing_id = url_index.get(dedup_key)
                 if existing_id:
@@ -402,17 +1286,9 @@ class EvidenceStore:
                     record.backend_sources = list(result.get("backend_sources") or record.backend_sources or [])
                     record.provider_count = int(result.get("provider_count") or record.provider_count or 1)
                     record.source_type = source_type or record.source_type
-                    record.quality_score = max(quality_score, record.quality_score)
-                    if quality_label == "high" or record.quality_label != "high":
-                        record.quality_label = quality_label
                     record.published_at = published_at or record.published_at
-                    record.freshness_days = (
-                        freshness_days
-                        if freshness_days is not None
-                        else record.freshness_days
-                    )
-                    if freshness_label != "unknown" or record.freshness_label == "unknown":
-                        record.freshness_label = freshness_label
+                    record.source_updated_at = source_updated_at or record.source_updated_at
+                    _apply_quality_metadata(record)
                     record.updated_at = time.time()
                     continue
 
@@ -431,14 +1307,12 @@ class EvidenceStore:
                     provider_count=int(result.get("provider_count") or 1),
                     domain=_domain(url),
                     source_type=source_type,
-                    quality_score=quality_score,
-                    quality_label=quality_label,
                     published_at=published_at,
-                    freshness_days=freshness_days,
-                    freshness_label=freshness_label,
+                    source_updated_at=source_updated_at,
                     created_at=time.time(),
                     updated_at=time.time(),
                 )
+                _apply_quality_metadata(record)
                 self._records_by_id[source_id] = record
                 task_ids.append(source_id)
                 url_index[dedup_key] = source_id
@@ -483,11 +1357,7 @@ class EvidenceStore:
                     created_at=time.time(),
                     updated_at=time.time(),
                 )
-                record.quality_score, record.quality_label = _score_quality(
-                    source_type=record.source_type,
-                    provider_count=record.provider_count,
-                    published_at=record.published_at,
-                )
+                _apply_quality_metadata(record)
                 self._records_by_id[source_id] = record
                 task_ids.append(source_id)
                 if normalized_url:
@@ -501,11 +1371,7 @@ class EvidenceStore:
                     record.snippet = truncate_text(full_content, 600)
             if not record.source_type or record.source_type == "web":
                 record.source_type = _classify_source_type(url, record.title)
-            record.quality_score, record.quality_label = _score_quality(
-                source_type=record.source_type,
-                provider_count=record.provider_count,
-                published_at=record.published_at,
-            )
+            _apply_quality_metadata(record)
             record.updated_at = time.time()
 
             return record.to_dict(include_full_content=True)
@@ -653,16 +1519,11 @@ class EvidenceStore:
                     domain = str(item.get("domain") or _domain(url)).strip()
                     source_type = str(item.get("source_type") or _classify_source_type(url, title)).strip() or "web"
                     published_at = str(item.get("published_at") or "").strip() or None
+                    source_updated_at = str(item.get("source_updated_at") or "").strip() or None
                     freshness_days = item.get("freshness_days")
                     freshness_label = str(item.get("freshness_label") or "").strip() or "unknown"
                     quality_score = int(item.get("quality_score") or 0)
                     quality_label = str(item.get("quality_label") or "").strip()
-                    if not quality_label:
-                        quality_score, quality_label = _score_quality(
-                            source_type=source_type,
-                            provider_count=provider_count,
-                            published_at=published_at,
-                        )
 
                     record = EvidenceRecord(
                         source_id=source_id,
@@ -678,18 +1539,32 @@ class EvidenceStore:
                         provider_count=provider_count,
                         domain=domain,
                         source_type=source_type,
+                        source_reliability_score=float(item.get("source_reliability_score") or 0.0),
+                        content_quality_score=float(item.get("content_quality_score") or 0.0),
                         quality_score=quality_score,
-                        quality_label=quality_label,
+                        quality_label=quality_label or "medium",
                         published_at=published_at,
+                        source_updated_at=source_updated_at,
                         freshness_days=(
                             int(freshness_days)
                             if freshness_days is not None and str(freshness_days).strip()
                             else None
                         ),
                         freshness_label=freshness_label,
+                        quality_reasons=[
+                            str(reason).strip()
+                            for reason in item.get("quality_reasons") or []
+                            if str(reason).strip()
+                        ],
+                        quality_flags=[
+                            str(flag).strip()
+                            for flag in item.get("quality_flags") or []
+                            if str(flag).strip()
+                        ],
                         created_at=time.time(),
                         updated_at=time.time(),
                     )
+                    _apply_quality_metadata(record)
                     self._records_by_id[source_id] = record
                     task_ids.append(source_id)
                     dedup_key = _normalize_url(url) or f"title::{title.casefold()}"

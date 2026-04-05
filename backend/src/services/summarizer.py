@@ -36,6 +36,17 @@ class TaskSummaryResult:
 class SummarizationService:
     """Handles synchronous and streaming task summarization."""
 
+    _INTERNAL_PROCESS_MARKERS = (
+        "审查提示",
+        "审查状态",
+        "blocked",
+        "warning",
+        "source_id",
+        "保守表述",
+        "校验",
+        "系统生成",
+    )
+
     def __init__(
         self,
         summarizer_factory: Callable[[], ToolAwareSimpleAgent],
@@ -53,9 +64,15 @@ class SummarizationService:
         task: TodoItem,
         context: str,
         observer: RequestTrace | None = None,
+        historical_memory_context: str | None = None,
     ) -> TaskSummaryResult:
         """Generate a task-specific summary using the summarizer agent."""
-        prompt = self._build_prompt(state, task, context)
+        prompt = self._build_prompt(
+            state,
+            task,
+            context,
+            historical_memory_context=historical_memory_context,
+        )
 
         agent = self._agent_factory()
         try:
@@ -87,10 +104,16 @@ class SummarizationService:
         task: TodoItem,
         context: str,
         observer: RequestTrace | None = None,
+        historical_memory_context: str | None = None,
     ) -> tuple[Iterator[str], Callable[[], TaskSummaryResult]]:
         """Buffer the raw stream, sanitize it, then emit safe summary chunks."""
 
-        prompt = self._build_prompt(state, task, context)
+        prompt = self._build_prompt(
+            state,
+            task,
+            context,
+            historical_memory_context=historical_memory_context,
+        )
         raw_parts: list[str] = []
         result_holder: dict[str, TaskSummaryResult] = {}
         call_failed = False
@@ -140,7 +163,14 @@ class SummarizationService:
 
         return generator(), finalize
 
-    def _build_prompt(self, state: SummaryState, task: TodoItem, context: str) -> str:
+    def _build_prompt(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        context: str,
+        *,
+        historical_memory_context: str | None = None,
+    ) -> str:
         """Construct the summarization prompt shared by both modes."""
         trimmed_context = truncate_text(
             context,
@@ -150,6 +180,15 @@ class SummarizationService:
         if not evidence_directory:
             evidence_directory = "- 暂无已登记来源"
 
+        memory_block = ""
+        historical_memory = str(historical_memory_context or "").strip()
+        if historical_memory:
+            memory_block = (
+                f"历史研究记忆：\n{historical_memory}\n"
+                "这些历史 notes 只用于启发总结结构、补充研究方向与提醒常见遗漏，"
+                "绝不能作为当前任务的 `source_id` 证据，也不能直接写入 `source_ids`。\n"
+            )
+
         return (
             f"任务主题：{state.research_topic}\n"
             f"任务名称：{task.title}\n"
@@ -157,22 +196,26 @@ class SummarizationService:
             f"检索查询：{task.query}\n"
             f"可用来源目录：\n{evidence_directory}\n"
             f"任务上下文：\n{trimmed_context}\n"
+            f"{memory_block}"
             f"{build_note_guidance(task)}\n"
             "请先调用 `evidence_lookup` 读取当前任务的来源目录；当摘要不足以支撑结论时，可调用 "
             "`fetch_page` 读取某个 source_id 对应网页正文，必要时再调用 `search_web` 补充搜索。\n"
             "最终必须只输出 JSON，格式如下：\n"
             "{\n"
+            '  "executive_summary": "1 段较完整的任务概述，说明本任务最重要的结论、依据与意义",\n'
             '  "key_findings": [\n'
-            '    {"text": "一句完整、面向用户的结论", "source_ids": ["T1-S1", "T1-S2"]}\n'
+            '    {"text": "2-3 句完整、面向用户的结论，包含事实、判断和意义", "source_ids": ["T1-S1", "T1-S2"]}\n'
             "  ],\n"
             '  "evidence_gaps": ["证据不足或待补充说明"]\n'
             "}\n"
             "要求：\n"
-            "1. `key_findings` 中每一项都必须带至少一个合法 source_id；\n"
-            "2. `text` 只写用户可见结论，不要写你的思考过程、工具计划或提示词复述；\n"
-            "3. `evidence_gaps` 仅写证据缺口，不要写工具调用叙述；\n"
-            "4. 不允许编造 source_id；\n"
-            "5. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
+            "1. `executive_summary` 用 1 段中文完整概括本任务的主要发现、现实含义和证据边界，避免只写一句空泛结论；\n"
+            "2. 尽量输出 4-6 条 `key_findings`，每条都要有信息密度，不要重复改写同一句话；\n"
+            "3. `key_findings` 中每一项都必须带至少一个合法 source_id；\n"
+            "4. `text` 只写用户可见结论，不要写你的思考过程、工具计划或提示词复述；\n"
+            "5. `evidence_gaps` 仅写证据缺口，不要写工具调用叙述；\n"
+            "6. 不允许编造 source_id；\n"
+            "7. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
         )
 
     def _finalize_summary(self, raw_text: str, task: TodoItem) -> TaskSummaryResult:
@@ -247,6 +290,11 @@ class SummarizationService:
         payload: dict[str, Any],
         valid_source_ids: set[str],
     ) -> dict[str, Any]:
+        executive_summary = self._normalize_executive_summary(
+            payload.get("executive_summary")
+            or payload.get("summary")
+            or payload.get("overview")
+        )
         findings: list[dict[str, Any]] = []
         for item in payload.get("key_findings") or []:
             if isinstance(item, str):
@@ -266,13 +314,20 @@ class SummarizationService:
             findings.append({"text": text, "source_ids": source_ids})
 
         evidence_gaps = self._normalize_evidence_gaps(payload.get("evidence_gaps"))
-        return {"key_findings": findings, "evidence_gaps": evidence_gaps}
+        if not executive_summary:
+            executive_summary = self._derive_executive_summary(findings, evidence_gaps)
+        return {
+            "executive_summary": executive_summary,
+            "key_findings": findings,
+            "evidence_gaps": evidence_gaps,
+        }
 
     def _fallback_summary_payload(
         self,
         text: str,
         valid_source_ids: set[str],
     ) -> dict[str, Any]:
+        executive_summary = ""
         findings: list[dict[str, Any]] = []
         evidence_gaps: list[str] = []
 
@@ -293,6 +348,9 @@ class SummarizationService:
             if looks_like_meta_reasoning(cleaned):
                 continue
 
+            if not executive_summary and len(cleaned) >= 24:
+                executive_summary = cleaned
+
             source_ids = self._normalize_source_ids([], valid_source_ids, text=cleaned)
             cleaned_text = strip_citation_markers(cleaned)
 
@@ -304,9 +362,54 @@ class SummarizationService:
                 evidence_gaps.append(cleaned_text)
 
         return {
+            "executive_summary": self._normalize_executive_summary(executive_summary)
+            or self._derive_executive_summary(findings, evidence_gaps),
             "key_findings": findings,
             "evidence_gaps": self._normalize_evidence_gaps(evidence_gaps),
         }
+
+    @staticmethod
+    def _contains_internal_process_language(value: Any) -> bool:
+        text = normalize_agent_markdown(str(value or "").strip()).lower()
+        if not text:
+            return False
+        return any(marker in text for marker in SummarizationService._INTERNAL_PROCESS_MARKERS)
+
+    @staticmethod
+    def _normalize_executive_summary(value: Any) -> str:
+        text = normalize_agent_markdown(str(value or "").strip())
+        text = strip_citation_markers(text)
+        if not text or looks_like_meta_reasoning(text):
+            return ""
+        parts = re.split(r"(?<=[。！？；\n])", text)
+        kept = [
+            normalize_agent_markdown(part.strip())
+            for part in parts
+            if normalize_agent_markdown(part.strip())
+            and not SummarizationService._contains_internal_process_language(part)
+        ]
+        if kept:
+            return "".join(kept).strip()
+        if SummarizationService._contains_internal_process_language(text):
+            return ""
+        return text
+
+    @staticmethod
+    def _derive_executive_summary(
+        findings: list[dict[str, Any]],
+        evidence_gaps: list[str],
+    ) -> str:
+        if not findings:
+            return ""
+
+        core_points = [str(item.get("text") or "").strip() for item in findings[:2] if str(item.get("text") or "").strip()]
+        if not core_points:
+            return ""
+
+        summary = "；".join(core_points)
+        if evidence_gaps:
+            summary = f"{summary}。当前仍需补充：{evidence_gaps[0]}"
+        return summary
 
     @staticmethod
     def _normalize_evidence_gaps(value: Any) -> list[str]:
@@ -326,7 +429,12 @@ class SummarizationService:
 
     @staticmethod
     def _render_markdown(payload: dict[str, Any]) -> str:
-        lines = ["# 任务总结", "", "## 关键发现"]
+        lines = ["# 任务总结"]
+        executive_summary = str(payload.get("executive_summary") or "").strip()
+        if executive_summary:
+            lines.extend(["", "## 任务概述", executive_summary])
+
+        lines.extend(["", "## 关键发现"])
         findings = payload.get("key_findings") or []
         if findings:
             for index, item in enumerate(findings, start=1):
@@ -338,7 +446,7 @@ class SummarizationService:
 
         evidence_gaps = payload.get("evidence_gaps") or []
         if evidence_gaps:
-            lines.extend(["", "## 证据不足"])
+            lines.extend(["", "## 证据边界与待补充点"])
             for item in evidence_gaps:
                 lines.append(f"- {item}")
 
