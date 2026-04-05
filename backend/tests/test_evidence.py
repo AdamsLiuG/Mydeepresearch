@@ -21,8 +21,8 @@ from services.evidence import (
     compute_freshness_label,
     compute_quality_score_and_label,
     compute_source_reliability_score,
-    extract_domain,
     extract_citation_ids,
+    extract_domain,
     format_evidence_sources,
     score_evidence_quality,
 )

@@ -22,7 +22,11 @@ from hello_agents.tools import SearchTool
 
 from config import Configuration
 from metrics import RequestTrace
-from services.embeddings import embeddings_available, encode_text, load_sentence_transformer
+from services.embeddings import (
+    embeddings_available,
+    encode_text,
+    load_sentence_transformer,
+)
 from utils import (
     deduplicate_and_format_sources,
     format_sources,

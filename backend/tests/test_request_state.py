@@ -1,7 +1,7 @@
-from concurrent.futures import ThreadPoolExecutor
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"

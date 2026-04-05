@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
-import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,8 +40,8 @@ from services.evidence import (
     extract_citation_ids,
     format_evidence_sources,
 )
-from services.planner import PlanningService
 from services.note_memory import NoteMemoryService
+from services.planner import PlanningService
 from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
 from services.request_state import RequestStateStore

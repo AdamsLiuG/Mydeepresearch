@@ -14,7 +14,11 @@ from typing import Any
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from services.embeddings import embeddings_available, encode_text, encode_texts
-from services.strategy_synthesizer import StrategyCard, StrategySourceRequest, StrategySynthesizer
+from services.strategy_synthesizer import (
+    StrategyCard,
+    StrategySourceRequest,
+    StrategySynthesizer,
+)
 from utils import truncate_text
 
 try:  # pragma: no cover - exercised through runtime fallback

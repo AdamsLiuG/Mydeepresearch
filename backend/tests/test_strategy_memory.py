@@ -2,10 +2,10 @@ import json
 import math
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-import types
 
 BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
@@ -25,7 +25,11 @@ from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from services import strategy_memory as strategy_memory_module
 from services.strategy_memory import StrategyMemoryService
-from services.strategy_synthesizer import StrategyCard, StrategySourceRequest, StrategySynthesizer
+from services.strategy_synthesizer import (
+    StrategyCard,
+    StrategySourceRequest,
+    StrategySynthesizer,
+)
 
 
 def keyword_embedding(text: str) -> list[float]:
