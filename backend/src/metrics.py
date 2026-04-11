@@ -143,6 +143,11 @@ class MetricsRegistry:
             "strategy_memory_refresh_total": 0,
             "strategy_memory_refresh_failed_total": 0,
             "strategy_memory_synthesized_card_total": 0,
+            "evidence_archive_ingest_total": 0,
+            "evidence_archive_query_total": 0,
+            "evidence_archive_dedup_total": 0,
+            "evidence_archive_restore_total": 0,
+            "evidence_archive_restore_miss_total": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -434,6 +439,7 @@ class RequestTrace:
         self.cache_exact_hits = 0
         self.cache_semantic_hits = 0
         self.cache_misses = 0
+        self.last_search_cache_details: dict[str, Any] = {}
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
@@ -490,6 +496,7 @@ class RequestTrace:
         success: bool,
         error: Any = None,
         cache_strategy: str = "miss",
+        cache_metadata: dict[str, Any] | None = None,
     ) -> None:
         metrics_registry.increment("search_call_total")
         if success:
@@ -497,7 +504,15 @@ class RequestTrace:
         else:
             metrics_registry.increment("search_failed_total")
 
-        normalized_strategy = cache_strategy if cache_strategy in {"exact", "semantic"} else "miss"
+        normalized_strategy = "miss"
+        if cache_strategy == "exact":
+            normalized_strategy = "exact"
+        elif cache_strategy in {"semantic", "semantic_ann", "semantic_lexical"}:
+            normalized_strategy = "semantic"
+
+        if cache_metadata:
+            with self._lock:
+                self.last_search_cache_details = _clone_dict(cache_metadata)
 
         if cache_hit:
             metrics_registry.increment("cache_hit_total")
@@ -799,11 +814,12 @@ class RequestTrace:
                 "completed_tasks": self.completed_tasks,
                 "skipped_tasks": self.skipped_tasks,
                 "failed_tasks": self.failed_tasks,
-                "cache_hits": self.cache_hits,
-                "cache_exact_hits": self.cache_exact_hits,
-                "cache_semantic_hits": self.cache_semantic_hits,
-                "cache_misses": self.cache_misses,
-                "prompt_tokens": self.prompt_tokens,
+            "cache_hits": self.cache_hits,
+            "cache_exact_hits": self.cache_exact_hits,
+            "cache_semantic_hits": self.cache_semantic_hits,
+            "cache_misses": self.cache_misses,
+            "last_search_cache_details": _clone_dict(self.last_search_cache_details),
+            "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "total_tokens": self.total_tokens,
                 "token_source": token_source,

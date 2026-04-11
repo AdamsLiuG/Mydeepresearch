@@ -24,16 +24,93 @@ class DummyDiskCache:
         self._store = {}
 
     def get(self, key, default=None):
-        return self._store.get(key, default)
+        entry = self._store.get(key)
+        if entry is None:
+            return default
+        expires_at = entry.get("expires_at")
+        if expires_at is not None and expires_at <= time.time():
+            self._store.pop(key, None)
+            return default
+        return deepcopy(entry.get("value"))
 
     def set(self, key, value, expire=None):
-        self._store[key] = value
+        expires_at = None
+        if expire is not None:
+            expires_at = time.time() + float(expire)
+        self._store[key] = {"value": deepcopy(value), "expires_at": expires_at}
+
+    def delete(self, key):
+        self._store.pop(key, None)
 
     def clear(self):
         self._store.clear()
 
     def close(self):
         return None
+
+
+class DummyChromaCollection:
+    def __init__(self):
+        self._records = {}
+
+    def upsert(self, ids, documents=None, metadatas=None, embeddings=None):
+        for index, record_id in enumerate(ids):
+            self._records[record_id] = {
+                "document": documents[index] if documents else None,
+                "metadata": deepcopy(metadatas[index]) if metadatas else {},
+                "embedding": list(embeddings[index]) if embeddings else None,
+            }
+
+    def delete(self, ids=None, where=None):
+        if ids:
+            for record_id in ids:
+                self._records.pop(record_id, None)
+            return
+        if where and "scope_key" in where:
+            scope_key = where["scope_key"]
+            removable = [
+                record_id
+                for record_id, record in self._records.items()
+                if str((record.get("metadata") or {}).get("scope_key") or "") == str(scope_key)
+            ]
+            for record_id in removable:
+                self._records.pop(record_id, None)
+
+    def query(self, query_embeddings=None, n_results=10, where=None, include=None):
+        query_embedding = list((query_embeddings or [[0.0]])[0])
+        scope_key = str((where or {}).get("scope_key") or "")
+        ranked = []
+        for record_id, record in self._records.items():
+            metadata = record.get("metadata") or {}
+            if scope_key and str(metadata.get("scope_key") or "") != scope_key:
+                continue
+            embedding = list(record.get("embedding") or [])
+            score = sum(left * right for left, right in zip(query_embedding, embedding))
+            ranked.append((score, record_id, deepcopy(metadata)))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        limited = ranked[: max(int(n_results or 1), 1)]
+        return {
+            "ids": [[record_id for _, record_id, _ in limited]],
+            "metadatas": [[metadata for _, _, metadata in limited]],
+            "distances": [[1.0 - score for score, _, _ in limited]],
+        }
+
+
+class DummyChromaClient:
+    _collections_by_path = {}
+
+    def __init__(self, path):
+        self.path = path
+        self._collections = self._collections_by_path.setdefault(path, {})
+
+    def get_or_create_collection(self, name, metadata=None):
+        if name not in self._collections:
+            self._collections[name] = DummyChromaCollection()
+        return self._collections[name]
+
+    def delete_collection(self, name):
+        self._collections.pop(name, None)
 
 
 class DummySentenceTransformer:
@@ -130,6 +207,10 @@ diskcache_stub = types.ModuleType("diskcache")
 diskcache_stub.Cache = DummyDiskCache
 sys.modules["diskcache"] = diskcache_stub
 
+chromadb_stub = types.ModuleType("chromadb")
+chromadb_stub.PersistentClient = DummyChromaClient
+sys.modules["chromadb"] = chromadb_stub
+
 sentence_transformers_stub = types.ModuleType("sentence_transformers")
 sentence_transformers_stub.SentenceTransformer = DummySentenceTransformer
 sys.modules["sentence_transformers"] = sentence_transformers_stub
@@ -161,6 +242,7 @@ class SearchCacheTests(unittest.TestCase):
         DummySearchTool.calls = []
         DummySearchTool.responses = {}
         DummySentenceTransformer.embeddings = {}
+        DummyChromaClient._collections_by_path = {}
         metrics_registry.reset()
         services_search.clear_search_cache()
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -185,6 +267,7 @@ class SearchCacheTests(unittest.TestCase):
                 "search_cache_enabled": True,
                 "search_cache_ttl_seconds": 900,
                 "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
                 "semantic_cache_enabled": False,
             },
             load_env_file=False,
@@ -202,11 +285,64 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(observer.snapshot()["cache_exact_hits"], 1)
         self.assertEqual(observer.snapshot()["cache_semantic_hits"], 0)
         self.assertEqual(observer.snapshot()["cache_misses"], 1)
+        self.assertEqual(observer.snapshot()["last_search_cache_details"]["cache_hit_mode"], "exact")
         metrics_snapshot = metrics_registry.snapshot()
         self.assertEqual(metrics_snapshot["cache_hit_total"], 1)
         self.assertEqual(metrics_snapshot["cache_exact_hit_total"], 1)
         self.assertEqual(metrics_snapshot["cache_semantic_hit_total"], 0)
         self.assertEqual(metrics_snapshot["cache_miss_total"], 1)
+
+    def test_dispatch_search_assigns_dynamic_ttl_buckets(self):
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_dynamic_ttl_enabled": True,
+                "search_cache_ttl_seconds": 43200,
+                "search_cache_fresh_ttl_seconds": 14400,
+                "search_cache_evergreen_ttl_seconds": 172800,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        services_search.dispatch_search("latest multimodal model benchmark 2026", config, 0)
+        fresh_key = services_search._build_cache_key("latest multimodal model benchmark 2026", "duckduckgo", config)
+        fresh_entry = services_search._read_exact_cache(fresh_key, config)
+        self.assertIsNotNone(fresh_entry)
+        self.assertEqual(fresh_entry.ttl_bucket, "fresh")
+        self.assertEqual(fresh_entry.ttl_seconds, 14400)
+
+        services_search.dispatch_search("what is mcp protocol architecture", config, 0)
+        evergreen_key = services_search._build_cache_key("what is mcp protocol architecture", "duckduckgo", config)
+        evergreen_entry = services_search._read_exact_cache(evergreen_key, config)
+        self.assertIsNotNone(evergreen_entry)
+        self.assertEqual(evergreen_entry.ttl_bucket, "evergreen")
+        self.assertEqual(evergreen_entry.ttl_seconds, 172800)
+
+    def test_dispatch_search_drops_expired_exact_cache_entries(self):
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_dynamic_ttl_enabled": False,
+                "search_cache_ttl_seconds": 1,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+
+        first = services_search.dispatch_search("stable cache query", config, 0)
+        time.sleep(1.05)
+        second = services_search.dispatch_search("stable cache query", config, 1)
+
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(DummySearchTool.call_count, 2)
 
     def test_dispatch_search_fuses_advanced_backends_and_deduplicates_urls(self):
         DummySearchTool.responses = {
@@ -847,6 +983,7 @@ class SearchCacheTests(unittest.TestCase):
             "search_cache_enabled": True,
             "search_cache_ttl_seconds": 900,
             "search_cache_dir": self.temp_dir.name,
+            "search_cache_vector_dir": self.temp_dir.name,
             "semantic_cache_enabled": False,
         }
         config_without_rerank = Configuration.from_env(
@@ -902,6 +1039,7 @@ class SearchCacheTests(unittest.TestCase):
             "search_cache_enabled": True,
             "search_cache_ttl_seconds": 900,
             "search_cache_dir": self.temp_dir.name,
+            "search_cache_vector_dir": self.temp_dir.name,
             "semantic_cache_enabled": True,
             "semantic_cache_embedding_model": "dummy-minilm",
             "semantic_cache_similarity_threshold": 0.90,
@@ -988,8 +1126,8 @@ class SearchCacheTests(unittest.TestCase):
 
     def test_dispatch_search_uses_semantic_cache_for_similar_queries(self):
         DummySentenceTransformer.embeddings = {
-            "multimodal llm progress in 2025": [1.0, 0.0, 0.0],
-            "2025 multimodal model advances": [1.0, 0.0, 0.0],
+            "multimodal llm capability progress": [1.0, 0.0, 0.0],
+            "multimodal model capability advances": [1.0, 0.0, 0.0],
         }
         observer = RequestTrace(
             request_id="req-semantic-cache",
@@ -1005,6 +1143,102 @@ class SearchCacheTests(unittest.TestCase):
                 "search_cache_enabled": True,
                 "search_cache_ttl_seconds": 900,
                 "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": True,
+                "semantic_cache_embedding_model": "dummy-minilm",
+                "semantic_cache_similarity_threshold": 0.90,
+            },
+            load_env_file=False,
+        )
+
+        first = services_search.dispatch_search(
+            "multimodal llm capability progress", config, 0, observer=observer
+        )
+        second = services_search.dispatch_search(
+            "multimodal model capability advances", config, 1, observer=observer
+        )
+
+        self.assertEqual(DummySearchTool.call_count, 1)
+        self.assertFalse(first[4])
+        self.assertTrue(second[4])
+        self.assertEqual(second[5], "semantic_ann")
+        self.assertEqual(observer.snapshot()["cache_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_misses"], 1)
+        self.assertEqual(observer.snapshot()["last_search_cache_details"]["cache_hit_mode"], "semantic_ann")
+
+    def test_dispatch_search_uses_semantic_cache_for_fresh_queries_with_same_topic_context(self):
+        DummySentenceTransformer.embeddings = {
+            "探索多模态大模型在 2025 年的关键突破 探索多模态大模型在 2025 年的关键突破 技术架构创新": [1.0, 0.0, 0.0],
+            "探索多模态大模型在 2025 年的关键突破 探索多模态大模型在 2025 年的关键突破 核心能力突破": [1.0, 0.0, 0.0],
+        }
+        observer = RequestTrace(
+            request_id="req-semantic-cache-fresh-topic",
+            topic="fresh semantic cache test",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": True,
+                "semantic_cache_embedding_model": "dummy-minilm",
+                "semantic_cache_similarity_threshold": 0.90,
+            },
+            load_env_file=False,
+        )
+        cache_context = {"research_topic": "探索多模态大模型在 2025 年的关键突破"}
+
+        first = services_search.dispatch_search(
+            "探索多模态大模型在 2025 年的关键突破 技术架构创新",
+            config,
+            0,
+            observer=observer,
+            cache_context=cache_context,
+        )
+        second = services_search.dispatch_search(
+            "探索多模态大模型在 2025 年的关键突破 核心能力突破",
+            config,
+            1,
+            observer=observer,
+            cache_context=cache_context,
+        )
+
+        self.assertEqual(DummySearchTool.call_count, 1)
+        self.assertFalse(first[4])
+        self.assertTrue(second[4])
+        self.assertEqual(second[5], "semantic_ann")
+        self.assertEqual(observer.snapshot()["cache_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
+        self.assertEqual(observer.snapshot()["cache_misses"], 1)
+        self.assertEqual(observer.snapshot()["last_search_cache_details"]["cache_hit_mode"], "semantic_ann")
+
+    def test_dispatch_search_skips_semantic_cache_for_fresh_queries(self):
+        DummySentenceTransformer.embeddings = {
+            "multimodal llm progress in 2025": [1.0, 0.0, 0.0],
+            "2025 multimodal model advances": [1.0, 0.0, 0.0],
+        }
+        observer = RequestTrace(
+            request_id="req-semantic-cache-fresh",
+            topic="semantic cache fresh test",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
                 "semantic_cache_enabled": True,
                 "semantic_cache_embedding_model": "dummy-minilm",
                 "semantic_cache_similarity_threshold": 0.90,
@@ -1019,13 +1253,40 @@ class SearchCacheTests(unittest.TestCase):
             "2025 multimodal model advances", config, 1, observer=observer
         )
 
-        self.assertEqual(DummySearchTool.call_count, 1)
+        self.assertEqual(DummySearchTool.call_count, 2)
         self.assertFalse(first[4])
-        self.assertTrue(second[4])
-        self.assertEqual(second[5], "semantic")
-        self.assertEqual(observer.snapshot()["cache_hits"], 1)
-        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
-        self.assertEqual(observer.snapshot()["cache_misses"], 1)
+        self.assertFalse(second[4])
+        self.assertEqual(second[5], "miss")
+        self.assertEqual(observer.snapshot()["cache_hits"], 0)
+        self.assertEqual(observer.snapshot()["cache_semantic_hits"], 0)
+        self.assertEqual(observer.snapshot()["cache_misses"], 2)
+
+    def test_dispatch_search_does_not_index_fresh_results_for_semantic_reuse(self):
+        DummySentenceTransformer.embeddings = {
+            "multimodal llm progress in 2025": [1.0, 0.0, 0.0],
+            "multimodal llm capability progress": [1.0, 0.0, 0.0],
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": True,
+                "semantic_cache_embedding_model": "dummy-minilm",
+                "semantic_cache_similarity_threshold": 0.90,
+            },
+            load_env_file=False,
+        )
+
+        first = services_search.dispatch_search("multimodal llm progress in 2025", config, 0)
+        second = services_search.dispatch_search("multimodal llm capability progress", config, 1)
+
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(second[5], "miss")
+        self.assertEqual(DummySearchTool.call_count, 2)
 
     def test_dispatch_search_uses_lexical_semantic_cache_with_same_topic_context(self):
         observer = RequestTrace(
@@ -1042,6 +1303,7 @@ class SearchCacheTests(unittest.TestCase):
                 "search_cache_enabled": True,
                 "search_cache_ttl_seconds": 900,
                 "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
                 "semantic_cache_enabled": True,
                 "semantic_cache_similarity_threshold": 0.95,
                 "semantic_cache_lexical_threshold": 0.35,
@@ -1062,14 +1324,14 @@ class SearchCacheTests(unittest.TestCase):
 
         with patch.object(services_search, "_embed_query", return_value=None):
             first = services_search.dispatch_search(
-                "多模态大模型 架构 视觉语言融合 最新研究 2024 2025",
+                "多模态大模型 架构设计 跨模态融合 注意力机制",
                 config,
                 0,
                 observer=observer,
                 cache_context=first_context,
             )
             second = services_search.dispatch_search(
-                "多模态大模型 架构设计 2024 2025 跨模态融合 注意力机制",
+                "多模态大模型 架构创新 跨模态融合 注意力机制",
                 config,
                 1,
                 observer=observer,
@@ -1080,10 +1342,38 @@ class SearchCacheTests(unittest.TestCase):
         self.assertFalse(first[4])
         self.assertEqual(first[5], "miss")
         self.assertTrue(second[4])
-        self.assertEqual(second[5], "semantic")
+        self.assertEqual(second[5], "semantic_lexical")
         self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
         metrics_snapshot = metrics_registry.snapshot()
         self.assertEqual(metrics_snapshot["cache_semantic_hit_total"], 1)
+
+    def test_dispatch_search_ignores_ann_candidates_when_cached_payload_is_missing(self):
+        DummySentenceTransformer.embeddings = {
+            "model serving latency optimization": [1.0, 0.0, 0.0],
+            "latency optimization for model serving": [1.0, 0.0, 0.0],
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": True,
+                "semantic_cache_embedding_model": "dummy-minilm",
+                "semantic_cache_similarity_threshold": 0.90,
+            },
+            load_env_file=False,
+        )
+
+        first = services_search.dispatch_search("model serving latency optimization", config, 0)
+        cache_key = services_search._build_cache_key("model serving latency optimization", "duckduckgo", config)
+        services_search._get_disk_cache(config).delete(cache_key)
+        second = services_search.dispatch_search("latency optimization for model serving", config, 1)
+
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(DummySearchTool.call_count, 2)
 
     def test_dispatch_search_does_not_reuse_semantic_cache_across_topics(self):
         observer = RequestTrace(
@@ -1100,6 +1390,7 @@ class SearchCacheTests(unittest.TestCase):
                 "search_cache_enabled": True,
                 "search_cache_ttl_seconds": 900,
                 "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
                 "semantic_cache_enabled": True,
                 "semantic_cache_similarity_threshold": 0.95,
                 "semantic_cache_lexical_threshold": 0.35,
@@ -1120,14 +1411,14 @@ class SearchCacheTests(unittest.TestCase):
 
         with patch.object(services_search, "_embed_query", return_value=None):
             first = services_search.dispatch_search(
-                "多模态大模型 架构设计 2024 2025 跨模态融合 注意力机制",
+                "多模态大模型 架构设计 跨模态融合 注意力机制",
                 config,
                 0,
                 observer=observer,
                 cache_context=first_context,
             )
             second = services_search.dispatch_search(
-                "多模态模型 架构设计 2025 跨模态融合 注意力创新",
+                "多模态模型 架构创新 跨模态融合 注意力创新",
                 config,
                 1,
                 observer=observer,
@@ -1207,6 +1498,7 @@ class SearchCacheTests(unittest.TestCase):
                 "search_cache_enabled": True,
                 "search_cache_ttl_seconds": 900,
                 "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
                 "semantic_cache_enabled": False,
             },
             load_env_file=False,
@@ -1217,6 +1509,7 @@ class SearchCacheTests(unittest.TestCase):
                 "search_cache_enabled": True,
                 "search_cache_ttl_seconds": 900,
                 "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
                 "semantic_cache_enabled": False,
             },
             load_env_file=False,

@@ -15,7 +15,9 @@ if str(BACKEND_SRC) not in sys.path:
 
 from config import Configuration
 from evals.judges.heuristic import HeuristicJudge
+from evals.judges.llm import LLMJudge
 from evals.loader import load_benchmark_cases
+from evals.run_benchmark import build_judge, parse_args
 from evals.runner import run_benchmark_suite
 from evals.schema import BenchmarkCase
 
@@ -173,6 +175,36 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["reports_generated"], 1)
         self.assertEqual(written["results"][0]["metrics"]["citation_count"], 1)
         self.assertTrue(written["results"][0]["metrics"]["degraded_flag"])
+
+
+class BenchmarkCLITests(unittest.TestCase):
+    def test_parse_args_supports_llm_judge_options(self):
+        args = parse_args(
+            [
+                "--judge",
+                "llm",
+                "--judge-model",
+                "gpt-5.4",
+                "--judge-base-url",
+                "https://example.com/v1",
+                "--judge-timeout-seconds",
+                "45",
+                "--judge-version",
+                "judge_v_test",
+            ]
+        )
+
+        self.assertEqual(args.judge, "llm")
+        self.assertEqual(args.judge_model, "gpt-5.4")
+        self.assertEqual(args.judge_base_url, "https://example.com/v1")
+        self.assertEqual(args.judge_timeout_seconds, 45.0)
+        self.assertEqual(args.judge_version, "judge_v_test")
+
+    def test_build_judge_returns_llm_judge_when_requested(self):
+        args = parse_args(["--judge", "llm", "--judge-model", "judge-model"])
+        judge = build_judge(args, config=Configuration.from_env(load_env_file=False))
+
+        self.assertIsInstance(judge, LLMJudge)
 
 
 if __name__ == "__main__":

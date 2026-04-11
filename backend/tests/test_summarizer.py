@@ -88,6 +88,57 @@ class SummarizationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no grounded findings"):
             service.summarize_task(self.state, self.task, "context")
 
+    def test_summarize_task_repairs_source_label_findings_from_evidence(self):
+        task = TodoItem(
+            id=1,
+            title="MCP 定义",
+            intent="解释 MCP 的核心定义",
+            query="什么是 MCP（Model Context Protocol）",
+            evidence_items=[
+                {
+                    "source_id": "T1-S1",
+                    "title": "知乎专栏文章",
+                    "url": "https://example.com/mcp",
+                    "snippet": "MCP 是统一协议标准，使模型能够以一致方式连接工具和数据源，常被比作 AI 世界的 USB-C 接口。",
+                },
+                {
+                    "source_id": "T1-S2",
+                    "title": "消费指南网站",
+                    "url": "https://example.com/shop",
+                    "snippet": "什么值得买是兴趣消费指南，为用户提供购物决策支持。",
+                },
+            ],
+        )
+        response = """
+{
+  "executive_summary": "知乎专栏文章，质量等级low，但内容看起来相关",
+  "key_findings": [
+    {"text": "知乎专栏文章，质量等级low，但内容看起来相关", "source_ids": ["T1-S1"]},
+    {"text": "消费指南网站，看起来不相关", "source_ids": ["T1-S2"]}
+  ],
+  "evidence_gaps": ["evidence_gaps：证据不足的地方"]
+}
+"""
+        service = SummarizationService(
+            lambda: DummyAgent(response=response),
+            self.config,
+        )
+
+        result = service.summarize_task(self.state, task, "context")
+
+        self.assertEqual(
+            result.payload["key_findings"],
+            [
+                {
+                    "text": "MCP 是统一协议标准，使模型能够以一致方式连接工具和数据源，常被比作 AI 世界的 USB-C 接口",
+                    "source_ids": ["T1-S1"],
+                }
+            ],
+        )
+        self.assertEqual(result.payload["evidence_gaps"], [])
+        self.assertIn("MCP 是统一协议标准", result.markdown)
+        self.assertNotIn("知乎专栏文章，质量等级low", result.markdown)
+
     def test_stream_task_summary_emits_sanitized_chunks_after_buffering(self):
         chunks = [
             "好的，我现在需要先调用 evidence_lookup。",

@@ -58,7 +58,13 @@ class RequestStateStore:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+
+        resolved_error = self._resolved_error(payload)
+        if resolved_error:
+            payload.setdefault("error", resolved_error)
+        return payload
 
     def list_recent(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         if not self._directory.exists():
@@ -87,17 +93,34 @@ class RequestStateStore:
         report_markdown = str(payload.get("report_markdown") or "").strip()
         status = str(payload.get("status") or "unknown").strip() or "unknown"
         phase = str(payload.get("phase") or "unknown").strip() or "unknown"
+        error = RequestStateStore._resolved_error(payload)
+        todo_items = payload.get("todo_items") or []
         return {
             "request_id": str(payload.get("request_id") or "").strip(),
             "topic": str(payload.get("topic") or "").strip(),
             "status": status,
             "phase": phase,
+            "error": error,
             "updated_at": payload.get("updated_at"),
             "search_api": payload.get("search_api"),
             "elapsed_ms": payload.get("elapsed_ms"),
+            "cache_diagnostics": payload.get("cache_diagnostics") or {},
             "report_markdown": report_markdown,
-            "todo_items": payload.get("todo_items") or [],
+            "todo_items": todo_items,
             "review_summary": payload.get("review_summary") or {},
             "can_resume": status not in {"success"} and phase != "completed",
-            "can_view_content": bool(report_markdown) or bool(payload.get("todo_items")),
+            "can_view_content": bool(report_markdown) or bool(todo_items) or bool(error),
         }
+
+    @staticmethod
+    def _resolved_error(payload: dict[str, Any]) -> str | None:
+        error = str(payload.get("error") or "").strip()
+        if error:
+            return error
+
+        request_metrics = payload.get("request_metrics")
+        if not isinstance(request_metrics, dict):
+            return None
+
+        nested_error = str(request_metrics.get("error") or "").strip()
+        return nested_error or None

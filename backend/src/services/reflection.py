@@ -20,6 +20,8 @@ _STRICT_JSON_INVALID_REASON = "reflection 输出不符合严格 JSON，已跳过
 _STRICT_JSON_DEGRADED_REASON = "reflection_invalid_output"
 _MAX_MISSING_ANGLES = 3
 _STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+_REFLECTION_SUMMARY_CHAR_LIMIT = 260
+_REFLECTION_SOURCES_CHAR_LIMIT = 160
 
 
 @dataclass
@@ -122,12 +124,11 @@ class ReflectionService:
             "id": task.id,
             "title": task.title,
             "intent": task.intent,
-            "query": task.query,
             "status": task.status,
             "origin": task.origin,
             "round": task.round,
-            "summary_excerpt": truncate_text(summary_text or "暂无可用信息", 500),
-            "sources_excerpt": truncate_text(sources_text or "暂无来源", 300),
+            "summary_excerpt": truncate_text(summary_text or "暂无可用信息", _REFLECTION_SUMMARY_CHAR_LIMIT),
+            "sources_excerpt": truncate_text(sources_text or "暂无来源", _REFLECTION_SOURCES_CHAR_LIMIT),
             "evidence_count": len(evidence_items),
             "unique_domain_count": len(unique_domains),
             "notice_count": len(task.notices or []),
@@ -187,25 +188,20 @@ class ReflectionService:
         task_overview_lines: list[str] = []
         for task in context.get("task_snapshots", []):
             task_overview_lines.append(
-                f"- 任务 {task['id']} ({task['origin']}, round={task['round']})\n"
-                f"  标题：{task['title']}\n"
-                f"  目标：{task['intent']}\n"
-                f"  查询：{task['query']}\n"
-                f"  状态：{task['status']}\n"
-                f"  证据：{task['evidence_count']} 个来源 / {task['unique_domain_count']} 个域名 / {task['notice_count']} 条 notice\n"
-                f"  摘要缺失：{'是' if task['summary_missing'] else '否'}\n"
-                f"  来源缺失：{'是' if task['sources_missing'] else '否'}\n"
+                f"- 任务 {task['id']} | {task['title']} | 状态={task['status']} | "
+                f"来源={task['evidence_count']} / 域名={task['unique_domain_count']} / notice={task['notice_count']} | "
+                f"摘要缺失={'是' if task['summary_missing'] else '否'} | 来源缺失={'是' if task['sources_missing'] else '否'}\n"
                 f"  摘要：{task['summary_excerpt']}\n"
-                f"  来源：{task['sources_excerpt']}\n"
             )
         task_overview = "\n".join(task_overview_lines) or "- 暂无任务结果"
+        compact_context_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
         prompt = request_reflection_instructions.format(
             current_date=context.get("current_date"),
             research_topic=context.get("research_topic"),
             task_count_summary=task_count_summary,
             gap_signals=gap_signal_lines,
             task_overview=task_overview,
-            reflection_context_json=json.dumps(context, ensure_ascii=False, indent=2),
+            reflection_context_json=compact_context_json,
         )
         return prompt + self._strategy_memory_block(strategy_memory_context)
 

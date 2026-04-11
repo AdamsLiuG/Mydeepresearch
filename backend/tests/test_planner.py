@@ -12,11 +12,16 @@ hello_agents_stub = types.ModuleType("hello_agents")
 
 class DummyToolAwareSimpleAgent:
     responses = []
+    calls = []
 
-    def run(self, prompt: str):
+    def run(self, prompt: str, **kwargs):
         self.last_prompt = prompt
+        self.calls.append({"prompt": prompt, "kwargs": dict(kwargs)})
         if self.responses:
-            return self.responses.pop(0)
+            outcome = self.responses.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
         return prompt
 
     def clear_history(self):
@@ -33,6 +38,7 @@ from services.planner import PlanningService
 class PlannerParsingTests(unittest.TestCase):
     def setUp(self) -> None:
         DummyToolAwareSimpleAgent.responses = []
+        DummyToolAwareSimpleAgent.calls = []
         self.service = PlanningService(
             DummyToolAwareSimpleAgent(),
             Configuration.from_env(load_env_file=False),
@@ -216,6 +222,19 @@ class PlannerParsingTests(unittest.TestCase):
         self.assertEqual(todo_items[1].title, "能力对比")
         self.assertNotIn("启动检索", [item.title for item in todo_items])
 
+    def test_plan_todo_list_prefers_json_mode_and_falls_back_when_unsupported(self):
+        DummyToolAwareSimpleAgent.responses = [
+            TypeError("run() got an unexpected keyword argument 'response_format'"),
+            '{"tasks":[{"title":"背景梳理","intent":"梳理主题背景","query":"AI agent background"}]}',
+        ]
+
+        state = types.SimpleNamespace(research_topic="AI agent")
+        todo_items = self.service.plan_todo_list(state)
+
+        self.assertEqual(len(todo_items), 1)
+        self.assertEqual(DummyToolAwareSimpleAgent.calls[0]["kwargs"]["response_format"], {"type": "json_object"})
+        self.assertEqual(DummyToolAwareSimpleAgent.calls[1]["kwargs"], {})
+
     def test_plan_todo_list_uses_task_confirmation_table_without_repair(self):
         DummyToolAwareSimpleAgent.responses = [
             """
@@ -263,6 +282,30 @@ class PlannerParsingTests(unittest.TestCase):
             todo_items[1].query,
             "探索多模态大模型在2025年的关键进展 应用场景落地",
         )
+
+    def test_plan_todo_list_replaces_raw_query_with_deterministic_canonical_query(self):
+        DummyToolAwareSimpleAgent.responses = [
+            """
+{"tasks":[
+  {
+    "title":"技术架构演进",
+    "intent":"梳理关键架构创新",
+    "query":"[TOOL_CALL:note:{\\"note_id\\":\\"note_20260405_001\\"}] 按任务顺序执行 search_web，更新笔记状态，query: 多模态大模型 架构演进 最新"
+  }
+]}
+""",
+        ]
+
+        state = types.SimpleNamespace(research_topic="探索多模态大模型在2025年的关键进展")
+        todo_items = self.service.plan_todo_list(state)
+
+        self.assertEqual(len(todo_items), 1)
+        self.assertEqual(
+            todo_items[0].query,
+            "探索多模态大模型在2025年的关键进展 技术架构演进",
+        )
+        self.assertNotIn("note_", todo_items[0].query)
+        self.assertNotIn("search_web", todo_items[0].query)
 
     def test_plan_todo_list_includes_historical_memory_block(self):
         agent = DummyToolAwareSimpleAgent()

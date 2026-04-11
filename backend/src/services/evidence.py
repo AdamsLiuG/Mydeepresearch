@@ -40,7 +40,13 @@ except Exception:  # pragma: no cover - test stubs may only expose a partial mod
 
 from config import Configuration
 from metrics import RequestTrace
+from services.evidence_index import (
+    EvidenceRetrievalHit,
+    EvidenceRetrievalService,
+    EvidenceStoreListener,
+)
 from services.search import dispatch_search
+from services.text_processing import normalize_agent_markdown, strip_citation_markers
 from utils import truncate_text
 
 try:  # pragma: no cover - optional dependency
@@ -79,6 +85,50 @@ HEADING_PATTERN = re.compile(
 )
 TITLE_CLAUSE_SPLIT_PATTERN = re.compile(r"\s*[\-|:|]\s*")
 SOCIAL_HANDLE_PATTERN = re.compile(r"^/?@?(?P<handle>[A-Za-z0-9_.-]{2,40})/?")
+RESEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9.+_-]{1,}|20\d{2}|[\u4e00-\u9fff]{2,}")
+LIST_PREFIX_PATTERN = re.compile(r"^(?:[-*•]\s+|\d+[.)、]\s+|[（(]?\d+[)）]\s+)")
+SOURCE_LABEL_PLACEHOLDER_PATTERNS = (
+    re.compile(r"质量等级", re.IGNORECASE),
+    re.compile(r"时效标签", re.IGNORECASE),
+    re.compile(r"看起来.{0,6}(?:相关|不相关)", re.IGNORECASE),
+    re.compile(r"(?:来源|网页|搜索)目录", re.IGNORECASE),
+    re.compile(r"搜索结果|结果页", re.IGNORECASE),
+    re.compile(
+        r"^(?:[\w\u4e00-\u9fff（）()《》·/+-]{1,32})?(?:社区|论坛|专栏|网站|网页|页面|博客|链接|文章|帖子|问答)(?:[,，:： -].*)?$",
+        re.IGNORECASE,
+    ),
+)
+GENERIC_RESEARCH_TOKENS = {
+    "ai",
+    "agent",
+    "agents",
+    "analysis",
+    "latest",
+    "llm",
+    "llms",
+    "model",
+    "models",
+    "overview",
+    "report",
+    "research",
+    "summary",
+    "task",
+    "workflow",
+    "主题",
+    "任务",
+    "分析",
+    "原因",
+    "场景",
+    "如何",
+    "对比",
+    "总结",
+    "报告",
+    "研究",
+    "背景",
+    "问题",
+    "进展",
+    "趋势",
+}
 
 SOURCE_TYPE_BONUS = {
     "government": 4.0,
@@ -1181,6 +1231,9 @@ class EvidenceRecord:
     freshness_label: str = "unknown"
     quality_reasons: list[str] = field(default_factory=list)
     quality_flags: list[str] = field(default_factory=list)
+    archive_doc_key: str | None = None
+    archive_version_id: str | None = None
+    archive_has_full_content: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -1212,6 +1265,9 @@ class EvidenceRecord:
             "freshness_label": self.freshness_label,
             "quality_reasons": list(self.quality_reasons),
             "quality_flags": list(self.quality_flags),
+            "archive_doc_key": self.archive_doc_key,
+            "archive_version_id": self.archive_version_id,
+            "archive_has_full_content": bool(self.archive_has_full_content),
             "has_full_content": bool(self.full_content),
         }
         if include_full_content and self.full_content:
@@ -1237,12 +1293,41 @@ def _apply_quality_metadata(record: EvidenceRecord) -> None:
 class EvidenceStore:
     """Thread-safe in-memory evidence store scoped to a single request."""
 
-    def __init__(self, *, freshness_reference_days: int = 365) -> None:
+    def __init__(
+        self,
+        *,
+        freshness_reference_days: int = 365,
+        listeners: list[EvidenceStoreListener] | None = None,
+        request_id_getter: Callable[[], str | None] | None = None,
+    ) -> None:
         self._lock = Lock()
         self._freshness_reference_days = max(1, int(freshness_reference_days or 365))
         self._records_by_id: dict[str, EvidenceRecord] = {}
         self._task_source_ids: dict[int, list[str]] = {}
         self._task_url_index: dict[int, dict[str, str]] = {}
+        self._listeners = list(listeners or [])
+        self._request_id_getter = request_id_getter
+
+    def _notify_listeners(
+        self,
+        *,
+        task_id: int,
+        records: list[EvidenceRecord],
+        reason: str,
+    ) -> None:
+        if not records or not self._listeners:
+            return
+        request_id = self._request_id_getter() if self._request_id_getter else None
+        for listener in self._listeners:
+            try:
+                listener.on_records_changed(
+                    task_id=task_id,
+                    records=list(records),
+                    reason=reason,
+                    request_id=request_id,
+                )
+            except Exception:
+                continue
 
     def record_search_results(
         self,
@@ -1258,6 +1343,7 @@ class EvidenceStore:
             return self.list_task_evidence(task_id)
 
         results = list(search_payload.get("results") or [])
+        changed_records: list[EvidenceRecord] = []
         with self._lock:
             task_ids = self._task_source_ids.setdefault(task_id, [])
             url_index = self._task_url_index.setdefault(task_id, {})
@@ -1290,6 +1376,7 @@ class EvidenceStore:
                     record.source_updated_at = source_updated_at or record.source_updated_at
                     _apply_quality_metadata(record)
                     record.updated_at = time.time()
+                    changed_records.append(record)
                     continue
 
                 source_id = f"T{task_id}-S{next_index}"
@@ -1316,7 +1403,9 @@ class EvidenceStore:
                 self._records_by_id[source_id] = record
                 task_ids.append(source_id)
                 url_index[dedup_key] = source_id
+                changed_records.append(record)
 
+        self._notify_listeners(task_id=task_id, records=changed_records, reason="search")
         return self.list_task_evidence(task_id)
 
     def update_full_content(
@@ -1331,6 +1420,7 @@ class EvidenceStore:
         """Attach fetched page content to an existing or new evidence record."""
 
         normalized_url = _normalize_url(url)
+        changed_record: EvidenceRecord | None = None
         with self._lock:
             task_ids = self._task_source_ids.setdefault(task_id, [])
             url_index = self._task_url_index.setdefault(task_id, {})
@@ -1373,8 +1463,11 @@ class EvidenceStore:
                 record.source_type = _classify_source_type(url, record.title)
             _apply_quality_metadata(record)
             record.updated_at = time.time()
+            changed_record = record
 
-            return record.to_dict(include_full_content=True)
+        if changed_record is not None:
+            self._notify_listeners(task_id=task_id, records=[changed_record], reason="fetch")
+        return changed_record.to_dict(include_full_content=True) if changed_record is not None else {}
 
     def list_task_evidence(
         self,
@@ -1472,6 +1565,7 @@ class EvidenceStore:
     def hydrate_from_tasks(self, tasks: list[Any]) -> None:
         """Rebuild the in-memory indices from persisted task evidence payloads."""
 
+        hydrated_by_task: dict[int, list[EvidenceRecord]] = {}
         with self._lock:
             self._records_by_id = {}
             self._task_source_ids = {}
@@ -1561,6 +1655,9 @@ class EvidenceStore:
                             for flag in item.get("quality_flags") or []
                             if str(flag).strip()
                         ],
+                        archive_doc_key=str(item.get("archive_doc_key") or "").strip() or None,
+                        archive_version_id=str(item.get("archive_version_id") or "").strip() or None,
+                        archive_has_full_content=bool(item.get("archive_has_full_content")),
                         created_at=time.time(),
                         updated_at=time.time(),
                     )
@@ -1569,6 +1666,10 @@ class EvidenceStore:
                     task_ids.append(source_id)
                     dedup_key = _normalize_url(url) or f"title::{title.casefold()}"
                     url_index[dedup_key] = source_id
+                    hydrated_by_task.setdefault(task_id, []).append(record)
+
+        for hydrated_task_id, records in hydrated_by_task.items():
+            self._notify_listeners(task_id=hydrated_task_id, records=records, reason="hydrate")
 
 
 def format_evidence_sources(evidence_items: list[dict[str, Any]]) -> str:
@@ -1638,6 +1739,56 @@ def build_task_context(
     return truncate_text(context, config.resolved_task_context_char_limit())
 
 
+def build_task_context_from_hits(
+    hits: list[EvidenceRetrievalHit | dict[str, Any]],
+    *,
+    answer_text: str | None,
+    config: Configuration,
+) -> str:
+    """Build summarization context from filtered evidence chunks."""
+
+    blocks: list[str] = []
+    if answer_text:
+        blocks.append(
+            "AI直接答案：\n"
+            + truncate_text(answer_text, config.resolved_direct_answer_char_limit())
+        )
+
+    for hit in hits:
+        if isinstance(hit, dict):
+            source_id = str(hit.get("source_id") or "")
+            title = str(hit.get("title") or hit.get("url") or "未知来源")
+            url = str(hit.get("url") or "")
+            domain = str(hit.get("domain") or "")
+            quality_label = str(hit.get("quality_label") or "")
+            freshness_label = str(hit.get("freshness_label") or "")
+            body = str(hit.get("text") or "")
+            chunk_id = str(hit.get("chunk_id") or "")
+        else:
+            source_id = str(hit.source_id or "")
+            title = str(hit.title or hit.url or "未知来源")
+            url = str(hit.url or "")
+            domain = str(hit.domain or "")
+            quality_label = str(hit.quality_label or "")
+            freshness_label = str(hit.freshness_label or "")
+            body = str(hit.text or "")
+            chunk_id = str(hit.chunk_id or "")
+
+        excerpt = truncate_text(body, config.resolved_max_tokens_per_source() * 4)
+        blocks.append(
+            f"[{source_id}] {title}\n"
+            f"URL: {url}\n"
+            f"域名: {domain}\n"
+            f"质量等级: {quality_label}\n"
+            f"时效标签: {freshness_label}\n"
+            f"Chunk: {chunk_id}\n"
+            f"正文摘录: {excerpt}"
+        )
+
+    context = "\n\n".join(blocks).strip()
+    return truncate_text(context, config.resolved_task_context_char_limit())
+
+
 def render_references(reference_items: list[dict[str, str]]) -> str:
     """Render a standard reference section."""
 
@@ -1653,6 +1804,189 @@ def render_references(reference_items: list[dict[str, str]]) -> str:
             line = f"{line} - {url}"
         rendered_lines.append(line)
     return "\n".join(rendered_lines)
+
+
+def build_research_keywords(*texts: Any) -> list[str]:
+    """Extract stable topic keywords used to reject irrelevant evidence snippets."""
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    fallback_keywords: list[str] = []
+
+    for value in texts:
+        text = normalize_agent_markdown(str(value or "").strip())
+        if not text:
+            continue
+        for token in RESEARCH_TOKEN_PATTERN.findall(text):
+            normalized = token.strip()
+            if not normalized:
+                continue
+            lowered = normalized.casefold()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            if lowered in GENERIC_RESEARCH_TOKENS:
+                fallback_keywords.append(normalized)
+                continue
+            keywords.append(normalized)
+
+    if keywords:
+        return keywords[:12]
+    return fallback_keywords[:8]
+
+
+def looks_like_source_label_text(
+    value: Any,
+    *,
+    source_title: str = "",
+) -> bool:
+    """Return whether text is mostly a source label instead of a user-facing finding."""
+
+    text = strip_citation_markers(normalize_agent_markdown(str(value or "").strip()))
+    if not text:
+        return True
+
+    compact = re.sub(r"\s+", " ", text).strip(" -:：;；,.，。")
+    if not compact:
+        return True
+
+    if source_title:
+        title = strip_citation_markers(normalize_agent_markdown(str(source_title or "").strip()))
+        if title:
+            title_lower = title.casefold()
+            compact_lower = compact.casefold()
+            if compact_lower == title_lower or compact_lower in title_lower or title_lower in compact_lower:
+                return True
+
+    if any(pattern.search(compact) for pattern in SOURCE_LABEL_PLACEHOLDER_PATTERNS):
+        return True
+
+    if compact.endswith(("文章", "专栏", "社区", "论坛", "网站", "网页", "页面", "博客", "链接", "帖子")):
+        return True
+
+    return False
+
+
+def derive_grounded_findings_from_evidence(
+    evidence_items: list[dict[str, Any]],
+    *,
+    query_text: str,
+    allowed_source_ids: list[str] | None = None,
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    """Convert evidence snippets into grounded fallback findings."""
+
+    if not evidence_items or limit <= 0:
+        return []
+
+    keywords = build_research_keywords(query_text)
+    allowed = {str(source_id).strip() for source_id in allowed_source_ids or [] if str(source_id).strip()}
+
+    findings: list[dict[str, Any]] = []
+    seen_texts: set[str] = set()
+    for item in evidence_items:
+        source_id = str(item.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        if allowed and source_id not in allowed:
+            continue
+
+        text = _best_grounded_claim_text(item, keywords=keywords)
+        if not text or text in seen_texts:
+            continue
+        seen_texts.add(text)
+        findings.append({"text": text, "source_ids": [source_id]})
+        if len(findings) >= limit:
+            break
+
+    return findings
+
+
+def _best_grounded_claim_text(item: dict[str, Any], *, keywords: list[str]) -> str:
+    title = normalize_agent_markdown(str(item.get("title") or "").strip())
+    title_compact = strip_citation_markers(title)
+    candidate_blocks = [
+        str(item.get("full_content") or "").strip(),
+        str(item.get("raw_content") or "").strip(),
+        str(item.get("snippet") or "").strip(),
+    ]
+    combined_text = " ".join(part for part in (title_compact, *candidate_blocks) if part).casefold()
+    if keywords and not any(keyword.casefold() in combined_text for keyword in keywords):
+        return ""
+
+    best_text = ""
+    best_score = -1
+    quality_bonus = {
+        "high": 2,
+        "medium": 1,
+        "low": 0,
+    }.get(str(item.get("quality_label") or "").strip().lower(), 0)
+
+    for block in candidate_blocks:
+        if not block:
+            continue
+        for sentence in _split_grounding_sentences(block):
+            candidate = _clean_grounding_sentence(sentence)
+            if not candidate or looks_like_source_label_text(candidate, source_title=title_compact):
+                continue
+            if title_compact and candidate.casefold() in title_compact.casefold():
+                continue
+
+            match_count = _keyword_match_count(candidate, keywords)
+            if keywords and match_count <= 0:
+                continue
+
+            score = match_count * 5 + quality_bonus
+            if 28 <= len(candidate) <= 220:
+                score += 2
+            elif len(candidate) >= 18:
+                score += 1
+            if "..." in candidate or "…" in candidate:
+                score -= 1
+
+            if score > best_score:
+                best_score = score
+                best_text = candidate
+
+    return best_text
+
+
+def _split_grounding_sentences(text: str) -> list[str]:
+    normalized = normalize_agent_markdown(str(text or "").strip())
+    if not normalized:
+        return []
+
+    parts = re.split(r"(?<=[。！？!?；;])\s+|\n+", normalized)
+    if len(parts) == 1:
+        return [normalized]
+    return [part for part in parts if part.strip()]
+
+
+def _clean_grounding_sentence(text: str) -> str:
+    cleaned = normalize_agent_markdown(str(text or "").strip())
+    if not cleaned:
+        return ""
+
+    cleaned = LIST_PREFIX_PATTERN.sub("", cleaned).strip()
+    cleaned = strip_citation_markers(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:：;；,.，。")
+    if len(cleaned) < 18:
+        return ""
+    if URL_PATTERN.search(cleaned):
+        return ""
+    return cleaned
+
+
+def _keyword_match_count(text: str, keywords: list[str]) -> int:
+    if not keywords:
+        return 1 if len(str(text or "").strip()) >= 18 else 0
+
+    lowered = str(text or "").casefold()
+    matches = 0
+    for keyword in keywords:
+        if keyword.casefold() in lowered:
+            matches += 1
+    return matches
 
 
 class SearchWebTool(Tool):
@@ -1778,20 +2112,32 @@ class FetchPageTool(Tool):
 class EvidenceLookupTool(Tool):
     """Expose request-local evidence records to downstream agents."""
 
-    def __init__(self, *, evidence_store: EvidenceStore) -> None:
+    def __init__(
+        self,
+        *,
+        evidence_store: EvidenceStore,
+        retrieval_service: EvidenceRetrievalService | None = None,
+        request_id_getter: Callable[[], str | None] | None = None,
+    ) -> None:
         super().__init__(
             name="evidence_lookup",
             description=(
-                "查询当前请求的证据库。参数建议使用 JSON，可按 task_id 或 source_id/source_ids 查询。"
+                "查询当前请求的证据库或按 query 检索证据 chunk。"
             ),
         )
         self._evidence_store = evidence_store
+        self._retrieval_service = retrieval_service
+        self._request_id_getter = request_id_getter
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
             ToolParameter(name="task_id", type="integer", description="任务 ID", required=False),
             ToolParameter(name="source_id", type="string", description="单个来源 ID", required=False),
             ToolParameter(name="source_ids", type="string", description="多个来源 ID", required=False),
+            ToolParameter(name="query", type="string", description="检索查询", required=False),
+            ToolParameter(name="top_k", type="integer", description="返回的 chunk 命中数量", required=False),
+            ToolParameter(name="scope", type="string", description="current | history | hybrid", required=False),
+            ToolParameter(name="mode", type="string", description="grounding | lead | repair", required=False),
         ]
 
     def run(self, parameters: dict[str, Any]) -> str:
@@ -1814,6 +2160,7 @@ class EvidenceLookupTool(Tool):
         task_id = int(task_id_raw) if task_id_raw not in (None, "") else None
         include_full_content = bool(parameters.get("include_full_content", False))
         limit = int(parameters.get("limit") or 0) or None
+        query_text = str(parameters.get("query") or "").strip()
 
         evidence = self._evidence_store.lookup(
             task_id=task_id,
@@ -1821,4 +2168,21 @@ class EvidenceLookupTool(Tool):
             include_full_content=include_full_content,
             limit=limit,
         )
+        if query_text and self._retrieval_service is not None:
+            result = self._retrieval_service.query(
+                query_text,
+                task_id=task_id,
+                scope=str(parameters.get("scope") or "current").strip() or "current",
+                mode=str(parameters.get("mode") or "grounding").strip() or "grounding",
+                top_k=int(parameters.get("top_k") or 0) or None,
+                request_id=self._request_id_getter() if self._request_id_getter else None,
+            )
+            return json.dumps(
+                {
+                    "evidence": evidence,
+                    **result.to_dict(),
+                },
+                ensure_ascii=False,
+            )
+
         return json.dumps({"evidence": evidence}, ensure_ascii=False)

@@ -13,7 +13,12 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace
 from models import SummaryState, TodoItem
-from services.evidence import extract_citation_ids, format_evidence_sources
+from services.evidence import (
+    derive_grounded_findings_from_evidence,
+    extract_citation_ids,
+    format_evidence_sources,
+    looks_like_source_label_text,
+)
 from services.notes import build_note_guidance
 from services.text_processing import (
     looks_like_meta_reasoning,
@@ -96,7 +101,7 @@ class SummarizationService:
                 completion_text=response,
             )
 
-        return self._finalize_summary(response, task)
+        return self._finalize_summary(response, task, research_topic=state.research_topic)
 
     def stream_task_summary(
         self,
@@ -126,7 +131,7 @@ class SummarizationService:
                 return result_holder["result"]
 
             raw_text = "".join(raw_parts)
-            result = self._finalize_summary(raw_text, task)
+            result = self._finalize_summary(raw_text, task, research_topic=state.research_topic)
             result_holder["result"] = result
 
             if observer and not call_recorded and not call_failed:
@@ -218,7 +223,13 @@ class SummarizationService:
             "7. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
         )
 
-    def _finalize_summary(self, raw_text: str, task: TodoItem) -> TaskSummaryResult:
+    def _finalize_summary(
+        self,
+        raw_text: str,
+        task: TodoItem,
+        *,
+        research_topic: str,
+    ) -> TaskSummaryResult:
         cleaned = (raw_text or "").strip()
         if self._config.strip_thinking_tokens:
             cleaned = strip_thinking_tokens(cleaned)
@@ -236,6 +247,19 @@ class SummarizationService:
             if isinstance(payload, dict)
             else self._fallback_summary_payload(normalize_agent_markdown(cleaned), valid_source_ids)
         )
+        normalized["key_findings"] = self._repair_grounded_findings(
+            normalized.get("key_findings") or [],
+            task,
+            research_topic=research_topic,
+        )
+        normalized["evidence_gaps"] = self._normalize_evidence_gaps(normalized.get("evidence_gaps"))
+        executive_summary = self._normalize_executive_summary(normalized.get("executive_summary"))
+        if not executive_summary or looks_like_source_label_text(executive_summary):
+            executive_summary = self._derive_executive_summary(
+                normalized["key_findings"],
+                normalized["evidence_gaps"],
+            )
+        normalized["executive_summary"] = executive_summary
 
         if not normalized["key_findings"]:
             raise ValueError("summary contained no grounded findings")
@@ -423,9 +447,76 @@ class SummarizationService:
             text = strip_citation_markers(text)
             if not text or looks_like_meta_reasoning(text) or text in seen:
                 continue
+            if text.casefold().startswith(("evidence_gaps", "evidence gap")):
+                continue
+            if text in {"证据不足的地方", "待补充说明", "待补充"}:
+                continue
             seen.add(text)
             normalized.append(text)
         return normalized
+
+    def _repair_grounded_findings(
+        self,
+        findings: list[dict[str, Any]],
+        task: TodoItem,
+        *,
+        research_topic: str,
+    ) -> list[dict[str, Any]]:
+        repaired: list[dict[str, Any]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        query_text = " ".join(
+            part
+            for part in (
+                research_topic,
+                getattr(task, "title", ""),
+                getattr(task, "intent", ""),
+                getattr(task, "query", ""),
+            )
+            if str(part or "").strip()
+        )
+
+        def append(text: str, source_ids: list[str]) -> None:
+            normalized_text = normalize_agent_markdown(str(text or "").strip())
+            if not normalized_text or not source_ids:
+                return
+            key = (normalized_text, tuple(source_ids))
+            if key in seen:
+                return
+            seen.add(key)
+            repaired.append({"text": normalized_text, "source_ids": list(source_ids)})
+
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            text = normalize_agent_markdown(str(item.get("text") or "").strip())
+            source_ids = [str(source_id).strip() for source_id in item.get("source_ids") or [] if str(source_id).strip()]
+            if not text or not source_ids:
+                continue
+            if looks_like_source_label_text(text):
+                replacements = derive_grounded_findings_from_evidence(
+                    task.evidence_items or [],
+                    query_text=query_text,
+                    allowed_source_ids=source_ids,
+                    limit=1,
+                )
+                for replacement in replacements:
+                    append(replacement["text"], list(replacement["source_ids"]))
+                continue
+            append(text, source_ids)
+
+        if len(repaired) >= 2:
+            return repaired
+
+        supplements = derive_grounded_findings_from_evidence(
+            task.evidence_items or [],
+            query_text=query_text,
+            limit=4,
+        )
+        for item in supplements:
+            append(str(item.get("text") or ""), list(item.get("source_ids") or []))
+            if len(repaired) >= 4:
+                break
+        return repaired
 
     @staticmethod
     def _render_markdown(payload: dict[str, Any]) -> str:

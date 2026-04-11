@@ -119,9 +119,20 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "average_citation_count": 0.0,
             "average_reference_match_rate": 0.0,
             "average_grounded_bullet_ratio": 0.0,
+            "average_factuality_score": 0.0,
+            "average_coverage_score": 0.0,
+            "average_citation_grounding_score": 0.0,
+            "average_freshness_score": 0.0,
+            "average_conservativeness_score": 0.0,
             "average_latency_ms": 0.0,
             "total_estimated_cost": 0.0,
             "error_cases": 0,
+            "judge_success_cases": 0,
+            "judge_error_cases": 0,
+            "judge_skipped_cases": 0,
+            "judge_pass_cases": 0,
+            "judge_warning_cases": 0,
+            "judge_fail_cases": 0,
         }
 
     def average(metric_name: str) -> float:
@@ -134,6 +145,24 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     report_generated = sum(1 for result in results if result["metrics"].get("report_generated"))
     degraded_cases = sum(1 for result in results if result["metrics"].get("degraded_flag"))
     error_cases = sum(1 for result in results if result.get("error"))
+    judge_success_cases = sum(
+        1 for result in results if str(result["metrics"].get("judge_status") or "").strip() == "success"
+    )
+    judge_error_cases = sum(
+        1 for result in results if str(result["metrics"].get("judge_status") or "").strip() == "error"
+    )
+    judge_skipped_cases = sum(
+        1 for result in results if str(result["metrics"].get("judge_status") or "").strip() == "skipped"
+    )
+    judge_pass_cases = sum(
+        1 for result in results if str(result["metrics"].get("overall_verdict") or "").strip() == "pass"
+    )
+    judge_warning_cases = sum(
+        1 for result in results if str(result["metrics"].get("overall_verdict") or "").strip() == "warning"
+    )
+    judge_fail_cases = sum(
+        1 for result in results if str(result["metrics"].get("overall_verdict") or "").strip() == "fail"
+    )
     total_estimated_cost = round(
         sum(float(result["metrics"].get("estimated_cost") or 0.0) for result in results),
         6,
@@ -151,8 +180,19 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "average_citation_count": average("citation_count"),
         "average_reference_match_rate": average("reference_match_rate"),
         "average_grounded_bullet_ratio": average("grounded_bullet_ratio"),
+        "average_factuality_score": average("factuality_score"),
+        "average_coverage_score": average("coverage_score"),
+        "average_citation_grounding_score": average("citation_grounding_score"),
+        "average_freshness_score": average("freshness_score"),
+        "average_conservativeness_score": average("conservativeness_score"),
         "average_latency_ms": average("total_latency_ms"),
         "total_estimated_cost": total_estimated_cost,
+        "judge_success_cases": judge_success_cases,
+        "judge_error_cases": judge_error_cases,
+        "judge_skipped_cases": judge_skipped_cases,
+        "judge_pass_cases": judge_pass_cases,
+        "judge_warning_cases": judge_warning_cases,
+        "judge_fail_cases": judge_fail_cases,
     }
 
 

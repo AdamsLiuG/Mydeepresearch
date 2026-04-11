@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,7 @@ from metrics import RequestTrace
 from models import SummaryState, TodoItem
 from prompts import get_current_date
 from services.evidence import extract_citation_ids, format_evidence_sources
+from services.evidence_index import EvidenceRetrievalService
 from services.text_processing import (
     looks_like_meta_reasoning,
     normalize_agent_markdown,
@@ -67,9 +69,14 @@ class ReviewService:
         self,
         review_agent: ToolAwareSimpleAgent | None,
         config: Configuration,
+        *,
+        retrieval_service: EvidenceRetrievalService | None = None,
+        request_id_getter: Callable[[], str | None] | None = None,
     ) -> None:
         self._agent = review_agent
         self._config = config
+        self._retrieval_service = retrieval_service
+        self._request_id_getter = request_id_getter
 
     def review_request(
         self,
@@ -122,6 +129,11 @@ class ReviewService:
         task_blocks: list[str] = []
         for task in state.todo_items:
             sources = format_evidence_sources(task.evidence_items) or "- 暂无来源"
+            repair_hits = self._repair_hits_for_task(state, task)
+            repair_text = "\n".join(
+                f"  - [{hit['origin']}] {hit['title']} ({hit['quality_label']}/{hit['freshness_label']}) {hit['url']}"
+                for hit in repair_hits
+            ) or "  - 暂无额外修补候选"
             issue_text = "\n".join(
                 f"  - [{issue.severity}] {issue.check}: {issue.message}"
                 for issue in issues
@@ -133,6 +145,7 @@ class ReviewService:
                 f"- 状态：{task.status}\n"
                 f"- 总结：\n{truncate_text(task.summary or '暂无可用信息', 1200)}\n"
                 f"- 来源目录：\n{truncate_text(sources, 1200)}\n"
+                f"- 修补候选：\n{repair_text}\n"
                 f"- 规则审查结果：\n{issue_text}\n"
             )
 
@@ -140,7 +153,10 @@ class ReviewService:
             f"当前日期：{get_current_date()}\n"
             f"研究主题：{state.research_topic}\n"
             "请基于以下任务结果补充指出仍然存在的证据问题。"
-            "你可以调用 evidence_lookup 或 fetch_page，但不要重写报告正文，也不要重复输出规则已明确指出的问题。\n\n"
+            "你可以调用 evidence_lookup；若需要检索历史修补线索，请使用 `scope=hybrid, mode=repair`。"
+            "历史命中只能作为线索，不能直接当作当前 source_id 引用。"
+            "你也可以调用 fetch_page 重新抓取 URL，把线索提升为当前证据。"
+            "不要重写报告正文，也不要重复输出规则已明确指出的问题。\n\n"
             f"{''.join(task_blocks)}"
         )
 
@@ -154,6 +170,28 @@ class ReviewService:
             claims_by_task[task.id] = task_claims
 
         return issues, claims_by_task
+
+    def _repair_hits_for_task(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+    ) -> list[dict[str, Any]]:
+        if self._retrieval_service is None:
+            return []
+        query_text = " ".join(
+            part.strip()
+            for part in [state.research_topic or "", task.title or "", task.intent or "", task.query or ""]
+            if str(part or "").strip()
+        )
+        result = self._retrieval_service.query(
+            query_text,
+            task_id=task.id,
+            scope="hybrid",
+            mode="repair",
+            top_k=3,
+            request_id=self._request_id_getter() if self._request_id_getter else None,
+        )
+        return [hit.to_dict() for hit in result.hits[:3]]
 
     def _review_task(
         self,

@@ -233,6 +233,13 @@
                   </span>
                   <span>{{ formatElapsed(item.elapsedMs) }}</span>
                 </div>
+                <p
+                  v-if="item.error"
+                  class="sidebar-history-error"
+                  :title="item.error"
+                >
+                  {{ item.error }}
+                </p>
               </div>
               <div class="sidebar-history-actions">
                 <button
@@ -291,6 +298,10 @@
             </button>
           </div>
         </header>
+
+        <p v-if="error" class="result-error-banner">
+          {{ error }}
+        </p>
 
         <section v-if="hasMetrics" class="metrics-strip">
           <div class="metric-card">
@@ -740,6 +751,7 @@ interface RecentResearchView {
   reportMarkdown: string;
   todoItems: TodoTaskView[];
   requestMetrics: UnknownRecord;
+  error?: string;
   canViewContent: boolean;
   canResume: boolean;
   phase?: string;
@@ -1005,7 +1017,11 @@ const recentResearchHistory = computed<RecentResearchView[]>(() => {
         reportMarkdown,
         todoItems: historyTasks,
         requestMetrics: entry,
-        canViewContent: Boolean(reportMarkdown) || historyTasks.length > 0,
+        error: getString(entry.error, ""),
+        canViewContent:
+          Boolean(reportMarkdown) ||
+          historyTasks.length > 0 ||
+          Boolean(getString(entry.error, "")),
         canResume:
           getString(entry.status, "unknown") !== "success" &&
           getString(entry.status, "unknown") !== "partial_success",
@@ -1365,6 +1381,7 @@ function updatePersistedHistoryDetail(
       ? mapHistoryTasks(payload.todo_items)
       : entry.todoItems;
     const nextSearchApi = getString(payload.search_api, entry.searchApi);
+    const nextError = getString(payload.error, getString(requestMetrics["error"], entry.error || ""));
 
     return {
       ...entry,
@@ -1375,7 +1392,11 @@ function updatePersistedHistoryDetail(
       reportMarkdown: reportMarkdown === "-" ? entry.reportMarkdown : reportMarkdown,
       todoItems,
       requestMetrics,
-      canViewContent: Boolean(reportMarkdown && reportMarkdown !== "-") || todoItems.length > 0,
+      error: nextError,
+      canViewContent:
+        Boolean(reportMarkdown && reportMarkdown !== "-") ||
+        todoItems.length > 0 ||
+        Boolean(nextError),
       canResume: typeof payload.can_resume === "boolean" ? payload.can_resume : entry.canResume,
       phase: getString(payload.phase, entry.phase || ""),
       updatedAt: getString(payload.updated_at, entry.updatedAt || "")
@@ -1452,9 +1473,11 @@ async function refreshPersistedHistory(signal?: AbortSignal) {
           reportMarkdown: getString(entry.report_markdown, ""),
           todoItems: mapHistoryTasks(entry.todo_items),
           requestMetrics: {},
+          error: getString(entry.error, ""),
           canViewContent:
             Boolean(entry.report_markdown) ||
-            (Array.isArray(entry.todo_items) && entry.todo_items.length > 0),
+            (Array.isArray(entry.todo_items) && entry.todo_items.length > 0) ||
+            Boolean(getString(entry.error, "")),
           canResume: Boolean(entry.can_resume),
           phase: getString(entry.phase, ""),
           updatedAt: getString(entry.updated_at, "")
@@ -1587,7 +1610,7 @@ async function viewHistoryResearch(item: RecentResearchView) {
   historyDetailLoadingRequestId.value = item.requestId;
 
   resetWorkflowState();
-  error.value = "";
+  error.value = item.error || "";
   selectedHistoryRequestId.value = item.requestId;
   form.topic = item.topic;
   form.searchApi = item.searchApi;
@@ -1596,7 +1619,9 @@ async function viewHistoryResearch(item: RecentResearchView) {
   reportMarkdown.value = item.reportMarkdown || "该历史研究未保存最终报告";
   latestRequestMetrics.value =
     Object.keys(item.requestMetrics).length > 0 ? { ...item.requestMetrics } : null;
-  progressLogs.value = [`正在加载历史研究详情：${item.topic}`];
+  progressLogs.value = item.error
+    ? [`正在加载历史研究详情：${item.topic}`, `失败原因：${item.error}`]
+    : [`正在加载历史研究详情：${item.topic}`];
   isExpanded.value = true;
 
   try {
@@ -1615,6 +1640,7 @@ async function viewHistoryResearch(item: RecentResearchView) {
       getString(payload.report_markdown, item.reportMarkdown) || "该历史研究未保存最终报告";
     const nextRequestMetrics =
       Object.keys(detailMetrics).length > 0 ? { ...detailMetrics } : null;
+    const detailError = getString(payload.error, getString(detailMetrics["error"], item.error || ""));
 
     form.topic = detailTopic;
     form.searchApi = detailSearchApi === "-" ? item.searchApi : detailSearchApi;
@@ -1622,7 +1648,10 @@ async function viewHistoryResearch(item: RecentResearchView) {
     activeTaskId.value = todoTasks.value[0]?.id ?? null;
     reportMarkdown.value = detailReport;
     latestRequestMetrics.value = nextRequestMetrics;
-    progressLogs.value = [`已载入历史研究：${detailTopic}`];
+    error.value = detailError;
+    progressLogs.value = detailError
+      ? [`已载入历史研究：${detailTopic}`, `失败原因：${detailError}`]
+      : [`已载入历史研究：${detailTopic}`];
 
     updatePersistedHistoryDetail(item.requestId, payload, detailMetrics);
   } catch (error) {
@@ -1632,10 +1661,16 @@ async function viewHistoryResearch(item: RecentResearchView) {
     console.warn("获取历史研究详情失败", error);
     latestRequestMetrics.value =
       Object.keys(item.requestMetrics).length > 0 ? { ...item.requestMetrics } : null;
-    progressLogs.value = [
-      `已载入历史研究摘要：${item.topic}`,
-      "历史详情加载失败，已显示摘要内容"
-    ];
+    progressLogs.value = item.error
+      ? [
+          `已载入历史研究摘要：${item.topic}`,
+          `失败原因：${item.error}`,
+          "历史详情加载失败，已显示摘要内容"
+        ]
+      : [
+          `已载入历史研究摘要：${item.topic}`,
+          "历史详情加载失败，已显示摘要内容"
+        ];
   } finally {
     if (historyDetailController === controller) {
       historyDetailController = null;
@@ -4295,6 +4330,17 @@ select:focus {
   color: #64748b;
 }
 
+.sidebar-history-error {
+  margin: 0;
+  color: #b91c1c;
+  font-size: 12px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .history-status-chip {
   display: inline-flex;
   align-items: center;
@@ -4325,6 +4371,17 @@ select:focus {
 .history-status-chip.in_progress {
   color: #1d4ed8;
   background: rgba(59, 130, 246, 0.16);
+}
+
+.result-error-banner {
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  background: rgba(254, 242, 242, 0.9);
+  color: #b91c1c;
+  font-size: 14px;
+  line-height: 1.6;
 }
 
 .history-repeat-btn {

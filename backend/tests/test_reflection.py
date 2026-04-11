@@ -113,6 +113,7 @@ class ReflectionServiceTests(unittest.TestCase):
         self.assertIn("must_output_single_json_object", prompt)
         self.assertIn("STRATEGY_MEMORY", prompt)
         self.assertIn("历史策略记忆", prompt)
+        self.assertNotIn('"query"', prompt)
 
     def test_assess_request_accepts_valid_strict_json(self):
         agent = StubReflectionAgent(

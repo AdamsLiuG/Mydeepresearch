@@ -109,6 +109,8 @@ class AgentExecutionTests(unittest.TestCase):
                 "request_state_enabled": False,
                 "task_react_enabled": False,
                 "report_repair_enabled": False,
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
             },
             load_env_file=False,
         )
@@ -270,6 +272,68 @@ class AgentExecutionTests(unittest.TestCase):
 
         self.assertEqual(captured["historical_memory_context"], "历史研究记忆：MCP protocol")
         self.assertEqual(captured["strategy_memory_context"], "历史策略记忆：优先官方文档与失败反模式。")
+
+    def test_run_warms_topic_cache_before_executing_tasks(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "request_reflection_enabled": False,
+                "review_stage_enabled": False,
+                "request_state_enabled": False,
+                "task_react_enabled": False,
+                "report_repair_enabled": False,
+                "search_cache_enabled": True,
+                "semantic_cache_enabled": True,
+            },
+            load_env_file=False,
+        )
+        topic = "探索多模态大模型在 2025 年的关键突破"
+        dispatch_calls = []
+
+        def fake_dispatch_search(query, config, loop_count, observer=None, cache_context=None):
+            dispatch_calls.append((query, cache_context))
+            if observer is not None:
+                observer.record_search_attempt(
+                    cache_hit=False,
+                    success=True,
+                    cache_strategy="miss",
+                )
+            return (
+                {
+                    "results": [
+                        {
+                            "title": "Topic Overview",
+                            "url": "https://example.com/topic",
+                            "content": "content",
+                        }
+                    ]
+                },
+                [],
+                None,
+                "advanced[searxng]",
+                False,
+                "miss",
+            )
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            self.assertTrue(state.topic_cache_warmup_completed)
+            self.assertEqual(dispatch_calls[0][0], agent._topic_canonical_query(state))
+            self.assertEqual(dispatch_calls[0][1], {"research_topic": topic})
+            task.status = "completed"
+            task.summary = "summary"
+            task.sources_summary = "* Example : https://example.com"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+
+        with patch.object(agent_module, "dispatch_search", side_effect=fake_dispatch_search) as mock_dispatch:
+            result = agent.run(topic)
+
+        self.assertEqual(mock_dispatch.call_count, 1)
+        self.assertEqual(dispatch_calls[0][0], topic)
+        self.assertEqual(result.todo_items[0].status, "completed")
 
     def test_run_passes_strategy_memory_context_into_reflection(self):
         agent = self._build_agent()
@@ -648,6 +712,12 @@ class AgentExecutionTests(unittest.TestCase):
             agent._normalize_query_candidate("研究方法 对比"),
             "研究方法 对比",
         )
+        self.assertEqual(
+            agent._normalize_query_candidate(
+                "[TOOL_CALL:note:{\"note_id\":\"note_123\"}] 按任务顺序执行 search_web 并更新笔记状态，query: MCP protocol architecture"
+            ),
+            "MCP protocol architecture",
+        )
 
     def test_task_search_queries_clean_request_style_original_query(self):
         agent = self._build_agent()
@@ -664,9 +734,10 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertTrue(candidates)
         self.assertEqual(
             candidates[0],
-            ("vLLM PagedAttention 论文与其在推理服务中的作用 PagedAttention 原理", "original"),
+            ("探索大模型推理服务的关键优化 PagedAttention 原理", "original"),
         )
         self.assertTrue(all("请简要研究" not in query for query, _ in candidates))
+        self.assertTrue(all("note_" not in query for query, _ in candidates))
 
     def test_execute_task_retries_with_broader_query_before_skipping(self):
         agent = self._build_agent()
@@ -834,6 +905,66 @@ class AgentExecutionTests(unittest.TestCase):
         ]
         self.assertTrue(search_stages)
         self.assertEqual(search_stages[-1]["metadata"]["cache_strategy"], "semantic")
+
+    def test_execute_task_batch_sync_warms_topic_cache_only_once(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "request_reflection_enabled": False,
+                "review_stage_enabled": False,
+                "request_state_enabled": False,
+                "task_react_enabled": False,
+                "report_repair_enabled": False,
+                "search_cache_enabled": True,
+                "semantic_cache_enabled": True,
+            },
+            load_env_file=False,
+        )
+        observer = RequestTrace(
+            request_id="req-topic-warmup",
+            topic="探索多模态大模型在 2025 年的关键突破",
+            search_api="advanced",
+            provider="custom",
+            model="Qwen/Qwen3.5-27B",
+            pricing_catalog={},
+        )
+        agent._request_trace = observer
+        state = SummaryState(research_topic="探索多模态大模型在 2025 年的关键突破")
+        first_task = TodoItem(id=1, title="任务1", intent="梳理背景", query="任务1")
+        second_task = TodoItem(id=2, title="任务2", intent="梳理进展", query="任务2")
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            task.status = "completed"
+            task.summary = "summary"
+            task.sources_summary = "* Example : https://example.com"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+
+        def fake_dispatch_search(query, config, loop_count, observer=None, cache_context=None):
+            if observer is not None:
+                observer.record_search_attempt(
+                    cache_hit=True,
+                    success=True,
+                    cache_strategy="exact",
+                )
+            return (
+                {"results": [{"title": "Topic", "url": "https://example.com", "content": "content"}]},
+                [],
+                None,
+                "advanced[searxng]",
+                True,
+                "exact",
+            )
+
+        with patch.object(agent_module, "dispatch_search", side_effect=fake_dispatch_search) as mock_dispatch:
+            agent._execute_task_batch_sync(state, [first_task])
+            agent._execute_task_batch_sync(state, [second_task])
+
+        self.assertTrue(state.topic_cache_warmup_completed)
+        self.assertEqual(mock_dispatch.call_count, 1)
 
     def test_execute_task_react_stops_after_sufficient_evidence_in_round_one(self):
         agent = self._build_agent()
@@ -1182,6 +1313,35 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertTrue(agent._request_trace.snapshot()["reflection_triggered"])
         self.assertEqual(agent._request_trace.snapshot()["reflection_added_tasks"], 0)
         self.assertIn("预算已满", agent._request_trace.snapshot()["reflection_reason"])
+
+    def test_reflection_gap_signals_ignore_generic_degraded_reasons_without_fallback(self):
+        agent = self._build_agent()
+        observer = RequestTrace(
+            request_id="req-reflection-skip",
+            topic="AI agent",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        observer.record_degraded("task_react_incomplete:max_rounds_reached")
+        agent._request_trace = observer
+        state = SummaryState(
+            research_topic="AI agent",
+            todo_items=[
+                TodoItem(
+                    id=1,
+                    title="任务1",
+                    intent="梳理背景",
+                    query="AI agent",
+                    status="completed",
+                    summary="完整总结",
+                    sources_summary="* Example : https://example.com",
+                )
+            ],
+        )
+
+        self.assertEqual(agent._reflection_gap_signals(state), [])
 
     def test_run_stream_emits_reflection_stage_and_updated_todo_list(self):
         agent = self._build_agent()

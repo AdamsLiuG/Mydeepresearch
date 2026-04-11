@@ -1,6 +1,8 @@
 .DS_Store
 .vscode/
 .history/
+.codex-playwright/
+.ruff_cache/
 
 # Environment and local config
 .env
@@ -21,7 +23,9 @@ venv/
 backend/.venv/
 backend/.cache/
 backend/.state/
+backend/.memory/
 backend/=*
+backend/backend/
 backend/build/
 backend/*.egg-info/
 backend/src/*.egg-info/
@@ -32,3 +36,14 @@ backend/notes/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+
+# Personal or generated local docs
+docs/
+AI_DEV_GUIDE.md
+CODEBASE_DIFF_ANALYSIS.md
+Deepresearch_advanced.md
+ENGINEERING.md
+resume.tex
+comparison.md
+Deepresearch Agent面试准备.md
+deepresearch_resume_analysis.md

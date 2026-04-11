@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from services.evidence import (
     FetchPageTool,
     SearchWebTool,
     build_task_context,
+    build_task_context_from_hits,
     compute_content_quality_score,
     compute_freshness_label,
     compute_quality_score_and_label,
@@ -25,6 +27,11 @@ from services.evidence import (
     extract_domain,
     format_evidence_sources,
     score_evidence_quality,
+)
+from services.evidence_index import (
+    EvidenceMemoryService,
+    EvidenceRetrievalService,
+    EvidenceRuntimeIndex,
 )
 
 
@@ -256,6 +263,152 @@ class EvidenceStoreTests(unittest.TestCase):
                 "published_at": "",
             }
         ])
+
+    def test_runtime_index_and_lookup_query_return_grounding_hits(self):
+        config = Configuration.from_env(load_env_file=False)
+        runtime_index = EvidenceRuntimeIndex(config)
+        retrieval = EvidenceRetrievalService(
+            runtime_index=runtime_index,
+            memory_service=None,
+            config=config,
+        )
+        store = EvidenceStore(listeners=[runtime_index])
+        store.record_search_results(
+            task_id=7,
+            query="mcp architecture",
+            search_payload={
+                "results": [
+                    {
+                        "title": "MCP Overview",
+                        "url": "https://example.com/mcp",
+                        "content": "Model Context Protocol architecture overview and grounding model",
+                    }
+                ]
+            },
+            backend="duckduckgo",
+        )
+        tool = EvidenceLookupTool(
+            evidence_store=store,
+            retrieval_service=retrieval,
+            request_id_getter=lambda: "req-runtime",
+        )
+
+        payload = json.loads(
+            tool.run(
+                {
+                    "task_id": 7,
+                    "query": "Model Context Protocol architecture",
+                    "scope": "current",
+                    "mode": "grounding",
+                    "top_k": 3,
+                }
+            )
+        )
+
+        self.assertEqual(payload["hits"][0]["source_id"], "T7-S1")
+        self.assertTrue(payload["hits"][0]["citation_eligible"])
+        context = build_task_context_from_hits(payload["hits"], answer_text=None, config=config)
+        self.assertIn("[T7-S1]", context)
+
+    def test_evidence_memory_persists_versions_and_runtime_hydrate_restores_chunks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Configuration.from_env(
+                overrides={
+                    "evidence_memory_enabled": True,
+                    "evidence_memory_dir": temp_dir,
+                },
+                load_env_file=False,
+            )
+            memory = EvidenceMemoryService(config)
+            runtime = EvidenceRuntimeIndex(config, archive_loader=memory)
+            store = EvidenceStore(
+                listeners=[memory, runtime],
+                request_id_getter=lambda: "req-archive-1",
+            )
+
+            store.record_search_results(
+                task_id=8,
+                query="evidence archive",
+                search_payload={
+                    "results": [
+                        {
+                            "title": "Archive Doc",
+                            "url": "https://example.com/archive-doc",
+                            "content": "short snippet for archive doc",
+                        }
+                    ]
+                },
+                backend="duckduckgo",
+            )
+            before_fetch = store.get_evidence("T8-S1")
+            self.assertTrue(before_fetch["archive_version_id"])
+
+            store.update_full_content(
+                task_id=8,
+                source_id="T8-S1",
+                url="https://example.com/archive-doc",
+                title="Archive Doc",
+                full_content="Detailed recovered full content for runtime hydrate and archive restore.",
+            )
+            after_fetch = store.get_evidence("T8-S1", include_full_content=True)
+            self.assertTrue(after_fetch["archive_has_full_content"])
+            self.assertNotEqual(before_fetch["archive_version_id"], after_fetch["archive_version_id"])
+
+            restored_runtime = EvidenceRuntimeIndex(config, archive_loader=memory)
+            restored_store = EvidenceStore(listeners=[restored_runtime])
+            restored_task = TodoItem(
+                id=8,
+                title="任务8",
+                intent="恢复 archive evidence",
+                query="archive hydrate",
+                evidence_items=[store.get_evidence("T8-S1")],
+            )
+            restored_store.hydrate_from_tasks([restored_task])
+            restored_hits = restored_runtime.query(
+                text="runtime hydrate archive restore",
+                task_id=8,
+                top_k=3,
+            )
+
+        self.assertTrue(restored_hits)
+        self.assertIn("Detailed recovered full content", restored_hits[0].text)
+        self.assertEqual(restored_hits[0].archive_version_id, after_fetch["archive_version_id"])
+
+    def test_history_grounding_scope_is_forced_back_to_current(self):
+        config = Configuration.from_env(load_env_file=False)
+        runtime_index = EvidenceRuntimeIndex(config)
+        retrieval = EvidenceRetrievalService(
+            runtime_index=runtime_index,
+            memory_service=None,
+            config=config,
+        )
+        store = EvidenceStore(listeners=[runtime_index])
+        store.record_search_results(
+            task_id=9,
+            query="grounding scope",
+            search_payload={
+                "results": [
+                    {
+                        "title": "Grounding Doc",
+                        "url": "https://example.com/grounding",
+                        "content": "Grounding scope stays on current request evidence only.",
+                    }
+                ]
+            },
+            backend="duckduckgo",
+        )
+
+        result = retrieval.query(
+            "current request grounding",
+            task_id=9,
+            scope="history",
+            mode="grounding",
+            request_id="req-scope",
+        )
+
+        self.assertEqual(result.scope, "current")
+        self.assertTrue(result.notices)
+        self.assertTrue(result.hits[0].citation_eligible)
 
     def test_extract_domain_normalizes_host_and_rejects_invalid_url(self):
         self.assertEqual(

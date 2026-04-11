@@ -55,6 +55,7 @@ class SummaryState:
     review_completed: bool = field(default=False)
     report_repair_completed: bool = field(default=False)
     report_repair_cycles: int = field(default=0)
+    topic_cache_warmup_completed: bool = field(default=False)
 
 
 @dataclass(kw_only=True)

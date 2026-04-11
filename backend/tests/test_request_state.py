@@ -31,23 +31,55 @@ class RequestStateStoreTests(unittest.TestCase):
                     "topic": "MCP",
                     "status": "success",
                     "phase": "completed",
+                    "cache_diagnostics": {
+                        "cache_hits": 3,
+                        "cache_exact_hits": 1,
+                        "cache_semantic_hits": 2,
+                        "cache_misses": 4,
+                        "last_search_cache_details": {
+                            "cache_hit_mode": "semantic_ann",
+                            "ttl_bucket": "evergreen",
+                        },
+                    },
                     "todo_items": [{"id": 2, "title": "任务2"}],
                     "report_markdown": "# report",
                 },
             )
+            store.save(
+                "req-3",
+                {
+                    "topic": "MCP connectivity",
+                    "status": "failed",
+                    "phase": "failed",
+                    "request_metrics": {
+                        "error": "Connection error.",
+                    },
+                },
+            )
 
             loaded = store.load("req-1")
-            recent = store.list_recent(limit=2)
+            loaded_failed = store.load("req-3")
+            recent = store.list_recent(limit=3)
 
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded["topic"], "AI agent")
-        self.assertEqual(len(recent), 2)
+        self.assertIsNotNone(loaded_failed)
+        self.assertEqual(loaded_failed["error"], "Connection error.")
+        self.assertEqual(len(recent), 3)
         recent_by_id = {item["request_id"]: item for item in recent}
         self.assertIn("req-1", recent_by_id)
         self.assertIn("req-2", recent_by_id)
+        self.assertIn("req-3", recent_by_id)
         self.assertTrue(recent_by_id["req-2"]["can_view_content"])
         self.assertFalse(recent_by_id["req-2"]["can_resume"])
         self.assertTrue(recent_by_id["req-1"]["can_resume"])
+        self.assertTrue(recent_by_id["req-3"]["can_view_content"])
+        self.assertEqual(recent_by_id["req-3"]["error"], "Connection error.")
+        self.assertEqual(recent_by_id["req-2"]["cache_diagnostics"]["cache_hits"], 3)
+        self.assertEqual(
+            recent_by_id["req-2"]["cache_diagnostics"]["last_search_cache_details"]["cache_hit_mode"],
+            "semantic_ann",
+        )
 
     def test_save_allows_concurrent_updates_for_same_request(self):
         with tempfile.TemporaryDirectory() as temp_dir:

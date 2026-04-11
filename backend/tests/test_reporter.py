@@ -15,9 +15,17 @@ from services.reporter import ReportingService
 class DummyAgent:
     def __init__(self, response: str):
         self._response = response
+        self.calls = []
 
-    def run(self, prompt: str):
-        return self._response
+    def run(self, prompt: str, **kwargs):
+        self.calls.append({"prompt": prompt, "kwargs": dict(kwargs)})
+        if isinstance(self._response, list):
+            outcome = self._response.pop(0)
+        else:
+            outcome = self._response
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     def clear_history(self):
         return None
@@ -74,6 +82,63 @@ class ReportingServiceTests(unittest.TestCase):
         self.assertIn("## 参考来源", report)
         self.assertIn("Grounded Source", report)
         self.assertIn("https://example.com/source", report)
+
+    def test_generate_report_prefers_json_mode_and_falls_back_when_unsupported(self):
+        store = EvidenceStore()
+        task = TodoItem(
+            id=1,
+            title="任务1",
+            intent="梳理背景",
+            query="AI agent",
+            status="completed",
+            summary="任务总结 [T1-S1]",
+            sources_summary="* [T1-S1] Grounded Source : https://example.com/source",
+            evidence_items=[
+                {
+                    "source_id": "T1-S1",
+                    "title": "Grounded Source",
+                    "url": "https://example.com/source",
+                }
+            ],
+        )
+        store.record_search_results(
+            task_id=1,
+            query="AI agent",
+            search_payload={
+                "results": [
+                    {
+                        "title": "Grounded Source",
+                        "url": "https://example.com/source",
+                        "content": "example snippet",
+                    }
+                ]
+            },
+            backend="duckduckgo",
+        )
+        response = [
+            TypeError("run() got an unexpected keyword argument 'response_format'"),
+            """
+{
+  "background_overview": "AI agent 在开放研究场景中需要可追溯证据。",
+  "key_findings": [{"claim": "多阶段研究流程可以提升任务可控性", "source_ids": ["T1-S1"]}],
+  "evidence_and_data": [{"point": "搜索结果被登记为 source_id 以支持引用绑定", "source_ids": ["T1-S1"]}],
+  "risks_and_challenges": [{"risk": "如果来源不足，报告应明确证据不足", "source_ids": ["T1-S1"]}],
+  "references": [{"source_id": "T1-S1", "title": "Grounded Source", "url": "https://example.com/source"}]
+}
+""",
+        ]
+        agent = DummyAgent(response)
+        service = ReportingService(
+            agent,
+            Configuration.from_env(load_env_file=False),
+            evidence_store=store,
+        )
+
+        report = service.generate_report(SummaryState(research_topic="AI agent", todo_items=[task]))
+
+        self.assertIn("## 核心洞见", report)
+        self.assertEqual(agent.calls[0]["kwargs"]["response_format"], {"type": "json_object"})
+        self.assertEqual(agent.calls[1]["kwargs"], {})
 
     def test_generate_report_supports_custom_sections_and_dynamic_order_in_flexible_mode(self):
         store = EvidenceStore()
@@ -446,6 +511,68 @@ class ReportingServiceTests(unittest.TestCase):
         self.assertIn("## 风险与挑战\n- 暂无相关信息", report)
         self.assertLess(report.index("## 风险与挑战"), report.index("## 研究过程说明（系统生成）"))
         self.assertLess(report.index("## 研究过程说明（系统生成）"), report.index("## 参考来源"))
+
+    def test_generate_report_replaces_source_label_findings_with_evidence_claims(self):
+        store = EvidenceStore()
+        store.record_search_results(
+            task_id=1,
+            query="什么是 MCP",
+            search_payload={
+                "results": [
+                    {
+                        "title": "知乎专栏文章",
+                        "url": "https://example.com/mcp",
+                        "content": "MCP 是统一协议标准，使模型能够以一致方式连接工具和数据源，常被比作 AI 世界的 USB-C 接口。",
+                    },
+                    {
+                        "title": "消费指南网站",
+                        "url": "https://example.com/shop",
+                        "content": "什么值得买是兴趣消费指南，为用户提供购物决策支持。",
+                    },
+                ]
+            },
+            backend="duckduckgo",
+        )
+        task = TodoItem(
+            id=1,
+            title="MCP 定义",
+            intent="解释 MCP 的核心定义",
+            query="什么是 MCP（Model Context Protocol）",
+            status="completed",
+            summary_payload={
+                "executive_summary": "知乎专栏文章，质量等级low，但内容看起来相关",
+                "key_findings": [
+                    {"text": "知乎专栏文章，质量等级low，但内容看起来相关", "source_ids": ["T1-S1"]},
+                    {"text": "消费指南网站，看起来不相关", "source_ids": ["T1-S2"]},
+                ],
+                "evidence_gaps": [],
+            },
+            evidence_items=store.list_task_evidence(1),
+        )
+        state = SummaryState(research_topic="什么是 MCP（Model Context Protocol）", todo_items=[task])
+
+        response = """
+{
+  "background_overview": "暂无相关信息",
+  "key_findings": [{"claim": "知乎专栏文章，质量等级low，但内容看起来相关", "source_ids": ["T1-S1"]}],
+  "evidence_and_data": [],
+  "risks_and_challenges": [],
+  "references": []
+}
+"""
+        service = ReportingService(
+            DummyAgent(response),
+            Configuration.from_env(load_env_file=False),
+            evidence_store=store,
+        )
+
+        report = service.generate_report(state)
+
+        self.assertIn("MCP 是统一协议标准，使模型能够以一致方式连接工具和数据源", report)
+        self.assertNotIn("知乎专栏文章，质量等级low，但内容看起来相关", report)
+        self.assertNotIn("消费指南网站，看起来不相关", report)
+        self.assertIn("https://example.com/mcp", report)
+        self.assertNotIn("https://example.com/shop", report)
 
     def test_generate_report_strips_internal_review_language_from_formal_content(self):
         store = EvidenceStore()

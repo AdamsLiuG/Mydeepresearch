@@ -279,6 +279,7 @@ task_react_plan_prompt = """
 - broaden_query
 - diversify_source_query
 - fetch_page_for_top_source
+- fetch_page_for_archive_hit
 - stop
 </ALLOWED_ACTIONS>
 
@@ -287,15 +288,17 @@ task_react_plan_prompt = """
 - `broaden_query`：适用于当前 query 过窄、需要放宽约束或补同主题相关证据；
 - `diversify_source_query`：适用于来源域名过少、缺少权威来源或存在明显来源偏置；
 - `fetch_page_for_top_source`：适用于已有来源但正文不足、需要补充页面全文；
+- `fetch_page_for_archive_hit`：适用于历史证据库命中高相关页面，值得先抓取该 URL 进入当前请求；
 - `stop`：适用于证据已足够、预算耗尽、继续收益低或没有明确补救方向。
 </DECISION_RULES>
 
 <FORMAT>
 请严格输出 JSON：
 {
-  "action": "rewrite_query | broaden_query | diversify_source_query | fetch_page_for_top_source | stop",
+  "action": "rewrite_query | broaden_query | diversify_source_query | fetch_page_for_top_source | fetch_page_for_archive_hit | stop",
   "query": "当 action 需要搜索时填写新的 query，否则留空",
   "source_id": "当 action=fetch_page_for_top_source 时填写",
+  "url": "当 action=fetch_page_for_archive_hit 时填写",
   "reason": "一句话说明为什么这么做"
 }
 </FORMAT>

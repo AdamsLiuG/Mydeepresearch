@@ -256,6 +256,55 @@ class Configuration(BaseModel):
         title="Strategy Memory Prompt Character Limit",
         description="Maximum prompt characters reserved for injected historical strategy memory",
     )
+    evidence_runtime_enabled: bool = Field(
+        default=True,
+        title="Evidence Runtime Enabled",
+        description="Whether to build a request-scoped runtime chunk index for grounding",
+    )
+    evidence_runtime_top_k: int = Field(
+        default=8,
+        ge=1,
+        title="Evidence Runtime Top K",
+        description="How many runtime evidence chunks to surface for task grounding",
+    )
+    evidence_chunk_chars: int = Field(
+        default=900,
+        ge=200,
+        title="Evidence Chunk Characters",
+        description="Chunk size used by runtime and persistent evidence indexing",
+    )
+    evidence_chunk_overlap: int = Field(
+        default=120,
+        ge=0,
+        title="Evidence Chunk Overlap",
+        description="Chunk overlap used by runtime and persistent evidence indexing",
+    )
+    evidence_runtime_embedding_model: str | None = Field(
+        default=None,
+        title="Evidence Runtime Embedding Model",
+        description="Optional embedding model override for runtime evidence retrieval",
+    )
+    evidence_memory_enabled: bool = Field(
+        default=False,
+        title="Evidence Memory Enabled",
+        description="Whether to persist cross-request evidence chunks and metadata",
+    )
+    evidence_memory_dir: str = Field(
+        default="./.memory/evidence",
+        title="Evidence Memory Directory",
+        description="Directory used by the persistent evidence archive and vector store",
+    )
+    evidence_memory_top_k: int = Field(
+        default=6,
+        ge=1,
+        title="Evidence Memory Top K",
+        description="How many historical evidence chunks to retrieve for lead/repair flows",
+    )
+    evidence_memory_embedding_model: str | None = Field(
+        default=None,
+        title="Evidence Memory Embedding Model",
+        description="Optional embedding model override for persistent evidence retrieval",
+    )
     fetch_full_page: bool = Field(
         default=True,
         title="Fetch Full Page",
@@ -327,14 +376,34 @@ class Configuration(BaseModel):
         description="Whether to cache search results in-process",
     )
     search_cache_ttl_seconds: int = Field(
-        default=900,
+        default=43200,
         title="Search Cache TTL",
         description="How long to keep in-process search cache entries",
+    )
+    search_cache_dynamic_ttl_enabled: bool = Field(
+        default=True,
+        title="Search Cache Dynamic TTL Enabled",
+        description="Whether to assign cache TTL dynamically based on query freshness signals",
+    )
+    search_cache_fresh_ttl_seconds: int = Field(
+        default=14400,
+        title="Search Cache Fresh TTL",
+        description="TTL for freshness-sensitive search cache entries",
+    )
+    search_cache_evergreen_ttl_seconds: int = Field(
+        default=172800,
+        title="Search Cache Evergreen TTL",
+        description="TTL for evergreen search cache entries",
     )
     search_cache_dir: str = Field(
         default="./.cache/search",
         title="Search Cache Directory",
         description="Directory used by the persistent search cache store",
+    )
+    search_cache_vector_dir: str = Field(
+        default="./.cache/search/vector",
+        title="Search Cache Vector Directory",
+        description="Directory used by the semantic ANN vector index for search cache recall",
     )
     semantic_cache_enabled: bool = Field(
         default=True,
@@ -674,6 +743,13 @@ class Configuration(BaseModel):
                 cache_path = backend_root() / cache_path
             self.search_cache_dir = str(cache_path.resolve(strict=False))
 
+        vector_dir = (self.search_cache_vector_dir or "").strip()
+        if vector_dir:
+            vector_path = Path(vector_dir).expanduser()
+            if not vector_path.is_absolute():
+                vector_path = backend_root() / vector_path
+            self.search_cache_vector_dir = str(vector_path.resolve(strict=False))
+
         thresholds_path = (self.perf_thresholds_path or "").strip()
         if thresholds_path:
             perf_path = Path(thresholds_path).expanduser()
@@ -701,6 +777,13 @@ class Configuration(BaseModel):
             if not memory_path.is_absolute():
                 memory_path = backend_root() / memory_path
             self.strategy_memory_dir = str(memory_path.resolve(strict=False))
+
+        evidence_memory_dir = (self.evidence_memory_dir or "").strip()
+        if evidence_memory_dir:
+            memory_path = Path(evidence_memory_dir).expanduser()
+            if not memory_path.is_absolute():
+                memory_path = backend_root() / memory_path
+            self.evidence_memory_dir = str(memory_path.resolve(strict=False))
         return self
 
     @classmethod
@@ -763,13 +846,26 @@ class Configuration(BaseModel):
             "strategy_memory_planning_top_k": os.getenv("STRATEGY_MEMORY_PLANNING_TOP_K"),
             "strategy_memory_reflection_top_k": os.getenv("STRATEGY_MEMORY_REFLECTION_TOP_K"),
             "strategy_memory_prompt_char_limit": os.getenv("STRATEGY_MEMORY_PROMPT_CHAR_LIMIT"),
+            "evidence_runtime_enabled": os.getenv("EVIDENCE_RUNTIME_ENABLED"),
+            "evidence_runtime_top_k": os.getenv("EVIDENCE_RUNTIME_TOP_K"),
+            "evidence_chunk_chars": os.getenv("EVIDENCE_CHUNK_CHARS"),
+            "evidence_chunk_overlap": os.getenv("EVIDENCE_CHUNK_OVERLAP"),
+            "evidence_runtime_embedding_model": os.getenv("EVIDENCE_RUNTIME_EMBEDDING_MODEL"),
+            "evidence_memory_enabled": os.getenv("EVIDENCE_MEMORY_ENABLED"),
+            "evidence_memory_dir": os.getenv("EVIDENCE_MEMORY_DIR"),
+            "evidence_memory_top_k": os.getenv("EVIDENCE_MEMORY_TOP_K"),
+            "evidence_memory_embedding_model": os.getenv("EVIDENCE_MEMORY_EMBEDDING_MODEL"),
             "host": os.getenv("HOST"),
             "port": os.getenv("PORT"),
             "log_level": os.getenv("LOG_LEVEL"),
             "cors_origins": os.getenv("CORS_ORIGINS"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
+            "search_cache_dynamic_ttl_enabled": os.getenv("SEARCH_CACHE_DYNAMIC_TTL_ENABLED"),
+            "search_cache_fresh_ttl_seconds": os.getenv("SEARCH_CACHE_FRESH_TTL_SECONDS"),
+            "search_cache_evergreen_ttl_seconds": os.getenv("SEARCH_CACHE_EVERGREEN_TTL_SECONDS"),
             "search_cache_dir": os.getenv("SEARCH_CACHE_DIR"),
+            "search_cache_vector_dir": os.getenv("SEARCH_CACHE_VECTOR_DIR"),
             "semantic_cache_enabled": os.getenv("SEMANTIC_CACHE_ENABLED"),
             "semantic_cache_embedding_model": os.getenv("SEMANTIC_CACHE_EMBEDDING_MODEL"),
             "semantic_cache_similarity_threshold": os.getenv("SEMANTIC_CACHE_SIMILARITY_THRESHOLD"),
@@ -843,6 +939,10 @@ class Configuration(BaseModel):
         """Return the persistent cache directory."""
         return self.search_cache_dir
 
+    def resolved_search_cache_vector_dir(self) -> str:
+        """Return the persistent ANN vector cache directory."""
+        return self.search_cache_vector_dir
+
     def resolved_note_memory_embedding_model(self) -> str:
         """Return the embedding model used by note memory retrieval."""
 
@@ -858,6 +958,22 @@ class Configuration(BaseModel):
         return (
             str(self.strategy_memory_embedding_model or "").strip()
             or self.resolved_note_memory_embedding_model()
+        )
+
+    def resolved_evidence_runtime_embedding_model(self) -> str:
+        """Return the embedding model used by runtime evidence retrieval."""
+
+        return (
+            str(self.evidence_runtime_embedding_model or "").strip()
+            or self.resolved_note_memory_embedding_model()
+        )
+
+    def resolved_evidence_memory_embedding_model(self) -> str:
+        """Return the embedding model used by persistent evidence retrieval."""
+
+        return (
+            str(self.evidence_memory_embedding_model or "").strip()
+            or self.resolved_evidence_runtime_embedding_model()
         )
 
     def resolved_advanced_search_backends(self) -> list[str]:
@@ -973,7 +1089,7 @@ class Configuration(BaseModel):
             return max(100, int(self.report_summary_char_limit))
 
         window = self.resolved_context_window()
-        return self._clamp((window // 48) * 4, 120, 6000)
+        return self._clamp((window // 128) * 4, 120, 1600)
 
     def resolved_report_sources_char_limit(self) -> int:
         """Resolve per-task source budget for the final report prompt."""
@@ -981,7 +1097,7 @@ class Configuration(BaseModel):
             return max(80, int(self.report_sources_char_limit))
 
         window = self.resolved_context_window()
-        return self._clamp((window // 96) * 4, 80, 3000)
+        return self._clamp((window // 256) * 4, 80, 600)
 
     def resolved_report_layout_mode(self) -> str:
         """Return the normalized report layout mode."""

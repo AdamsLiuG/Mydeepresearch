@@ -21,6 +21,7 @@ from prompts import (
 from utils import strip_thinking_tokens
 
 logger = logging.getLogger(__name__)
+_STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 
 NUMBERED_TASK_PATTERN = re.compile(
     r"^(?:[-*]\s*)?(?P<index>\d+)[\.\)、]\s*(?P<title>[^：:]{1,40})(?:[：:]\s*(?P<intent>.+))?$"
@@ -65,6 +66,24 @@ META_PHASE_PREFIXES = (
     "随后",
     "先做",
     "后做",
+)
+QUERY_NOISE_PATTERNS = (
+    re.compile(r"```.*?```", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\[TOOL_CALL:[^\]]+\]", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bnote_[A-Za-z0-9_]+\b", re.IGNORECASE),
+    re.compile(r"\b(?:search_web|update_note|note_tool)\s*\([^)]*\)", re.IGNORECASE),
+)
+QUERY_NOISE_PHRASES = (
+    "search_web",
+    "update note",
+    "按顺序执行",
+    "按任务顺序执行",
+    "并更新笔记状态",
+    "更新笔记状态",
+    "工具调用",
+    "工作流",
+    "流程编排",
+    "进度同步",
 )
 
 class PlanningService:
@@ -114,14 +133,12 @@ class PlanningService:
         for idx, item in enumerate(tasks_payload, start=1):
             title = str(item.get("title") or f"任务{idx}").strip()
             intent = str(item.get("intent") or "聚焦主题的关键问题").strip()
-            query = str(item.get("query") or "").strip()
-
-            if not query:
-                query = self._default_query_for_task(
-                    research_topic=state.research_topic,
-                    title=title,
-                    intent=intent,
-                )
+            query = self._canonical_query_for_task(
+                research_topic=state.research_topic,
+                title=title,
+                intent=intent,
+                raw_query=str(item.get("query") or "").strip(),
+            )
 
             task = TodoItem(
                 id=idx,
@@ -180,14 +197,12 @@ class PlanningService:
         for item in unique_tasks[:max_additional_tasks]:
             title = str(item.get("title") or f"任务{next_id}").strip()
             intent = str(item.get("intent") or "聚焦主题的关键问题").strip()
-            query = str(item.get("query") or "").strip()
-
-            if not query:
-                query = self._default_query_for_task(
-                    research_topic=state.research_topic,
-                    title=title,
-                    intent=intent,
-                )
+            query = self._canonical_query_for_task(
+                research_topic=state.research_topic,
+                title=title,
+                intent=intent,
+                raw_query=str(item.get("query") or "").strip(),
+            )
 
             supplemental_items.append(
                 TodoItem(
@@ -260,14 +275,12 @@ class PlanningService:
         for item in unique_tasks[:max_additional_tasks]:
             title = str(item.get("title") or f"任务{next_id}").strip()
             intent = str(item.get("intent") or "修补当前审查暴露的证据缺口").strip()
-            query = str(item.get("query") or "").strip()
-
-            if not query:
-                query = self._default_query_for_task(
-                    research_topic=state.research_topic,
-                    title=title,
-                    intent=intent,
-                )
+            query = self._canonical_query_for_task(
+                research_topic=state.research_topic,
+                title=title,
+                intent=intent,
+                raw_query=str(item.get("query") or "").strip(),
+            )
 
             repair_items.append(
                 TodoItem(
@@ -316,19 +329,41 @@ class PlanningService:
         title: str,
         intent: str,
     ) -> str:
-        """Build a differentiated fallback query when the planner omits one."""
+        """Backward-compatible alias for the deterministic task query canonicalizer."""
 
-        topic = (research_topic or "").strip()
-        task_title = self._normalize_task_title(title)
-        task_intent = (intent or "").strip()
+        return self._canonical_query_for_task(
+            research_topic=research_topic,
+            title=title,
+            intent=intent,
+            raw_query="",
+        )
+
+    def _canonical_query_for_task(
+        self,
+        *,
+        research_topic: str,
+        title: str,
+        intent: str,
+        raw_query: str,
+    ) -> str:
+        """Build the deterministic final search query for a task."""
+
+        topic = self._clean_query_noise(research_topic)
+        task_title = self._strip_title_already_in_topic(topic, self._normalize_task_title(title))
+        task_intent = self._concise_intent(intent)
+        cleaned_raw_query = self._clean_query_noise(raw_query)
 
         if topic and task_title:
             return f"{topic} {task_title}".strip()
+        if topic and task_intent:
+            return f"{topic} {task_intent}".strip()
         if topic:
             return topic
-        if task_title and task_intent:
-            return f"{task_title} {task_intent}".strip()
-        return task_title or task_intent
+        if task_title:
+            return task_title
+        if task_intent:
+            return task_intent
+        return cleaned_raw_query
 
     @staticmethod
     def create_fallback_task(state: SummaryState) -> TodoItem:
@@ -337,7 +372,7 @@ class PlanningService:
             id=1,
             title="基础背景梳理",
             intent="收集主题的核心背景与最新动态",
-            query=f"{state.research_topic} 最新进展" if state.research_topic else "基础背景梳理",
+            query=state.research_topic if state.research_topic else "基础背景梳理",
             origin="planned",
             round=1,
         )
@@ -794,12 +829,42 @@ class PlanningService:
                 if line.startswith(label):
                     _, _, suffix = line.partition("：")
                     if suffix.strip():
-                        return suffix.strip()
+                        return self._clean_query_noise(suffix)
                     _, _, suffix = line.partition(":")
                     if suffix.strip():
-                        return suffix.strip()
+                        return self._clean_query_noise(suffix)
 
         return ""
+
+    def _clean_query_noise(self, value: str) -> str:
+        cleaned = str(value or "").strip()
+        for pattern in QUERY_NOISE_PATTERNS:
+            cleaned = pattern.sub(" ", cleaned)
+        for phrase in QUERY_NOISE_PHRASES:
+            cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?:^|[\s,，;；])(?:query|search query|检索方向|搜索方向|检索关键词|搜索关键词)\s*[:：]\s*",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.replace("`", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" -:：,，;；|/")
+
+    def _concise_intent(self, intent: str) -> str:
+        cleaned = self._clean_query_noise(intent)
+        if not cleaned:
+            return ""
+        parts = re.split(r"[。！？!?；;]+", cleaned, maxsplit=1)
+        return parts[0].strip()
+
+    def _strip_title_already_in_topic(self, research_topic: str, title: str) -> str:
+        normalized_topic = re.sub(r"\s+", "", str(research_topic or "")).casefold()
+        normalized_title = re.sub(r"\s+", "", str(title or "")).casefold()
+        if normalized_topic and normalized_title and normalized_title in normalized_topic:
+            return ""
+        return title
 
     def _filter_duplicate_candidates(
         self,
@@ -924,7 +989,13 @@ class PlanningService:
         observer: RequestTrace | None = None,
     ) -> str:
         try:
-            response = self._agent.run(prompt)
+            try:
+                response = self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
+            except Exception as exc:
+                if not self._response_format_is_unsupported(exc):
+                    raise
+                logger.info("Planner JSON mode unsupported; retrying without response_format: %s", exc)
+                response = self._agent.run(prompt)
         except Exception as exc:
             if observer:
                 observer.record_llm_call(
@@ -945,6 +1016,26 @@ class PlanningService:
         finally:
             self._agent.clear_history()
 
+    @staticmethod
+    def _response_format_is_unsupported(exc: Exception) -> bool:
+        """Return whether the provider rejected the JSON-mode request contract."""
+
+        message = str(exc or "").casefold()
+        if "response_format" not in message and "json_object" not in message and "json schema" not in message:
+            return isinstance(exc, TypeError) and "response_format" in message
+
+        unsupported_markers = (
+            "unsupported",
+            "not support",
+            "not supported",
+            "invalid",
+            "unknown",
+            "unexpected",
+            "extra inputs are not permitted",
+            "extra fields not permitted",
+        )
+        return any(marker in message for marker in unsupported_markers)
+
     def _sanitize_tasks(
         self,
         tasks: List[dict[str, Any]],
@@ -958,8 +1049,8 @@ class PlanningService:
         for item in tasks:
             original_title = str(item.get("title") or "")
             title = self._normalize_task_title(original_title)
-            intent = str(item.get("intent") or "").strip()
-            query = str(item.get("query") or "").strip()
+            intent = self._clean_query_noise(str(item.get("intent") or ""))
+            query = self._clean_query_noise(str(item.get("query") or ""))
             if not title:
                 rejected_count += 1
                 continue

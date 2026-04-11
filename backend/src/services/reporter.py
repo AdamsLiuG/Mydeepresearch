@@ -11,9 +11,16 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace
 from models import SummaryState
-from services.evidence import extract_citation_ids, render_references
+from services.evidence import (
+    derive_grounded_findings_from_evidence,
+    extract_citation_ids,
+    looks_like_source_label_text,
+    render_references,
+)
 from services.text_processing import normalize_agent_markdown
 from utils import strip_thinking_tokens, truncate_text
+
+_STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 
 
 class ReportingService:
@@ -74,7 +81,12 @@ class ReportingService:
         prompt = self._build_prompt(state)
 
         try:
-            response = self._agent.run(prompt)
+            try:
+                response = self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
+            except Exception as exc:
+                if not self._response_format_is_unsupported(exc):
+                    raise
+                response = self._agent.run(prompt)
         except Exception as exc:
             if observer:
                 observer.record_llm_call(
@@ -116,16 +128,15 @@ class ReportingService:
                 self._task_prompt_summary(task),
                 self._config.resolved_report_summary_char_limit(),
             )
-            sources_block = truncate_text(
-                task.sources_summary or "暂无来源",
-                self._config.resolved_report_sources_char_limit(),
-            )
             citations = ", ".join(sorted(extract_citation_ids(summary_block))) or "无"
+            source_ids = sorted(extract_citation_ids(summary_block))
+            sources_block = self._task_prompt_references(
+                task,
+                cited_source_ids=source_ids,
+            )
             task_blocks.append(
                 f"### 任务 {task.id}: {task.title}\n"
                 f"- 任务目标：{task.intent}\n"
-                f"- 检索查询：{task.query}\n"
-                f"- 执行状态：{task.status}\n"
                 f"- 已有引用：{citations}\n"
                 f"- 任务总结：\n{summary_block}\n"
                 f"- 来源概览：\n{sources_block}\n"
@@ -269,6 +280,42 @@ class ReportingService:
 
         return task.summary or "暂无可用信息"
 
+    def _task_prompt_references(
+        self,
+        task: Any,
+        *,
+        cited_source_ids: list[str],
+    ) -> str:
+        evidence_items = list(getattr(task, "evidence_items", None) or [])
+        available_source_ids = [
+            str(item.get("source_id") or "").strip()
+            for item in evidence_items
+            if str(item.get("source_id") or "").strip()
+        ]
+
+        selected_source_ids: list[str] = []
+        for source_id in cited_source_ids:
+            if source_id in available_source_ids and source_id not in selected_source_ids:
+                selected_source_ids.append(source_id)
+
+        if not selected_source_ids:
+            selected_source_ids = available_source_ids[:3]
+
+        if selected_source_ids:
+            references = self._evidence_store.build_reference_map(selected_source_ids)
+            rendered = render_references(references).strip()
+            if rendered:
+                return truncate_text(
+                    rendered,
+                    self._config.resolved_report_sources_char_limit(),
+                )
+
+        fallback_sources = str(getattr(task, "sources_summary", "") or "").strip() or "暂无来源"
+        return truncate_text(
+            fallback_sources,
+            self._config.resolved_report_sources_char_limit(),
+        )
+
     def _extract_json_payload(self, text: str) -> dict[str, Any] | None:
         decoder = json.JSONDecoder()
         index = 0
@@ -285,6 +332,26 @@ class ReportingService:
                 return payload
             index += max(end, 1)
         return None
+
+    @staticmethod
+    def _response_format_is_unsupported(exc: Exception) -> bool:
+        """Return whether the provider rejected the JSON-mode request contract."""
+
+        message = str(exc or "").casefold()
+        if "response_format" not in message and "json_object" not in message and "json schema" not in message:
+            return isinstance(exc, TypeError) and "response_format" in message
+
+        unsupported_markers = (
+            "unsupported",
+            "not support",
+            "not supported",
+            "invalid",
+            "unknown",
+            "unexpected",
+            "extra inputs are not permitted",
+            "extra fields not permitted",
+        )
+        return any(marker in message for marker in unsupported_markers)
 
     @staticmethod
     def _normalize_source_ids(value: Any, *, valid_source_ids: set[str]) -> list[str]:
@@ -331,6 +398,9 @@ class ReportingService:
                 continue
             text = self._strip_internal_process_sentences(text)
             if not text:
+                dropped_items += 1
+                continue
+            if looks_like_source_label_text(text):
                 dropped_items += 1
                 continue
             source_ids = self._normalize_source_ids(
@@ -415,7 +485,7 @@ class ReportingService:
             content = self._strip_internal_process_sentences(
                 item.get("content") or item.get("text") or item.get("body")
             )
-            if not content:
+            if not content or looks_like_source_label_text(content):
                 dropped_sections += 1
                 continue
 
@@ -455,7 +525,19 @@ class ReportingService:
             "暂无相关信息",
             "暂无可用信息",
             "暂无经过引用校验的结论",
-        }
+        } or looks_like_source_label_text(normalized)
+
+    @staticmethod
+    def _task_query_text(task: Any) -> str:
+        return " ".join(
+            part
+            for part in (
+                getattr(task, "title", ""),
+                getattr(task, "intent", ""),
+                getattr(task, "query", ""),
+            )
+            if str(part or "").strip()
+        )
 
     def _task_grounded_findings(
         self,
@@ -482,6 +564,27 @@ class ReportingService:
                         break
                 if not raw_text:
                     continue
+                if looks_like_source_label_text(raw_text):
+                    replacements = derive_grounded_findings_from_evidence(
+                        list(getattr(task, "evidence_items", None) or []),
+                        query_text=self._task_query_text(task),
+                        allowed_source_ids=list(item.get("source_ids") or extract_citation_ids(raw_text)),
+                        limit=1,
+                    )
+                    for replacement in replacements:
+                        replacement_text = normalize_agent_markdown(str(replacement.get("text") or "").strip())
+                        replacement_source_ids = self._normalize_source_ids(
+                            replacement.get("source_ids"),
+                            valid_source_ids=valid_source_ids,
+                        )
+                        if not replacement_text or not replacement_source_ids:
+                            continue
+                        key = (replacement_text, tuple(replacement_source_ids))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        findings.append({"text": replacement_text, "source_ids": replacement_source_ids})
+                    continue
 
                 source_ids = self._normalize_source_ids(
                     item.get("source_ids") or extract_citation_ids(raw_text),
@@ -501,6 +604,25 @@ class ReportingService:
             append_items(payload.get("key_findings"))
 
         append_items(getattr(task, "claims", None))
+        if len(findings) < 2:
+            supplements = derive_grounded_findings_from_evidence(
+                list(getattr(task, "evidence_items", None) or []),
+                query_text=self._task_query_text(task),
+                limit=4,
+            )
+            for item in supplements:
+                text = normalize_agent_markdown(str(item.get("text") or "").strip())
+                source_ids = self._normalize_source_ids(
+                    item.get("source_ids"),
+                    valid_source_ids=valid_source_ids,
+                )
+                if not text or not source_ids:
+                    continue
+                key = (text, tuple(source_ids))
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append({"text": text, "source_ids": source_ids})
         return findings
 
     def _build_task_fallback_sections(

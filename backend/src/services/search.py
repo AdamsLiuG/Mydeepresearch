@@ -39,6 +39,11 @@ try:  # pragma: no cover - exercised through runtime fallback
 except ImportError:  # pragma: no cover - exercised through runtime fallback
     DiskCache = None
 
+try:  # pragma: no cover - exercised through runtime fallback
+    import chromadb
+except Exception:  # pragma: no cover - exercised through runtime fallback
+    chromadb = None
+
 logger = logging.getLogger(__name__)
 
 _GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
@@ -53,8 +58,38 @@ _TRACKING_QUERY_PARAMS = {
     "ref_src",
 }
 _CJK_CHAR_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_ASCII_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+_FRESH_YEAR_PATTERN = re.compile(r"\b202[56]\b")
 _SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 _SEMANTIC_SCHOLAR_USER_AGENT = "helloagents-deepresearch/1.0"
+_SEMANTIC_CACHE_COLLECTION_NAME = "semantic_search_cache_v1"
+_FRESH_SIGNAL_WORDS = {
+    "latest",
+    "current",
+    "recent",
+    "today",
+    "news",
+    "release",
+    "version",
+    "update",
+    "benchmark",
+    "price",
+    "trend",
+}
+_FRESH_SIGNAL_PHRASES = ("最新", "当前", "最近", "今天", "新闻", "发布", "版本", "更新", "评测", "价格", "趋势")
+_EVERGREEN_SIGNAL_WORDS = {
+    "definition",
+    "overview",
+    "introduction",
+    "principle",
+    "architecture",
+    "guide",
+    "tutorial",
+    "history",
+    "protocol",
+    "specification",
+}
+_EVERGREEN_SIGNAL_PHRASES = ("what is", "是什么", "定义", "概念", "原理", "架构", "指南", "教程", "历史", "协议", "规范")
 _SEMANTIC_SCHOLAR_FIELDS = ",".join(
     [
         "title",
@@ -75,6 +110,10 @@ _MEMORY_SCOPE_INDEX: dict[str, list[str]] = {}
 _DISK_CACHE: Any | None = None
 _DISK_CACHE_DIR: str | None = None
 _DISK_CACHE_WARNING_EMITTED = False
+_VECTOR_CACHE_CLIENT: Any | None = None
+_VECTOR_CACHE_COLLECTION: Any | None = None
+_VECTOR_CACHE_DIR: str | None = None
+_VECTOR_CACHE_WARNING_EMITTED = False
 _EMBEDDING_MODEL_NAME: str | None = None
 _EMBEDDING_WARNING_EMITTED = False
 
@@ -93,6 +132,9 @@ class SearchCacheEntry:
     answer_text: str | None
     backend_label: str
     created_at: float
+    ttl_bucket: str = "normal"
+    ttl_seconds: int = 0
+    expires_at: float = 0.0
     embedding: list[float] | None = None
 
     def clone(self) -> SearchCacheEntry:
@@ -111,6 +153,9 @@ class SearchCacheEntry:
             answer_text=self.answer_text,
             backend_label=self.backend_label,
             created_at=self.created_at,
+            ttl_bucket=self.ttl_bucket,
+            ttl_seconds=self.ttl_seconds,
+            expires_at=self.expires_at,
             embedding=list(self.embedding) if self.embedding else None,
         )
 
@@ -130,6 +175,9 @@ class SearchCacheEntry:
             "answer_text": self.answer_text,
             "backend_label": self.backend_label,
             "created_at": self.created_at,
+            "ttl_bucket": self.ttl_bucket,
+            "ttl_seconds": self.ttl_seconds,
+            "expires_at": self.expires_at,
             "embedding": list(self.embedding) if self.embedding else None,
         }
 
@@ -150,8 +198,26 @@ class SearchCacheEntry:
             answer_text=record.get("answer_text"),
             backend_label=str(record.get("backend_label") or record.get("backend") or ""),
             created_at=float(record.get("created_at") or 0.0),
+            ttl_bucket=str(record.get("ttl_bucket") or "normal"),
+            ttl_seconds=max(int(record.get("ttl_seconds") or 0), 0),
+            expires_at=float(record.get("expires_at") or 0.0),
             embedding=_coerce_embedding(record.get("embedding")),
         )
+
+    def resolved_expires_at(self, *, fallback_ttl_seconds: int = 0) -> float:
+        if self.expires_at > 0:
+            return self.expires_at
+
+        ttl_seconds = max(int(self.ttl_seconds or fallback_ttl_seconds or 0), 0)
+        if ttl_seconds <= 0 or self.created_at <= 0:
+            return 0.0
+        return self.created_at + ttl_seconds
+
+    def is_expired(self, *, fallback_ttl_seconds: int = 0, now: float | None = None) -> bool:
+        expires_at = self.resolved_expires_at(fallback_ttl_seconds=fallback_ttl_seconds)
+        if expires_at <= 0:
+            return False
+        return (time.time() if now is None else now) >= expires_at
 
 
 @dataclass
@@ -189,6 +255,9 @@ def clear_search_cache() -> None:
 
     global _DISK_CACHE
     global _DISK_CACHE_DIR
+    global _VECTOR_CACHE_CLIENT
+    global _VECTOR_CACHE_COLLECTION
+    global _VECTOR_CACHE_DIR
 
     with _CACHE_LOCK:
         _MEMORY_CACHE.clear()
@@ -198,6 +267,14 @@ def clear_search_cache() -> None:
             _DISK_CACHE.close()
             _DISK_CACHE = None
             _DISK_CACHE_DIR = None
+        if _VECTOR_CACHE_CLIENT is not None:
+            try:
+                _VECTOR_CACHE_CLIENT.delete_collection(_SEMANTIC_CACHE_COLLECTION_NAME)
+            except Exception:
+                pass
+            _VECTOR_CACHE_CLIENT = None
+            _VECTOR_CACHE_COLLECTION = None
+            _VECTOR_CACHE_DIR = None
 
 
 def _normalize_query(query: str) -> str:
@@ -242,6 +319,56 @@ def _build_semantic_text(query: str, cache_context: dict[str, str] | None) -> st
     ]
     combined = " ".join(part.strip() for part in parts if part and str(part).strip())
     return _normalize_query(combined)
+
+
+def _ascii_word_tokens(text: str) -> set[str]:
+    return {match.group(0) for match in _ASCII_WORD_PATTERN.finditer((text or "").casefold())}
+
+
+def _has_any_signal(normalized_text: str, *, words: set[str], phrases: tuple[str, ...]) -> bool:
+    ascii_words = _ascii_word_tokens(normalized_text)
+    if ascii_words & words:
+        return True
+    return any(phrase in normalized_text for phrase in phrases)
+
+
+def classify_search_query_bucket(query: str, cache_context: dict[str, Any] | None = None) -> str:
+    """Classify a query into `fresh`, `normal`, or `evergreen` cache TTL buckets."""
+
+    normalized_context = _normalize_cache_context(cache_context)
+    normalized_text = (_build_semantic_text(query, normalized_context) or _normalize_query(query)).casefold()
+    if not normalized_text:
+        return "normal"
+
+    if _FRESH_YEAR_PATTERN.search(normalized_text):
+        return "fresh"
+    if _has_any_signal(
+        normalized_text,
+        words=_FRESH_SIGNAL_WORDS,
+        phrases=_FRESH_SIGNAL_PHRASES,
+    ):
+        return "fresh"
+    if _has_any_signal(
+        normalized_text,
+        words=_EVERGREEN_SIGNAL_WORDS,
+        phrases=_EVERGREEN_SIGNAL_PHRASES,
+    ):
+        return "evergreen"
+    return "normal"
+
+
+def _resolve_cache_ttl(query: str, cache_context: dict[str, Any] | None, config: Configuration) -> tuple[str, int]:
+    """Resolve the TTL bucket and concrete lifetime for a query."""
+
+    if not config.search_cache_dynamic_ttl_enabled:
+        return "normal", max(int(config.search_cache_ttl_seconds or 0), 1)
+
+    bucket = classify_search_query_bucket(query, cache_context)
+    if bucket == "fresh":
+        return bucket, max(int(config.search_cache_fresh_ttl_seconds or 0), 1)
+    if bucket == "evergreen":
+        return bucket, max(int(config.search_cache_evergreen_ttl_seconds or 0), 1)
+    return "normal", max(int(config.search_cache_ttl_seconds or 0), 1)
 
 
 def _contains_cjk(text: str) -> bool:
@@ -391,6 +518,16 @@ def _emit_embedding_warning_once(message: str, *args: Any) -> None:
     logger.warning(message, *args)
 
 
+def _emit_vector_warning_once(message: str, *args: Any) -> None:
+    global _VECTOR_CACHE_WARNING_EMITTED
+
+    if _VECTOR_CACHE_WARNING_EMITTED:
+        return
+
+    _VECTOR_CACHE_WARNING_EMITTED = True
+    logger.warning(message, *args)
+
+
 def _get_disk_cache(config: Configuration) -> Any | None:
     """Return the persistent disk cache, or None if unavailable."""
 
@@ -410,6 +547,46 @@ def _get_disk_cache(config: Configuration) -> Any | None:
             _DISK_CACHE = DiskCache(cache_dir)
             _DISK_CACHE_DIR = cache_dir
         return _DISK_CACHE
+
+
+def _get_vector_cache_collection(config: Configuration) -> Any | None:
+    """Return the semantic ANN vector collection, or None when unavailable."""
+
+    global _VECTOR_CACHE_CLIENT
+    global _VECTOR_CACHE_COLLECTION
+    global _VECTOR_CACHE_DIR
+    global _VECTOR_CACHE_WARNING_EMITTED
+
+    if chromadb is None:
+        _emit_vector_warning_once(
+            "chromadb is not installed; semantic cache will fall back to lexical scope scans"
+        )
+        return None
+
+    vector_dir = config.resolved_search_cache_vector_dir()
+    with _CACHE_LOCK:
+        if _VECTOR_CACHE_COLLECTION is not None and _VECTOR_CACHE_DIR == vector_dir:
+            return _VECTOR_CACHE_COLLECTION
+
+        try:
+            Path(vector_dir).mkdir(parents=True, exist_ok=True)
+            _VECTOR_CACHE_CLIENT = chromadb.PersistentClient(path=str(vector_dir))
+            _VECTOR_CACHE_COLLECTION = _VECTOR_CACHE_CLIENT.get_or_create_collection(
+                name=_SEMANTIC_CACHE_COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+            )
+            _VECTOR_CACHE_DIR = vector_dir
+            _VECTOR_CACHE_WARNING_EMITTED = False
+            return _VECTOR_CACHE_COLLECTION
+        except Exception as exc:  # pragma: no cover - depends on local runtime
+            _VECTOR_CACHE_CLIENT = None
+            _VECTOR_CACHE_COLLECTION = None
+            _VECTOR_CACHE_DIR = None
+            _emit_vector_warning_once(
+                "Failed to initialize semantic cache vector index; falling back to lexical scope scans error=%s",
+                exc,
+            )
+            return None
 
 
 def _get_scope_keys(config: Configuration, scope_key: str) -> list[str]:
@@ -435,28 +612,174 @@ def _set_scope_keys(config: Configuration, scope_key: str, keys: list[str]) -> N
         _MEMORY_SCOPE_INDEX[scope_key] = list(keys)
 
 
-def _read_exact_cache(key: str, ttl_seconds: int, config: Configuration) -> SearchCacheEntry | None:
-    """Read an exact cache entry from disk or memory."""
+def _delete_disk_cache_key(disk_cache: Any, key: str) -> None:
+    delete_method = getattr(disk_cache, "delete", None)
+    if callable(delete_method):
+        delete_method(key)
 
+
+def _delete_vector_cache_key(config: Configuration, key: str) -> None:
+    collection = _get_vector_cache_collection(config)
+    if collection is None:
+        return
+    try:
+        collection.delete(ids=[key])
+    except Exception:  # pragma: no cover - depends on local runtime
+        logger.debug("failed to delete semantic cache vector record key=%s", key)
+
+
+def _remove_scope_key(config: Configuration, scope_key: str, key: str) -> None:
+    scope_keys = _get_scope_keys(config, scope_key)
+    if key not in scope_keys:
+        return
+    _set_scope_keys(config, scope_key, [candidate for candidate in scope_keys if candidate != key])
+
+
+def _delete_cache_entry(
+    key: str,
+    config: Configuration,
+    *,
+    scope_key: str | None = None,
+) -> None:
+    disk_cache = _get_disk_cache(config)
+    if disk_cache is not None:
+        _delete_disk_cache_key(disk_cache, key)
+    else:
+        with _CACHE_LOCK:
+            _MEMORY_CACHE.pop(key, None)
+
+    if scope_key:
+        _remove_scope_key(config, scope_key, key)
+    _delete_vector_cache_key(config, key)
+
+
+def _read_exact_cache(key: str, config: Configuration) -> SearchCacheEntry | None:
+    """Read an exact cache entry from disk or memory, enforcing per-entry TTL."""
+
+    fallback_ttl_seconds = max(int(config.search_cache_ttl_seconds or 0), 1)
     disk_cache = _get_disk_cache(config)
     if disk_cache is not None:
         record = disk_cache.get(key)
         if record is None:
             return None
-        return SearchCacheEntry.from_record(record)
+
+        entry = SearchCacheEntry.from_record(record)
+        if entry.is_expired(fallback_ttl_seconds=fallback_ttl_seconds):
+            scope_key = _build_scope_key(
+                entry.search_api,
+                entry.fetch_full_page,
+                entry.cache_signature,
+                entry.topic_scope,
+            )
+            _delete_cache_entry(key, config, scope_key=scope_key)
+            return None
+        return entry
 
     with _CACHE_LOCK:
         entry = _MEMORY_CACHE.get(key)
         if not entry:
             return None
 
-        if (time.time() - entry.created_at) > ttl_seconds:
+        if entry.is_expired(fallback_ttl_seconds=fallback_ttl_seconds):
             _MEMORY_CACHE.pop(key, None)
-            for scope_key, keys in list(_MEMORY_SCOPE_INDEX.items()):
-                _MEMORY_SCOPE_INDEX[scope_key] = [candidate for candidate in keys if candidate != key]
+            for candidate_scope_key, keys in list(_MEMORY_SCOPE_INDEX.items()):
+                _MEMORY_SCOPE_INDEX[candidate_scope_key] = [
+                    candidate for candidate in keys if candidate != key
+                ]
             return None
 
         return entry.clone()
+
+
+def _vector_metadata_for_entry(key: str, entry: SearchCacheEntry, scope_key: str) -> dict[str, Any]:
+    return {
+        "cache_key": key,
+        "scope_key": scope_key,
+        "search_api": entry.search_api,
+        "fetch_full_page": int(entry.fetch_full_page),
+        "cache_signature": _canonical_cache_signature(entry.cache_signature),
+        "created_at": float(entry.created_at),
+        "expires_at": float(entry.resolved_expires_at(fallback_ttl_seconds=entry.ttl_seconds)),
+        "ttl_bucket": entry.ttl_bucket,
+        "ttl_seconds": int(entry.ttl_seconds or 0),
+    }
+
+
+def _semantic_cache_reuse_allowed(ttl_bucket: str, *, topic_scope: str = "") -> bool:
+    """Return whether a TTL bucket may participate in semantic cache reuse."""
+
+    normalized_bucket = str(ttl_bucket or "normal").strip().casefold()
+    if normalized_bucket != "fresh":
+        return True
+    return bool(_normalize_query(topic_scope))
+
+
+def _upsert_vector_cache_entry(
+    key: str,
+    entry: SearchCacheEntry,
+    config: Configuration,
+    *,
+    scope_key: str,
+) -> None:
+    if entry.embedding is None or not _semantic_cache_reuse_allowed(
+        entry.ttl_bucket,
+        topic_scope=entry.topic_scope,
+    ):
+        return
+
+    collection = _get_vector_cache_collection(config)
+    if collection is None:
+        return
+
+    try:
+        collection.upsert(
+            ids=[key],
+            documents=[entry.semantic_text or entry.normalized_query or entry.query],
+            metadatas=[_vector_metadata_for_entry(key, entry, scope_key)],
+            embeddings=[entry.embedding],
+        )
+    except Exception as exc:  # pragma: no cover - depends on local runtime
+        logger.warning("failed to upsert semantic cache vector key=%s error=%s", key, exc)
+
+
+def _query_vector_candidate_keys(
+    query_embedding: list[float],
+    *,
+    scope_key: str,
+    config: Configuration,
+    n_results: int = 12,
+) -> tuple[list[str], bool]:
+    collection = _get_vector_cache_collection(config)
+    if collection is None:
+        return [], False
+
+    try:
+        payload = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=max(1, int(n_results or 1)),
+            where={"scope_key": scope_key},
+            include=["metadatas", "distances"],
+        )
+    except Exception as exc:  # pragma: no cover - depends on local runtime
+        logger.warning("semantic cache ANN query failed scope=%s error=%s", scope_key, exc)
+        return [], False
+
+    raw_ids = payload.get("ids") or [[]]
+    raw_metadatas = payload.get("metadatas") or [[]]
+    ids = raw_ids[0] if raw_ids else []
+    metadatas = raw_metadatas[0] if raw_metadatas else []
+
+    candidate_keys: list[str] = []
+    seen: set[str] = set()
+    for index, candidate_id in enumerate(ids):
+        metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+        key = str(metadata.get("cache_key") or candidate_id or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        candidate_keys.append(key)
+
+    return candidate_keys, True
 
 
 def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> None:
@@ -470,15 +793,21 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
         entry.topic_scope,
     )
     if disk_cache is not None:
-        disk_cache.set(key, entry.to_record(), expire=config.search_cache_ttl_seconds)
+        disk_cache.set(key, entry.to_record(), expire=max(int(entry.ttl_seconds or 0), 1))
     else:
         with _CACHE_LOCK:
             _MEMORY_CACHE[key] = entry.clone()
 
-    scope_keys = _get_scope_keys(config, scope_key)
-    if key not in scope_keys:
-        scope_keys.append(key)
-        _set_scope_keys(config, scope_key, scope_keys)
+    if _semantic_cache_reuse_allowed(entry.ttl_bucket, topic_scope=entry.topic_scope):
+        scope_keys = _get_scope_keys(config, scope_key)
+        if key not in scope_keys:
+            scope_keys.append(key)
+            _set_scope_keys(config, scope_key, scope_keys)
+        _upsert_vector_cache_entry(key, entry, config, scope_key=scope_key)
+        return
+
+    _remove_scope_key(config, scope_key, key)
+    _delete_vector_cache_key(config, key)
 
 
 def _load_embedding_model(config: Configuration) -> Any | None:
@@ -552,57 +881,59 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _read_semantic_cache(
+def _score_semantic_entry(
+    entry: SearchCacheEntry,
+    *,
     query_embedding: list[float] | None,
     semantic_text: str,
-    search_api: str,
     config: Configuration,
-    *,
-    topic_scope: str = "",
-) -> tuple[SearchCacheEntry | None, float, float]:
-    """Read the best semantic cache match for a query."""
-
-    if query_embedding is None and not semantic_text:
-        return None, 0.0, 0.0
-
-    scope_key = _build_scope_key(
-        search_api,
-        _resolved_search_fetch_full_page(search_api, config),
-        config.resolved_search_cache_signature(search_api),
-        topic_scope,
+) -> tuple[float, float, float]:
+    similarity = (
+        _cosine_similarity(query_embedding, entry.embedding)
+        if query_embedding is not None and entry.embedding is not None
+        else -1.0
     )
-    candidate_keys = _get_scope_keys(config, scope_key)
-    if not candidate_keys:
-        return None, 0.0, 0.0
+    lexical_similarity = _lexical_similarity(
+        semantic_text,
+        entry.semantic_text or entry.normalized_query,
+    )
 
+    semantic_threshold = max(config.semantic_cache_similarity_threshold, 1e-9)
+    lexical_threshold = max(config.semantic_cache_lexical_threshold, 1e-9)
+    semantic_score = (similarity / semantic_threshold) if similarity >= 0.0 else 0.0
+    lexical_score = (lexical_similarity / lexical_threshold) if lexical_similarity >= 0.0 else 0.0
+    return max(semantic_score, lexical_score), similarity, lexical_similarity
+
+
+def _select_best_semantic_match(
+    candidate_keys: list[str],
+    *,
+    query_embedding: list[float] | None,
+    semantic_text: str,
+    config: Configuration,
+    scope_key: str,
+    update_scope_index: bool,
+) -> tuple[SearchCacheEntry | None, str | None, float, float]:
     best_entry: SearchCacheEntry | None = None
+    best_key: str | None = None
     best_similarity = -1.0
     best_lexical_similarity = -1.0
     best_score = 0.0
     live_keys: list[str] = []
-    semantic_threshold = max(config.semantic_cache_similarity_threshold, 1e-9)
-    lexical_threshold = max(config.semantic_cache_lexical_threshold, 1e-9)
 
     for candidate_key in candidate_keys:
-        entry = _read_exact_cache(candidate_key, config.search_cache_ttl_seconds, config)
+        entry = _read_exact_cache(candidate_key, config)
         if entry is None:
+            _delete_cache_entry(candidate_key, config, scope_key=scope_key)
             continue
 
         live_keys.append(candidate_key)
-        similarity = (
-            _cosine_similarity(query_embedding, entry.embedding)
-            if query_embedding is not None and entry.embedding is not None
-            else -1.0
+        combined_score, similarity, lexical_similarity = _score_semantic_entry(
+            entry,
+            query_embedding=query_embedding,
+            semantic_text=semantic_text,
+            config=config,
         )
-        lexical_similarity = _lexical_similarity(
-            semantic_text,
-            entry.semantic_text or entry.normalized_query,
-        )
-
-        semantic_score = (similarity / semantic_threshold) if similarity >= 0.0 else 0.0
-        lexical_score = (lexical_similarity / lexical_threshold) if lexical_similarity >= 0.0 else 0.0
-        combined_score = max(semantic_score, lexical_score)
-
         if combined_score > best_score or (
             math.isclose(combined_score, best_score)
             and (similarity, lexical_similarity) > (best_similarity, best_lexical_similarity)
@@ -611,14 +942,136 @@ def _read_semantic_cache(
             best_similarity = similarity
             best_lexical_similarity = lexical_similarity
             best_entry = entry
+            best_key = candidate_key
 
-    if live_keys != candidate_keys:
+    if update_scope_index and live_keys != candidate_keys:
         _set_scope_keys(config, scope_key, live_keys)
 
     if best_entry and best_score >= 1.0:
-        return best_entry, max(best_similarity, 0.0), max(best_lexical_similarity, 0.0)
+        return (
+            best_entry,
+            best_key,
+            max(best_similarity, 0.0),
+            max(best_lexical_similarity, 0.0),
+        )
+    return None, None, max(best_similarity, 0.0), max(best_lexical_similarity, 0.0)
 
-    return None, max(best_similarity, 0.0), max(best_lexical_similarity, 0.0)
+
+def _read_semantic_cache_legacy(
+    query_embedding: list[float] | None,
+    semantic_text: str,
+    search_api: str,
+    config: Configuration,
+    *,
+    topic_scope: str = "",
+) -> tuple[SearchCacheEntry | None, str | None, float, float]:
+    scope_key = _build_scope_key(
+        search_api,
+        _resolved_search_fetch_full_page(search_api, config),
+        config.resolved_search_cache_signature(search_api),
+        topic_scope,
+    )
+    candidate_keys = _get_scope_keys(config, scope_key)
+    if not candidate_keys:
+        return None, None, 0.0, 0.0
+
+    return _select_best_semantic_match(
+        candidate_keys,
+        query_embedding=query_embedding,
+        semantic_text=semantic_text,
+        config=config,
+        scope_key=scope_key,
+        update_scope_index=True,
+    )
+
+
+def _read_semantic_cache_ann(
+    query_embedding: list[float],
+    semantic_text: str,
+    search_api: str,
+    config: Configuration,
+    *,
+    topic_scope: str = "",
+) -> tuple[SearchCacheEntry | None, str | None, float, float, list[str], bool]:
+    scope_key = _build_scope_key(
+        search_api,
+        _resolved_search_fetch_full_page(search_api, config),
+        config.resolved_search_cache_signature(search_api),
+        topic_scope,
+    )
+    candidate_keys, ann_available = _query_vector_candidate_keys(
+        query_embedding,
+        scope_key=scope_key,
+        config=config,
+        n_results=12,
+    )
+    if not ann_available or not candidate_keys:
+        return None, None, 0.0, 0.0, candidate_keys, ann_available
+
+    entry, matched_key, similarity, lexical_similarity = _select_best_semantic_match(
+        candidate_keys,
+        query_embedding=query_embedding,
+        semantic_text=semantic_text,
+        config=config,
+        scope_key=scope_key,
+        update_scope_index=False,
+    )
+    return entry, matched_key, similarity, lexical_similarity, candidate_keys, ann_available
+
+
+def _read_semantic_cache(
+    query_embedding: list[float] | None,
+    semantic_text: str,
+    search_api: str,
+    config: Configuration,
+    *,
+    topic_scope: str = "",
+) -> tuple[SearchCacheEntry | None, str | None, float, float, str]:
+    """Read the best semantic cache match for a query."""
+
+    if query_embedding is None and not semantic_text:
+        return None, None, 0.0, 0.0, "miss"
+
+    scope_key = _build_scope_key(
+        search_api,
+        _resolved_search_fetch_full_page(search_api, config),
+        config.resolved_search_cache_signature(search_api),
+        topic_scope,
+    )
+    if query_embedding is not None:
+        (
+            ann_entry,
+            ann_key,
+            ann_similarity,
+            ann_lexical_similarity,
+            ann_candidate_keys,
+            ann_available,
+        ) = _read_semantic_cache_ann(
+            query_embedding,
+            semantic_text,
+            search_api,
+            config,
+            topic_scope=topic_scope,
+        )
+        if ann_entry is not None:
+            return ann_entry, ann_key, ann_similarity, ann_lexical_similarity, "semantic_ann"
+
+        if ann_available and ann_candidate_keys:
+            return None, None, ann_similarity, ann_lexical_similarity, "miss"
+
+        if ann_available and not _get_scope_keys(config, scope_key):
+            return None, None, 0.0, 0.0, "miss"
+
+    legacy_entry, legacy_key, similarity, lexical_similarity = _read_semantic_cache_legacy(
+        query_embedding,
+        semantic_text,
+        search_api,
+        config,
+        topic_scope=topic_scope,
+    )
+    if legacy_entry is not None:
+        return legacy_entry, legacy_key, similarity, lexical_similarity, "semantic_lexical"
+    return None, None, similarity, lexical_similarity, "miss"
 
 
 def _normalize_search_payload(
@@ -1658,6 +2111,31 @@ def _fuse_advanced_search_results(
     return payload, notices, answer_text, backend_label
 
 
+def _build_cache_observer_metadata(
+    *,
+    cache_hit_mode: str,
+    query_ttl_bucket: str,
+    query_ttl_seconds: int,
+    matched_cache_key: str | None = None,
+    entry: SearchCacheEntry | None = None,
+) -> dict[str, Any]:
+    expires_at = None
+    ttl_bucket = query_ttl_bucket
+    ttl_seconds = query_ttl_seconds
+    if entry is not None:
+        ttl_bucket = str(entry.ttl_bucket or ttl_bucket or "normal")
+        ttl_seconds = max(int(entry.ttl_seconds or ttl_seconds or 0), 0)
+        expires_at = entry.resolved_expires_at(fallback_ttl_seconds=ttl_seconds) or None
+
+    return {
+        "cache_hit_mode": cache_hit_mode,
+        "ttl_bucket": ttl_bucket,
+        "ttl_seconds": ttl_seconds,
+        "expires_at": expires_at,
+        "matched_cache_key": matched_cache_key,
+    }
+
+
 def dispatch_search(
     query: str,
     config: Configuration,
@@ -1675,13 +2153,31 @@ def dispatch_search(
     normalized_cache_context = _normalize_cache_context(cache_context)
     topic_scope = _build_topic_scope(normalized_cache_context)
     semantic_text = _build_semantic_text(query, normalized_cache_context)
+    ttl_bucket, ttl_seconds = _resolve_cache_ttl(query, normalized_cache_context, config)
     semantic_embedding: list[float] | None = None
     if config.search_cache_enabled:
-        exact_cached = _read_exact_cache(cache_key, config.search_cache_ttl_seconds, config)
+        exact_cached = _read_exact_cache(cache_key, config)
         if exact_cached:
             if observer:
-                observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="exact")
-            logger.info("Search exact cache hit: backend=%s query=%s", search_api, query)
+                observer.record_search_attempt(
+                    cache_hit=True,
+                    success=True,
+                    cache_strategy="exact",
+                    cache_metadata=_build_cache_observer_metadata(
+                        cache_hit_mode="exact",
+                        query_ttl_bucket=ttl_bucket,
+                        query_ttl_seconds=ttl_seconds,
+                        matched_cache_key=cache_key,
+                        entry=exact_cached,
+                    ),
+                )
+            logger.info(
+                "Search exact cache hit: backend=%s query=%s ttl_bucket=%s expires_at=%.3f",
+                search_api,
+                query,
+                exact_cached.ttl_bucket or ttl_bucket,
+                exact_cached.resolved_expires_at(fallback_ttl_seconds=ttl_seconds),
+            )
             return (
                 exact_cached.payload,
                 exact_cached.notices,
@@ -1691,9 +2187,13 @@ def dispatch_search(
                 "exact",
             )
 
-        if config.semantic_cache_enabled:
+        semantic_cache_allowed = config.semantic_cache_enabled and _semantic_cache_reuse_allowed(
+            ttl_bucket,
+            topic_scope=topic_scope,
+        )
+        if semantic_cache_allowed:
             semantic_embedding = _embed_query(semantic_text or query, config)
-            semantic_cached, similarity, lexical_similarity = _read_semantic_cache(
+            semantic_cached, matched_cache_key, similarity, lexical_similarity, cache_hit_mode = _read_semantic_cache(
                 semantic_embedding,
                 semantic_text,
                 search_api,
@@ -1702,15 +2202,28 @@ def dispatch_search(
             )
             if semantic_cached:
                 if observer:
-                    observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="semantic")
+                    observer.record_search_attempt(
+                        cache_hit=True,
+                        success=True,
+                        cache_strategy=cache_hit_mode,
+                        cache_metadata=_build_cache_observer_metadata(
+                            cache_hit_mode=cache_hit_mode,
+                            query_ttl_bucket=ttl_bucket,
+                            query_ttl_seconds=ttl_seconds,
+                            matched_cache_key=matched_cache_key,
+                            entry=semantic_cached,
+                        ),
+                    )
                 logger.info(
-                    "Search semantic cache hit: backend=%s query=%s matched_query=%s similarity=%.4f lexical_similarity=%.4f topic_scope=%s",
+                    "Search semantic cache hit: backend=%s query=%s matched_query=%s similarity=%.4f lexical_similarity=%.4f topic_scope=%s mode=%s ttl_bucket=%s",
                     search_api,
                     query,
                     semantic_cached.query,
                     similarity,
                     lexical_similarity,
                     topic_scope or "<global>",
+                    cache_hit_mode,
+                    semantic_cached.ttl_bucket or ttl_bucket,
                 )
                 return (
                     semantic_cached.payload,
@@ -1718,8 +2231,16 @@ def dispatch_search(
                     semantic_cached.answer_text,
                     semantic_cached.backend_label,
                     True,
-                    "semantic",
+                    cache_hit_mode,
                 )
+        elif config.semantic_cache_enabled:
+            logger.info(
+                "Search semantic cache skipped: backend=%s query=%s ttl_bucket=%s topic_scope=%s",
+                search_api,
+                query,
+                ttl_bucket,
+                topic_scope or "<global>",
+            )
 
     try:
         if search_api == "advanced":
@@ -1739,7 +2260,17 @@ def dispatch_search(
             )
     except Exception as exc:  # pragma: no cover - defensive logging
         if observer:
-            observer.record_search_attempt(cache_hit=False, success=False, error=exc)
+            observer.record_search_attempt(
+                cache_hit=False,
+                success=False,
+                error=exc,
+                cache_strategy="miss",
+                cache_metadata=_build_cache_observer_metadata(
+                    cache_hit_mode="miss",
+                    query_ttl_bucket=ttl_bucket,
+                    query_ttl_seconds=ttl_seconds,
+                ),
+            )
         logger.exception("Search backend %s failed: %s", search_api, exc)
         raise
     results = payload.get("results", [])
@@ -1757,9 +2288,19 @@ def dispatch_search(
     )
 
     if observer:
-        observer.record_search_attempt(cache_hit=False, success=True, cache_strategy="miss")
+        observer.record_search_attempt(
+            cache_hit=False,
+            success=True,
+            cache_strategy="miss",
+            cache_metadata=_build_cache_observer_metadata(
+                cache_hit_mode="miss",
+                query_ttl_bucket=ttl_bucket,
+                query_ttl_seconds=ttl_seconds,
+            ),
+        )
 
     if config.search_cache_enabled:
+        created_at = time.time()
         cache_entry = SearchCacheEntry(
             query=query.strip(),
             normalized_query=_normalize_query(query),
@@ -1772,7 +2313,10 @@ def dispatch_search(
             notices=notices,
             answer_text=answer_text,
             backend_label=backend_label,
-            created_at=time.time(),
+            created_at=created_at,
+            ttl_bucket=ttl_bucket,
+            ttl_seconds=ttl_seconds,
+            expires_at=created_at + ttl_seconds,
             embedding=semantic_embedding,
         )
         _write_cache(cache_key, cache_entry, config)

@@ -37,8 +37,15 @@ from services.evidence import (
     FetchPageTool,
     SearchWebTool,
     build_task_context,
+    build_task_context_from_hits,
     extract_citation_ids,
     format_evidence_sources,
+)
+from services.evidence_index import (
+    EvidenceMemoryService,
+    EvidenceRetrievalHit,
+    EvidenceRetrievalService,
+    EvidenceRuntimeIndex,
 )
 from services.note_memory import NoteMemoryService
 from services.planner import PlanningService
@@ -46,7 +53,7 @@ from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
 from services.request_state import RequestStateStore
 from services.reviewer import ReviewService
-from services.search import dispatch_search
+from services.search import classify_search_query_bucket, dispatch_search
 from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService, TaskSummaryResult
@@ -87,6 +94,24 @@ _LEADING_SEARCH_QUERY_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_QUERY_NOISE_PATTERNS = (
+    re.compile(r"```.*?```", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\[TOOL_CALL:[^\]]+\]", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bnote_[A-Za-z0-9_]+\b", re.IGNORECASE),
+    re.compile(r"\b(?:search_web|update_note|note_tool)\s*\([^)]*\)", re.IGNORECASE),
+)
+_QUERY_NOISE_PHRASES = (
+    "search_web",
+    "update note",
+    "按顺序执行",
+    "按任务顺序执行",
+    "并更新笔记状态",
+    "更新笔记状态",
+    "工具调用",
+    "工作流",
+    "流程编排",
+    "进度同步",
+)
 
 
 class ToolExecutionTimeoutError(TimeoutError):
@@ -124,6 +149,7 @@ class TaskReactDecision:
     action: str
     query: str = ""
     source_id: str | None = None
+    url: str = ""
     reason: str = ""
 
 
@@ -355,8 +381,25 @@ class DeepResearchAgent:
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
         self._summary_slots = Semaphore(self.config.task_summary_max_concurrency)
+        self._evidence_memory = EvidenceMemoryService(self.config)
+        self._evidence_runtime = EvidenceRuntimeIndex(
+            self.config,
+            archive_loader=self._evidence_memory if self._evidence_memory.enabled else None,
+        )
+        evidence_listeners = []
+        if self._evidence_memory.enabled:
+            evidence_listeners.append(self._evidence_memory)
+        if self._evidence_runtime.enabled:
+            evidence_listeners.append(self._evidence_runtime)
         self._evidence_store = EvidenceStore(
             freshness_reference_days=self.config.freshness_reference_days,
+            listeners=evidence_listeners,
+            request_id_getter=lambda: self.request_id,
+        )
+        self._evidence_retrieval = EvidenceRetrievalService(
+            runtime_index=self._evidence_runtime if self._evidence_runtime.enabled else None,
+            memory_service=self._evidence_memory if self._evidence_memory.enabled else None,
+            config=self.config,
         )
         self._request_state_store = (
             RequestStateStore(
@@ -396,7 +439,11 @@ class DeepResearchAgent:
             evidence_store=self._evidence_store,
             timeout_seconds=float(self.config.search_tool_timeout_seconds or 10.0),
         )
-        self.evidence_lookup_tool = EvidenceLookupTool(evidence_store=self._evidence_store)
+        self.evidence_lookup_tool = EvidenceLookupTool(
+            evidence_store=self._evidence_store,
+            retrieval_service=self._evidence_retrieval,
+            request_id_getter=lambda: self.request_id,
+        )
         self.tools_registry.register_tool(self.search_web_tool)
         self.tools_registry.register_tool(self.fetch_page_tool)
         self.tools_registry.register_tool(self.evidence_lookup_tool)
@@ -446,6 +493,8 @@ class DeepResearchAgent:
         self.reviewer = ReviewService(
             self.review_agent if self.config.review_agent_enabled else None,
             self.config,
+            retrieval_service=self._evidence_retrieval,
+            request_id_getter=lambda: self.request_id,
         )
         self.summarizer = SummarizationService(
             self._summarizer_factory,
@@ -493,6 +542,22 @@ class DeepResearchAgent:
 
         llm_kwargs["allow_reasoning_fallback"] = allow_reasoning_fallback
         return SafeHelloAgentsLLM(**llm_kwargs)
+
+    def _ensure_evidence_retrieval(self) -> EvidenceRetrievalService:
+        if not hasattr(self, "_evidence_memory"):
+            self._evidence_memory = EvidenceMemoryService(self.config)
+        if not hasattr(self, "_evidence_runtime"):
+            self._evidence_runtime = EvidenceRuntimeIndex(
+                self.config,
+                archive_loader=self._evidence_memory if self._evidence_memory.enabled else None,
+            )
+        if not hasattr(self, "_evidence_retrieval"):
+            self._evidence_retrieval = EvidenceRetrievalService(
+                runtime_index=self._evidence_runtime if self._evidence_runtime.enabled else None,
+                memory_service=self._evidence_memory if self._evidence_memory.enabled else None,
+                config=self.config,
+            )
+        return self._evidence_retrieval
 
     def _create_tool_aware_agent(
         self,
@@ -689,12 +754,20 @@ class DeepResearchAgent:
             return
 
         observer_snapshot = self._request_trace.snapshot() if self._request_trace else {}
+        cache_diagnostics = {
+            "cache_hits": observer_snapshot.get("cache_hits", 0),
+            "cache_exact_hits": observer_snapshot.get("cache_exact_hits", 0),
+            "cache_semantic_hits": observer_snapshot.get("cache_semantic_hits", 0),
+            "cache_misses": observer_snapshot.get("cache_misses", 0),
+            "last_search_cache_details": dict(observer_snapshot.get("last_search_cache_details") or {}),
+        }
         payload = {
-            "snapshot_version": 1,
+            "snapshot_version": 2,
             "request_id": self.request_id,
             "topic": state.research_topic,
             "phase": phase,
             "status": status,
+            "error": observer_snapshot.get("error"),
             "search_api": observer_snapshot.get("search_api"),
             "elapsed_ms": observer_snapshot.get("elapsed_ms"),
             "report_markdown": report_markdown or state.structured_report or state.running_summary or "",
@@ -706,6 +779,8 @@ class DeepResearchAgent:
             "review_completed": bool(state.review_completed),
             "report_repair_completed": bool(state.report_repair_completed),
             "report_repair_cycles": int(state.report_repair_cycles or 0),
+            "topic_cache_warmup_completed": bool(state.topic_cache_warmup_completed),
+            "cache_diagnostics": cache_diagnostics,
             "request_metrics": observer_snapshot,
         }
         self._request_state_store.save(self.request_id, payload)
@@ -791,6 +866,7 @@ class DeepResearchAgent:
             review_completed=bool(payload.get("review_completed")),
             report_repair_completed=bool(payload.get("report_repair_completed")),
             report_repair_cycles=max(0, int(payload.get("report_repair_cycles") or 0)),
+            topic_cache_warmup_completed=bool(payload.get("topic_cache_warmup_completed")),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
         for task in state.todo_items:
@@ -808,6 +884,7 @@ class DeepResearchAgent:
     ) -> None:
         """Execute a task batch for the synchronous request path."""
 
+        self._warm_topic_search_cache(state, observer=self._request_trace)
         for task in tasks:
             for _ in self._execute_task(state, task, emit_stream=False):
                 pass
@@ -874,6 +951,7 @@ class DeepResearchAgent:
         if not tasks or observer is None:
             return
 
+        self._warm_topic_search_cache(state, observer=observer)
         event_queue: Queue[dict[str, Any]] = Queue()
 
         def enqueue(
@@ -978,8 +1056,8 @@ class DeepResearchAgent:
         signals: list[str] = []
         observer = self._request_trace
 
-        if observer and (observer.fallback_count or observer.degraded_reasons):
-            signals.append("request_has_fallback_or_degraded")
+        if observer and observer.fallback_count:
+            signals.append("request_has_fallback")
 
         for task in state.todo_items:
             if task.status == "failed":
@@ -1942,6 +2020,17 @@ class DeepResearchAgent:
         """Normalize a candidate search query and strip request-style boilerplate."""
 
         cleaned = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (value or "").strip())
+        for pattern in _QUERY_NOISE_PATTERNS:
+            cleaned = pattern.sub(" ", cleaned)
+        for phrase in _QUERY_NOISE_PHRASES:
+            cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?:^|[\s,，;；])(?:query|search query|检索方向|搜索方向|检索关键词|搜索关键词)\s*[:：]\s*",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.replace("`", " ")
 
         while cleaned:
             previous = cleaned
@@ -1952,6 +2041,191 @@ class DeepResearchAgent:
                 break
 
         return " ".join(cleaned.strip().split())
+
+    def _topic_canonical_query(self, state: SummaryState) -> str:
+        """Return the stable topic-level query used to warm and probe cache reuse."""
+
+        return self._normalize_query_candidate(state.research_topic or "")
+
+    def _warm_topic_search_cache(
+        self,
+        state: SummaryState,
+        *,
+        observer: RequestTrace | None,
+    ) -> None:
+        """Warm a stable topic-level cache entry before task-specific searches."""
+
+        if state.topic_cache_warmup_completed:
+            return
+
+        state.topic_cache_warmup_completed = True
+        if not self.config.search_cache_enabled or not self.config.semantic_cache_enabled:
+            return
+        if observer is None:
+            return
+
+        topic_query = self._topic_canonical_query(state)
+        if not topic_query:
+            return
+
+        search_span = observer.start_stage(
+            "search",
+            scope="request",
+            metadata={
+                "query": topic_query,
+                "purpose": "topic_cache_warmup",
+            },
+        )
+        try:
+            (
+                search_result,
+                notices,
+                answer_text,
+                backend,
+                cache_hit,
+                cache_strategy,
+            ) = self._run_with_timeout(
+                lambda: dispatch_search(
+                    topic_query,
+                    self.config,
+                    state.research_loop_count,
+                    observer=observer,
+                    cache_context={"research_topic": state.research_topic},
+                ),
+                timeout_seconds=self.config.search_tool_timeout_seconds,
+                operation_name=f"主题缓存预热[{topic_query}]",
+            )
+        except Exception as exc:
+            observer.record_degraded("topic_cache_warmup_failed")
+            search_span.complete(
+                status="failed",
+                error=exc,
+                metadata={
+                    "query": topic_query,
+                    "purpose": "topic_cache_warmup",
+                },
+            )
+            logger.warning("Topic cache warmup failed topic=%s error=%s", topic_query, exc)
+            return
+
+        cache_details = dict(observer.snapshot().get("last_search_cache_details") or {})
+        search_span.complete(
+            status="success",
+            metadata={
+                "query": topic_query,
+                "purpose": "topic_cache_warmup",
+                "backend": backend,
+                "result_count": len((search_result or {}).get("results", [])),
+                "cache_hit": cache_hit,
+                "cache_strategy": cache_strategy,
+                "notice_count": len(notices),
+                "answer_present": bool(answer_text),
+                **cache_details,
+            },
+        )
+        logger.info(
+            "Topic cache warmup completed topic=%s cache_hit=%s strategy=%s result_count=%s",
+            topic_query,
+            cache_hit,
+            cache_strategy,
+            len((search_result or {}).get("results", [])),
+        )
+
+    def _concise_query_intent(self, value: str) -> str:
+        cleaned = self._normalize_query_candidate(value)
+        if not cleaned:
+            return ""
+        return re.split(r"[。！？!?；;]+", cleaned, maxsplit=1)[0].strip()
+
+    def _strip_title_already_in_topic(self, topic: str, title: str) -> str:
+        normalized_topic = re.sub(r"\s+", "", str(topic or "")).casefold()
+        normalized_title = re.sub(r"\s+", "", str(title or "")).casefold()
+        if normalized_topic and normalized_title and normalized_title in normalized_topic:
+            return ""
+        return title
+
+    def _canonical_task_query(self, state: SummaryState, task: TodoItem) -> str:
+        topic = self._topic_canonical_query(state)
+        raw_title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
+        title = self._strip_title_already_in_topic(topic, self._normalize_query_candidate(raw_title))
+        intent = self._concise_query_intent(task.intent or "")
+        if topic and title:
+            return self._normalize_query_candidate(f"{topic} {title}")
+        if topic and intent:
+            return self._normalize_query_candidate(f"{topic} {intent}")
+        return topic or title or intent or self._normalize_query_candidate(task.query or "")
+
+    def _expanded_task_query_with_intent(self, state: SummaryState, task: TodoItem) -> str:
+        topic = self._topic_canonical_query(state)
+        raw_title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
+        title = self._strip_title_already_in_topic(topic, self._normalize_query_candidate(raw_title))
+        intent = self._concise_query_intent(task.intent or "")
+        return self._normalize_query_candidate(" ".join(part for part in [topic, title, intent] if part))
+
+    def _task_retrieval_query(self, state: SummaryState, task: TodoItem) -> str:
+        return self._normalize_query_candidate(
+            " ".join(
+                part
+                for part in [
+                    state.research_topic or "",
+                    re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip()),
+                    task.intent or "",
+                    task.query or "",
+                ]
+                if str(part or "").strip()
+            )
+        )
+
+    def _grounding_hits_for_task(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        *,
+        observer: RequestTrace | None,
+    ) -> list[EvidenceRetrievalHit]:
+        if not self.config.evidence_runtime_enabled:
+            return []
+        result = self._ensure_evidence_retrieval().query(
+            self._task_retrieval_query(state, task),
+            task_id=task.id,
+            scope="current",
+            mode="grounding",
+            top_k=self.config.evidence_runtime_top_k,
+            request_id=self.request_id,
+            observer=observer,
+        )
+        return list(result.hits)
+
+    def _repair_hits_for_task(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        *,
+        observer: RequestTrace | None,
+        query_text: str | None = None,
+        top_k: int | None = None,
+    ) -> list[EvidenceRetrievalHit]:
+        result = self._ensure_evidence_retrieval().query(
+            query_text or self._task_retrieval_query(state, task),
+            task_id=task.id,
+            scope="hybrid",
+            mode="repair",
+            top_k=top_k or self.config.evidence_memory_top_k,
+            request_id=self.request_id,
+            observer=observer,
+        )
+        return list(result.hits)
+
+    def _query_signal_tokens(self, value: str) -> set[str]:
+        cleaned = self._normalize_query_candidate(value).casefold()
+        ascii_tokens = set(re.findall(r"[a-z0-9]+", cleaned))
+        cjk_tokens = {char for char in cleaned if "\u4e00" <= char <= "\u9fff"}
+        return ascii_tokens | cjk_tokens
+
+    def _query_adds_new_signal(self, base_query: str, candidate_query: str) -> bool:
+        base_tokens = self._query_signal_tokens(base_query)
+        candidate_tokens = self._query_signal_tokens(candidate_query)
+        return bool(candidate_tokens - base_tokens)
 
     def _should_rewrite_task_query(
         self,
@@ -1982,10 +2256,7 @@ class DeepResearchAgent:
     def _rewritten_task_query(self, state: SummaryState, task: TodoItem) -> str:
         """Return a richer query candidate combining topic, title and intent."""
 
-        topic = (state.research_topic or "").strip()
-        title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
-        intent = (task.intent or "").strip()
-        return self._normalize_query_candidate(" ".join(part for part in [topic, title, intent] if part))
+        return self._expanded_task_query_with_intent(state, task)
 
     def _task_search_queries(
         self,
@@ -1994,13 +2265,19 @@ class DeepResearchAgent:
     ) -> list[tuple[str, str]]:
         """Return progressively broader queries for a task-level search retry."""
 
-        topic = (state.research_topic or "").strip()
-        title = re.sub(r"^任务\s*\d+\s*[:：\-]\s*", "", (task.title or "").strip())
-        intent = (task.intent or "").strip()
-        original_query = (task.query or "").strip()
-
         candidates: list[tuple[str, str]] = []
         seen: set[str] = set()
+        canonical_query = self._canonical_task_query(state, task)
+        rewritten_query = self._expanded_task_query_with_intent(state, task)
+        topic_only_query = self._topic_canonical_query(state)
+        fresh_bucket = classify_search_query_bucket(
+            canonical_query,
+            {
+                "research_topic": state.research_topic,
+                "task_title": task.title,
+                "task_intent": task.intent,
+            },
+        )
 
         def add(value: str, strategy: str) -> None:
             normalized = self._normalize_query_candidate(value)
@@ -2009,21 +2286,18 @@ class DeepResearchAgent:
             seen.add(normalized)
             candidates.append((normalized, strategy))
 
-        add(original_query, "original")
-        if self._should_rewrite_task_query(
-            original_query=original_query,
-            title=title,
-            intent=intent,
+        add(canonical_query, "original")
+        if (
+            self.config.task_query_rewrite_enabled
+            and rewritten_query
+            and self._query_adds_new_signal(canonical_query, rewritten_query)
         ):
-            add(self._rewritten_task_query(state, task), "rewrite")
-        if topic and title:
-            add(f"{topic} {title}", "expand")
-            add(f"{topic} {title} 最新进展", "expand")
-        if topic and intent:
-            add(f"{topic} {intent}", "expand")
-        add(topic, "expand")
+            add(rewritten_query, "rewrite")
+        add(topic_only_query, "expand")
+        if fresh_bucket == "fresh":
+            add(f"{canonical_query} 最新进展", "expand")
 
-        fallback = self._normalize_query_candidate(" ".join(part for part in [title, intent] if part))
+        fallback = rewritten_query or canonical_query or topic_only_query
         return candidates or [(fallback, "rewrite")]
 
     @staticmethod
@@ -2174,6 +2448,7 @@ class DeepResearchAgent:
         task: TodoItem,
         observation: TaskReactObservation,
         evidence_items: list[dict[str, Any]],
+        repair_hits: list[EvidenceRetrievalHit],
     ) -> TaskReactDecision:
         search_budget_left = (
             task.react_additional_search_count
@@ -2183,6 +2458,19 @@ class DeepResearchAgent:
             task.react_fetch_count < max(int(self.config.task_react_max_fetches_per_task or 0), 0)
         )
         top_item = self._top_evidence_item(evidence_items)
+        current_urls = {
+            str(item.get("url") or "").strip()
+            for item in evidence_items
+            if str(item.get("url") or "").strip()
+        }
+        archive_hit = next(
+            (
+                hit
+                for hit in repair_hits
+                if not hit.citation_eligible and hit.url and hit.url not in current_urls
+            ),
+            None,
+        )
 
         if observation.evidence_sufficiency:
             return TaskReactDecision(action="stop", reason="证据已足够，结束任务级闭环。")
@@ -2216,6 +2504,13 @@ class DeepResearchAgent:
                 reason="已有来源但正文不足，先抓取最相关来源的全文。",
             )
 
+        if archive_hit and fetch_budget_left:
+            return TaskReactDecision(
+                action="fetch_page_for_archive_hit",
+                url=archive_hit.url,
+                reason="历史证据库命中高相关正文，先抓取该页面纳入当前请求证据。",
+            )
+
         if (
             any(
                 signal in observation.gap_signals
@@ -2244,27 +2539,41 @@ class DeepResearchAgent:
         task: TodoItem,
         observation: TaskReactObservation,
         evidence_items: list[dict[str, Any]],
+        repair_hits: list[EvidenceRetrievalHit],
         *,
         observer: RequestTrace | None,
     ) -> TaskReactDecision:
-        fallback = self._fallback_task_react_decision(state, task, observation, evidence_items)
+        fallback = self._fallback_task_react_decision(state, task, observation, evidence_items, repair_hits)
         if fallback.action == "stop":
             return fallback
 
         top_item = self._top_evidence_item(evidence_items) or {}
+        repair_candidates = [
+            {
+                "origin": hit.origin,
+                "citation_eligible": hit.citation_eligible,
+                "source_id": hit.source_id,
+                "title": hit.title,
+                "url": hit.url,
+                "quality_label": hit.quality_label,
+                "freshness_label": hit.freshness_label,
+            }
+            for hit in repair_hits[:3]
+        ]
         prompt = (
             f"研究主题：{state.research_topic}\n"
             f"任务标题：{task.title}\n"
             f"任务目标：{task.intent}\n"
             f"当前查询：{task.query}\n"
             f"当前观察：{json.dumps(observation.to_dict(), ensure_ascii=False)}\n"
+            f"修补候选：{json.dumps(repair_candidates, ensure_ascii=False)}\n"
             f"预算：{{\"max_rounds\": {self.config.task_react_max_rounds}, "
             f"\"searches_used\": {task.react_additional_search_count}, "
             f"\"searches_left\": {max(int(self.config.task_react_max_additional_searches_per_task or 0), 0) - task.react_additional_search_count}, "
             f"\"fetches_used\": {task.react_fetch_count}, "
             f"\"fetches_left\": {max(int(self.config.task_react_max_fetches_per_task or 0), 0) - task.react_fetch_count}}}\n"
             f"最相关来源：{json.dumps({'source_id': top_item.get('source_id'), 'title': top_item.get('title'), 'url': top_item.get('url')}, ensure_ascii=False)}\n"
-            f"建议基线动作：{json.dumps({'action': fallback.action, 'query': fallback.query, 'source_id': fallback.source_id, 'reason': fallback.reason}, ensure_ascii=False)}"
+            f"建议基线动作：{json.dumps({'action': fallback.action, 'query': fallback.query, 'source_id': fallback.source_id, 'url': fallback.url, 'reason': fallback.reason}, ensure_ascii=False)}"
         )
 
         try:
@@ -2301,6 +2610,7 @@ class DeepResearchAgent:
             "broaden_query",
             "diversify_source_query",
             "fetch_page_for_top_source",
+            "fetch_page_for_archive_hit",
             "stop",
         }:
             return fallback
@@ -2309,12 +2619,16 @@ class DeepResearchAgent:
             action=action,
             query=self._normalize_query_candidate(str(payload.get("query") or "").strip()),
             source_id=str(payload.get("source_id") or "").strip() or None,
+            url=str(payload.get("url") or "").strip(),
             reason=str(payload.get("reason") or "").strip() or fallback.reason,
         )
 
         if decision.action == "fetch_page_for_top_source":
             if not decision.source_id and fallback.source_id:
                 decision.source_id = fallback.source_id
+        elif decision.action == "fetch_page_for_archive_hit":
+            if not decision.url and fallback.url:
+                decision.url = fallback.url
         elif decision.action != "stop" and not decision.query:
             decision.query = fallback.query
 
@@ -2322,8 +2636,11 @@ class DeepResearchAgent:
             return decision
         if decision.action == "fetch_page_for_top_source" and not decision.source_id:
             return fallback
-        if decision.action != "fetch_page_for_top_source" and not decision.query:
+        if decision.action == "fetch_page_for_archive_hit" and not decision.url:
             return fallback
+        if decision.action != "fetch_page_for_top_source" and not decision.query:
+            if decision.action != "fetch_page_for_archive_hit":
+                return fallback
         return decision
 
     def _apply_task_budget(
@@ -2448,6 +2765,7 @@ class DeepResearchAgent:
         next_action = "initial_search"
         next_query = (task.query or "").strip()
         next_source_id: str | None = None
+        next_url = ""
         observation = TaskReactObservation(
             gap_signals=[],
             source_count=0,
@@ -2476,15 +2794,23 @@ class DeepResearchAgent:
             current_answer = answer_text
             current_backend = backend
 
-            if next_action == "fetch_page_for_top_source":
+            if next_action in {"fetch_page_for_top_source", "fetch_page_for_archive_hit"}:
                 target_item = None
-                if next_source_id:
+                if next_action == "fetch_page_for_top_source" and next_source_id:
                     target_item = evidence_store.get_evidence(next_source_id, include_full_content=True)
-                if target_item is None:
+                if next_action == "fetch_page_for_top_source" and target_item is None:
                     target_item = self._top_evidence_item(evidence_store.list_task_evidence(task.id))
 
-                target_url = str((target_item or {}).get("url") or "").strip()
-                target_source_id = str((target_item or {}).get("source_id") or "").strip() or None
+                target_url = (
+                    next_url.strip()
+                    if next_action == "fetch_page_for_archive_hit"
+                    else str((target_item or {}).get("url") or "").strip()
+                )
+                target_source_id = (
+                    None
+                    if next_action == "fetch_page_for_archive_hit"
+                    else str((target_item or {}).get("source_id") or "").strip() or None
+                )
                 if target_url:
                     try:
                         response = self.fetch_page_tool.run(
@@ -2623,6 +2949,9 @@ class DeepResearchAgent:
                     )
 
                 if search_span:
+                    cache_details = {}
+                    if observer:
+                        cache_details = dict(observer.snapshot().get("last_search_cache_details") or {})
                     completed = search_span.complete(
                         status="success",
                         metadata={
@@ -2633,6 +2962,7 @@ class DeepResearchAgent:
                             "cache_strategy": cache_strategy,
                             "notice_count": len(notices),
                             "react_round": round_index,
+                            **cache_details,
                         },
                     )
                     if emit_stream:
@@ -2684,11 +3014,17 @@ class DeepResearchAgent:
                 and not observation.evidence_sufficiency
             )
             if should_continue:
+                repair_hits = self._repair_hits_for_task(
+                    state,
+                    task,
+                    observer=observer,
+                )
                 decision = self._plan_task_react_decision(
                     state,
                     task,
                     observation,
                     task.evidence_items,
+                    repair_hits,
                     observer=observer,
                 )
                 if decision.action != "stop":
@@ -2708,6 +3044,7 @@ class DeepResearchAgent:
                     next_action = decision.action
                     next_query = decision.query
                     next_source_id = decision.source_id
+                    next_url = decision.url
                     continue
 
                 task.react_stop_reason = "low_repair_value"
@@ -2784,10 +3121,19 @@ class DeepResearchAgent:
             self._persist_request_state(state, phase="task_execution", status="in_progress")
             return
 
-        context = build_task_context(
-            task.evidence_items,
-            answer_text=answer_text,
-            config=self.config,
+        grounding_hits = self._grounding_hits_for_task(state, task, observer=observer)
+        context = (
+            build_task_context_from_hits(
+                grounding_hits,
+                answer_text=answer_text,
+                config=self.config,
+            )
+            if grounding_hits
+            else build_task_context(
+                task.evidence_items,
+                answer_text=answer_text,
+                config=self.config,
+            )
         )
         historical_memory_context = self._task_memory_context(state, task, observer)
 

@@ -36,6 +36,27 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.strategy_memory_dir, expected)
         self.assertEqual(cfg.resolved_strategy_memory_embedding_model(), "demo-embedding")
 
+    def test_relative_search_cache_vector_dir_resolves_under_backend_root(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={"search_cache_vector_dir": ".cache/search/vector"},
+                load_env_file=False,
+            )
+
+        expected = str((config.backend_root() / ".cache/search/vector").resolve(strict=False))
+        self.assertEqual(cfg.search_cache_vector_dir, expected)
+        self.assertEqual(cfg.resolved_search_cache_vector_dir(), expected)
+
+    def test_relative_evidence_memory_dir_resolves_under_backend_root(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={"evidence_memory_dir": ".memory/evidence"},
+                load_env_file=False,
+            )
+
+        expected = str((config.backend_root() / ".memory/evidence").resolve(strict=False))
+        self.assertEqual(cfg.evidence_memory_dir, expected)
+
     def test_string_overrides_are_normalized(self):
         with patch.dict(os.environ, {}, clear=True):
             cfg = config.Configuration.from_env(
@@ -52,6 +73,15 @@ class ConfigurationTests(unittest.TestCase):
                     "log_level": "debug",
                     "port": "9001",
                     "cors_origins": "http://localhost:5174, http://localhost:3000",
+                    "evidence_runtime_enabled": "true",
+                    "evidence_runtime_top_k": "9",
+                    "evidence_chunk_chars": "950",
+                    "evidence_chunk_overlap": "100",
+                    "evidence_memory_enabled": "true",
+                    "search_cache_dynamic_ttl_enabled": "true",
+                    "search_cache_ttl_seconds": "43200",
+                    "search_cache_fresh_ttl_seconds": "14400",
+                    "search_cache_evergreen_ttl_seconds": "172800",
                     "semantic_cache_warmup_enabled": "false",
                     "semantic_cache_lexical_threshold": "0.81",
                     "max_agent_tasks": "3",
@@ -79,6 +109,15 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.advanced_rerank_max_content_chars, 800)
         self.assertEqual(cfg.log_level, "DEBUG")
         self.assertEqual(cfg.port, 9001)
+        self.assertTrue(cfg.evidence_runtime_enabled)
+        self.assertEqual(cfg.evidence_runtime_top_k, 9)
+        self.assertEqual(cfg.evidence_chunk_chars, 950)
+        self.assertEqual(cfg.evidence_chunk_overlap, 100)
+        self.assertTrue(cfg.evidence_memory_enabled)
+        self.assertTrue(cfg.search_cache_dynamic_ttl_enabled)
+        self.assertEqual(cfg.search_cache_ttl_seconds, 43200)
+        self.assertEqual(cfg.search_cache_fresh_ttl_seconds, 14400)
+        self.assertEqual(cfg.search_cache_evergreen_ttl_seconds, 172800)
         self.assertFalse(cfg.semantic_cache_warmup_enabled)
         self.assertEqual(cfg.semantic_cache_lexical_threshold, 0.81)
         self.assertEqual(cfg.max_agent_tasks, 3)
