@@ -2,8 +2,6 @@
 
 联网研究型 Agent 应用工程项目，强调 `任务规划 + 工具调用 + 流式交互 + 失败降级 + 可观测性 + benchmark / CI` 的完整闭环。
 
-这个仓库的定位不是知识库 RAG，也不承担向量检索主线；它更适合在简历里展示 Agent 产品化和工程落地能力。金融研报项目负责讲 RAG，这个项目负责讲开放互联网研究 Agent。
-
 ## 项目亮点
 
 - 后端：FastAPI + HelloAgents，串联 `planning -> research -> review -> report`，并在任务级和报告级引入受控 ReAct 闭环
@@ -18,7 +16,7 @@
 ```bash
 cd backend
 cp .env.example .env
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python src/main.py
+.venv/bin/python src/main.py
 ```
 
 默认监听 `http://localhost:8000`。
@@ -132,17 +130,17 @@ npm run dev
 
 ```bash
 cd backend
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python evals/run_benchmark.py --input evals/benchmarks/sample_benchmark.jsonl --output evals/results/sample_results.json
+.venv/bin/python evals/run_benchmark.py --input evals/benchmarks/sample_benchmark.jsonl --output evals/results/sample_results.json
 ```
 
 ### Engineering perf
 
 ```bash
 cd backend
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_smoke --profile stub
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_regression --profile real_local --write-baseline
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_load --profile stub --users 4 --spawn-rate 2 --duration 20s
-/media/main/hjz/agent/deepresearch/helloagents-deepresearch/backend/.venv/bin/python -m perf.run_profile --profile real_local
+.venv/bin/python -m perf.run_smoke --profile stub
+.venv/bin/python -m perf.run_regression --profile real_local --write-baseline
+.venv/bin/python -m perf.run_load --profile stub --users 4 --spawn-rate 2 --duration 20s
+.venv/bin/python -m perf.run_profile --profile real_local
 ```
 
 ### CI
@@ -163,10 +161,3 @@ CI 位于 `.github/workflows/ci.yml`，覆盖：
 - 它的价值在于 Agent 编排、SSE 交互、降级策略、可观测性和工程化闭环
 - 金融研报项目负责承载 RAG 检索系统叙事，这个项目负责承载 Agent 应用工程叙事
 
-## 更多文档
-
-- [backend/README.md](backend/README.md)
-- [docs/DEMO_PLAYBOOK.md](docs/DEMO_PLAYBOOK.md)
-- [docs/INTERVIEW_GUIDE.md](docs/INTERVIEW_GUIDE.md)
-- [ENGINEERING.md](ENGINEERING.md)
-- [CODEBASE_DIFF_ANALYSIS.md](CODEBASE_DIFF_ANALYSIS.md)
