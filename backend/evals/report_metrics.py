@@ -36,6 +36,10 @@ class MetricRecord:
     cache_misses: int
     cache_exact_hits: int
     cache_semantic_hits: int
+    cache_approximate_hits: int
+    cache_approximate_dense_hits: int
+    cache_approximate_sparse_hits: int
+    cache_approximate_hybrid_hits: int
     todo_items: list[dict[str, Any]]
     source_label: str
 
@@ -135,6 +139,24 @@ def normalize_request_snapshot(
             _safe_int(metrics.get("cache_semantic_hits"))
             or _safe_int(cache_diagnostics.get("cache_semantic_hits"))
         ),
+        cache_approximate_hits=(
+            _safe_int(metrics.get("cache_approximate_hits"))
+            or _safe_int(cache_diagnostics.get("cache_approximate_hits"))
+            or _safe_int(metrics.get("cache_semantic_hits"))
+            or _safe_int(cache_diagnostics.get("cache_semantic_hits"))
+        ),
+        cache_approximate_dense_hits=(
+            _safe_int(metrics.get("cache_approximate_dense_hits"))
+            or _safe_int(cache_diagnostics.get("cache_approximate_dense_hits"))
+        ),
+        cache_approximate_sparse_hits=(
+            _safe_int(metrics.get("cache_approximate_sparse_hits"))
+            or _safe_int(cache_diagnostics.get("cache_approximate_sparse_hits"))
+        ),
+        cache_approximate_hybrid_hits=(
+            _safe_int(metrics.get("cache_approximate_hybrid_hits"))
+            or _safe_int(cache_diagnostics.get("cache_approximate_hybrid_hits"))
+        ),
         todo_items=todo_items,
         source_label=source_label,
     )
@@ -165,6 +187,13 @@ def normalize_eval_result(
         cache_misses=_safe_int(trace_payload.get("cache_misses")),
         cache_exact_hits=_safe_int(trace_payload.get("cache_exact_hits")),
         cache_semantic_hits=_safe_int(trace_payload.get("cache_semantic_hits")),
+        cache_approximate_hits=(
+            _safe_int(trace_payload.get("cache_approximate_hits"))
+            or _safe_int(trace_payload.get("cache_semantic_hits"))
+        ),
+        cache_approximate_dense_hits=_safe_int(trace_payload.get("cache_approximate_dense_hits")),
+        cache_approximate_sparse_hits=_safe_int(trace_payload.get("cache_approximate_sparse_hits")),
+        cache_approximate_hybrid_hits=_safe_int(trace_payload.get("cache_approximate_hybrid_hits")),
         todo_items=_normalize_todo_items(payload.get("todo_items") or trace_payload.get("todo_items")),
         source_label=source_label,
     )
@@ -179,6 +208,10 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
     cache_misses = 0
     cache_exact_hits = 0
     cache_semantic_hits = 0
+    cache_approximate_hits = 0
+    cache_approximate_dense_hits = 0
+    cache_approximate_sparse_hits = 0
+    cache_approximate_hybrid_hits = 0
 
     for record in records:
         if record.status:
@@ -190,6 +223,10 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
         cache_misses += max(record.cache_misses, 0)
         cache_exact_hits += max(record.cache_exact_hits, 0)
         cache_semantic_hits += max(record.cache_semantic_hits, 0)
+        cache_approximate_hits += max(record.cache_approximate_hits, 0)
+        cache_approximate_dense_hits += max(record.cache_approximate_dense_hits, 0)
+        cache_approximate_sparse_hits += max(record.cache_approximate_sparse_hits, 0)
+        cache_approximate_hybrid_hits += max(record.cache_approximate_hybrid_hits, 0)
 
         for task in record.todo_items:
             task_status = str(task.get("status") or "").strip().lower() or "unknown"
@@ -230,6 +267,10 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
             "misses": cache_misses,
             "exact_hits": cache_exact_hits,
             "semantic_hits": cache_semantic_hits,
+            "approximate_hits": cache_approximate_hits,
+            "approximate_dense_hits": cache_approximate_dense_hits,
+            "approximate_sparse_hits": cache_approximate_sparse_hits,
+            "approximate_hybrid_hits": cache_approximate_hybrid_hits,
             "hit_rate": round(cache_hits / cache_total, 4) if cache_total else None,
         },
         "latency_ms": {
@@ -454,7 +495,8 @@ def _render_summary_block(title: str, summary: dict[str, Any] | None) -> list[st
             "- 缓存命中率："
             f"{_format_metric(cache.get('hit_rate'))} "
             f"(hits={cache.get('hits', 0)}, misses={cache.get('misses', 0)}, "
-            f"exact={cache.get('exact_hits', 0)}, semantic={cache.get('semantic_hits', 0)})"
+            f"exact={cache.get('exact_hits', 0)}, approximate={cache.get('approximate_hits', 0)}, "
+            f"semantic_compat={cache.get('semantic_hits', 0)})"
         ),
         f"- 平均耗时：{_format_metric(latency.get('average'), suffix=' ms')}",
         "",

@@ -112,6 +112,10 @@ class StubAgent:
                 "cache_hits": 0,
                 "cache_exact_hits": 0,
                 "cache_semantic_hits": 0,
+                "cache_approximate_hits": 0,
+                "cache_approximate_dense_hits": 0,
+                "cache_approximate_sparse_hits": 0,
+                "cache_approximate_hybrid_hits": 0,
                 "cache_misses": 1,
                 "total_tokens": 120,
                 "estimated_cost": 0.0012,
@@ -127,12 +131,14 @@ class StubAgent:
                     "fallback_trigger_total": 0,
                     "cache_exact_hit_total": 0,
                     "cache_semantic_hit_total": 0,
+                    "cache_approximate_hit_total": 0,
                     "reflection_call_total": 1,
                     "reflection_replan_total": 1,
                     "reflection_skipped_total": 0,
                 },
                 "cache_exact_hit_total": 0,
                 "cache_semantic_hit_total": 0,
+                "cache_approximate_hit_total": 0,
             },
         }
         yield {
@@ -372,9 +378,11 @@ class ApiTests(unittest.TestCase):
         metrics_event = next(event for event in events if event["type"] == "metrics_snapshot")
         self.assertIn("cache_exact_hits", metrics_event["request_metrics"])
         self.assertIn("cache_semantic_hits", metrics_event["request_metrics"])
+        self.assertIn("cache_approximate_hits", metrics_event["request_metrics"])
         self.assertIn("reflection_added_tasks", metrics_event["request_metrics"])
         self.assertIn("cache_exact_hit_total", metrics_event["aggregate_metrics"])
         self.assertIn("cache_semantic_hit_total", metrics_event["aggregate_metrics"])
+        self.assertIn("cache_approximate_hit_total", metrics_event["aggregate_metrics"])
 
     def test_stream_endpoint_allows_loopback_origin_pair(self):
         base_config = main.Configuration.from_env(

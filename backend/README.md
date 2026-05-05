@@ -23,7 +23,7 @@
 - 泛化 query 自动重写，降低短 query 空检索概率
 - 搜索工具调用超时保护，避免外部 provider 长时间卡住任务
 - 搜索工具失败重试参数化，可按本地环境调节容错策略
-- 搜索 exact / semantic cache
+- 搜索 exact / approximate cache
 - fallback / degraded 响应标记
 - 估算 token / cost 指标
 - benchmark stub agent，用于稳定演示和 CI perf
@@ -57,14 +57,16 @@ uv run python src/main.py
 - `SEARCH_TOOL_RETRY_ATTEMPTS`：搜索工具失败或超时后的重试次数
 - `SEARCH_TOOL_RETRY_BACKOFF_SECONDS`：两次重试之间的固定等待时间
 - `SEARCH_API`：搜索后端，可选 `duckduckgo / tavily / perplexity / searxng / semanticscholar / advanced`
-- `SEMANTIC_CACHE_WARMUP_ENABLED`：是否在后端启动时预热 semantic cache embedding 模型，降低首轮搜索冷启动超时概率
+- `APPROXIMATE_CACHE_ENABLED`：是否启用 approximate cache，相似 query 会在同 topic / 同配置 / 未过期约束下复用搜索结果
+- `APPROXIMATE_CACHE_DENSE_THRESHOLD` / `APPROXIMATE_CACHE_SPARSE_THRESHOLD`：dense embedding 与 sparse lexical 两类近似命中的阈值
+- `SEMANTIC_CACHE_WARMUP_ENABLED`：是否在后端启动时预热 approximate cache 的 embedding 模型，降低首轮 dense recall 冷启动超时概率
 - `SEMANTIC_SCHOLAR_API_KEY`：当 `SEARCH_API=semanticscholar` 时建议配置，避免共享限流
 
 ## 重点观测点
 
 - `/metrics/json` 返回进程内 counters、latencies、recent request trace
 - SSE 事件覆盖 `stage_started`、`stage_completed`、`fallback_triggered`、`degraded_response`、`metrics_snapshot`
-- 搜索缓存会区分 exact hit、semantic hit、miss
+- 搜索缓存会区分 exact hit、approximate dense / sparse / hybrid hit、miss；`cache_semantic_hits` 仍作为兼容字段保留
 - `estimated_cost` 基于 `LLM_PRICING_JSON` 估算；未配置时默认是 `0`
 
 ## 演示保底模式

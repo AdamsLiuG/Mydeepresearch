@@ -49,6 +49,10 @@ class ReportMetricsTests(unittest.TestCase):
                     "cache_misses": 1,
                     "cache_exact_hits": 1,
                     "cache_semantic_hits": 2,
+                    "cache_approximate_hits": 2,
+                    "cache_approximate_dense_hits": 1,
+                    "cache_approximate_sparse_hits": 0,
+                    "cache_approximate_hybrid_hits": 1,
                 },
             }
             (request_dir / "req-1.json").write_text(
@@ -83,6 +87,10 @@ class ReportMetricsTests(unittest.TestCase):
                                 "cache_misses": 1,
                                 "cache_exact_hits": 1,
                                 "cache_semantic_hits": 2,
+                                "cache_approximate_hits": 2,
+                                "cache_approximate_dense_hits": 1,
+                                "cache_approximate_sparse_hits": 0,
+                                "cache_approximate_hybrid_hits": 1,
                             },
                             "todo_items": [
                                 {
@@ -140,6 +148,9 @@ class ReportMetricsTests(unittest.TestCase):
             self.assertEqual(request_summary["task_completion_rate"], 0.5)
             self.assertEqual(request_summary["citation_validity_rate"], 0.5)
             self.assertEqual(request_summary["cache"]["hit_rate"], 0.75)
+            self.assertEqual(request_summary["cache"]["approximate_hits"], 2)
+            self.assertEqual(request_summary["cache"]["approximate_dense_hits"], 1)
+            self.assertEqual(request_summary["cache"]["approximate_hybrid_hits"], 1)
             self.assertEqual(request_summary["latency_ms"]["average"], 120.0)
 
             matched_summary = payload["request_state"]["summary_matched_eval_request_ids"]
@@ -153,6 +164,7 @@ class ReportMetricsTests(unittest.TestCase):
             self.assertEqual(eval_summary["task_completion_rate"], 0.6667)
             self.assertEqual(eval_summary["citation_validity_rate"], 0.5)
             self.assertEqual(eval_summary["cache"]["hit_rate"], 0.4286)
+            self.assertEqual(eval_summary["cache"]["approximate_hits"], 2)
             self.assertEqual(eval_summary["latency_ms"]["average"], 165.0)
 
             markdown = render_markdown(payload)

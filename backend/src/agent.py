@@ -2059,7 +2059,7 @@ class DeepResearchAgent:
             return
 
         state.topic_cache_warmup_completed = True
-        if not self.config.search_cache_enabled or not self.config.semantic_cache_enabled:
+        if not self.config.search_cache_enabled or not self.config.resolved_approximate_cache_enabled():
             return
         if observer is None:
             return

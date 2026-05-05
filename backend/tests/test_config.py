@@ -137,6 +137,45 @@ class ConfigurationTests(unittest.TestCase):
             ],
         )
 
+    def test_approximate_cache_config_accepts_new_names_and_legacy_aliases(self):
+        with patch.dict(
+            os.environ,
+            {
+                "APPROXIMATE_CACHE_ENABLED": "true",
+                "APPROXIMATE_CACHE_DENSE_ENABLED": "false",
+                "APPROXIMATE_CACHE_SPARSE_ENABLED": "true",
+                "APPROXIMATE_CACHE_DENSE_THRESHOLD": "0.88",
+                "APPROXIMATE_CACHE_SPARSE_THRESHOLD": "0.42",
+                "APPROXIMATE_CACHE_DENSE_TOP_K": "7",
+                "APPROXIMATE_CACHE_SPARSE_TOP_K": "5",
+            },
+            clear=True,
+        ):
+            cfg = config.Configuration.from_env(load_env_file=False)
+
+        self.assertTrue(cfg.resolved_approximate_cache_enabled())
+        self.assertFalse(cfg.resolved_approximate_cache_dense_enabled())
+        self.assertTrue(cfg.resolved_approximate_cache_sparse_enabled())
+        self.assertEqual(cfg.resolved_approximate_cache_dense_threshold(), 0.88)
+        self.assertEqual(cfg.resolved_approximate_cache_sparse_threshold(), 0.42)
+        self.assertEqual(cfg.resolved_approximate_cache_dense_top_k(), 7)
+        self.assertEqual(cfg.resolved_approximate_cache_sparse_top_k(), 5)
+
+        with patch.dict(
+            os.environ,
+            {
+                "SEMANTIC_CACHE_ENABLED": "false",
+                "SEMANTIC_CACHE_SIMILARITY_THRESHOLD": "0.77",
+                "SEMANTIC_CACHE_LEXICAL_THRESHOLD": "0.33",
+            },
+            clear=True,
+        ):
+            legacy_cfg = config.Configuration.from_env(load_env_file=False)
+
+        self.assertFalse(legacy_cfg.resolved_approximate_cache_enabled())
+        self.assertEqual(legacy_cfg.resolved_approximate_cache_dense_threshold(), 0.77)
+        self.assertEqual(legacy_cfg.resolved_approximate_cache_sparse_threshold(), 0.33)
+
     def test_loopback_cors_origins_expand_to_localhost_and_127(self):
         with patch.dict(os.environ, {}, clear=True):
             cfg = config.Configuration.from_env(

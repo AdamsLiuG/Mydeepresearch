@@ -35,6 +35,10 @@ export interface MetricsSnapshot {
   generated_at?: string;
   cache_hit_total?: number;
   cache_miss_total?: number;
+  cache_approximate_hit_total?: number;
+  cache_approximate_dense_hit_total?: number;
+  cache_approximate_sparse_hit_total?: number;
+  cache_approximate_hybrid_hit_total?: number;
   counters?: Record<string, number>;
   recent_requests?: Record<string, unknown>[];
   [key: string]: unknown;

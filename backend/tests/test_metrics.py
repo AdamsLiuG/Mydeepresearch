@@ -138,6 +138,34 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(aggregate_snapshot["latencies_ms"]["planning_latency_ms"]["count"], 1)
         self.assertEqual(aggregate_snapshot["latencies_ms"]["total_latency_ms"]["count"], 1)
 
+    def test_metrics_record_approximate_cache_hit_modes_with_semantic_compatibility(self):
+        observer = RequestTrace(
+            request_id="req-approximate",
+            topic="AI cache",
+            search_api="duckduckgo",
+            provider="custom",
+            model="demo-model",
+            pricing_catalog={},
+        )
+
+        observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="approximate_dense")
+        observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="approximate_sparse")
+        observer.record_search_attempt(cache_hit=True, success=True, cache_strategy="approximate_hybrid")
+        request_snapshot = observer.complete_request(status="success")
+        aggregate_snapshot = metrics_registry.snapshot()
+
+        self.assertEqual(request_snapshot["cache_hits"], 3)
+        self.assertEqual(request_snapshot["cache_semantic_hits"], 3)
+        self.assertEqual(request_snapshot["cache_approximate_hits"], 3)
+        self.assertEqual(request_snapshot["cache_approximate_dense_hits"], 1)
+        self.assertEqual(request_snapshot["cache_approximate_sparse_hits"], 1)
+        self.assertEqual(request_snapshot["cache_approximate_hybrid_hits"], 1)
+        self.assertEqual(aggregate_snapshot["cache_approximate_hit_total"], 3)
+        self.assertEqual(aggregate_snapshot["cache_approximate_dense_hit_total"], 1)
+        self.assertEqual(aggregate_snapshot["cache_approximate_sparse_hit_total"], 1)
+        self.assertEqual(aggregate_snapshot["cache_approximate_hybrid_hit_total"], 1)
+        self.assertEqual(aggregate_snapshot["cache_semantic_hit_total"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

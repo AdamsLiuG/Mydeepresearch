@@ -403,36 +403,77 @@ class Configuration(BaseModel):
     search_cache_vector_dir: str = Field(
         default="./.cache/search/vector",
         title="Search Cache Vector Directory",
-        description="Directory used by the semantic ANN vector index for search cache recall",
+        description="Directory used by the dense ANN vector index for approximate cache recall",
     )
     semantic_cache_enabled: bool = Field(
         default=True,
         title="Semantic Cache Enabled",
-        description="Whether to use embedding similarity to reuse semantically similar search results",
+        description="Legacy alias for approximate cache enablement when APPROXIMATE_CACHE_ENABLED is unset",
     )
     semantic_cache_warmup_enabled: bool = Field(
         default=True,
         title="Semantic Cache Warmup Enabled",
-        description="Whether to warm up the semantic-cache embedding model during API startup",
+        description="Whether to warm up the approximate-cache embedding model during API startup",
     )
     semantic_cache_embedding_model: str = Field(
         default="sentence-transformers/all-MiniLM-L6-v2",
         title="Semantic Cache Embedding Model",
-        description="Embedding model used to vectorize search queries for semantic cache matching",
+        description="Embedding model used to vectorize search queries for dense approximate cache matching",
     )
     semantic_cache_similarity_threshold: float = Field(
         default=0.90,
         ge=0.0,
         le=1.0,
         title="Semantic Cache Similarity Threshold",
-        description="Cosine similarity threshold for semantic search cache hits",
+        description="Legacy alias for the dense approximate cache threshold",
     )
     semantic_cache_lexical_threshold: float = Field(
         default=0.35,
         ge=0.0,
         le=1.0,
         title="Semantic Cache Lexical Threshold",
-        description="Lexical similarity threshold used to reuse semantically related cache entries when embeddings are weak",
+        description="Legacy alias for the sparse approximate cache threshold",
+    )
+    approximate_cache_enabled: bool | None = Field(
+        default=None,
+        title="Approximate Cache Enabled",
+        description="Whether to reuse similar search results through dense and sparse approximate signals",
+    )
+    approximate_cache_dense_enabled: bool | None = Field(
+        default=None,
+        title="Approximate Cache Dense Enabled",
+        description="Whether approximate cache uses embedding/ANN dense recall",
+    )
+    approximate_cache_sparse_enabled: bool | None = Field(
+        default=None,
+        title="Approximate Cache Sparse Enabled",
+        description="Whether approximate cache uses lexical sparse recall",
+    )
+    approximate_cache_dense_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        title="Approximate Cache Dense Threshold",
+        description="Cosine similarity threshold for dense approximate cache hits",
+    )
+    approximate_cache_sparse_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        title="Approximate Cache Sparse Threshold",
+        description="Lexical similarity threshold for sparse approximate cache hits",
+    )
+    approximate_cache_dense_top_k: int = Field(
+        default=12,
+        ge=1,
+        title="Approximate Cache Dense Top K",
+        description="How many ANN candidates to recall for approximate cache scoring",
+    )
+    approximate_cache_sparse_top_k: int = Field(
+        default=12,
+        ge=1,
+        title="Approximate Cache Sparse Top K",
+        description="How many lexical candidates to recall for approximate cache scoring",
     )
     max_tokens_per_source: int | None = Field(
         default=None,
@@ -870,6 +911,13 @@ class Configuration(BaseModel):
             "semantic_cache_embedding_model": os.getenv("SEMANTIC_CACHE_EMBEDDING_MODEL"),
             "semantic_cache_similarity_threshold": os.getenv("SEMANTIC_CACHE_SIMILARITY_THRESHOLD"),
             "semantic_cache_lexical_threshold": os.getenv("SEMANTIC_CACHE_LEXICAL_THRESHOLD"),
+            "approximate_cache_enabled": os.getenv("APPROXIMATE_CACHE_ENABLED"),
+            "approximate_cache_dense_enabled": os.getenv("APPROXIMATE_CACHE_DENSE_ENABLED"),
+            "approximate_cache_sparse_enabled": os.getenv("APPROXIMATE_CACHE_SPARSE_ENABLED"),
+            "approximate_cache_dense_threshold": os.getenv("APPROXIMATE_CACHE_DENSE_THRESHOLD"),
+            "approximate_cache_sparse_threshold": os.getenv("APPROXIMATE_CACHE_SPARSE_THRESHOLD"),
+            "approximate_cache_dense_top_k": os.getenv("APPROXIMATE_CACHE_DENSE_TOP_K"),
+            "approximate_cache_sparse_top_k": os.getenv("APPROXIMATE_CACHE_SPARSE_TOP_K"),
             "max_tokens_per_source": os.getenv("MAX_TOKENS_PER_SOURCE"),
             "task_context_char_limit": os.getenv("TASK_CONTEXT_CHAR_LIMIT"),
             "task_summary_max_concurrency": os.getenv("TASK_SUMMARY_MAX_CONCURRENCY"),
@@ -942,6 +990,51 @@ class Configuration(BaseModel):
     def resolved_search_cache_vector_dir(self) -> str:
         """Return the persistent ANN vector cache directory."""
         return self.search_cache_vector_dir
+
+    def resolved_approximate_cache_enabled(self) -> bool:
+        """Return whether approximate cache reuse is enabled, honoring semantic-cache aliases."""
+
+        if self.approximate_cache_enabled is not None:
+            return bool(self.approximate_cache_enabled)
+        return bool(self.semantic_cache_enabled)
+
+    def resolved_approximate_cache_dense_enabled(self) -> bool:
+        """Return whether dense embedding recall participates in approximate cache reuse."""
+
+        if self.approximate_cache_dense_enabled is not None:
+            return bool(self.approximate_cache_dense_enabled)
+        return True
+
+    def resolved_approximate_cache_sparse_enabled(self) -> bool:
+        """Return whether sparse lexical recall participates in approximate cache reuse."""
+
+        if self.approximate_cache_sparse_enabled is not None:
+            return bool(self.approximate_cache_sparse_enabled)
+        return True
+
+    def resolved_approximate_cache_dense_threshold(self) -> float:
+        """Return the dense approximate-cache hit threshold."""
+
+        if self.approximate_cache_dense_threshold is not None:
+            return float(self.approximate_cache_dense_threshold)
+        return float(self.semantic_cache_similarity_threshold)
+
+    def resolved_approximate_cache_sparse_threshold(self) -> float:
+        """Return the sparse approximate-cache hit threshold."""
+
+        if self.approximate_cache_sparse_threshold is not None:
+            return float(self.approximate_cache_sparse_threshold)
+        return float(self.semantic_cache_lexical_threshold)
+
+    def resolved_approximate_cache_dense_top_k(self) -> int:
+        """Return the bounded ANN recall size for approximate cache matching."""
+
+        return max(int(self.approximate_cache_dense_top_k or 1), 1)
+
+    def resolved_approximate_cache_sparse_top_k(self) -> int:
+        """Return the bounded lexical recall size for approximate cache matching."""
+
+        return max(int(self.approximate_cache_sparse_top_k or 1), 1)
 
     def resolved_note_memory_embedding_model(self) -> str:
         """Return the embedding model used by note memory retrieval."""

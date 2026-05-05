@@ -102,18 +102,25 @@ def _build_config(payload: ResearchRequest) -> Configuration:
 
 
 def _warmup_semantic_cache_model(config: Configuration) -> None:
-    """Warm up the semantic-cache embedding model without blocking startup on failure."""
+    """Warm up the approximate-cache embedding model without blocking startup on failure."""
 
-    if not config.semantic_cache_enabled:
+    if not config.resolved_approximate_cache_enabled():
         logger.info(
-            "Semantic cache warmup skipped: semantic cache disabled",
+            "Approximate cache warmup skipped: approximate cache disabled",
+            extra={"request_id": "startup"},
+        )
+        return
+
+    if not config.resolved_approximate_cache_dense_enabled():
+        logger.info(
+            "Approximate cache warmup skipped: dense signal disabled",
             extra={"request_id": "startup"},
         )
         return
 
     if not config.semantic_cache_warmup_enabled:
         logger.info(
-            "Semantic cache warmup skipped: startup warmup disabled",
+            "Approximate cache warmup skipped: startup warmup disabled",
             extra={"request_id": "startup"},
         )
         return
@@ -121,7 +128,7 @@ def _warmup_semantic_cache_model(config: Configuration) -> None:
     model_name = str(config.semantic_cache_embedding_model or "").strip()
     if not model_name:
         logger.info(
-            "Semantic cache warmup skipped: embedding model unset",
+            "Approximate cache warmup skipped: embedding model unset",
             extra={"request_id": "startup"},
         )
         return
@@ -130,7 +137,7 @@ def _warmup_semantic_cache_model(config: Configuration) -> None:
 
     if not embeddings_available():
         logger.info(
-            "Semantic cache warmup skipped: sentence-transformers unavailable model=%s",
+            "Approximate cache warmup skipped: sentence-transformers unavailable model=%s",
             model_name,
             extra={"request_id": "startup"},
         )
@@ -141,7 +148,7 @@ def _warmup_semantic_cache_model(config: Configuration) -> None:
         model = load_sentence_transformer(model_name)
     except Exception as exc:  # pragma: no cover - depends on local runtime state
         logger.warning(
-            "Semantic cache warmup failed model=%s error=%s",
+            "Approximate cache warmup failed model=%s error=%s",
             model_name,
             exc,
             extra={"request_id": "startup"},
@@ -151,7 +158,7 @@ def _warmup_semantic_cache_model(config: Configuration) -> None:
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     if model is None:
         logger.info(
-            "Semantic cache warmup skipped: model unavailable model=%s elapsed_ms=%.2f",
+            "Approximate cache warmup skipped: model unavailable model=%s elapsed_ms=%.2f",
             model_name,
             elapsed_ms,
             extra={"request_id": "startup"},
@@ -159,7 +166,7 @@ def _warmup_semantic_cache_model(config: Configuration) -> None:
         return
 
     logger.info(
-        "Semantic cache warmup completed model=%s elapsed_ms=%.2f",
+        "Approximate cache warmup completed model=%s elapsed_ms=%.2f",
         model_name,
         elapsed_ms,
         extra={"request_id": "startup"},
@@ -239,7 +246,7 @@ def create_app(
             "task_react_enabled=%s task_react_max_rounds=%s "
             "report_repair_enabled=%s report_repair_max_tasks=%s request_state_enabled=%s api_key=%s "
             "notes_workspace=%s cors_origins=%s search_cache_enabled=%s search_cache_ttl_seconds=%s "
-            "semantic_cache_enabled=%s semantic_cache_warmup_enabled=%s semantic_cache_embedding_model=%s "
+            "approximate_cache_enabled=%s semantic_cache_enabled=%s semantic_cache_warmup_enabled=%s semantic_cache_embedding_model=%s "
             "benchmark_stub_enabled=%s benchmark_profile=%s",
             config.llm_provider,
             config.resolved_model() or "unset",
@@ -263,6 +270,7 @@ def create_app(
             ",".join(config.cors_origins),
             config.search_cache_enabled,
             config.search_cache_ttl_seconds,
+            config.resolved_approximate_cache_enabled(),
             config.semantic_cache_enabled,
             config.semantic_cache_warmup_enabled,
             config.semantic_cache_embedding_model,

@@ -119,6 +119,10 @@ class MetricsRegistry:
             "cache_hit_total": 0,
             "cache_exact_hit_total": 0,
             "cache_semantic_hit_total": 0,
+            "cache_approximate_hit_total": 0,
+            "cache_approximate_dense_hit_total": 0,
+            "cache_approximate_sparse_hit_total": 0,
+            "cache_approximate_hybrid_hit_total": 0,
             "cache_miss_total": 0,
             "reflection_call_total": 0,
             "reflection_replan_total": 0,
@@ -239,6 +243,10 @@ class MetricsRegistry:
         cache_hits = counters.get("cache_hit_total", 0)
         cache_exact_hits = counters.get("cache_exact_hit_total", 0)
         cache_semantic_hits = counters.get("cache_semantic_hit_total", 0)
+        cache_approximate_hits = counters.get("cache_approximate_hit_total", 0)
+        cache_approximate_dense_hits = counters.get("cache_approximate_dense_hit_total", 0)
+        cache_approximate_sparse_hits = counters.get("cache_approximate_sparse_hit_total", 0)
+        cache_approximate_hybrid_hits = counters.get("cache_approximate_hybrid_hit_total", 0)
         cache_misses = counters.get("cache_miss_total", 0)
         cache_total = cache_hits + cache_misses
         task_react_round_total = counters.get("task_react_round_total", 0)
@@ -254,6 +262,10 @@ class MetricsRegistry:
             "cache_hit_total": cache_hits,
             "cache_exact_hit_total": cache_exact_hits,
             "cache_semantic_hit_total": cache_semantic_hits,
+            "cache_approximate_hit_total": cache_approximate_hits,
+            "cache_approximate_dense_hit_total": cache_approximate_dense_hits,
+            "cache_approximate_sparse_hit_total": cache_approximate_sparse_hits,
+            "cache_approximate_hybrid_hit_total": cache_approximate_hybrid_hits,
             "cache_miss_total": cache_misses,
             "cache_hit_rate": round((cache_hits / cache_total), 4) if cache_total else 0.0,
             "latencies_ms": latencies,
@@ -438,6 +450,10 @@ class RequestTrace:
         self.cache_hits = 0
         self.cache_exact_hits = 0
         self.cache_semantic_hits = 0
+        self.cache_approximate_hits = 0
+        self.cache_approximate_dense_hits = 0
+        self.cache_approximate_sparse_hits = 0
+        self.cache_approximate_hybrid_hits = 0
         self.cache_misses = 0
         self.last_search_cache_details: dict[str, Any] = {}
         self.prompt_tokens = 0
@@ -504,11 +520,20 @@ class RequestTrace:
         else:
             metrics_registry.increment("search_failed_total")
 
+        hit_mode = str((cache_metadata or {}).get("cache_hit_mode") or cache_strategy or "miss")
         normalized_strategy = "miss"
-        if cache_strategy == "exact":
+        approximate_hit_mode: str | None = None
+        if hit_mode == "exact" or cache_strategy == "exact":
             normalized_strategy = "exact"
+        elif hit_mode in {"approximate_dense", "approximate_sparse", "approximate_hybrid"}:
+            normalized_strategy = "approximate"
+            approximate_hit_mode = hit_mode
         elif cache_strategy in {"semantic", "semantic_ann", "semantic_lexical"}:
-            normalized_strategy = "semantic"
+            normalized_strategy = "approximate"
+            if cache_strategy == "semantic_ann":
+                approximate_hit_mode = "approximate_dense"
+            elif cache_strategy == "semantic_lexical":
+                approximate_hit_mode = "approximate_sparse"
 
         if cache_metadata:
             with self._lock:
@@ -522,10 +547,24 @@ class RequestTrace:
                 metrics_registry.increment("cache_exact_hit_total")
                 with self._lock:
                     self.cache_exact_hits += 1
-            elif normalized_strategy == "semantic":
+            elif normalized_strategy == "approximate":
                 metrics_registry.increment("cache_semantic_hit_total")
+                metrics_registry.increment("cache_approximate_hit_total")
                 with self._lock:
                     self.cache_semantic_hits += 1
+                    self.cache_approximate_hits += 1
+                if approximate_hit_mode == "approximate_dense":
+                    metrics_registry.increment("cache_approximate_dense_hit_total")
+                    with self._lock:
+                        self.cache_approximate_dense_hits += 1
+                elif approximate_hit_mode == "approximate_sparse":
+                    metrics_registry.increment("cache_approximate_sparse_hit_total")
+                    with self._lock:
+                        self.cache_approximate_sparse_hits += 1
+                elif approximate_hit_mode == "approximate_hybrid":
+                    metrics_registry.increment("cache_approximate_hybrid_hit_total")
+                    with self._lock:
+                        self.cache_approximate_hybrid_hits += 1
         else:
             metrics_registry.increment("cache_miss_total")
             with self._lock:
@@ -814,12 +853,16 @@ class RequestTrace:
                 "completed_tasks": self.completed_tasks,
                 "skipped_tasks": self.skipped_tasks,
                 "failed_tasks": self.failed_tasks,
-            "cache_hits": self.cache_hits,
-            "cache_exact_hits": self.cache_exact_hits,
-            "cache_semantic_hits": self.cache_semantic_hits,
-            "cache_misses": self.cache_misses,
-            "last_search_cache_details": _clone_dict(self.last_search_cache_details),
-            "prompt_tokens": self.prompt_tokens,
+                "cache_hits": self.cache_hits,
+                "cache_exact_hits": self.cache_exact_hits,
+                "cache_semantic_hits": self.cache_semantic_hits,
+                "cache_approximate_hits": self.cache_approximate_hits,
+                "cache_approximate_dense_hits": self.cache_approximate_dense_hits,
+                "cache_approximate_sparse_hits": self.cache_approximate_sparse_hits,
+                "cache_approximate_hybrid_hits": self.cache_approximate_hybrid_hits,
+                "cache_misses": self.cache_misses,
+                "last_search_cache_details": _clone_dict(self.last_search_cache_details),
+                "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "total_tokens": self.total_tokens,
                 "token_source": token_source,

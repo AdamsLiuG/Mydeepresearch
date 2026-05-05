@@ -1147,6 +1147,7 @@ class SearchCacheTests(unittest.TestCase):
                 "semantic_cache_enabled": True,
                 "semantic_cache_embedding_model": "dummy-minilm",
                 "semantic_cache_similarity_threshold": 0.90,
+                "approximate_cache_sparse_threshold": 0.95,
             },
             load_env_file=False,
         )
@@ -1161,11 +1162,65 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(DummySearchTool.call_count, 1)
         self.assertFalse(first[4])
         self.assertTrue(second[4])
-        self.assertEqual(second[5], "semantic_ann")
+        self.assertEqual(second[5], "approximate_dense")
         self.assertEqual(observer.snapshot()["cache_hits"], 1)
         self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
         self.assertEqual(observer.snapshot()["cache_misses"], 1)
-        self.assertEqual(observer.snapshot()["last_search_cache_details"]["cache_hit_mode"], "semantic_ann")
+        self.assertEqual(
+            observer.snapshot()["last_search_cache_details"]["cache_hit_mode"],
+            "approximate_dense",
+        )
+
+    def test_dispatch_search_reports_hybrid_approximate_cache_details(self):
+        DummySentenceTransformer.embeddings = {
+            "llm cache architecture": [1.0, 0.0, 0.0],
+            "llm cache architecture design": [1.0, 0.0, 0.0],
+        }
+        observer = RequestTrace(
+            request_id="req-approximate-hybrid-cache",
+            topic="approximate cache test",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "approximate_cache_enabled": True,
+                "approximate_cache_dense_threshold": 0.90,
+                "approximate_cache_sparse_threshold": 0.30,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+
+        first = services_search.dispatch_search("llm cache architecture", config, 0, observer=observer)
+        second = services_search.dispatch_search(
+            "llm cache architecture design",
+            config,
+            1,
+            observer=observer,
+        )
+
+        self.assertEqual(DummySearchTool.call_count, 1)
+        self.assertFalse(first[4])
+        self.assertTrue(second[4])
+        self.assertEqual(second[5], "approximate_hybrid")
+        snapshot = observer.snapshot()
+        self.assertEqual(snapshot["cache_approximate_hits"], 1)
+        self.assertEqual(snapshot["cache_approximate_hybrid_hits"], 1)
+        self.assertEqual(snapshot["cache_semantic_hits"], 1)
+        cache_details = snapshot["last_search_cache_details"]
+        self.assertEqual(cache_details["cache_hit_mode"], "approximate_hybrid")
+        self.assertGreaterEqual(cache_details["dense_similarity"], 0.90)
+        self.assertGreaterEqual(cache_details["sparse_similarity"], 0.30)
+        self.assertGreaterEqual(cache_details["combined_score"], 1.0)
+        self.assertTrue(cache_details["matched_cache_key"])
 
     def test_dispatch_search_uses_semantic_cache_for_fresh_queries_with_same_topic_context(self):
         DummySentenceTransformer.embeddings = {
@@ -1213,11 +1268,14 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(DummySearchTool.call_count, 1)
         self.assertFalse(first[4])
         self.assertTrue(second[4])
-        self.assertEqual(second[5], "semantic_ann")
+        self.assertEqual(second[5], "approximate_hybrid")
         self.assertEqual(observer.snapshot()["cache_hits"], 1)
         self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
         self.assertEqual(observer.snapshot()["cache_misses"], 1)
-        self.assertEqual(observer.snapshot()["last_search_cache_details"]["cache_hit_mode"], "semantic_ann")
+        self.assertEqual(
+            observer.snapshot()["last_search_cache_details"]["cache_hit_mode"],
+            "approximate_hybrid",
+        )
 
     def test_dispatch_search_skips_semantic_cache_for_fresh_queries(self):
         DummySentenceTransformer.embeddings = {
@@ -1342,10 +1400,80 @@ class SearchCacheTests(unittest.TestCase):
         self.assertFalse(first[4])
         self.assertEqual(first[5], "miss")
         self.assertTrue(second[4])
-        self.assertEqual(second[5], "semantic_lexical")
+        self.assertEqual(second[5], "approximate_sparse")
         self.assertEqual(observer.snapshot()["cache_semantic_hits"], 1)
         metrics_snapshot = metrics_registry.snapshot()
         self.assertEqual(metrics_snapshot["cache_semantic_hit_total"], 1)
+
+    def test_dispatch_search_unions_dense_and_sparse_approximate_candidates(self):
+        DummySentenceTransformer.embeddings = {
+            "graph neural network compiler systems": [0.98, 0.20, 0.0],
+            "llm inference latency optimization throughput": [0.0, 1.0, 0.0],
+            "llm inference latency optimization guide": [1.0, 0.0, 0.0],
+        }
+        observer = RequestTrace(
+            request_id="req-approximate-union-cache",
+            topic="approximate cache union",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "approximate_cache_enabled": True,
+                "approximate_cache_dense_threshold": 0.99,
+                "approximate_cache_sparse_threshold": 0.35,
+                "approximate_cache_dense_top_k": 1,
+                "approximate_cache_sparse_top_k": 5,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+
+        services_search.dispatch_search("graph neural network compiler systems", config, 0, observer=observer)
+        services_search.dispatch_search(
+            "llm inference latency optimization throughput",
+            config,
+            1,
+            observer=observer,
+        )
+        dense_key = services_search._build_cache_key(
+            "graph neural network compiler systems",
+            "duckduckgo",
+            config,
+        )
+        sparse_key = services_search._build_cache_key(
+            "llm inference latency optimization throughput",
+            "duckduckgo",
+            config,
+        )
+
+        with patch.object(
+            services_search,
+            "_query_vector_candidate_keys",
+            return_value=([dense_key], True),
+        ):
+            third = services_search.dispatch_search(
+                "llm inference latency optimization guide",
+                config,
+                2,
+                observer=observer,
+            )
+
+        self.assertEqual(DummySearchTool.call_count, 2)
+        self.assertTrue(third[4])
+        self.assertEqual(third[5], "approximate_sparse")
+        cache_details = observer.snapshot()["last_search_cache_details"]
+        self.assertEqual(cache_details["cache_hit_mode"], "approximate_sparse")
+        self.assertEqual(cache_details["matched_cache_key"], sparse_key)
+        self.assertLess(cache_details["dense_similarity"], 0.99)
+        self.assertGreaterEqual(cache_details["sparse_similarity"], 0.35)
 
     def test_dispatch_search_ignores_ann_candidates_when_cached_payload_is_missing(self):
         DummySentenceTransformer.embeddings = {

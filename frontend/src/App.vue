@@ -318,13 +318,16 @@
               {{ requestCacheHits }} 命中 / {{ requestCacheMisses }} 未命中
             </strong>
             <span class="metric-hint">
-              请求细分：精确 {{ requestExactCacheHits }} / 语义 {{ requestSemanticCacheHits }}
+              请求细分：精确 {{ requestExactCacheHits }} / 近似 {{ requestApproximateCacheHits }}
+            </span>
+            <span class="metric-hint" v-if="requestApproximateCacheHits">
+              近似模式：Dense {{ requestApproximateDenseHits }} / Sparse {{ requestApproximateSparseHits }} / Hybrid {{ requestApproximateHybridHits }}
             </span>
             <span class="metric-hint">
               全局累计：{{ globalCacheHits }} 命中 / {{ globalCacheMisses }} 未命中
             </span>
             <span class="metric-hint">
-              全局细分：精确 {{ globalExactCacheHits }} / 语义 {{ globalSemanticCacheHits }}
+              全局细分：精确 {{ globalExactCacheHits }} / 近似 {{ globalApproximateCacheHits }}
             </span>
           </div>
           <div class="metric-card">
@@ -941,8 +944,18 @@ const requestCacheHits = computed(() =>
 const requestExactCacheHits = computed(() =>
   getNumber(latestRequestMetrics.value?.cache_exact_hits)
 );
-const requestSemanticCacheHits = computed(() =>
-  getNumber(latestRequestMetrics.value?.cache_semantic_hits)
+const requestApproximateCacheHits = computed(() => {
+  const direct = getNumber(latestRequestMetrics.value?.cache_approximate_hits);
+  return direct || getNumber(latestRequestMetrics.value?.cache_semantic_hits);
+});
+const requestApproximateDenseHits = computed(() =>
+  getNumber(latestRequestMetrics.value?.cache_approximate_dense_hits)
+);
+const requestApproximateSparseHits = computed(() =>
+  getNumber(latestRequestMetrics.value?.cache_approximate_sparse_hits)
+);
+const requestApproximateHybridHits = computed(() =>
+  getNumber(latestRequestMetrics.value?.cache_approximate_hybrid_hits)
 );
 const requestCacheMisses = computed(() =>
   getNumber(latestRequestMetrics.value?.cache_misses)
@@ -974,10 +987,20 @@ const globalExactCacheHits = computed(() => {
     ensureRecord(latestAggregateMetrics.value?.counters).cache_exact_hit_total
   );
 });
-const globalSemanticCacheHits = computed(() => {
-  const direct = getNumber(latestAggregateMetrics.value?.cache_semantic_hit_total);
+const globalApproximateCacheHits = computed(() => {
+  const direct = getNumber(latestAggregateMetrics.value?.cache_approximate_hit_total);
   if (direct) {
     return direct;
+  }
+  const counterDirect = getNumber(
+    ensureRecord(latestAggregateMetrics.value?.counters).cache_approximate_hit_total
+  );
+  if (counterDirect) {
+    return counterDirect;
+  }
+  const semanticDirect = getNumber(latestAggregateMetrics.value?.cache_semantic_hit_total);
+  if (semanticDirect) {
+    return semanticDirect;
   }
   return getNumber(
     ensureRecord(latestAggregateMetrics.value?.counters).cache_semantic_hit_total

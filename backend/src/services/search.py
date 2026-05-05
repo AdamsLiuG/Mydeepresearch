@@ -221,6 +221,18 @@ class SearchCacheEntry:
 
 
 @dataclass
+class ApproximateCacheMatchResult:
+    entry: SearchCacheEntry | None = None
+    matched_key: str | None = None
+    dense_similarity: float = 0.0
+    sparse_similarity: float = 0.0
+    dense_score: float = 0.0
+    sparse_score: float = 0.0
+    combined_score: float = 0.0
+    hit_mode: str = "miss"
+
+
+@dataclass
 class AdvancedBackendOutcome:
     backend_order: int
     requested_backend: str
@@ -301,15 +313,15 @@ def _normalize_cache_context(cache_context: dict[str, Any] | None) -> dict[str, 
 
 
 def _build_topic_scope(cache_context: dict[str, str] | None) -> str:
-    """Return the normalized topic scope used to isolate semantic cache reuse."""
+    """Return the normalized topic scope used to isolate approximate cache reuse."""
 
     if not cache_context:
         return ""
     return _normalize_query(cache_context.get("research_topic") or "")
 
 
-def _build_semantic_text(query: str, cache_context: dict[str, str] | None) -> str:
-    """Return the normalized text used for semantic and lexical cache matching."""
+def _build_approximate_text(query: str, cache_context: dict[str, str] | None) -> str:
+    """Return the normalized text used for dense and sparse approximate cache matching."""
 
     parts = [
         cache_context.get("research_topic", "") if cache_context else "",
@@ -319,6 +331,12 @@ def _build_semantic_text(query: str, cache_context: dict[str, str] | None) -> st
     ]
     combined = " ".join(part.strip() for part in parts if part and str(part).strip())
     return _normalize_query(combined)
+
+
+def _build_semantic_text(query: str, cache_context: dict[str, str] | None) -> str:
+    """Backward-compatible name for persisted semantic_text cache records."""
+
+    return _build_approximate_text(query, cache_context)
 
 
 def _ascii_word_tokens(text: str) -> set[str]:
@@ -336,7 +354,7 @@ def classify_search_query_bucket(query: str, cache_context: dict[str, Any] | Non
     """Classify a query into `fresh`, `normal`, or `evergreen` cache TTL buckets."""
 
     normalized_context = _normalize_cache_context(cache_context)
-    normalized_text = (_build_semantic_text(query, normalized_context) or _normalize_query(query)).casefold()
+    normalized_text = (_build_approximate_text(query, normalized_context) or _normalize_query(query)).casefold()
     if not normalized_text:
         return "normal"
 
@@ -559,7 +577,7 @@ def _get_vector_cache_collection(config: Configuration) -> Any | None:
 
     if chromadb is None:
         _emit_vector_warning_once(
-            "chromadb is not installed; semantic cache will fall back to lexical scope scans"
+            "chromadb is not installed; approximate cache dense recall will fall back to sparse scope scans"
         )
         return None
 
@@ -583,7 +601,7 @@ def _get_vector_cache_collection(config: Configuration) -> Any | None:
             _VECTOR_CACHE_COLLECTION = None
             _VECTOR_CACHE_DIR = None
             _emit_vector_warning_once(
-                "Failed to initialize semantic cache vector index; falling back to lexical scope scans error=%s",
+                "Failed to initialize approximate cache vector index; falling back to sparse scope scans error=%s",
                 exc,
             )
             return None
@@ -625,7 +643,7 @@ def _delete_vector_cache_key(config: Configuration, key: str) -> None:
     try:
         collection.delete(ids=[key])
     except Exception:  # pragma: no cover - depends on local runtime
-        logger.debug("failed to delete semantic cache vector record key=%s", key)
+        logger.debug("failed to delete approximate cache vector record key=%s", key)
 
 
 def _remove_scope_key(config: Configuration, scope_key: str, key: str) -> None:
@@ -705,13 +723,19 @@ def _vector_metadata_for_entry(key: str, entry: SearchCacheEntry, scope_key: str
     }
 
 
-def _semantic_cache_reuse_allowed(ttl_bucket: str, *, topic_scope: str = "") -> bool:
-    """Return whether a TTL bucket may participate in semantic cache reuse."""
+def _approximate_cache_reuse_allowed(ttl_bucket: str, *, topic_scope: str = "") -> bool:
+    """Return whether a TTL bucket may participate in approximate cache reuse."""
 
     normalized_bucket = str(ttl_bucket or "normal").strip().casefold()
     if normalized_bucket != "fresh":
         return True
     return bool(_normalize_query(topic_scope))
+
+
+def _semantic_cache_reuse_allowed(ttl_bucket: str, *, topic_scope: str = "") -> bool:
+    """Backward-compatible alias for approximate cache reuse checks."""
+
+    return _approximate_cache_reuse_allowed(ttl_bucket, topic_scope=topic_scope)
 
 
 def _upsert_vector_cache_entry(
@@ -721,9 +745,13 @@ def _upsert_vector_cache_entry(
     *,
     scope_key: str,
 ) -> None:
-    if entry.embedding is None or not _semantic_cache_reuse_allowed(
-        entry.ttl_bucket,
-        topic_scope=entry.topic_scope,
+    if (
+        entry.embedding is None
+        or not config.resolved_approximate_cache_dense_enabled()
+        or not _approximate_cache_reuse_allowed(
+            entry.ttl_bucket,
+            topic_scope=entry.topic_scope,
+        )
     ):
         return
 
@@ -739,7 +767,7 @@ def _upsert_vector_cache_entry(
             embeddings=[entry.embedding],
         )
     except Exception as exc:  # pragma: no cover - depends on local runtime
-        logger.warning("failed to upsert semantic cache vector key=%s error=%s", key, exc)
+        logger.warning("failed to upsert approximate cache vector key=%s error=%s", key, exc)
 
 
 def _query_vector_candidate_keys(
@@ -761,7 +789,7 @@ def _query_vector_candidate_keys(
             include=["metadatas", "distances"],
         )
     except Exception as exc:  # pragma: no cover - depends on local runtime
-        logger.warning("semantic cache ANN query failed scope=%s error=%s", scope_key, exc)
+        logger.warning("approximate cache ANN query failed scope=%s error=%s", scope_key, exc)
         return [], False
 
     raw_ids = payload.get("ids") or [[]]
@@ -798,7 +826,7 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
         with _CACHE_LOCK:
             _MEMORY_CACHE[key] = entry.clone()
 
-    if _semantic_cache_reuse_allowed(entry.ttl_bucket, topic_scope=entry.topic_scope):
+    if _approximate_cache_reuse_allowed(entry.ttl_bucket, topic_scope=entry.topic_scope):
         scope_keys = _get_scope_keys(config, scope_key)
         if key not in scope_keys:
             scope_keys.append(key)
@@ -816,12 +844,12 @@ def _load_embedding_model(config: Configuration) -> Any | None:
     global _EMBEDDING_MODEL_NAME
     global _EMBEDDING_WARNING_EMITTED
 
-    if not config.semantic_cache_enabled:
+    if not config.resolved_approximate_cache_enabled() or not config.resolved_approximate_cache_dense_enabled():
         return None
 
     if not embeddings_available():
         _emit_embedding_warning_once(
-            "sentence-transformers is not installed; semantic cache will fall back to exact-match persistence"
+            "sentence-transformers is not installed; approximate cache will use sparse matching only"
         )
         return None
 
@@ -831,7 +859,7 @@ def _load_embedding_model(config: Configuration) -> Any | None:
     except Exception as exc:  # pragma: no cover - depends on local runtime state
         _EMBEDDING_MODEL_NAME = model_name
         _emit_embedding_warning_once(
-            "Failed to load semantic cache embedding model=%s; falling back to exact-match persistence error=%s",
+            "Failed to load approximate cache embedding model=%s; using sparse matching only error=%s",
             model_name,
             exc,
         )
@@ -840,14 +868,14 @@ def _load_embedding_model(config: Configuration) -> Any | None:
     if model is None:
         return None
     if _EMBEDDING_MODEL_NAME != model_name:
-        logger.info("Loaded semantic cache embedding model=%s", model_name)
+        logger.info("Loaded approximate cache embedding model=%s", model_name)
     _EMBEDDING_MODEL_NAME = model_name
     _EMBEDDING_WARNING_EMITTED = False
     return model
 
 
 def _embed_query(query: str, config: Configuration) -> list[float] | None:
-    """Return the query embedding, or None if semantic cache is unavailable."""
+    """Return the query embedding, or None if dense approximate cache is unavailable."""
 
     if _load_embedding_model(config) is None:
         return None
@@ -860,7 +888,7 @@ def _embed_query(query: str, config: Configuration) -> list[float] | None:
         )
     except Exception as exc:  # pragma: no cover - depends on local runtime state
         _emit_embedding_warning_once(
-            "Failed to encode semantic cache query; falling back to exact-match persistence error=%s",
+            "Failed to encode approximate cache query; using sparse matching only error=%s",
             exc,
         )
         return None
@@ -881,46 +909,122 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _score_semantic_entry(
+def _score_approximate_entry(
     entry: SearchCacheEntry,
     *,
     query_embedding: list[float] | None,
-    semantic_text: str,
+    approximate_text: str,
     config: Configuration,
-) -> tuple[float, float, float]:
-    similarity = (
+) -> ApproximateCacheMatchResult:
+    dense_similarity = (
         _cosine_similarity(query_embedding, entry.embedding)
-        if query_embedding is not None and entry.embedding is not None
+        if (
+            config.resolved_approximate_cache_dense_enabled()
+            and query_embedding is not None
+            and entry.embedding is not None
+        )
         else -1.0
     )
-    lexical_similarity = _lexical_similarity(
-        semantic_text,
-        entry.semantic_text or entry.normalized_query,
+    sparse_similarity = (
+        _lexical_similarity(
+            approximate_text,
+            entry.semantic_text or entry.normalized_query,
+        )
+        if config.resolved_approximate_cache_sparse_enabled()
+        else -1.0
     )
 
-    semantic_threshold = max(config.semantic_cache_similarity_threshold, 1e-9)
-    lexical_threshold = max(config.semantic_cache_lexical_threshold, 1e-9)
-    semantic_score = (similarity / semantic_threshold) if similarity >= 0.0 else 0.0
-    lexical_score = (lexical_similarity / lexical_threshold) if lexical_similarity >= 0.0 else 0.0
-    return max(semantic_score, lexical_score), similarity, lexical_similarity
+    dense_threshold = max(config.resolved_approximate_cache_dense_threshold(), 1e-9)
+    sparse_threshold = max(config.resolved_approximate_cache_sparse_threshold(), 1e-9)
+    dense_score = (dense_similarity / dense_threshold) if dense_similarity >= 0.0 else 0.0
+    sparse_score = (sparse_similarity / sparse_threshold) if sparse_similarity >= 0.0 else 0.0
+    dense_pass = dense_similarity >= dense_threshold
+    sparse_pass = sparse_similarity >= sparse_threshold
+
+    hit_mode = "miss"
+    if dense_pass and sparse_pass:
+        hit_mode = "approximate_hybrid"
+    elif dense_pass:
+        hit_mode = "approximate_dense"
+    elif sparse_pass:
+        hit_mode = "approximate_sparse"
+
+    combined_score = max(dense_score, sparse_score)
+    if dense_pass and sparse_pass:
+        combined_score += 0.1 * min(dense_score, sparse_score)
+
+    return ApproximateCacheMatchResult(
+        dense_similarity=max(dense_similarity, 0.0),
+        sparse_similarity=max(sparse_similarity, 0.0),
+        dense_score=dense_score,
+        sparse_score=sparse_score,
+        combined_score=combined_score,
+        hit_mode=hit_mode,
+    )
 
 
-def _select_best_semantic_match(
+def _select_best_approximate_match(
     candidate_keys: list[str],
     *,
     query_embedding: list[float] | None,
-    semantic_text: str,
+    approximate_text: str,
     config: Configuration,
     scope_key: str,
     update_scope_index: bool,
-) -> tuple[SearchCacheEntry | None, str | None, float, float]:
-    best_entry: SearchCacheEntry | None = None
-    best_key: str | None = None
-    best_similarity = -1.0
-    best_lexical_similarity = -1.0
-    best_score = 0.0
+) -> ApproximateCacheMatchResult:
+    best_match = ApproximateCacheMatchResult()
     live_keys: list[str] = []
+    seen_keys: set[str] = set()
 
+    for candidate_key in candidate_keys:
+        if candidate_key in seen_keys:
+            continue
+        seen_keys.add(candidate_key)
+        entry = _read_exact_cache(candidate_key, config)
+        if entry is None:
+            _delete_cache_entry(candidate_key, config, scope_key=scope_key)
+            continue
+
+        live_keys.append(candidate_key)
+        match = _score_approximate_entry(
+            entry,
+            query_embedding=query_embedding,
+            approximate_text=approximate_text,
+            config=config,
+        )
+        if match.combined_score > best_match.combined_score or (
+            math.isclose(match.combined_score, best_match.combined_score)
+            and (match.dense_similarity, match.sparse_similarity)
+            > (best_match.dense_similarity, best_match.sparse_similarity)
+        ):
+            match.entry = entry
+            match.matched_key = candidate_key
+            best_match = match
+
+    if update_scope_index and live_keys != candidate_keys:
+        _set_scope_keys(config, scope_key, live_keys)
+
+    if best_match.entry and best_match.hit_mode != "miss" and best_match.combined_score >= 1.0:
+        return best_match
+    best_match.entry = None
+    best_match.matched_key = None
+    best_match.hit_mode = "miss"
+    return best_match
+
+
+def _query_sparse_candidate_keys(
+    approximate_text: str,
+    *,
+    scope_key: str,
+    config: Configuration,
+    limit: int,
+) -> list[str]:
+    candidate_keys = _get_scope_keys(config, scope_key)
+    if not candidate_keys:
+        return []
+
+    ranked_keys: list[tuple[float, str]] = []
+    live_keys: list[str] = []
     for candidate_key in candidate_keys:
         entry = _read_exact_cache(candidate_key, config)
         if entry is None:
@@ -928,95 +1032,87 @@ def _select_best_semantic_match(
             continue
 
         live_keys.append(candidate_key)
-        combined_score, similarity, lexical_similarity = _score_semantic_entry(
-            entry,
-            query_embedding=query_embedding,
-            semantic_text=semantic_text,
-            config=config,
+        sparse_similarity = _lexical_similarity(
+            approximate_text,
+            entry.semantic_text or entry.normalized_query,
         )
-        if combined_score > best_score or (
-            math.isclose(combined_score, best_score)
-            and (similarity, lexical_similarity) > (best_similarity, best_lexical_similarity)
-        ):
-            best_score = combined_score
-            best_similarity = similarity
-            best_lexical_similarity = lexical_similarity
-            best_entry = entry
-            best_key = candidate_key
+        if sparse_similarity >= 0.0:
+            ranked_keys.append((sparse_similarity, candidate_key))
 
-    if update_scope_index and live_keys != candidate_keys:
+    if live_keys != candidate_keys:
         _set_scope_keys(config, scope_key, live_keys)
 
-    if best_entry and best_score >= 1.0:
-        return (
-            best_entry,
-            best_key,
-            max(best_similarity, 0.0),
-            max(best_lexical_similarity, 0.0),
-        )
-    return None, None, max(best_similarity, 0.0), max(best_lexical_similarity, 0.0)
+    ranked_keys.sort(key=lambda item: item[0], reverse=True)
+    return [candidate_key for _, candidate_key in ranked_keys[: max(int(limit or 1), 1)]]
 
 
-def _read_semantic_cache_legacy(
+def _merge_candidate_keys(*candidate_groups: list[str]) -> list[str]:
+    candidate_keys: list[str] = []
+    seen: set[str] = set()
+    for group in candidate_groups:
+        for candidate_key in group:
+            if not candidate_key or candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            candidate_keys.append(candidate_key)
+    return candidate_keys
+
+
+def _read_approximate_cache(
     query_embedding: list[float] | None,
-    semantic_text: str,
+    approximate_text: str,
     search_api: str,
     config: Configuration,
     *,
     topic_scope: str = "",
-) -> tuple[SearchCacheEntry | None, str | None, float, float]:
+) -> ApproximateCacheMatchResult:
+    """Read the best approximate cache match using dense and sparse candidate union."""
+
+    if (
+        (query_embedding is None and not approximate_text)
+        or not (
+            config.resolved_approximate_cache_dense_enabled()
+            or config.resolved_approximate_cache_sparse_enabled()
+        )
+    ):
+        return ApproximateCacheMatchResult()
+
     scope_key = _build_scope_key(
         search_api,
         _resolved_search_fetch_full_page(search_api, config),
         config.resolved_search_cache_signature(search_api),
         topic_scope,
     )
-    candidate_keys = _get_scope_keys(config, scope_key)
+    dense_candidate_keys: list[str] = []
+    if query_embedding is not None and config.resolved_approximate_cache_dense_enabled():
+        dense_candidate_keys, _ = _query_vector_candidate_keys(
+            query_embedding,
+            scope_key=scope_key,
+            config=config,
+            n_results=config.resolved_approximate_cache_dense_top_k(),
+        )
+
+    sparse_candidate_keys: list[str] = []
+    if approximate_text and config.resolved_approximate_cache_sparse_enabled():
+        sparse_candidate_keys = _query_sparse_candidate_keys(
+            approximate_text,
+            scope_key=scope_key,
+            config=config,
+            limit=config.resolved_approximate_cache_sparse_top_k(),
+        )
+
+    candidate_keys = _merge_candidate_keys(dense_candidate_keys, sparse_candidate_keys)
     if not candidate_keys:
-        return None, None, 0.0, 0.0
+        return ApproximateCacheMatchResult()
 
-    return _select_best_semantic_match(
+    return _select_best_approximate_match(
         candidate_keys,
         query_embedding=query_embedding,
-        semantic_text=semantic_text,
-        config=config,
-        scope_key=scope_key,
-        update_scope_index=True,
-    )
-
-
-def _read_semantic_cache_ann(
-    query_embedding: list[float],
-    semantic_text: str,
-    search_api: str,
-    config: Configuration,
-    *,
-    topic_scope: str = "",
-) -> tuple[SearchCacheEntry | None, str | None, float, float, list[str], bool]:
-    scope_key = _build_scope_key(
-        search_api,
-        _resolved_search_fetch_full_page(search_api, config),
-        config.resolved_search_cache_signature(search_api),
-        topic_scope,
-    )
-    candidate_keys, ann_available = _query_vector_candidate_keys(
-        query_embedding,
-        scope_key=scope_key,
-        config=config,
-        n_results=12,
-    )
-    if not ann_available or not candidate_keys:
-        return None, None, 0.0, 0.0, candidate_keys, ann_available
-
-    entry, matched_key, similarity, lexical_similarity = _select_best_semantic_match(
-        candidate_keys,
-        query_embedding=query_embedding,
-        semantic_text=semantic_text,
+        approximate_text=approximate_text,
         config=config,
         scope_key=scope_key,
         update_scope_index=False,
     )
-    return entry, matched_key, similarity, lexical_similarity, candidate_keys, ann_available
 
 
 def _read_semantic_cache(
@@ -1027,51 +1123,22 @@ def _read_semantic_cache(
     *,
     topic_scope: str = "",
 ) -> tuple[SearchCacheEntry | None, str | None, float, float, str]:
-    """Read the best semantic cache match for a query."""
+    """Backward-compatible wrapper around approximate cache matching."""
 
-    if query_embedding is None and not semantic_text:
-        return None, None, 0.0, 0.0, "miss"
-
-    scope_key = _build_scope_key(
-        search_api,
-        _resolved_search_fetch_full_page(search_api, config),
-        config.resolved_search_cache_signature(search_api),
-        topic_scope,
-    )
-    if query_embedding is not None:
-        (
-            ann_entry,
-            ann_key,
-            ann_similarity,
-            ann_lexical_similarity,
-            ann_candidate_keys,
-            ann_available,
-        ) = _read_semantic_cache_ann(
-            query_embedding,
-            semantic_text,
-            search_api,
-            config,
-            topic_scope=topic_scope,
-        )
-        if ann_entry is not None:
-            return ann_entry, ann_key, ann_similarity, ann_lexical_similarity, "semantic_ann"
-
-        if ann_available and ann_candidate_keys:
-            return None, None, ann_similarity, ann_lexical_similarity, "miss"
-
-        if ann_available and not _get_scope_keys(config, scope_key):
-            return None, None, 0.0, 0.0, "miss"
-
-    legacy_entry, legacy_key, similarity, lexical_similarity = _read_semantic_cache_legacy(
+    match = _read_approximate_cache(
         query_embedding,
         semantic_text,
         search_api,
         config,
         topic_scope=topic_scope,
     )
-    if legacy_entry is not None:
-        return legacy_entry, legacy_key, similarity, lexical_similarity, "semantic_lexical"
-    return None, None, similarity, lexical_similarity, "miss"
+    return (
+        match.entry,
+        match.matched_key,
+        match.dense_similarity,
+        match.sparse_similarity,
+        match.hit_mode,
+    )
 
 
 def _normalize_search_payload(
@@ -2118,6 +2185,11 @@ def _build_cache_observer_metadata(
     query_ttl_seconds: int,
     matched_cache_key: str | None = None,
     entry: SearchCacheEntry | None = None,
+    dense_similarity: float | None = None,
+    sparse_similarity: float | None = None,
+    dense_score: float | None = None,
+    sparse_score: float | None = None,
+    combined_score: float | None = None,
 ) -> dict[str, Any]:
     expires_at = None
     ttl_bucket = query_ttl_bucket
@@ -2127,13 +2199,24 @@ def _build_cache_observer_metadata(
         ttl_seconds = max(int(entry.ttl_seconds or ttl_seconds or 0), 0)
         expires_at = entry.resolved_expires_at(fallback_ttl_seconds=ttl_seconds) or None
 
-    return {
+    metadata = {
         "cache_hit_mode": cache_hit_mode,
         "ttl_bucket": ttl_bucket,
         "ttl_seconds": ttl_seconds,
         "expires_at": expires_at,
         "matched_cache_key": matched_cache_key,
     }
+    if dense_similarity is not None:
+        metadata["dense_similarity"] = dense_similarity
+    if sparse_similarity is not None:
+        metadata["sparse_similarity"] = sparse_similarity
+    if dense_score is not None:
+        metadata["dense_score"] = dense_score
+    if sparse_score is not None:
+        metadata["sparse_score"] = sparse_score
+    if combined_score is not None:
+        metadata["combined_score"] = combined_score
+    return metadata
 
 
 def dispatch_search(
@@ -2152,9 +2235,9 @@ def dispatch_search(
     cache_key = _build_cache_key(query, search_api, config)
     normalized_cache_context = _normalize_cache_context(cache_context)
     topic_scope = _build_topic_scope(normalized_cache_context)
-    semantic_text = _build_semantic_text(query, normalized_cache_context)
+    approximate_text = _build_approximate_text(query, normalized_cache_context)
     ttl_bucket, ttl_seconds = _resolve_cache_ttl(query, normalized_cache_context, config)
-    semantic_embedding: list[float] | None = None
+    approximate_embedding: list[float] | None = None
     if config.search_cache_enabled:
         exact_cached = _read_exact_cache(cache_key, config)
         if exact_cached:
@@ -2187,55 +2270,62 @@ def dispatch_search(
                 "exact",
             )
 
-        semantic_cache_allowed = config.semantic_cache_enabled and _semantic_cache_reuse_allowed(
+        approximate_cache_allowed = config.resolved_approximate_cache_enabled() and _approximate_cache_reuse_allowed(
             ttl_bucket,
             topic_scope=topic_scope,
         )
-        if semantic_cache_allowed:
-            semantic_embedding = _embed_query(semantic_text or query, config)
-            semantic_cached, matched_cache_key, similarity, lexical_similarity, cache_hit_mode = _read_semantic_cache(
-                semantic_embedding,
-                semantic_text,
+        if approximate_cache_allowed:
+            if config.resolved_approximate_cache_dense_enabled():
+                approximate_embedding = _embed_query(approximate_text or query, config)
+            approximate_match = _read_approximate_cache(
+                approximate_embedding,
+                approximate_text,
                 search_api,
                 config,
                 topic_scope=topic_scope,
             )
-            if semantic_cached:
+            if approximate_match.entry:
                 if observer:
                     observer.record_search_attempt(
                         cache_hit=True,
                         success=True,
-                        cache_strategy=cache_hit_mode,
+                        cache_strategy=approximate_match.hit_mode,
                         cache_metadata=_build_cache_observer_metadata(
-                            cache_hit_mode=cache_hit_mode,
+                            cache_hit_mode=approximate_match.hit_mode,
                             query_ttl_bucket=ttl_bucket,
                             query_ttl_seconds=ttl_seconds,
-                            matched_cache_key=matched_cache_key,
-                            entry=semantic_cached,
+                            matched_cache_key=approximate_match.matched_key,
+                            entry=approximate_match.entry,
+                            dense_similarity=approximate_match.dense_similarity,
+                            sparse_similarity=approximate_match.sparse_similarity,
+                            dense_score=approximate_match.dense_score,
+                            sparse_score=approximate_match.sparse_score,
+                            combined_score=approximate_match.combined_score,
                         ),
                     )
                 logger.info(
-                    "Search semantic cache hit: backend=%s query=%s matched_query=%s similarity=%.4f lexical_similarity=%.4f topic_scope=%s mode=%s ttl_bucket=%s",
+                    "Search approximate cache hit: backend=%s query=%s matched_query=%s dense_similarity=%.4f sparse_similarity=%.4f combined_score=%.4f topic_scope=%s mode=%s ttl_bucket=%s",
                     search_api,
                     query,
-                    semantic_cached.query,
-                    similarity,
-                    lexical_similarity,
+                    approximate_match.entry.query,
+                    approximate_match.dense_similarity,
+                    approximate_match.sparse_similarity,
+                    approximate_match.combined_score,
                     topic_scope or "<global>",
-                    cache_hit_mode,
-                    semantic_cached.ttl_bucket or ttl_bucket,
+                    approximate_match.hit_mode,
+                    approximate_match.entry.ttl_bucket or ttl_bucket,
                 )
                 return (
-                    semantic_cached.payload,
-                    semantic_cached.notices,
-                    semantic_cached.answer_text,
-                    semantic_cached.backend_label,
+                    approximate_match.entry.payload,
+                    approximate_match.entry.notices,
+                    approximate_match.entry.answer_text,
+                    approximate_match.entry.backend_label,
                     True,
-                    cache_hit_mode,
+                    approximate_match.hit_mode,
                 )
-        elif config.semantic_cache_enabled:
+        elif config.resolved_approximate_cache_enabled():
             logger.info(
-                "Search semantic cache skipped: backend=%s query=%s ttl_bucket=%s topic_scope=%s",
+                "Search approximate cache skipped: backend=%s query=%s ttl_bucket=%s topic_scope=%s",
                 search_api,
                 query,
                 ttl_bucket,
@@ -2304,7 +2394,7 @@ def dispatch_search(
         cache_entry = SearchCacheEntry(
             query=query.strip(),
             normalized_query=_normalize_query(query),
-            semantic_text=semantic_text,
+            semantic_text=approximate_text,
             topic_scope=topic_scope,
             search_api=search_api,
             fetch_full_page=effective_fetch_full_page,
@@ -2317,7 +2407,7 @@ def dispatch_search(
             ttl_bucket=ttl_bucket,
             ttl_seconds=ttl_seconds,
             expires_at=created_at + ttl_seconds,
-            embedding=semantic_embedding,
+            embedding=approximate_embedding,
         )
         _write_cache(cache_key, cache_entry, config)
 

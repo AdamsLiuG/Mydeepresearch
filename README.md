@@ -20,13 +20,29 @@
 | **六阶段编排** | `Planning → Search/ReAct → Summarization → Reflection → Review → Report`，带条件分支和 repair 循环 |
 | **任务级 ReAct 闭环** | 根据 6 维证据信号（来源数、域名覆盖、时效、质量、正文充足度）动态决定补证据动作 |
 | **证据质量评估** | 18 种来源类型分类、来源可信度评分、低质量过滤（navigation page / clickbait / aggregator 检测） |
-| **多层搜索缓存** | exact match + 语义缓存（sentence-transformers + ChromaDB ANN）+ 动态 TTL（fresh/normal/evergreen） |
+| **搜索缓存** | Exact Cache + Approximate Cache（dense ANN + sparse lexical + hybrid scoring）+ 动态 TTL |
 | **降级与容错** | Planner 兜底、搜索 retry + timeout、任务级失败隔离、`partial_success` 状态、report repair loop |
 | **全链路可观测** | `X-Request-ID` + `RequestTrace` + `MetricsRegistry` + SSE 实时事件 + `/metrics/json` |
 | **多搜索后端** | DuckDuckGo / Tavily / SearXNG / Semantic Scholar / 多后端融合（Advanced） |
 | **结构化报告** | JSON 结构化输出 → 引用校验 → Markdown 渲染，支持 fixed / flexible 两种布局模式 |
 | **前端实时展示** | Vue 3 + SSE 消费，实时渲染任务卡片、来源列表、工具调用痕迹和最终报告 |
 | **自建评测** | benchmark loader + heuristic judge + full system validation + perf smoke/regression/load |
+
+## 界面展示
+
+以下截图展示了项目 demo 的主要使用流程：从研究主题输入、历史研究管理，到任务执行过程、来源证据审查、任务总结和最终报告生成。
+
+| 研究入口 | 历史研究 |
+|---|---|
+| <img src="展示样例/示例1.png" alt="研究主题输入与固定演示场景" width="360"> | <img src="展示样例/示例3.png" alt="历史研究列表与再次研究入口" width="360"> |
+
+| 流程总览与指标 | 单任务证据详情 |
+|---|---|
+| <img src="展示样例/示例2.png" alt="研究流程状态、任务规划和运行指标" width="480"> | <img src="展示样例/示例4.png" alt="任务清单、系统提示、审查发现和最新来源" width="480"> |
+
+| 任务总结 | 最终报告 |
+|---|---|
+| <img src="展示样例/示例5.png" alt="任务总结与 Claim 校验结果" width="480"> | <img src="展示样例/示例6.png" alt="最终报告与引用绑定结果" width="480"> |
 
 ## 系统架构
 
@@ -42,7 +58,7 @@
 │  └─ 空结果时自动生成 fallback task                              │
 ├──────────────────────────────────────────────────────────────┤
 │  Stage 2: Task Execution (per task)                         │
-│  ├─ 搜索执行（多后端 + exact/semantic cache）                   │
+│  ├─ 搜索执行（多后端 + exact/approximate cache）                │
 │  ├─ 证据入库（分类 → 评分 → 过滤 → EvidenceStore）              │
 │  ├─ ReAct 闭环（Observe → Decide → Act，最多 N 轮）            │
 │  │   ├─ 动作：rewrite_query / broaden_query / diversify /     │
@@ -241,12 +257,13 @@ curl -X POST http://localhost:8000/research/stream \
 
 ### 搜索与缓存机制
 
-[search.py](backend/src/services/search.py)（2341 行）实现了三层缓存：
+[search.py](backend/src/services/search.py) 实现了 `Exact Cache + Approximate Cache`：
 
-1. **Exact Match**：标准化 query + search_api + fetch_full_page 后的精确匹配，支持 diskcache 持久化
-2. **Semantic Cache**：sentence-transformers 编码 + ChromaDB ANN 向量检索，按 cosine similarity 阈值判定命中
-3. **Lexical Fallback**：当 embedding 不可用时，退化到 Jaccard n-gram 相似度匹配
-4. **Dynamic TTL**：根据 query 的时效性信号（"最新" / "2025" / "overview" / "protocol"）自动分配 fresh/normal/evergreen 三档 TTL
+1. **Exact Cache**：标准化 query + search_api + fetch_full_page + cache signature 完全一致时直接复用，支持 diskcache 持久化
+2. **Approximate Cache**：同 topic scope / 同搜索配置 / 未过期前提下，合并 dense ANN 候选和 sparse lexical 候选，再用 hybrid scoring 决定是否复用
+3. **Dense Signal**：sentence-transformers 编码 + ChromaDB ANN 向量召回，按 dense threshold 判定 embedding 相似命中
+4. **Sparse Signal**：token / n-gram Jaccard 召回，覆盖专有名词、年份、产品名等 lexical 高重合场景
+5. **Dynamic TTL**：根据 query 的时效性信号（"最新" / "2025" / "overview" / "protocol"）自动分配 fresh/normal/evergreen 三档 TTL
 
 ### 报告生成与引用校验
 
@@ -298,9 +315,9 @@ ReAct 闭环不是盲目重试，而是基于 6 维证据信号做受控决策�
 
 不直接把搜索结果丢给 LLM。证据入库前先经过来源类型分类、可信度评分和多种过滤器（导航页检测、clickbait 检测、聚合站检测、重复检测），减少低质量信息对最终报告的干扰。
 
-### 4. 三层搜索缓存 + 动态 TTL
+### 4. Exact + Approximate 搜索缓存 + 动态 TTL
 
-exact match → 语义 ANN → lexical fallback 三层匹配，避免相似 query 的重复搜索。TTL 根据 query 中的时效信号自动分桶（搜"2025最新进展"→ 短 TTL，搜"TCP 协议原理"→ 长 TTL）。
+Exact Cache 处理 query 和配置完全一致的复用；Approximate Cache 将 dense embedding 和 sparse lexical 作为同一层的两种信号，先 union 候选再 hybrid scoring，返回 `approximate_dense` / `approximate_sparse` / `approximate_hybrid`。TTL 根据 query 中的时效信号自动分桶（搜"2025最新进展"→ 短 TTL，搜"TCP 协议原理"→ 长 TTL），fresh 查询仍需明确 topic scope 才允许近似复用。
 
 ### 5. 工程化降级策略
 
@@ -340,7 +357,7 @@ benchmark 定义、批量运行、heuristic judge 评分全部自建，不依赖
 | **LLM** | `LLM_PROVIDER`, `LLM_MODEL_ID`, `LLM_API_KEY`, `LLM_BASE_URL` |
 | **搜索** | `SEARCH_API`, `FETCH_FULL_PAGE`, `SEMANTIC_SCHOLAR_API_KEY` |
 | **Agent 编排** | `MAX_AGENT_TASKS`, `TASK_REACT_ENABLED`, `TASK_REACT_MAX_ROUNDS`, `REQUEST_REFLECTION_ENABLED`, `REVIEW_STAGE_ENABLED`, `REPORT_REPAIR_ENABLED` |
-| **搜索缓存** | `SEARCH_CACHE_ENABLED`, `SEMANTIC_CACHE_ENABLED`, `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` |
+| **搜索缓存** | `SEARCH_CACHE_ENABLED`, `APPROXIMATE_CACHE_ENABLED`, `APPROXIMATE_CACHE_DENSE_THRESHOLD`, `APPROXIMATE_CACHE_SPARSE_THRESHOLD` |
 | **工具守卫** | `SEARCH_TOOL_TIMEOUT_SECONDS`, `SEARCH_TOOL_RETRY_ATTEMPTS` |
 
 ## Benchmark / Perf / CI
