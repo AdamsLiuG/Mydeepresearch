@@ -77,11 +77,45 @@ note_tool_stub.NoteTool = DummyNoteTool
 sys.modules.setdefault("hello_agents.tools.builtin.note_tool", note_tool_stub)
 
 import agent as agent_module
+import task_executor as task_executor_module
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from models import SummaryState, TodoItem
 from services.evidence import EvidenceStore
 from services.reflection import ReflectionAssessment
+
+
+class AgentDecompositionTests(unittest.TestCase):
+    def test_agent_uses_dedicated_orchestration_mixins(self):
+        from repair_orchestrator import RepairOrchestratorMixin
+        from state_manager import StateManagerMixin
+        from stream_coordinator import StreamCoordinatorMixin
+        from task_executor import TaskExecutorMixin
+
+        self.assertTrue(issubclass(agent_module.DeepResearchAgent, StateManagerMixin))
+        self.assertTrue(issubclass(agent_module.DeepResearchAgent, StreamCoordinatorMixin))
+        self.assertTrue(issubclass(agent_module.DeepResearchAgent, RepairOrchestratorMixin))
+        self.assertTrue(issubclass(agent_module.DeepResearchAgent, TaskExecutorMixin))
+
+    def test_task_execution_helpers_live_on_task_executor_mixin(self):
+        from task_executor import TaskExecutorMixin
+
+        expected_helpers = [
+            "_run_with_timeout",
+            "_dispatch_search_with_guardrails",
+            "_normalize_query_candidate",
+            "_task_search_queries",
+            "_observe_task_evidence",
+            "_fallback_task_react_decision",
+            "_plan_task_react_decision",
+            "_search_with_fallback_queries",
+            "_execute_task",
+            "_record_task_failure",
+        ]
+
+        for helper_name in expected_helpers:
+            self.assertIn(helper_name, TaskExecutorMixin.__dict__)
+            self.assertNotIn(helper_name, agent_module.DeepResearchAgent.__dict__)
 
 
 class StubTracker:
@@ -328,7 +362,7 @@ class AgentExecutionTests(unittest.TestCase):
 
         agent._execute_task = fake_execute_task
 
-        with patch.object(agent_module, "dispatch_search", side_effect=fake_dispatch_search) as mock_dispatch:
+        with patch.object(task_executor_module, "dispatch_search", side_effect=fake_dispatch_search) as mock_dispatch:
             result = agent.run(topic)
 
         self.assertEqual(mock_dispatch.call_count, 1)
@@ -464,7 +498,7 @@ class AgentExecutionTests(unittest.TestCase):
         state = SummaryState(research_topic="AI agent")
         task = TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
 
-        with patch.object(agent_module, "dispatch_search", side_effect=RuntimeError("search offline")):
+        with patch.object(task_executor_module, "dispatch_search", side_effect=RuntimeError("search offline")):
             events = list(
                 agent_module.DeepResearchAgent._execute_task(
                     agent,
@@ -500,7 +534,7 @@ class AgentExecutionTests(unittest.TestCase):
         task = TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
 
         with patch.object(
-            agent_module,
+            task_executor_module,
             "dispatch_search",
             return_value=(
                 {
@@ -618,7 +652,7 @@ class AgentExecutionTests(unittest.TestCase):
                 raise outcome
             return outcome
 
-        with patch.object(agent_module, "dispatch_search", side_effect=flaky_dispatch) as mock_dispatch:
+        with patch.object(task_executor_module, "dispatch_search", side_effect=flaky_dispatch) as mock_dispatch:
             events = list(
                 agent_module.DeepResearchAgent._execute_task(
                     agent,
@@ -677,7 +711,7 @@ class AgentExecutionTests(unittest.TestCase):
                 "miss",
             )
 
-        with patch.object(agent_module, "dispatch_search", side_effect=slow_dispatch) as mock_dispatch:
+        with patch.object(task_executor_module, "dispatch_search", side_effect=slow_dispatch) as mock_dispatch:
             events = list(
                 agent_module.DeepResearchAgent._execute_task(
                     agent,
@@ -755,7 +789,7 @@ class AgentExecutionTests(unittest.TestCase):
         task = TodoItem(id=2, title="性能基准对比", intent="评估主流模型能力水平与资源消耗", query="性能基准对比")
 
         with patch.object(
-            agent_module,
+            task_executor_module,
             "dispatch_search",
             side_effect=[
                 ({"results": []}, [], None, "searxng", False, "miss"),
@@ -859,7 +893,7 @@ class AgentExecutionTests(unittest.TestCase):
                 )
             return result
 
-        with patch.object(agent_module, "dispatch_search", side_effect=fake_dispatch_search):
+        with patch.object(task_executor_module, "dispatch_search", side_effect=fake_dispatch_search):
             first_observer = RequestTrace(
                 request_id="req-semantic-first",
                 topic="多模态大模型前沿技术",
@@ -959,7 +993,7 @@ class AgentExecutionTests(unittest.TestCase):
                 "exact",
             )
 
-        with patch.object(agent_module, "dispatch_search", side_effect=fake_dispatch_search) as mock_dispatch:
+        with patch.object(task_executor_module, "dispatch_search", side_effect=fake_dispatch_search) as mock_dispatch:
             agent._execute_task_batch_sync(state, [first_task])
             agent._execute_task_batch_sync(state, [second_task])
 
@@ -992,7 +1026,7 @@ class AgentExecutionTests(unittest.TestCase):
         task = TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
 
         with patch.object(
-            agent_module,
+            task_executor_module,
             "dispatch_search",
             return_value=(
                 {
@@ -1066,7 +1100,7 @@ class AgentExecutionTests(unittest.TestCase):
         task = TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
 
         with patch.object(
-            agent_module,
+            task_executor_module,
             "dispatch_search",
             side_effect=[
                 (

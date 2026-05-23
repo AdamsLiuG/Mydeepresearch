@@ -38,7 +38,19 @@ requires = ["setuptools>=73.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["agent", "config", "main", "metrics", "models", "prompts", "utils"]
+py-modules = [
+    "agent",
+    "config",
+    "main",
+    "metrics",
+    "models",
+    "prompts",
+    "repair_orchestrator",
+    "state_manager",
+    "stream_coordinator",
+    "task_executor",
+    "utils",
+]
 
 [tool.setuptools.package-dir]
 "" = "src"
