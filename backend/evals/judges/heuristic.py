@@ -70,6 +70,48 @@ def _collect_bullet_lines(report_text: str, section_titles: tuple[str, ...]) -> 
     return bullets
 
 
+def _trace_int(trace: Mapping[str, Any], key: str) -> int:
+    try:
+        return max(0, int(trace.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _memory_metrics(trace: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract L1 memory exposure metrics already present in the request trace.
+
+    ``*_prompt_injections`` counts blocks that were *rendered*. Under shadow mode the
+    agent withholds them, so the effective injection count is reported separately to
+    keep "would have injected" distinguishable from "did inject".
+    """
+
+    shadow_mode = bool(trace.get("memory_shadow_mode"))
+    rendered_injections = _trace_int(trace, "note_memory_prompt_injections") + _trace_int(
+        trace,
+        "strategy_memory_prompt_injections",
+    )
+    match_kinds = [
+        str(value).strip()
+        for value in list(trace.get("note_memory_last_match_types") or [])
+        + list(trace.get("strategy_memory_last_match_kinds") or [])
+        if str(value).strip()
+    ]
+
+    return {
+        "memory_query_count": _trace_int(trace, "note_memory_queries")
+        + _trace_int(trace, "strategy_memory_queries"),
+        "memory_hit_count": _trace_int(trace, "note_memory_hits")
+        + _trace_int(trace, "strategy_memory_hits"),
+        "memory_rendered_injection_count": rendered_injections,
+        "memory_effective_injection_count": 0 if shadow_mode else rendered_injections,
+        "note_memory_hit_count": _trace_int(trace, "note_memory_hits"),
+        "strategy_memory_hit_count": _trace_int(trace, "strategy_memory_hits"),
+        "memory_shadow_mode": shadow_mode,
+        "memory_shadow_suppressions": _trace_int(trace, "memory_shadow_suppressions"),
+        "memory_match_kinds": sorted(set(match_kinds)),
+    }
+
+
 class HeuristicJudge(Judge):
     """Deterministic text-based judge for early benchmark iterations."""
 
@@ -156,4 +198,5 @@ class HeuristicJudge(Judge):
             "completed_task_count": sum(
                 1 for item in todo_items if getattr(item, "status", None) == "completed"
             ),
+            **_memory_metrics(trace),
         }

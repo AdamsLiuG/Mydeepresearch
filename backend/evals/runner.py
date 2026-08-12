@@ -126,6 +126,11 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "average_conservativeness_score": 0.0,
             "average_latency_ms": 0.0,
             "total_estimated_cost": 0.0,
+            "average_memory_query_count": 0.0,
+            "average_memory_hit_count": 0.0,
+            "average_memory_effective_injection_count": 0.0,
+            "memory_shadow_cases": 0,
+            "cases_with_memory_injection": 0,
             "error_cases": 0,
             "judge_success_cases": 0,
             "judge_error_cases": 0,
@@ -167,6 +172,12 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         sum(float(result["metrics"].get("estimated_cost") or 0.0) for result in results),
         6,
     )
+    shadow_cases = sum(1 for result in results if result["metrics"].get("memory_shadow_mode"))
+    cases_with_memory_injection = sum(
+        1
+        for result in results
+        if int(result["metrics"].get("memory_effective_injection_count") or 0) > 0
+    )
 
     return {
         "total_cases": total,
@@ -187,6 +198,11 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "average_conservativeness_score": average("conservativeness_score"),
         "average_latency_ms": average("total_latency_ms"),
         "total_estimated_cost": total_estimated_cost,
+        "average_memory_query_count": average("memory_query_count"),
+        "average_memory_hit_count": average("memory_hit_count"),
+        "average_memory_effective_injection_count": average("memory_effective_injection_count"),
+        "memory_shadow_cases": shadow_cases,
+        "cases_with_memory_injection": cases_with_memory_injection,
         "judge_success_cases": judge_success_cases,
         "judge_error_cases": judge_error_cases,
         "judge_skipped_cases": judge_skipped_cases,
@@ -205,6 +221,7 @@ def run_benchmark_suite(
     output_path: str | Path | None = None,
     benchmark_path: str | Path | None = None,
     request_id_prefix: str = "eval",
+    variant: str | None = None,
 ) -> dict[str, Any]:
     """Run a full benchmark suite and optionally write the result file."""
     results = [
@@ -221,6 +238,7 @@ def run_benchmark_suite(
     payload = {
         "generated_at": _utc_now(),
         "benchmark_path": str(benchmark_path) if benchmark_path else None,
+        "variant": variant,
         "summary": build_summary(results),
         "results": results,
     }

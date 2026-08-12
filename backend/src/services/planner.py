@@ -99,6 +99,7 @@ class PlanningService:
         observer: RequestTrace | None = None,
         historical_memory_context: str | None = None,
         strategy_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> List[TodoItem]:
         """Ask the planner agent to break the topic into actionable tasks."""
         prompt = todo_planner_instructions.format(
@@ -107,6 +108,7 @@ class PlanningService:
         )
         prompt += self._historical_memory_block(historical_memory_context)
         prompt += self._strategy_memory_block(strategy_memory_context)
+        prompt += str(skill_pack_context or "")
         response = self._invoke_planner(prompt, observer=observer)
         logger.info("Planner raw output (truncated): %s", response[:500])
 
@@ -165,6 +167,7 @@ class PlanningService:
         max_additional_tasks: int,
         observer: RequestTrace | None = None,
         historical_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> List[TodoItem]:
         """Generate supplemental tasks that cover missing angles without duplicating existing work."""
 
@@ -186,6 +189,7 @@ class PlanningService:
             max_additional_tasks=max_additional_tasks,
         )
         prompt += self._historical_memory_block(historical_memory_context)
+        prompt += str(skill_pack_context or "")
         response = self._invoke_planner(prompt, observer=observer)
         logger.info("Supplemental planner raw output (truncated): %s", response[:500])
 

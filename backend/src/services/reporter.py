@@ -76,9 +76,10 @@ class ReportingService:
         self,
         state: SummaryState,
         observer: RequestTrace | None = None,
+        skill_pack_context: str | None = None,
     ) -> str:
         """Generate a structured report based on completed tasks."""
-        prompt = self._build_prompt(state)
+        prompt = self._build_prompt(state) + str(skill_pack_context or "")
 
         try:
             try:

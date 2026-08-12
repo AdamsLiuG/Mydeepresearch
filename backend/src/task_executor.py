@@ -1413,6 +1413,7 @@ class TaskExecutorMixin:
                     context,
                     observer=observer,
                     historical_memory_context=historical_memory_context,
+                    skill_pack_context=self._skill_stage_context("task_execution"),
                 )
                 try:
                     for event in self._drain_tool_events(state, step=step):
@@ -1473,6 +1474,7 @@ class TaskExecutorMixin:
                             context,
                             observer=observer,
                             historical_memory_context=historical_memory_context,
+                            skill_pack_context=self._skill_stage_context("task_execution"),
                         )
                     )
 

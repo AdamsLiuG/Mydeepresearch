@@ -15,6 +15,7 @@ from typing import Any
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from services.embeddings import embeddings_available, encode_text, encode_texts
+from services.memory_sanitizer import collapse_whitespace, sanitize_injection_text
 from utils import truncate_text
 
 try:  # pragma: no cover - exercised through runtime fallback
@@ -59,7 +60,7 @@ def _checksum_text(value: str) -> str:
 
 
 def _normalize_text(value: Any) -> str:
-    return " ".join(str(value or "").strip().split())
+    return collapse_whitespace(value)
 
 
 def _iter_chunk_windows(text: str, *, size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLAP) -> list[str]:
@@ -944,7 +945,10 @@ class NoteMemoryService:
         remaining -= len(header)
 
         for hit in hits:
-            excerpt = truncate_text(hit.content, max(80, min(remaining, 260)))
+            excerpt = truncate_text(
+                sanitize_injection_text(hit.content),
+                max(80, min(remaining, 260)),
+            )
             topic = hit.resolved_topic or "未知主题"
             item_lines = [
                 f"- 标题：{hit.title}",
@@ -956,7 +960,10 @@ class NoteMemoryService:
             if len(block) > remaining and len(lines) > 1:
                 break
             if len(block) > remaining:
-                excerpt = truncate_text(hit.content, max(40, remaining - 60))
+                excerpt = truncate_text(
+                    sanitize_injection_text(hit.content),
+                    max(40, remaining - 60),
+                )
                 block = "\n".join(
                     [
                         f"- 标题：{hit.title}",

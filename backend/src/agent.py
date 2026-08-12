@@ -45,6 +45,7 @@ from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
 from services.request_state import RequestStateStore
 from services.reviewer import ReviewService
+from services.skill_pack import SkillPackService, SkillSelection
 from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService
@@ -331,6 +332,8 @@ class DeepResearchAgent(
             self.config,
             synthesizer=self._strategy_synthesizer,
         )
+        self._skill_pack = SkillPackService(self.config)
+        self._skill_selection: SkillSelection | None = None
 
         self.note_tool = (
             NoteTool(workspace=self.config.notes_workspace)
@@ -523,6 +526,7 @@ class DeepResearchAgent(
             model=self.config.resolved_model(),
             pricing_catalog=self.config.llm_pricing_json,
         )
+        self._request_trace.memory_shadow_mode = bool(self.config.memory_shadow_mode)
         return self._request_trace
 
     def _request_status(self, state: SummaryState, report: str | None = None) -> str:
@@ -560,15 +564,83 @@ class DeepResearchAgent(
             note_ids.add(str(state.report_note_id or "").strip())
         return note_ids
 
+    def _select_skill_pack(self, topic: str, observer: RequestTrace | None) -> None:
+        """Pick exactly one research skill pack for this request, once, before planning.
+
+        Kept separate from the stage helpers so selection is a single, observable decision:
+        which pack (or neutral fallback) governs the whole request is recorded on the trace,
+        which is what lets eval reports stratify outcomes by pack.
+        """
+
+        self._skill_selection = None
+        if not self._skill_pack.enabled:
+            return
+        try:
+            selection = self._skill_pack.select(topic or "")
+        except Exception as exc:  # pragma: no cover - selection must never fail a request
+            logger.warning("skill pack selection failed error=%s", exc)
+            if observer is not None:
+                observer.record_degraded("skill_pack_invalid")
+            return
+        if selection is None:
+            # Even the neutral fallback is missing/invalid; proceed with built-in prompts.
+            if observer is not None:
+                observer.record_degraded("skill_pack_unavailable")
+            return
+        self._skill_selection = selection
+        if observer is not None:
+            observer.record_skill_pack_selection(
+                pack_id=selection.pack.pack_id,
+                version=str(selection.pack.version),
+                match_score=selection.match_score,
+                fallback_reason=selection.fallback_reason,
+                shadow=selection.shadow,
+            )
+
+    def _skill_stage_context(self, stage: str) -> str:
+        """Render the skill fragment for one stage, or empty when nothing should be injected.
+
+        A pack with ``status: shadow`` is recorded at selection time but never injected, mirroring
+        memory shadow mode so a candidate pack can be observed before it influences behaviour.
+        """
+
+        selection = self._skill_selection
+        if selection is None or selection.shadow:
+            return ""
+        return self._skill_pack.render_block(selection.pack, stage)
+
+    def _shadow_gate(
+        self,
+        rendered: str,
+        *,
+        stage: str,
+        observer: RequestTrace | None,
+    ) -> str:
+        """Withhold retrieved memory from the prompt while keeping retrieval observable.
+
+        Shadow mode lets us collect "what would have been injected" without changing
+        any downstream behaviour, so memory can be measured before it is enabled.
+        """
+
+        if not rendered or not self.config.memory_shadow_mode:
+            return rendered
+        if observer is not None:
+            observer.record_memory_shadow_suppression(stage)
+        return ""
+
     def _planning_memory_context(
         self,
         state: SummaryState,
         observer: RequestTrace | None,
     ) -> str:
-        return self._note_memory.search_for_planning(
-            state.research_topic or "",
-            current_request_id=self.request_id,
-            exclude_note_ids=self._current_note_ids(state, include_report=False),
+        return self._shadow_gate(
+            self._note_memory.search_for_planning(
+                state.research_topic or "",
+                current_request_id=self.request_id,
+                exclude_note_ids=self._current_note_ids(state, include_report=False),
+                observer=observer,
+            ),
+            stage="planning_note",
             observer=observer,
         )
 
@@ -577,9 +649,13 @@ class DeepResearchAgent(
         state: SummaryState,
         observer: RequestTrace | None,
     ) -> str:
-        return self._strategy_memory.search_for_planning(
-            state.research_topic or "",
-            current_request_id=self.request_id,
+        return self._shadow_gate(
+            self._strategy_memory.search_for_planning(
+                state.research_topic or "",
+                current_request_id=self.request_id,
+                observer=observer,
+            ),
+            stage="planning_strategy",
             observer=observer,
         )
 
@@ -592,12 +668,16 @@ class DeepResearchAgent(
         excluded_note_ids = self._current_note_ids(state)
         if str(task.note_id or "").strip():
             excluded_note_ids.add(str(task.note_id or "").strip())
-        return self._note_memory.search_for_task(
-            state.research_topic or "",
-            task.title,
-            task.intent,
-            current_request_id=self.request_id,
-            exclude_note_ids=excluded_note_ids,
+        return self._shadow_gate(
+            self._note_memory.search_for_task(
+                state.research_topic or "",
+                task.title,
+                task.intent,
+                current_request_id=self.request_id,
+                exclude_note_ids=excluded_note_ids,
+                observer=observer,
+            ),
+            stage="task_execution_note",
             observer=observer,
         )
 
@@ -611,11 +691,15 @@ class DeepResearchAgent(
             for task in state.todo_items
             if task.status in {"failed", "skipped"} or not str(task.summary or "").strip()
         ]
-        return self._strategy_memory.search_for_reflection(
-            state.research_topic or "",
-            gap_signals=self._reflection_gap_signals(state),
-            task_titles=task_titles,
-            current_request_id=self.request_id,
+        return self._shadow_gate(
+            self._strategy_memory.search_for_reflection(
+                state.research_topic or "",
+                gap_signals=self._reflection_gap_signals(state),
+                task_titles=task_titles,
+                current_request_id=self.request_id,
+                observer=observer,
+            ),
+            stage="reflection_strategy",
             observer=observer,
         )
 
@@ -636,7 +720,23 @@ class DeepResearchAgent(
         *,
         observer: RequestTrace | None,
     ) -> None:
+        # Flush usage before re-synthesising: the maintenance pass reads the card files that
+        # refresh_request may rewrite, so recording hits first keeps the counters intact.
+        self._flush_strategy_memory_usage(observer=observer)
         self._strategy_memory.refresh_request(request_id, observer=observer)
+
+    def _flush_strategy_memory_usage(self, *, observer: RequestTrace | None) -> None:
+        """Persist which strategy cards this request actually used, then decay unused drafts.
+
+        Hits are collected in the request trace during retrieval and written once here, so the
+        query path performs no writes.
+        """
+
+        strategy_ids = list(getattr(observer, "strategy_memory_hit_ids", []) or [])
+        try:
+            self._strategy_memory.run_maintenance(strategy_ids, observer=observer)
+        except Exception as exc:  # pragma: no cover - maintenance must never fail a request
+            logger.warning("strategy memory maintenance failed error=%s", exc)
 
     def _reflection_gap_signals(self, state: SummaryState) -> list[str]:
         """Return request-level signals that justify running reflection."""
@@ -704,6 +804,7 @@ class DeepResearchAgent(
             state,
             gap_signals=gap_signals,
             strategy_memory_context=self._reflection_strategy_context(state, observer),
+            skill_pack_context=self._skill_stage_context("reflection"),
             observer=observer,
         )
 
@@ -717,6 +818,7 @@ class DeepResearchAgent(
                 max_additional_tasks=max_additional_tasks,
                 observer=observer,
                 historical_memory_context=historical_memory_context,
+                skill_pack_context=self._skill_stage_context("planning"),
             )
             if additional_tasks:
                 state.todo_items.extend(additional_tasks)
@@ -756,6 +858,7 @@ class DeepResearchAgent(
         review_summary = self.reviewer.review_request(
             state,
             observer=observer,
+            skill_pack_context=self._skill_stage_context("review"),
         )
 
         if review_summary.get("overall_status") == "blocked":
@@ -776,6 +879,7 @@ class DeepResearchAgent(
         observer = self._start_request_trace(topic)
         state = initial_state or SummaryState(research_topic=topic)
         report = state.structured_report or ""
+        self._select_skill_pack(state.research_topic or topic, observer)
         try:
             resumed = initial_state is not None
 
@@ -792,6 +896,7 @@ class DeepResearchAgent(
                         observer=observer,
                         historical_memory_context=historical_memory_context,
                         strategy_memory_context=self._planning_strategy_context(state, observer),
+                        skill_pack_context=self._skill_stage_context("planning"),
                     )
                     planning_span.complete(
                         status="success",
@@ -924,7 +1029,7 @@ class DeepResearchAgent(
             if not report:
                 report_span = observer.start_stage("report", scope="request")
                 try:
-                    report = self.reporting.generate_report(state, observer=observer)
+                    report = self.reporting.generate_report(state, observer=observer, skill_pack_context=self._skill_stage_context("report"))
                     report_span.complete(
                         status="success",
                         metadata={"report_length": len(report or "")},
@@ -1022,6 +1127,7 @@ class DeepResearchAgent(
                         observer=observer,
                         historical_memory_context=historical_memory_context,
                         strategy_memory_context=self._planning_strategy_context(state, observer),
+                        skill_pack_context=self._skill_stage_context("planning"),
                     )
                     yield planning_span.complete(
                         status="success",
@@ -1328,7 +1434,7 @@ class DeepResearchAgent(
                 report_started["step"] = final_step
                 yield report_started
                 try:
-                    report = self.reporting.generate_report(state, observer=observer)
+                    report = self.reporting.generate_report(state, observer=observer, skill_pack_context=self._skill_stage_context("report"))
                     completed_event = report_span.complete(
                         status="success",
                         metadata={"report_length": len(report or "")},

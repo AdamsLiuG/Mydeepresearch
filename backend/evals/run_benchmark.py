@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -16,9 +17,27 @@ if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
 from config import Configuration
+from evals.compare_variants import compare_result_files, render_markdown
 from evals.judges import HeuristicJudge, LLMJudge
 from evals.loader import load_benchmark_cases
 from evals.runner import run_benchmark_suite
+
+VARIANT_DIR = BACKEND_ROOT / "evals" / "variants"
+
+
+def load_variant(name: str) -> dict:
+    """Load a named variant definition from evals/variants."""
+    path = VARIANT_DIR / f"{name}.json"
+    if not path.is_file():
+        available = sorted(item.stem for item in VARIANT_DIR.glob("*.json"))
+        raise SystemExit(
+            f"unknown variant {name!r}; available: {', '.join(available) or 'none'}"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    overrides = payload.get("config_overrides")
+    if not isinstance(overrides, dict):
+        raise SystemExit(f"variant {name!r} is missing a config_overrides object")
+    return payload
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -49,6 +68,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--request-id-prefix",
         default="eval",
         help="Prefix added to per-case request ids.",
+    )
+    parser.add_argument(
+        "--variant",
+        default=None,
+        help="Optional named variant from evals/variants applied as config overrides.",
+    )
+    parser.add_argument(
+        "--compare-to",
+        default=None,
+        help="Optional baseline result JSON path; emits a case-aligned delta report.",
+    )
+    parser.add_argument(
+        "--comparison-output",
+        default=None,
+        help="Optional path for the comparison Markdown report (implies --compare-to).",
     )
     parser.add_argument(
         "--judge",
@@ -108,6 +142,11 @@ def main() -> int:
         cases = cases[: args.limit]
 
     overrides = {}
+    variant_name: str | None = None
+    if args.variant:
+        variant = load_variant(args.variant)
+        variant_name = str(variant.get("name") or args.variant)
+        overrides.update(variant["config_overrides"])
     if args.search_api:
         overrides["search_api"] = args.search_api
 
@@ -123,10 +162,13 @@ def main() -> int:
         output_path=args.output,
         benchmark_path=args.input,
         request_id_prefix=args.request_id_prefix,
+        variant=variant_name,
     )
 
     summary = result["summary"]
     print(f"Judge: {args.judge}")
+    if variant_name:
+        print(f"Variant: {variant_name}")
     print(f"Benchmark cases: {summary['total_cases']}")
     print(f"Reports generated: {summary['reports_generated']}")
     print(f"Degraded cases: {summary['degraded_cases']}")
@@ -146,7 +188,21 @@ def main() -> int:
         print(f"Average section completeness: {summary['average_section_completeness']}")
     print(f"Average latency ms: {summary['average_latency_ms']}")
     print(f"Total estimated cost: {summary['total_estimated_cost']}")
+    print(f"Average memory hits: {summary['average_memory_hit_count']}")
+    print(f"Cases with memory injected: {summary['cases_with_memory_injection']}")
+    print(f"Shadow-mode cases: {summary['memory_shadow_cases']}")
     print(f"Results written to: {result.get('output_path', args.output)}")
+
+    if args.compare_to:
+        comparison = compare_result_files(
+            args.compare_to,
+            result.get("output_path", args.output),
+            output_md=args.comparison_output,
+        )
+        print()
+        print(render_markdown(comparison))
+        if args.comparison_output:
+            print(f"Comparison written to: {comparison.get('output_md')}")
     return 0
 
 

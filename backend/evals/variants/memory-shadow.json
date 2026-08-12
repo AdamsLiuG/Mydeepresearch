@@ -1,0 +1,9 @@
+{
+  "name": "memory-shadow",
+  "description": "Both memories retrieved and traced but never injected. Collects 'would have injected' data with zero behaviour change.",
+  "config_overrides": {
+    "note_memory_enabled": true,
+    "strategy_memory_enabled": true,
+    "memory_shadow_mode": true
+  }
+}

@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -14,10 +15,24 @@ from typing import Any
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from services.embeddings import embeddings_available, encode_text, encode_texts
+from services.memory_sanitizer import (
+    collapse_whitespace,
+    normalize_list,
+    parse_json_list,
+    sanitize_injection_text,
+)
 from services.strategy_synthesizer import (
+    DOMAIN_GENERAL,
+    MATURITY_ARCHIVED,
+    MATURITY_DRAFT,
+    MATURITY_ORDER,
+    MATURITY_RETRIEVAL_WEIGHTS,
     StrategyCard,
     StrategySourceRequest,
     StrategySynthesizer,
+    maturity_meets_gate,
+    normalize_maturity,
+    normalize_topic_domain,
 )
 from utils import truncate_text
 
@@ -51,50 +66,40 @@ def _safe_int(value: Any) -> int | None:
 
 
 def _normalize_text(value: Any) -> str:
-    return " ".join(str(value or "").strip().split())
+    return collapse_whitespace(value)
 
 
 def _normalize_list(value: Any, *, max_items: int = 6) -> list[str]:
-    if isinstance(value, list):
-        candidates = value
-    elif value in (None, ""):
-        candidates = []
-    else:
-        candidates = [value]
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in candidates:
-        text = _normalize_text(item)
-        if not text:
-            continue
-        lowered = text.casefold()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        normalized.append(text)
-        if len(normalized) >= max_items:
-            break
-    return normalized
+    return normalize_list(value, max_items=max_items)
 
 
 def _parse_json_list(value: Any) -> list[Any]:
-    if isinstance(value, list):
-        return value
-    text = str(value or "").strip()
-    if not text:
-        return []
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    return payload if isinstance(payload, list) else []
+    return parse_json_list(value)
 
 
 def _checksum_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO timestamp, normalizing naive values to UTC so comparisons are safe."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 @dataclass
@@ -115,6 +120,8 @@ class StrategyHit:
     similarity: float
     score: float
     match_reason: str
+    maturity: str = MATURITY_DRAFT
+    topic_domain: str = DOMAIN_GENERAL
 
 
 class StrategyMemoryService:
@@ -229,6 +236,7 @@ class StrategyMemoryService:
         *,
         current_request_id: str | None = None,
         observer: RequestTrace | None = None,
+        topic_domains: set[str] | None = None,
     ) -> str:
         return self._search_and_render(
             query_text=research_topic,
@@ -236,6 +244,7 @@ class StrategyMemoryService:
             top_k=self._config.strategy_memory_planning_top_k,
             current_request_id=current_request_id,
             observer=observer,
+            topic_domains=topic_domains,
         )
 
     def search_for_reflection(
@@ -246,6 +255,7 @@ class StrategyMemoryService:
         task_titles: list[str] | None = None,
         current_request_id: str | None = None,
         observer: RequestTrace | None = None,
+        topic_domains: set[str] | None = None,
     ) -> str:
         query_text = " ".join(
             part
@@ -262,6 +272,7 @@ class StrategyMemoryService:
             top_k=self._config.strategy_memory_reflection_top_k,
             current_request_id=current_request_id,
             observer=observer,
+            topic_domains=topic_domains,
         )
 
     def _search_and_render(
@@ -272,6 +283,7 @@ class StrategyMemoryService:
         top_k: int,
         current_request_id: str | None,
         observer: RequestTrace | None,
+        topic_domains: set[str] | None = None,
     ) -> str:
         if not self.enabled or not _normalize_text(query_text):
             return ""
@@ -296,11 +308,13 @@ class StrategyMemoryService:
             stage=stage,
             top_k=max(1, int(top_k or 1)),
             current_request_id=current_request_id,
+            topic_domains=topic_domains,
         )
         if observer:
             observer.record_strategy_memory_query(
                 hit_count=len(hits),
                 match_kinds=[hit.strategy_kind for hit in hits],
+                strategy_ids=[hit.strategy_id for hit in hits],
             )
         if not hits:
             return ""
@@ -428,6 +442,13 @@ class StrategyMemoryService:
             if observer:
                 observer.record_degraded("strategy_memory_embedding_failed")
             return
+
+        # Carry the existing governance grade and usage counters over before the old card files
+        # are removed, otherwise re-synthesising a request would demote a promoted card back to
+        # draft and wipe the evidence of it ever having been useful.
+        for card, _ in valid_pairs:
+            card.maturity = self._read_card_maturity(card.strategy_id)
+            card.hit_count, card.last_hit_at = self._read_card_usage(card.strategy_id)
 
         self._delete_request_from_collection(collection, manifest, request_id)
         collection.upsert(
@@ -693,6 +714,155 @@ class StrategyMemoryService:
             encoding="utf-8",
         )
 
+    def _read_card_maturity(self, strategy_id: str) -> str:
+        """Return the maturity already recorded on disk for this card id.
+
+        Re-synthesis rewrites a card from scratch, which would silently reset a promotion.
+        The on-disk card file is therefore the durable record of governance grade and is
+        read back before the card is re-indexed.
+        """
+
+        return normalize_maturity(self._read_card_payload(strategy_id).get("maturity"))
+
+    def _read_card_payload(self, strategy_id: str) -> dict[str, Any]:
+        """Load a stored card file, returning an empty mapping when unreadable."""
+
+        try:
+            payload = json.loads(self._card_path(strategy_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _read_card_usage(self, strategy_id: str) -> tuple[int, str]:
+        """Return the persisted ``(hit_count, last_hit_at)`` for this card id."""
+
+        payload = self._read_card_payload(strategy_id)
+        try:
+            hit_count = max(0, int(payload.get("hit_count") or 0))
+        except (TypeError, ValueError):
+            hit_count = 0
+        return hit_count, str(payload.get("last_hit_at") or "")
+
+    def record_card_hits(self, strategy_ids: list[str]) -> int:
+        """Flush per-request usage onto the stored cards in a single batch.
+
+        Called once when a request finishes rather than on every retrieval, so the hot query
+        path stays free of writes. Usage is what later distinguishes a card that is genuinely
+        useful from one that merely exists.
+        """
+
+        updated = 0
+        timestamp = _utc_now()
+        for strategy_id in dict.fromkeys(_normalize_list(strategy_ids or [], max_items=64)):
+            payload = self._read_card_payload(strategy_id)
+            if not payload:
+                continue
+            try:
+                current = max(0, int(payload.get("hit_count") or 0))
+            except (TypeError, ValueError):
+                current = 0
+            payload["hit_count"] = current + 1
+            payload["last_hit_at"] = timestamp
+            try:
+                self._card_path(strategy_id).write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError:  # pragma: no cover - defensive filesystem guard
+                continue
+            updated += 1
+        return updated
+
+    def archive_stale_cards(self, *, now: datetime | None = None) -> list[str]:
+        """Archive draft cards that have gone unused past the configured idle window.
+
+        Only drafts decay. A verified or promoted card represents an explicit decision and is
+        never archived automatically. Cards never hit fall back to their creation time.
+        """
+
+        idle_days = max(0, int(self._config.memory_decay_idle_days or 0))
+        if idle_days <= 0:
+            return []
+
+        reference = now or datetime.now(timezone.utc)
+        cutoff = reference - timedelta(days=idle_days)
+        archived: list[str] = []
+        if not self._cards_dir.is_dir():
+            return []
+
+        for path in sorted(self._cards_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if normalize_maturity(payload.get("maturity")) != MATURITY_DRAFT:
+                continue
+
+            last_used = _parse_timestamp(payload.get("last_hit_at")) or _parse_timestamp(
+                payload.get("created_at")
+            )
+            if last_used is None or last_used >= cutoff:
+                continue
+
+            strategy_id = _normalize_text(payload.get("strategy_id"))
+            if strategy_id and self.set_card_maturity(strategy_id, MATURITY_ARCHIVED):
+                archived.append(strategy_id)
+        return archived
+
+    def run_maintenance(
+        self,
+        strategy_ids: list[str] | None = None,
+        *,
+        observer: RequestTrace | None = None,
+    ) -> dict[str, Any]:
+        """Single post-request pass: persist usage, then decay unused drafts."""
+
+        if not self.enabled:
+            return {"recorded_hits": 0, "archived": []}
+
+        recorded = self.record_card_hits(strategy_ids or [])
+        archived = self.archive_stale_cards()
+        if archived:
+            metrics_registry.increment("strategy_memory_archived_card_total", len(archived))
+            if observer:
+                observer.record_degraded(f"strategy_memory_cards_archived:{len(archived)}")
+        return {"recorded_hits": recorded, "archived": archived}
+
+    def set_card_maturity(self, strategy_id: str, maturity: str) -> bool:
+        """Promote or demote a stored card, updating both the card file and the index.
+
+        Returns ``False`` when the card is unknown so callers can distinguish a no-op from a
+        successful grade change.
+        """
+
+        normalized_id = _normalize_text(strategy_id)
+        if not normalized_id:
+            return False
+        normalized_maturity = normalize_maturity(maturity)
+        if normalized_maturity not in MATURITY_ORDER:  # pragma: no cover - defensive
+            return False
+
+        path = self._card_path(normalized_id)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+
+        payload["maturity"] = normalized_maturity
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        collection = self._get_collection()
+        if collection is not None and hasattr(collection, "update"):
+            try:
+                collection.update(ids=[normalized_id], metadatas=[{"maturity": normalized_maturity}])
+            except Exception:  # pragma: no cover - depends on runtime vector backend
+                logger.debug("failed to update strategy card maturity id=%s", normalized_id)
+        return True
+
     def _delete_card_file(self, strategy_id: str) -> None:
         self._card_path(strategy_id).unlink(missing_ok=True)
 
@@ -729,6 +899,7 @@ class StrategyMemoryService:
         stage: str,
         top_k: int,
         current_request_id: str | None,
+        topic_domains: set[str] | None = None,
     ) -> list[StrategyHit]:
         if self._collection is None:
             return []
@@ -777,6 +948,12 @@ class StrategyMemoryService:
                 max_items=3,
             )
             origin_status = _safe_status(metadata.get("origin_status"))
+            maturity = normalize_maturity(metadata.get("maturity"))
+            if not maturity_meets_gate(maturity, self._config.memory_maturity_gate):
+                continue
+            topic_domain = normalize_topic_domain(metadata.get("topic_domain"))
+            if topic_domains and topic_domain not in topic_domains:
+                continue
             hit = StrategyHit(
                 strategy_id=_normalize_text(metadata.get("strategy_id")),
                 strategy_kind=strategy_kind,
@@ -797,8 +974,11 @@ class StrategyMemoryService:
                     stage=stage,
                     strategy_kind=strategy_kind,
                     origin_status=origin_status,
+                    maturity=maturity,
                 ),
                 match_reason="",
+                maturity=maturity,
+                topic_domain=topic_domain,
             )
             hit.match_reason = self._build_match_reason(hit, stage=stage)
             hits.append(hit)
@@ -822,6 +1002,7 @@ class StrategyMemoryService:
         stage: str,
         strategy_kind: str,
         origin_status: str,
+        maturity: str = MATURITY_DRAFT,
     ) -> float:
         score = similarity
         if stage == "planning":
@@ -839,6 +1020,7 @@ class StrategyMemoryService:
             origin_status,
             0.0,
         )
+        score += MATURITY_RETRIEVAL_WEIGHTS.get(normalize_maturity(maturity), 0.0)
         return score
 
     def _build_match_reason(self, hit: StrategyHit, *, stage: str) -> str:
@@ -861,6 +1043,11 @@ class StrategyMemoryService:
             parts.append("来自部分成功请求")
         elif hit.origin_status == "failed":
             parts.append("来自失败请求")
+
+        if hit.maturity == MATURITY_DRAFT:
+            parts.append("未经验证草稿")
+        elif hit.maturity == "promoted":
+            parts.append("已验证并采纳")
         return "；".join(parts)
 
     def _render_prompt_context(self, hits: list[StrategyHit], *, stage: str) -> str:
@@ -876,15 +1063,19 @@ class StrategyMemoryService:
         remaining = max(240, int(self._config.strategy_memory_prompt_char_limit or 240)) - len(header)
 
         for hit in hits:
-            action_line = "；".join(hit.recommended_actions[:3]) or "暂无明确推荐动作"
-            query_line = "；".join(hit.query_templates[:2]) or "暂无固定检索模板"
-            pitfall_line = "；".join(hit.pitfalls_to_avoid[:2]) or "暂无显式反模式"
-            signal_line = "；".join(hit.match_signals[:3]) or truncate_text(hit.applicable_when, 100)
+            action_line = sanitize_injection_text("；".join(hit.recommended_actions[:3])) or "暂无明确推荐动作"
+            query_line = sanitize_injection_text("；".join(hit.query_templates[:2])) or "暂无固定检索模板"
+            pitfall_line = sanitize_injection_text("；".join(hit.pitfalls_to_avoid[:2])) or "暂无显式反模式"
+            applicable_when = sanitize_injection_text(hit.applicable_when)
+            signal_line = sanitize_injection_text("；".join(hit.match_signals[:3])) or truncate_text(
+                applicable_when,
+                100,
+            )
             block = "\n".join(
                 [
-                    f"- 标题：{hit.title}",
+                    f"- 标题：{sanitize_injection_text(hit.title)}",
                     f"  类型：{hit.strategy_kind}；匹配原因：{hit.match_reason}",
-                    f"  适用场景：{truncate_text(hit.applicable_when, 160)}",
+                    f"  适用场景：{truncate_text(applicable_when, 160)}",
                     f"  触发信号：{truncate_text(signal_line, 120)}",
                     f"  推荐动作：{truncate_text(action_line, 160)}",
                     f"  检索模板：{truncate_text(query_line, 140)}",

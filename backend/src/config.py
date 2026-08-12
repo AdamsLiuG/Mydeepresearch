@@ -190,6 +190,45 @@ class Configuration(BaseModel):
         title="Notes Workspace",
         description="Directory for NoteTool to persist task notes",
     )
+    memory_shadow_mode: bool = Field(
+        default=False,
+        title="Memory Shadow Mode",
+        description="When enabled, memory retrieval still runs and is traced but results are never injected into prompts",
+    )
+    memory_maturity_gate: str = Field(
+        default="draft",
+        title="Memory Maturity Gate",
+        description="Lowest strategy card maturity still eligible for retrieval (draft | verified | promoted)",
+    )
+    memory_decay_idle_days: int = Field(
+        default=0,
+        ge=0,
+        title="Memory Decay Idle Days",
+        description="Archive draft strategy cards unused for this many days; 0 disables decay",
+    )
+    skill_pack_enabled: bool = Field(
+        default=False,
+        title="Skill Pack Enabled",
+        description="Whether to select a research skill pack and inject its stage fragments into prompts",
+    )
+    skill_pack_dir: str = Field(
+        default="./skills/research",
+        title="Skill Pack Directory",
+        description="Directory holding research skill packs; each subdirectory is one pack with a SKILL.md",
+    )
+    skill_prompt_char_limit: int = Field(
+        default=1200,
+        ge=200,
+        title="Skill Prompt Character Limit",
+        description="Maximum characters allowed for a single injected skill pack stage fragment",
+    )
+    skill_pack_min_match_score: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        title="Skill Pack Minimum Match Score",
+        description="Global floor for pack selection; below this the neutral fallback pack is used",
+    )
     note_memory_enabled: bool = Field(
         default=False,
         title="Note Memory Enabled",
@@ -736,6 +775,22 @@ class Configuration(BaseModel):
 
         return value
 
+    @field_validator("memory_maturity_gate", mode="before")
+    @classmethod
+    def _normalize_memory_maturity_gate(cls, value: Any) -> Any:
+        if value is None:
+            return "draft"
+
+        if isinstance(value, str):
+            normalized = value.strip().lower() or "draft"
+            if normalized not in {"draft", "verified", "promoted"}:
+                raise ValueError(
+                    "memory_maturity_gate must be one of 'draft', 'verified', 'promoted'"
+                )
+            return normalized
+
+        return value
+
     @field_validator("benchmark_profile", mode="before")
     @classmethod
     def _normalize_benchmark_profile(cls, value: Any) -> Any:
@@ -875,6 +930,13 @@ class Configuration(BaseModel):
             "semantic_scholar_api_key": os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
+            "memory_shadow_mode": os.getenv("MEMORY_SHADOW_MODE"),
+            "memory_maturity_gate": os.getenv("MEMORY_MATURITY_GATE"),
+            "memory_decay_idle_days": os.getenv("MEMORY_DECAY_IDLE_DAYS"),
+            "skill_pack_enabled": os.getenv("SKILL_PACK_ENABLED"),
+            "skill_pack_dir": os.getenv("SKILL_PACK_DIR"),
+            "skill_prompt_char_limit": os.getenv("SKILL_PROMPT_CHAR_LIMIT"),
+            "skill_pack_min_match_score": os.getenv("SKILL_PACK_MIN_MATCH_SCORE"),
             "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
             "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
             "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),

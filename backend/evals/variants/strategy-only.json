@@ -1,0 +1,9 @@
+{
+  "name": "strategy-only",
+  "description": "Only strategy memory (planning / reflection patterns, anti-patterns) is enabled and injected.",
+  "config_overrides": {
+    "note_memory_enabled": false,
+    "strategy_memory_enabled": true,
+    "memory_shadow_mode": false
+  }
+}

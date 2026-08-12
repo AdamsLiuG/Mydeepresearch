@@ -168,8 +168,10 @@ class AgentExecutionTests(unittest.TestCase):
             search_for_reflection=lambda *args, **kwargs: "",
             refresh_request=lambda *args, **kwargs: None,
         )
+        instance._skill_pack = SimpleNamespace(enabled=False)
+        instance._skill_selection = None
         instance.planner = SimpleNamespace(
-            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None: [
+            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None, skill_pack_context=None: [
                 TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
             ],
             plan_additional_tasks=lambda state, **kwargs: [],
@@ -181,13 +183,13 @@ class AgentExecutionTests(unittest.TestCase):
             ),
         )
         instance.reflection = SimpleNamespace(
-            assess_request=lambda state, gap_signals, strategy_memory_context=None, observer=None: None
+            assess_request=lambda state, gap_signals, strategy_memory_context=None, skill_pack_context=None, observer=None: None
         )
         instance.reporting = SimpleNamespace(
-            generate_report=lambda state, observer=None: "# report"
+            generate_report=lambda state, observer=None, skill_pack_context=None: "# report"
         )
         instance.summarizer = SimpleNamespace(
-            summarize_task=lambda state, task, context, observer=None, historical_memory_context=None: "summary"
+            summarize_task=lambda state, task, context, observer=None, historical_memory_context=None, skill_pack_context=None: "summary"
         )
         instance.task_react_agent = SimpleNamespace(
             run=lambda prompt: '{"action":"stop","reason":"stub"}',
@@ -227,7 +229,7 @@ class AgentExecutionTests(unittest.TestCase):
             load_env_file=False,
         )
         agent.planner = SimpleNamespace(
-            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None: [
+            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None, skill_pack_context=None: [
                 TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent background"),
                 TodoItem(id=2, title="任务2", intent="梳理挑战", query="AI agent challenges"),
                 TodoItem(id=3, title="任务3", intent="梳理案例", query="AI agent case studies"),
@@ -277,6 +279,7 @@ class AgentExecutionTests(unittest.TestCase):
             observer=None,
             historical_memory_context=None,
             strategy_memory_context=None,
+            skill_pack_context=None,
         ):
             captured["historical_memory_context"] = historical_memory_context
             captured["strategy_memory_context"] = strategy_memory_context
@@ -396,7 +399,7 @@ class AgentExecutionTests(unittest.TestCase):
 
         agent._execute_task = fake_execute_task
         agent.reflection = SimpleNamespace(
-            assess_request=lambda state, gap_signals, strategy_memory_context=None, observer=None: (
+            assess_request=lambda state, gap_signals, strategy_memory_context=None, skill_pack_context=None, observer=None: (
                 captured.setdefault("strategy_memory_context", strategy_memory_context),
                 ReflectionAssessment(
                     coverage_status="sufficient",
@@ -1216,7 +1219,7 @@ class AgentExecutionTests(unittest.TestCase):
         agent._execute_task = fake_execute_task
         agent._run_review_stage = fake_review
         agent.planner = SimpleNamespace(
-            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None: [
+            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None, skill_pack_context=None: [
                 TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
             ],
             plan_additional_tasks=lambda state, **kwargs: [],
@@ -1276,7 +1279,7 @@ class AgentExecutionTests(unittest.TestCase):
 
         agent._execute_task = fake_execute_task
         agent.reflection = SimpleNamespace(
-            assess_request=lambda state, gap_signals, strategy_memory_context=None, observer=None: ReflectionAssessment(
+            assess_request=lambda state, gap_signals, strategy_memory_context=None, skill_pack_context=None, observer=None: ReflectionAssessment(
                 coverage_status="needs_more_research",
                 reason="首轮研究仍缺少工程实践维度。",
                 gap_signals=gap_signals,
@@ -1284,7 +1287,7 @@ class AgentExecutionTests(unittest.TestCase):
             )
         )
         agent.planner = SimpleNamespace(
-            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None: [
+            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None, skill_pack_context=None: [
                 TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
             ],
             plan_additional_tasks=lambda state, **kwargs: [
@@ -1336,7 +1339,7 @@ class AgentExecutionTests(unittest.TestCase):
 
         agent._execute_task = fake_execute_task
         agent.reflection = SimpleNamespace(
-            assess_request=lambda state, gap_signals, strategy_memory_context=None, observer=None: (_ for _ in ()).throw(
+            assess_request=lambda state, gap_signals, strategy_memory_context=None, skill_pack_context=None, observer=None: (_ for _ in ()).throw(
                 AssertionError("reflection should not run when budget is exhausted")
             )
         )
@@ -1404,7 +1407,7 @@ class AgentExecutionTests(unittest.TestCase):
 
         agent._execute_task = fake_execute_task
         agent.reflection = SimpleNamespace(
-            assess_request=lambda state, gap_signals, strategy_memory_context=None, observer=None: ReflectionAssessment(
+            assess_request=lambda state, gap_signals, strategy_memory_context=None, skill_pack_context=None, observer=None: ReflectionAssessment(
                 coverage_status="needs_more_research",
                 reason="需要补充落地视角。",
                 gap_signals=gap_signals,
@@ -1412,7 +1415,7 @@ class AgentExecutionTests(unittest.TestCase):
             )
         )
         agent.planner = SimpleNamespace(
-            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None: [
+            plan_todo_list=lambda state, observer=None, historical_memory_context=None, strategy_memory_context=None, skill_pack_context=None: [
                 TodoItem(id=1, title="任务1", intent="梳理背景", query="AI agent")
             ],
             plan_additional_tasks=lambda state, **kwargs: [

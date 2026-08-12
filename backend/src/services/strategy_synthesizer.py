@@ -11,11 +11,76 @@ from typing import Any, Callable
 from hello_agents import ToolAwareSimpleAgent
 
 from config import Configuration
+from services.memory_sanitizer import normalize_list as _shared_normalize_list
+from services.memory_sanitizer import normalize_text as _shared_normalize_text
 from utils import strip_thinking_tokens, truncate_text
 
 logger = logging.getLogger(__name__)
 
 _ALLOWED_KINDS = {"planning_pattern", "reflection_pattern", "anti_pattern"}
+
+# Maturity is a governance grade, not a quality score. Newly distilled cards always start as
+# ``draft``: they stay retrievable but are down-weighted, so value can be collected before a
+# card is trusted. Promotion is deliberate, never a side effect of synthesis.
+MATURITY_ARCHIVED = "archived"
+MATURITY_DRAFT = "draft"
+MATURITY_VERIFIED = "verified"
+MATURITY_PROMOTED = "promoted"
+
+# ``archived`` sits below the lowest configurable gate on purpose: decayed cards are then
+# excluded by the same comparison that enforces the gate, with no extra filter needed.
+MATURITY_ORDER = {
+    MATURITY_ARCHIVED: -1,
+    MATURITY_DRAFT: 0,
+    MATURITY_VERIFIED: 1,
+    MATURITY_PROMOTED: 2,
+}
+
+# Applied at retrieval time instead of gating on write, so a draft still surfaces when nothing
+# better matches, but always loses to a verified card of comparable similarity.
+MATURITY_RETRIEVAL_WEIGHTS = {
+    MATURITY_ARCHIVED: -1.0,
+    MATURITY_DRAFT: -0.15,
+    MATURITY_VERIFIED: 0.0,
+    MATURITY_PROMOTED: 0.05,
+}
+
+
+def normalize_maturity(value: Any) -> str:
+    """Coerce any stored value to a known maturity, defaulting to the safest grade."""
+
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in MATURITY_ORDER else MATURITY_DRAFT
+
+
+def maturity_meets_gate(maturity: Any, gate: Any) -> bool:
+    """Report whether a card's maturity is at or above the configured retrieval gate."""
+
+    return MATURITY_ORDER[normalize_maturity(maturity)] >= MATURITY_ORDER[normalize_maturity(gate)]
+
+
+# The domain vocabulary is deliberately closed. An open vocabulary would let synonyms
+# proliferate ("政策" / "法规" / "policy"), which makes the tag useless for filtering. Values
+# mirror the planned research skill packs so one tag can serve both retrieval and pack
+# selection later.
+DOMAIN_GENERAL = "general"
+
+TOPIC_DOMAINS = (
+    "policy_analysis",
+    "tech_selection",
+    "academic_review",
+    "competitor_scan",
+    DOMAIN_GENERAL,
+)
+
+
+def normalize_topic_domain(value: Any) -> str:
+    """Coerce any stored or model-produced value to a known domain, defaulting to general."""
+
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized if normalized in TOPIC_DOMAINS else DOMAIN_GENERAL
+
+
 _KIND_TO_STAGE = {
     "planning_pattern": "planning",
     "reflection_pattern": "reflection",
@@ -30,32 +95,11 @@ def _utc_now() -> str:
 
 
 def _normalize_text(value: Any, *, fallback: str = "") -> str:
-    text = str(value or "").strip()
-    return text or fallback
+    return _shared_normalize_text(value, fallback=fallback)
 
 
 def _normalize_list(value: Any, *, max_items: int) -> list[str]:
-    if isinstance(value, list):
-        candidates = value
-    elif value in (None, ""):
-        candidates = []
-    else:
-        candidates = [value]
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in candidates:
-        text = " ".join(str(item or "").strip().split())
-        if not text:
-            continue
-        lowered = text.casefold()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        normalized.append(text)
-        if len(normalized) >= max_items:
-            break
-    return normalized
+    return _shared_normalize_list(value, max_items=max_items)
 
 
 @dataclass
@@ -109,6 +153,10 @@ class StrategyCard:
     origin_review_status: str
     origin_task_ids: list[int]
     created_at: str
+    maturity: str = MATURITY_DRAFT
+    topic_domain: str = DOMAIN_GENERAL
+    hit_count: int = 0
+    last_hit_at: str = ""
 
     def to_document(self) -> str:
         sections = [
@@ -140,6 +188,10 @@ class StrategyCard:
             "origin_review_status": self.origin_review_status,
             "origin_task_ids": json.dumps(self.origin_task_ids, ensure_ascii=False),
             "created_at": self.created_at,
+            "maturity": normalize_maturity(self.maturity),
+            "topic_domain": normalize_topic_domain(self.topic_domain),
+            "hit_count": int(self.hit_count or 0),
+            "last_hit_at": str(self.last_hit_at or ""),
         }
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -159,6 +211,10 @@ class StrategyCard:
             "origin_review_status": self.origin_review_status,
             "origin_task_ids": list(self.origin_task_ids),
             "created_at": self.created_at,
+            "maturity": normalize_maturity(self.maturity),
+            "topic_domain": normalize_topic_domain(self.topic_domain),
+            "hit_count": int(self.hit_count or 0),
+            "last_hit_at": str(self.last_hit_at or ""),
         }
 
 
@@ -192,6 +248,7 @@ class StrategySynthesizer:
             indent=2,
         )
         requested_kinds = ", ".join(source_request.requested_kinds)
+        allowed_domains = ", ".join(TOPIC_DOMAINS)
         return (
             "你是一名 Strategy Memory 提炼器，只负责把历史请求压缩成可复用的方法经验卡片。\n\n"
             "<GOAL>\n"
@@ -202,12 +259,21 @@ class StrategySynthesizer:
             "- anti_pattern 重点描述在哪些信号下容易出错、应避免什么；\n"
             "- planning_pattern / reflection_pattern 重点描述何时适用、推荐动作、推荐来源偏好。\n"
             "</GOAL>\n\n"
+            "<TOPIC_DOMAIN>\n"
+            f"- topic_domain 只能从这个封闭列表中选一个：{allowed_domains}\n"
+            "- policy_analysis：政策、法规、监管要求、合规与生效范围类；\n"
+            "- tech_selection：技术方案对比、组件选型、性能与工程权衡类；\n"
+            "- academic_review：学术综述、方法论对比、文献追溯类；\n"
+            "- competitor_scan：竞品、市场格局、厂商动态类；\n"
+            "- 无法确定或跨多个领域时，一律填 general，不要自己发明新值。\n"
+            "</TOPIC_DOMAIN>\n\n"
             "<OUTPUT_RULES>\n"
             "- 只能输出一个 JSON array；\n"
             "- 不要输出 Markdown 代码块；\n"
             "- 每个元素必须包含以下字段：\n"
             '  "strategy_kind", "title", "applicable_when", "match_signals", '
-            '"recommended_actions", "query_templates", "preferred_sources", "pitfalls_to_avoid"\n'
+            '"recommended_actions", "query_templates", "preferred_sources", "pitfalls_to_avoid", '
+            '"topic_domain"\n'
             "- 不要输出其他解释文字。\n"
             "</OUTPUT_RULES>\n\n"
             "<JSON_CONTEXT>\n"
@@ -318,4 +384,5 @@ class StrategySynthesizer:
             origin_review_status=source_request.review_status,
             origin_task_ids=origin_task_ids,
             created_at=created_at,
+            topic_domain=normalize_topic_domain(payload.get("topic_domain")),
         )

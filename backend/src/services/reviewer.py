@@ -83,6 +83,7 @@ class ReviewService:
         state: SummaryState,
         *,
         observer: RequestTrace | None = None,
+        skill_pack_context: str | None = None,
     ) -> dict[str, Any]:
         """Review task summaries and evidence before final report generation."""
 
@@ -90,7 +91,7 @@ class ReviewService:
         llm_summary: dict[str, Any] = {}
 
         if self._config.review_agent_enabled and self._agent is not None:
-            prompt = self._build_prompt(state, issues)
+            prompt = self._build_prompt(state, issues, skill_pack_context=skill_pack_context)
             try:
                 response = self._agent.run(prompt)
             except Exception as exc:
@@ -125,6 +126,8 @@ class ReviewService:
         self,
         state: SummaryState,
         issues: list[ReviewIssue],
+        *,
+        skill_pack_context: str | None = None,
     ) -> str:
         task_blocks: list[str] = []
         for task in state.todo_items:
@@ -158,6 +161,7 @@ class ReviewService:
             "你也可以调用 fetch_page 重新抓取 URL，把线索提升为当前证据。"
             "不要重写报告正文，也不要重复输出规则已明确指出的问题。\n\n"
             f"{''.join(task_blocks)}"
+            + str(skill_pack_context or "")
         )
 
     def _rule_based_review(self, state: SummaryState) -> tuple[list[ReviewIssue], dict[int, list[dict[str, Any]]]]:

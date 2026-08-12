@@ -51,6 +51,7 @@ class ReflectionService:
         *,
         gap_signals: list[str],
         strategy_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
         observer=None,
     ) -> ReflectionAssessment:
         """Judge whether the current request needs more research coverage."""
@@ -58,6 +59,7 @@ class ReflectionService:
         prompt = self._build_prompt(
             context,
             strategy_memory_context=strategy_memory_context,
+            skill_pack_context=skill_pack_context,
         )
         existing_task_titles = {
             str(task.get("title") or "").strip().casefold()
@@ -172,6 +174,7 @@ class ReflectionService:
         context: dict[str, Any],
         *,
         strategy_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> str:
         """Render the reflection prompt from a structured context object."""
         task_counts = context.get("task_counts", {})
@@ -203,7 +206,7 @@ class ReflectionService:
             task_overview=task_overview,
             reflection_context_json=compact_context_json,
         )
-        return prompt + self._strategy_memory_block(strategy_memory_context)
+        return prompt + self._strategy_memory_block(strategy_memory_context) + str(skill_pack_context or "")
 
     @staticmethod
     def _strategy_memory_block(strategy_memory_context: str | None) -> str:

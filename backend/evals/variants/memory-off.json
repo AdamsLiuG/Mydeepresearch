@@ -1,0 +1,9 @@
+{
+  "name": "memory-off",
+  "description": "Baseline variant: all cross-request memory disabled. Use as the comparison anchor.",
+  "config_overrides": {
+    "note_memory_enabled": false,
+    "strategy_memory_enabled": false,
+    "memory_shadow_mode": false
+  }
+}

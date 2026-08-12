@@ -1,0 +1,9 @@
+{
+  "name": "note-only",
+  "description": "Only note memory (historical conclusions / task states) is enabled and injected.",
+  "config_overrides": {
+    "note_memory_enabled": true,
+    "strategy_memory_enabled": false,
+    "memory_shadow_mode": false
+  }
+}

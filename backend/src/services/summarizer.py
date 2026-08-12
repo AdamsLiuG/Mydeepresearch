@@ -70,6 +70,7 @@ class SummarizationService:
         context: str,
         observer: RequestTrace | None = None,
         historical_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> TaskSummaryResult:
         """Generate a task-specific summary using the summarizer agent."""
         prompt = self._build_prompt(
@@ -77,6 +78,7 @@ class SummarizationService:
             task,
             context,
             historical_memory_context=historical_memory_context,
+            skill_pack_context=skill_pack_context,
         )
 
         agent = self._agent_factory()
@@ -110,6 +112,7 @@ class SummarizationService:
         context: str,
         observer: RequestTrace | None = None,
         historical_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> tuple[Iterator[str], Callable[[], TaskSummaryResult]]:
         """Buffer the raw stream, sanitize it, then emit safe summary chunks."""
 
@@ -118,6 +121,7 @@ class SummarizationService:
             task,
             context,
             historical_memory_context=historical_memory_context,
+            skill_pack_context=skill_pack_context,
         )
         raw_parts: list[str] = []
         result_holder: dict[str, TaskSummaryResult] = {}
@@ -175,6 +179,7 @@ class SummarizationService:
         context: str,
         *,
         historical_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> str:
         """Construct the summarization prompt shared by both modes."""
         trimmed_context = truncate_text(
@@ -221,6 +226,7 @@ class SummarizationService:
             "5. `evidence_gaps` 仅写证据缺口，不要写工具调用叙述；\n"
             "6. 不允许编造 source_id；\n"
             "7. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
+            + str(skill_pack_context or "")
         )
 
     def _finalize_summary(

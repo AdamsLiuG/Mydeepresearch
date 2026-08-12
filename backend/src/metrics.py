@@ -147,6 +147,10 @@ class MetricsRegistry:
             "strategy_memory_refresh_total": 0,
             "strategy_memory_refresh_failed_total": 0,
             "strategy_memory_synthesized_card_total": 0,
+            "strategy_memory_archived_card_total": 0,
+            "skill_pack_selection_total": 0,
+            "skill_pack_fallback_total": 0,
+            "memory_shadow_suppression_total": 0,
             "evidence_archive_ingest_total": 0,
             "evidence_archive_query_total": 0,
             "evidence_archive_dedup_total": 0,
@@ -485,6 +489,15 @@ class RequestTrace:
         self.strategy_memory_hits = 0
         self.strategy_memory_prompt_injections = 0
         self.strategy_memory_last_match_kinds: list[str] = []
+        self.strategy_memory_hit_ids: list[str] = []
+        self.memory_shadow_mode = False
+        self.memory_shadow_suppressions = 0
+        self.memory_shadow_suppressed_stages: dict[str, int] = {}
+        self.skill_pack_id = ""
+        self.skill_pack_version = ""
+        self.skill_pack_match_score = 0.0
+        self.skill_pack_fallback_reason = ""
+        self.skill_pack_shadow = False
         metrics_registry.increment("request_total")
 
     def start_stage(
@@ -759,6 +772,7 @@ class RequestTrace:
         *,
         hit_count: int,
         match_kinds: list[str] | None = None,
+        strategy_ids: list[str] | None = None,
     ) -> None:
         metrics_registry.increment("strategy_memory_query_total")
         if hit_count > 0:
@@ -771,11 +785,21 @@ class RequestTrace:
             for match_kind in match_kinds or []
             if str(match_kind).strip()
         ]
+        normalized_ids = [
+            str(strategy_id).strip()
+            for strategy_id in strategy_ids or []
+            if str(strategy_id).strip()
+        ]
         with self._lock:
             self.strategy_memory_queries += 1
             self.strategy_memory_hits += max(0, int(hit_count or 0))
             if normalized_kinds:
                 self.strategy_memory_last_match_kinds = normalized_kinds
+            # Accumulated across the whole request so usage can be flushed to the cards once,
+            # instead of writing on every retrieval in the hot path.
+            for strategy_id in normalized_ids:
+                if strategy_id not in self.strategy_memory_hit_ids:
+                    self.strategy_memory_hit_ids.append(strategy_id)
 
     def record_strategy_memory_prompt_injection(
         self,
@@ -792,6 +816,42 @@ class RequestTrace:
             self.strategy_memory_prompt_injections += 1
             if normalized_kinds:
                 self.strategy_memory_last_match_kinds = normalized_kinds
+
+    def record_memory_shadow_suppression(self, stage: str) -> None:
+        """Record that a rendered memory block was withheld from the prompt."""
+
+        metrics_registry.increment("memory_shadow_suppression_total")
+        normalized_stage = str(stage or "unknown").strip() or "unknown"
+        with self._lock:
+            self.memory_shadow_suppressions += 1
+            self.memory_shadow_suppressed_stages[normalized_stage] = (
+                self.memory_shadow_suppressed_stages.get(normalized_stage, 0) + 1
+            )
+
+    def record_skill_pack_selection(
+        self,
+        *,
+        pack_id: str,
+        version: str = "",
+        match_score: float = 0.0,
+        fallback_reason: str = "",
+        shadow: bool = False,
+    ) -> None:
+        """Record which research skill pack was selected for this request.
+
+        Captured once per request so eval reports can stratify outcomes by pack, and so a
+        fallback to the neutral pack is always attributable to a reason.
+        """
+
+        metrics_registry.increment("skill_pack_selection_total")
+        if fallback_reason:
+            metrics_registry.increment("skill_pack_fallback_total")
+        with self._lock:
+            self.skill_pack_id = str(pack_id or "").strip()
+            self.skill_pack_version = str(version or "").strip()
+            self.skill_pack_match_score = round(float(match_score or 0.0), 4)
+            self.skill_pack_fallback_reason = str(fallback_reason or "").strip()
+            self.skill_pack_shadow = bool(shadow)
 
     def attach_result(
         self,
@@ -893,6 +953,15 @@ class RequestTrace:
                 "strategy_memory_hits": self.strategy_memory_hits,
                 "strategy_memory_prompt_injections": self.strategy_memory_prompt_injections,
                 "strategy_memory_last_match_kinds": list(self.strategy_memory_last_match_kinds),
+                "strategy_memory_hit_ids": list(self.strategy_memory_hit_ids),
+                "memory_shadow_mode": self.memory_shadow_mode,
+                "memory_shadow_suppressions": self.memory_shadow_suppressions,
+                "memory_shadow_suppressed_stages": dict(self.memory_shadow_suppressed_stages),
+                "skill_pack_id": self.skill_pack_id,
+                "skill_pack_version": self.skill_pack_version,
+                "skill_pack_match_score": self.skill_pack_match_score,
+                "skill_pack_fallback_reason": self.skill_pack_fallback_reason,
+                "skill_pack_shadow": self.skill_pack_shadow,
                 "report_markdown": self.report_markdown,
                 "todo_items": _clone_dict({"items": self.todo_items}).get("items", []),
                 "report_note_id": self.report_note_id,
