@@ -66,7 +66,12 @@ class RequestStateStore:
             payload.setdefault("error", resolved_error)
         return payload
 
-    def list_recent(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_recent(
+        self,
+        *,
+        limit: int | None = None,
+        include_content: bool = False,
+    ) -> list[dict[str, Any]]:
         if not self._directory.exists():
             return []
 
@@ -85,17 +90,21 @@ class RequestStateStore:
                 continue
             if not isinstance(payload, dict):
                 continue
-            snapshots.append(self._summarize(payload))
+            snapshots.append(self._summarize(payload, include_content=include_content))
         return snapshots
 
     @staticmethod
-    def _summarize(payload: dict[str, Any]) -> dict[str, Any]:
+    def _summarize(
+        payload: dict[str, Any],
+        *,
+        include_content: bool = False,
+    ) -> dict[str, Any]:
         report_markdown = str(payload.get("report_markdown") or "").strip()
         status = str(payload.get("status") or "unknown").strip() or "unknown"
         phase = str(payload.get("phase") or "unknown").strip() or "unknown"
         error = RequestStateStore._resolved_error(payload)
         todo_items = payload.get("todo_items") or []
-        return {
+        summary: dict[str, Any] = {
             "request_id": str(payload.get("request_id") or "").strip(),
             "topic": str(payload.get("topic") or "").strip(),
             "status": status,
@@ -105,12 +114,16 @@ class RequestStateStore:
             "search_api": payload.get("search_api"),
             "elapsed_ms": payload.get("elapsed_ms"),
             "cache_diagnostics": payload.get("cache_diagnostics") or {},
-            "report_markdown": report_markdown,
-            "todo_items": todo_items,
             "review_summary": payload.get("review_summary") or {},
+            "task_count": len(todo_items),
+            "has_report": bool(report_markdown),
             "can_resume": status not in {"success"} and phase != "completed",
             "can_view_content": bool(report_markdown) or bool(todo_items) or bool(error),
         }
+        if include_content:
+            summary["report_markdown"] = report_markdown
+            summary["todo_items"] = todo_items
+        return summary
 
     @staticmethod
     def _resolved_error(payload: dict[str, Any]) -> str | None:

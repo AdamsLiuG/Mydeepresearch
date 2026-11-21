@@ -1942,6 +1942,35 @@ class SearchCacheTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["url"], "https://arxiv.org/abs/2601.12345")
         self.assertIn("fusion_score", payload["results"][0])
 
+    def test_scope_key_concurrent_appends_are_thread_safe_and_bounded(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        config = Configuration.from_env(
+            overrides={
+                "search_cache_enabled": True,
+                "search_cache_dir": self.temp_dir.name,
+            },
+            load_env_file=False,
+        )
+        scope = "scope::concurrent-test"
+
+        def add_batch(start_idx: int) -> None:
+            for offset in range(25):
+                services_search._append_scope_key(config, scope, f"key-{start_idx + offset}")
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(add_batch, [0, 25, 50, 75]))
+
+        keys = services_search._get_scope_keys(config, scope)
+        self.assertEqual(len(keys), 100)
+        self.assertEqual(len(set(keys)), 100)
+
+        # Exceeding _MAX_SCOPE_KEYS bounds scope size cleanly
+        for idx in range(100, services_search._MAX_SCOPE_KEYS + 30):
+            services_search._append_scope_key(config, scope, f"key-{idx}")
+        bounded = services_search._get_scope_keys(config, scope)
+        self.assertEqual(len(bounded), services_search._MAX_SCOPE_KEYS)
+
 
 if __name__ == "__main__":
     unittest.main()

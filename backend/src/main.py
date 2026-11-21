@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from queue import Empty, Queue
+from threading import Event, Thread
 from typing import Any, Callable, Dict, Iterator
 from uuid import uuid4
 
@@ -352,11 +357,11 @@ def create_app(
         return response
 
     @app.get("/healthz")
-    def health_check() -> Dict[str, str]:
+    async def health_check() -> Dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/metrics/json")
-    def metrics_json() -> Dict[str, Any]:
+    async def metrics_json() -> Dict[str, Any]:
         return metrics_registry.snapshot()
 
     @app.post("/research", response_model=ResearchResponse)
@@ -407,19 +412,22 @@ def create_app(
         )
 
     @app.get("/requests")
-    def list_persisted_requests(limit: int | None = None) -> Dict[str, Any]:
+    async def list_persisted_requests(
+        limit: int | None = None,
+        include_content: bool = False,
+    ) -> Dict[str, Any]:
         store = app.state.request_state_store
         if store is None:
             return {"items": []}
-        return {"items": store.list_recent(limit=limit)}
+        return {"items": await asyncio.to_thread(store.list_recent, limit=limit, include_content=include_content)}
 
     @app.get("/requests/{request_id}")
-    def get_persisted_request(request_id: str) -> Dict[str, Any]:
+    async def get_persisted_request(request_id: str) -> Dict[str, Any]:
         store = app.state.request_state_store
         if store is None:
             raise HTTPException(status_code=404, detail="request state store is disabled")
 
-        payload = store.load(request_id)
+        payload = await asyncio.to_thread(store.load, request_id)
         if payload is None:
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
         return payload
@@ -477,8 +485,98 @@ def create_app(
             todo_items=todo_payload,
         )
 
+    def _build_sse_stream(
+        stream_starter: Callable[[Event], Iterator[dict[str, Any]]],
+        *,
+        request: Request | None,
+        request_id: str,
+        heartbeat_seconds: float,
+        error_log_label: str,
+    ) -> StreamingResponse:
+        cancel_event = Event()
+        event_queue: Queue[tuple[str, Any]] = Queue()
+        heartbeat_interval = max(0.05, float(heartbeat_seconds or 15.0))
+
+        def producer() -> None:
+            try:
+                for event in stream_starter(cancel_event):
+                    if cancel_event.is_set():
+                        break
+                    event_queue.put(("event", event))
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                logger.exception(
+                    "%s",
+                    error_log_label,
+                    extra={"request_id": request_id},
+                )
+                event_queue.put(("error", exc))
+            finally:
+                event_queue.put(("done", None))
+
+        worker = Thread(
+            target=producer,
+            name=f"sse-producer-{request_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
+
+        async def event_iterator() -> AsyncIterator[str]:
+            last_emitted = time.monotonic()
+            poll_slice = min(0.1, heartbeat_interval)
+            try:
+                while True:
+                    if request is not None and await request.is_disconnected():
+                        cancel_event.set()
+                        break
+
+                    try:
+                        kind, payload = await asyncio.to_thread(event_queue.get, True, poll_slice)
+                    except Empty:
+                        now = time.monotonic()
+                        if now - last_emitted >= heartbeat_interval:
+                            yield ": keepalive\n\n"
+                            last_emitted = now
+                        continue
+
+                    if kind == "event":
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        last_emitted = time.monotonic()
+                    elif kind == "error":
+                        error_payload = {
+                            "type": "error",
+                            "detail": f"{payload} (request_id={request_id})",
+                        }
+                        yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                        break
+                    else:
+                        break
+            finally:
+                cancel_event.set()
+                await asyncio.to_thread(worker.join, 1.0)
+
+        return StreamingResponse(
+            event_iterator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    def _supports_cancel_event(fn: Callable[..., Any]) -> bool:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "cancel_event":
+                return True
+        return False
+
     @app.post("/research/stream")
-    def stream_research(payload: ResearchRequest, request: Request) -> StreamingResponse:
+    async def stream_research(payload: ResearchRequest, request: Request) -> StreamingResponse:
         request_id = _request_id(request)
         try:
             config = _build_config(payload)
@@ -496,35 +594,23 @@ def create_app(
                 detail=f"Research failed to start (request_id={request_id})",
             ) from exc
 
-        def event_iterator() -> Iterator[str]:
-            try:
-                for event in agent.run_stream(payload.topic):
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception as exc:  # pragma: no cover - defensive guardrail
-                logger.exception(
-                    "Streaming research failed topic=%s",
-                    payload.topic,
-                    extra={"request_id": request_id},
-                )
-                error_payload = {
-                    "type": "error",
-                    "detail": f"{exc} (request_id={request_id})",
-                }
-                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+        def _start(cancel_event: Event) -> Iterator[dict[str, Any]]:
+            if _supports_cancel_event(agent.run_stream):
+                return agent.run_stream(payload.topic, cancel_event=cancel_event)
+            return agent.run_stream(payload.topic)
 
-        return StreamingResponse(
-            event_iterator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Request-ID": request_id,
-            },
+        return _build_sse_stream(
+            _start,
+            request=request,
+            request_id=request_id,
+            heartbeat_seconds=config.sse_heartbeat_interval_seconds,
+            error_log_label=f"Streaming research failed topic={payload.topic}",
         )
 
     @app.post("/requests/{request_id}/resume/stream")
-    def stream_resume_research(
+    async def stream_resume_research(
         request_id: str,
+        request: Request,
         payload: ResumeRequest | None = None,
     ) -> StreamingResponse:
         try:
@@ -548,30 +634,17 @@ def create_app(
                 detail=f"Resume failed to start (request_id={request_id})",
             ) from exc
 
-        def event_iterator() -> Iterator[str]:
-            try:
-                for event in agent.run_stream_resume(request_id):
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception as exc:  # pragma: no cover - defensive guardrail
-                logger.exception(
-                    "Streaming resume failed request_id=%s",
-                    request_id,
-                    extra={"request_id": request_id},
-                )
-                error_payload = {
-                    "type": "error",
-                    "detail": f"{exc} (request_id={request_id})",
-                }
-                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+        def _start(cancel_event: Event) -> Iterator[dict[str, Any]]:
+            if _supports_cancel_event(agent.run_stream_resume):
+                return agent.run_stream_resume(request_id, cancel_event=cancel_event)
+            return agent.run_stream_resume(request_id)
 
-        return StreamingResponse(
-            event_iterator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Request-ID": request_id,
-            },
+        return _build_sse_stream(
+            _start,
+            request=request,
+            request_id=request_id,
+            heartbeat_seconds=config.sse_heartbeat_interval_seconds,
+            error_log_label=f"Streaming resume failed request_id={request_id}",
         )
 
     return app

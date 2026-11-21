@@ -1505,6 +1505,7 @@ async function refreshPersistedHistory(signal?: AbortSignal) {
           requestMetrics: {},
           error: getString(entry.error, ""),
           canViewContent:
+            Boolean(entry.can_view_content) ||
             Boolean(entry.report_markdown) ||
             (Array.isArray(entry.todo_items) && entry.todo_items.length > 0) ||
             Boolean(getString(entry.error, "")),
@@ -2298,6 +2299,24 @@ function handleResearchEvent(event: ResearchStreamEvent) {
       nextAggregate.recent_requests = previousAggregate.recent_requests;
     }
     latestAggregateMetrics.value = nextAggregate;
+    return;
+  }
+
+  if (event.type === "report_outline") {
+    reportMarkdown.value = "";
+    const sections = Array.isArray(event.sections) ? event.sections : [];
+    if (sections.length > 0) {
+      progressLogs.value.push(`报告大纲已就绪（${sections.length} 个章节）`);
+    }
+    return;
+  }
+
+  if (event.type === "report_chunk") {
+    const chunk = typeof event.content === "string" ? event.content : "";
+    if (chunk) {
+      reportMarkdown.value += chunk;
+      pulse(reportHighlight);
+    }
     return;
   }
 

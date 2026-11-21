@@ -567,6 +567,78 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    def test_list_requests_returns_slim_payload_by_default_and_supports_include_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_config = main.Configuration.from_env(
+                overrides={
+                    "request_state_enabled": True,
+                    "request_state_dir": temp_dir,
+                },
+                load_env_file=False,
+            )
+            with isolated_configuration():
+                with TestClient(main.create_app(base_config=base_config)) as client:
+                    client.app.state.request_state_store.save(
+                        "req-slim",
+                        {
+                            "topic": "slim test",
+                            "status": "success",
+                            "phase": "completed",
+                            "todo_items": [{"id": 1, "title": "t1", "evidence_items": [{"snippet": "x" * 500}]}],
+                            "report_markdown": "# Full Report\n" + ("body " * 200),
+                        },
+                    )
+                    slim_resp = client.get("/requests")
+                    full_resp = client.get("/requests?include_content=true")
+
+        self.assertEqual(slim_resp.status_code, 200)
+        slim_item = slim_resp.json()["items"][0]
+        self.assertNotIn("report_markdown", slim_item)
+        self.assertNotIn("todo_items", slim_item)
+        self.assertTrue(slim_item["can_view_content"])
+        self.assertTrue(slim_item["has_report"])
+        self.assertEqual(slim_item["task_count"], 1)
+
+        full_item = full_resp.json()["items"][0]
+        self.assertIn("report_markdown", full_item)
+        self.assertIn("todo_items", full_item)
+
+    def test_stream_research_emits_keepalive_heartbeat_and_passes_cancel_event(self):
+        import time as _time
+
+        captured_cancel = {}
+
+        class SlowStubAgent:
+            def __init__(self, config, request_id=None):
+                self.config = config
+                self.request_id = request_id
+
+            def run_stream(self, topic: str, cancel_event=None):
+                captured_cancel["event"] = cancel_event
+                _time.sleep(0.18)
+                yield {"type": "status", "message": f"working:{topic}"}
+                yield {"type": "done"}
+
+        base_config = main.Configuration.from_env(
+            overrides={
+                "request_state_enabled": False,
+                "sse_heartbeat_interval_seconds": 0.06,
+            },
+            load_env_file=False,
+        )
+        with isolated_configuration():
+            with patch.dict(os.environ, {"SSE_HEARTBEAT_INTERVAL_SECONDS": "0.06"}):
+                with patch.object(main, "DeepResearchAgent", SlowStubAgent):
+                    with TestClient(main.create_app(base_config=base_config)) as client:
+                        response = client.post("/research/stream", json={"topic": "heartbeat"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("x-accel-buffering"), "no")
+        self.assertIn(": keepalive", response.text)
+        self.assertIn("working:heartbeat", response.text)
+        self.assertIsNotNone(captured_cancel.get("event"))
+        self.assertTrue(captured_cancel["event"].is_set())
+
 
 if __name__ == "__main__":
     unittest.main()

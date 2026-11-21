@@ -712,27 +712,56 @@ def _get_vector_cache_collection(config: Configuration) -> Any | None:
             return None
 
 
+_MAX_SCOPE_KEYS = 200
+
+
+def _scope_key_ttl_seconds(config: Configuration) -> int:
+    return max(int(getattr(config, "search_cache_evergreen_ttl_seconds", 172800) or 172800), 3600)
+
+
 def _get_scope_keys(config: Configuration, scope_key: str) -> list[str]:
     """Load cached entry keys for a given semantic namespace."""
 
     disk_cache = _get_disk_cache(config)
-    if disk_cache is not None:
-        return list(disk_cache.get(scope_key, default=[]))
-
     with _CACHE_LOCK:
+        if disk_cache is not None:
+            return list(disk_cache.get(scope_key, default=[]))
         return list(_MEMORY_SCOPE_INDEX.get(scope_key, []))
 
 
 def _set_scope_keys(config: Configuration, scope_key: str, keys: list[str]) -> None:
-    """Persist the semantic namespace index."""
+    """Persist the semantic namespace index with bounded capacity and TTL."""
+
+    bounded = list(keys)[-_MAX_SCOPE_KEYS:]
+    disk_cache = _get_disk_cache(config)
+    with _CACHE_LOCK:
+        if disk_cache is not None:
+            disk_cache.set(scope_key, bounded, expire=_scope_key_ttl_seconds(config))
+            return
+        _MEMORY_SCOPE_INDEX[scope_key] = bounded
+
+
+def _append_scope_key(config: Configuration, scope_key: str, key: str) -> None:
+    """Atomically append a cache key to a semantic namespace with bounded capacity."""
 
     disk_cache = _get_disk_cache(config)
-    if disk_cache is not None:
-        disk_cache.set(scope_key, list(keys))
-        return
-
     with _CACHE_LOCK:
-        _MEMORY_SCOPE_INDEX[scope_key] = list(keys)
+        if disk_cache is not None:
+            keys = list(disk_cache.get(scope_key, default=[]))
+            if key in keys:
+                return
+            keys.append(key)
+            disk_cache.set(
+                scope_key,
+                keys[-_MAX_SCOPE_KEYS:],
+                expire=_scope_key_ttl_seconds(config),
+            )
+            return
+        keys = list(_MEMORY_SCOPE_INDEX.get(scope_key, []))
+        if key in keys:
+            return
+        keys.append(key)
+        _MEMORY_SCOPE_INDEX[scope_key] = keys[-_MAX_SCOPE_KEYS:]
 
 
 def _delete_disk_cache_key(disk_cache: Any, key: str) -> None:
@@ -752,10 +781,22 @@ def _delete_vector_cache_key(config: Configuration, key: str) -> None:
 
 
 def _remove_scope_key(config: Configuration, scope_key: str, key: str) -> None:
-    scope_keys = _get_scope_keys(config, scope_key)
-    if key not in scope_keys:
-        return
-    _set_scope_keys(config, scope_key, [candidate for candidate in scope_keys if candidate != key])
+    disk_cache = _get_disk_cache(config)
+    with _CACHE_LOCK:
+        if disk_cache is not None:
+            scope_keys = list(disk_cache.get(scope_key, default=[]))
+            if key not in scope_keys:
+                return
+            disk_cache.set(
+                scope_key,
+                [candidate for candidate in scope_keys if candidate != key],
+                expire=_scope_key_ttl_seconds(config),
+            )
+            return
+        scope_keys = list(_MEMORY_SCOPE_INDEX.get(scope_key, []))
+        if key not in scope_keys:
+            return
+        _MEMORY_SCOPE_INDEX[scope_key] = [candidate for candidate in scope_keys if candidate != key]
 
 
 def _delete_cache_entry(
@@ -932,10 +973,7 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
             _MEMORY_CACHE[key] = entry.clone()
 
     if _approximate_cache_reuse_allowed(entry.ttl_bucket, topic_scope=entry.topic_scope):
-        scope_keys = _get_scope_keys(config, scope_key)
-        if key not in scope_keys:
-            scope_keys.append(key)
-            _set_scope_keys(config, scope_key, scope_keys)
+        _append_scope_key(config, scope_key, key)
         _upsert_vector_cache_entry(key, entry, config, scope_key=scope_key)
         return
 

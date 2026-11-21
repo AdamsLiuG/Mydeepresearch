@@ -6,7 +6,7 @@ import ipaddress
 import logging
 import re
 from pathlib import Path
-from threading import Lock, Semaphore, local
+from threading import Event, Lock, Semaphore, Thread, local
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
@@ -902,8 +902,22 @@ class DeepResearchAgent(
     ) -> None:
         # Flush usage before re-synthesising: the maintenance pass reads the card files that
         # refresh_request may rewrite, so recording hits first keeps the counters intact.
-        self._flush_strategy_memory_usage(observer=observer)
-        self._strategy_memory.refresh_request(request_id, observer=observer)
+        def _run_refresh() -> None:
+            self._flush_strategy_memory_usage(observer=observer)
+            self._strategy_memory.refresh_request(request_id, observer=observer)
+
+        if bool(getattr(self.config, "async_memory_refresh_enabled", False)):
+            Thread(
+                target=_run_refresh,
+                name=f"strategy-memory-refresh-{request_id[:8]}",
+                daemon=True,
+            ).start()
+            return
+        _run_refresh()
+
+    def _is_cancelled(self) -> bool:
+        cancel_event = getattr(self, "_cancel_event", None)
+        return bool(cancel_event is not None and cancel_event.is_set())
 
     def _flush_strategy_memory_usage(self, *, observer: RequestTrace | None) -> None:
         """Persist which strategy cards this request actually used, then decay unused drafts.
@@ -1127,8 +1141,10 @@ class DeepResearchAgent(
         resumed: bool,
         resume_phase: str | None,
         emit_stream: bool,
+        cancel_event: Event | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Run the unified 6-stage workflow for both sync and streaming callers."""
+        self._cancel_event = cancel_event
         report = state.structured_report or ""
         request_completed = False
         self._select_skill_pack(state.research_topic or topic, observer, state=state)
@@ -1138,6 +1154,12 @@ class DeepResearchAgent(
             yield {"type": "status", "message": "初始化研究流程"}
 
         try:
+            if self._is_cancelled():
+                observer.record_degraded("client_disconnected")
+                observer.complete_request(status="cancelled")
+                request_completed = True
+                self._persist_request_state(state, phase="cancelled", status="cancelled", report_markdown=report)
+                return
             if resumed and resume_phase:
                 self._restore_task_counters(observer, state)
                 self._persist_request_state(state, phase=resume_phase, status="in_progress")
@@ -1235,6 +1257,13 @@ class DeepResearchAgent(
                 else:
                     self._execute_task_batch_sync(state, pending_tasks)
                 self._persist_request_state(state, phase="task_execution", status="in_progress")
+
+            if self._is_cancelled():
+                observer.record_degraded("client_disconnected")
+                observer.complete_request(status="cancelled")
+                request_completed = True
+                self._persist_request_state(state, phase="cancelled", status="cancelled", report_markdown=report)
+                return
 
             if not state.reflection_completed:
                 reflection_gap_signals = self._reflection_gap_signals(state)
@@ -1526,6 +1555,12 @@ class DeepResearchAgent(
                     state.report_repair_completed = True
 
             final_step = next_step
+            if self._is_cancelled():
+                observer.record_degraded("client_disconnected")
+                observer.complete_request(status="cancelled")
+                request_completed = True
+                self._persist_request_state(state, phase="cancelled", status="cancelled", report_markdown=report)
+                return
             if not report:
                 report_span = observer.start_stage(
                     "report",
@@ -1635,6 +1670,7 @@ class DeepResearchAgent(
             )
             raise
         finally:
+            self._cancel_event = None
             self._restore_request_config()
 
     def run(
@@ -1676,6 +1712,7 @@ class DeepResearchAgent(
         *,
         initial_state: SummaryState | None = None,
         resume_phase: str | None = None,
+        cancel_event: Event | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Execute the workflow yielding incremental progress events."""
         observer = self._start_request_trace(topic)
@@ -1687,15 +1724,26 @@ class DeepResearchAgent(
             resumed=initial_state is not None,
             resume_phase=resume_phase,
             emit_stream=True,
+            cancel_event=cancel_event,
         )
 
-    def run_stream_resume(self, request_id: str) -> Iterator[dict[str, Any]]:
+    def run_stream_resume(
+        self,
+        request_id: str,
+        *,
+        cancel_event: Event | None = None,
+    ) -> Iterator[dict[str, Any]]:
         """Resume a persisted request snapshot in streaming mode."""
 
         snapshot = self._load_resume_snapshot(request_id)
         state, phase = self._state_from_snapshot(snapshot)
         topic = state.research_topic or str(snapshot.get("topic") or "").strip()
-        yield from self.run_stream(topic, initial_state=state, resume_phase=phase)
+        yield from self.run_stream(
+            topic,
+            initial_state=state,
+            resume_phase=phase,
+            cancel_event=cancel_event,
+        )
 
     def _drain_tool_events(
         self,

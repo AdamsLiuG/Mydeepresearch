@@ -443,6 +443,17 @@ class Configuration(BaseModel):
         title="CORS Origins",
         description="Allowed CORS origins for the HTTP API",
     )
+    sse_heartbeat_interval_seconds: float = Field(
+        default=15.0,
+        gt=0.0,
+        title="SSE Heartbeat Interval Seconds",
+        description="Keepalive comment interval emitted on idle SSE streams",
+    )
+    async_memory_refresh_enabled: bool = Field(
+        default=False,
+        title="Async Memory Refresh Enabled",
+        description="When enabled, run post-report strategy memory synthesis in a background thread",
+    )
     search_cache_enabled: bool = Field(
         default=True,
         title="Search Cache Enabled",
@@ -1067,6 +1078,8 @@ class Configuration(BaseModel):
             "port": os.getenv("PORT"),
             "log_level": os.getenv("LOG_LEVEL"),
             "cors_origins": os.getenv("CORS_ORIGINS"),
+            "sse_heartbeat_interval_seconds": os.getenv("SSE_HEARTBEAT_INTERVAL_SECONDS"),
+            "async_memory_refresh_enabled": os.getenv("ASYNC_MEMORY_REFRESH_ENABLED"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
             "search_cache_dynamic_ttl_enabled": os.getenv("SEARCH_CACHE_DYNAMIC_TTL_ENABLED"),

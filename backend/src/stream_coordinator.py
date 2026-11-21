@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from queue import Empty, Queue
-from threading import Thread
+from threading import Thread, local
 from typing import Any, Iterator
 
 from models import SummaryState, TodoItem
@@ -13,6 +13,7 @@ from services.summarizer import TaskSummaryResult
 from services.text_processing import strip_citation_markers
 
 logger = logging.getLogger(__name__)
+_WORKER_CONTEXT = local()
 
 
 class StreamCoordinatorMixin:
@@ -104,14 +105,26 @@ class StreamCoordinatorMixin:
             event_queue.put(payload)
 
         def tool_event_sink(event: dict[str, Any]) -> None:
-            enqueue(event)
+            payload = dict(event)
+            if payload.get("task_id") is None:
+                thread_task_id = getattr(_WORKER_CONTEXT, "task_id", None)
+                if thread_task_id is not None:
+                    payload["task_id"] = thread_task_id
+            enqueue(payload)
 
         self._set_tool_event_sink(tool_event_sink)
         threads: list[Thread] = []
 
+        def _cancelled() -> bool:
+            checker = getattr(self, "_is_cancelled", None)
+            return bool(checker()) if callable(checker) else False
+
         def worker(task: TodoItem) -> None:
+            _WORKER_CONTEXT.task_id = task.id
             step = channel_map.get(task.id, {}).get("step", 0)
             try:
+                if _cancelled():
+                    return
                 enqueue(
                     {
                         "type": "task_status",
@@ -126,6 +139,8 @@ class StreamCoordinatorMixin:
                     task=task,
                 )
                 for event in self._execute_task(state, task, emit_stream=True, step=step):
+                    if _cancelled():
+                        break
                     enqueue(event, task=task)
             except Exception as exc:  # pragma: no cover - defensive guardrail
                 logger.exception("Task execution failed", exc_info=exc)
@@ -149,6 +164,7 @@ class StreamCoordinatorMixin:
                 )
                 enqueue(observer.metrics_event(), task=task)
             finally:
+                _WORKER_CONTEXT.task_id = None
                 enqueue({"type": "__task_done__", "task_id": task.id})
 
         for task in tasks:
@@ -161,20 +177,27 @@ class StreamCoordinatorMixin:
 
         try:
             while finished_workers < active_workers:
-                event = event_queue.get()
+                if _cancelled():
+                    break
+                try:
+                    event = event_queue.get(timeout=0.2)
+                except Empty:
+                    continue
                 if event.get("type") == "__task_done__":
                     finished_workers += 1
                     continue
                 yield event
 
-            while True:
-                try:
-                    event = event_queue.get_nowait()
-                except Empty:
-                    break
-                if event.get("type") != "__task_done__":
-                    yield event
+            if not _cancelled():
+                while True:
+                    try:
+                        event = event_queue.get_nowait()
+                    except Empty:
+                        break
+                    if event.get("type") != "__task_done__":
+                        yield event
         finally:
             self._set_tool_event_sink(None)
+            join_timeout = 2.0 if _cancelled() else None
             for thread in threads:
-                thread.join()
+                thread.join(timeout=join_timeout)

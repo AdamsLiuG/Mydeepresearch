@@ -1800,6 +1800,51 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertTrue(observation.evidence_sufficiency)
         self.assertEqual(observation.stop_reason, "high_confidence_early_stop")
 
+    def test_stream_coordinator_binds_thread_local_task_id_and_respects_cancel_event(self):
+        from threading import Event
+
+        agent = self._build_agent()
+        state = SummaryState(research_topic="并发流式测试")
+        t1 = TodoItem(id=1, title="任务1", intent="i1", query="q1")
+        t2 = TodoItem(id=2, title="任务2", intent="i2", query="q2")
+        state.todo_items = [t1, t2]
+
+        agent._start_request_trace(state.research_topic)
+        channel_map: dict[int, dict] = {}
+        agent._assign_stream_channels(state.todo_items, channel_map, start_step=1)
+
+        sink_holder = {"sink": None}
+        agent._set_tool_event_sink = lambda sink: sink_holder.__setitem__("sink", sink)
+        agent._warm_topic_search_cache = lambda s, observer=None: None
+
+        def fake_exec(s, task, emit_stream=True, step=None):
+            # Simulate a tool event emitted from worker thread WITHOUT explicit task_id
+            if sink_holder["sink"] is not None:
+                sink_holder["sink"]({"type": "tool_call", "tool": "search_web"})
+            task.status = "completed"
+            yield {"type": "task_status", "task_id": task.id, "status": "completed"}
+
+        agent._execute_task = fake_exec
+        events = list(agent._execute_task_batch_stream(state, [t1, t2], channel_map))
+        tool_events = [ev for ev in events if ev.get("type") == "tool_call"]
+        self.assertEqual(len(tool_events), 2)
+        self.assertEqual({ev["task_id"] for ev in tool_events}, {1, 2})
+        self.assertEqual({ev["stream_token"] for ev in tool_events}, {"task_1", "task_2"})
+
+        # Pre-set cancel_event short-circuits workflow before planning/reporting
+        cancel_ev = Event()
+        cancel_ev.set()
+        report_called = {"flag": False}
+        agent.reporting = type(
+            "StubReporting",
+            (),
+            {"generate_report": staticmethod(lambda *a, **kw: (report_called.__setitem__("flag", True) or ""))},
+        )()
+        cancelled_events = list(agent.run_stream("取消测试", cancel_event=cancel_ev))
+        self.assertFalse(report_called["flag"])
+        self.assertFalse(any(ev.get("type") == "final_report" for ev in cancelled_events))
+        self.assertIn("client_disconnected", agent._request_trace.degraded_reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

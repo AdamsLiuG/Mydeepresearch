@@ -108,28 +108,47 @@ async function streamFromEndpoint(
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
+  const parseSseFrame = (rawFrame: string): ResearchStreamEvent | null => {
+    const dataLines: string[] = [];
+    for (const line of rawFrame.split("\n")) {
+      // Ignore empty lines and SSE heartbeat/comment lines (e.g. ": keepalive").
+      if (!line || line.startsWith(":")) {
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    const dataPayload = dataLines.join("\n").trim();
+    if (!dataPayload) {
+      return null;
+    }
+    try {
+      return JSON.parse(dataPayload) as ResearchStreamEvent;
+    } catch (error) {
+      console.error("解析流式事件失败：", error, dataPayload);
+      return null;
+    }
+  };
+
   while (true) {
     const { value, done } = await reader.read();
-    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const chunk = decoder
+      .decode(value || new Uint8Array(), { stream: !done })
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+    buffer += chunk;
 
     let boundary = buffer.indexOf("\n\n");
     while (boundary !== -1) {
-      const rawEvent = buffer.slice(0, boundary).trim();
+      const rawFrame = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
 
-      if (rawEvent.startsWith("data:")) {
-        const dataPayload = rawEvent.slice(5).trim();
-        if (dataPayload) {
-          try {
-            const event = JSON.parse(dataPayload) as ResearchStreamEvent;
-            onEvent(event);
-
-            if (event.type === "error" || event.type === "done") {
-              return;
-            }
-          } catch (error) {
-            console.error("解析流式事件失败：", error, dataPayload);
-          }
+      const event = parseSseFrame(rawFrame);
+      if (event) {
+        onEvent(event);
+        if (event.type === "error" || event.type === "done") {
+          return;
         }
       }
 
@@ -137,20 +156,10 @@ async function streamFromEndpoint(
     }
 
     if (done) {
-      // 处理可能的尾巴事件
-      if (buffer.trim()) {
-        const rawEvent = buffer.trim();
-        if (rawEvent.startsWith("data:")) {
-          const dataPayload = rawEvent.slice(5).trim();
-          if (dataPayload) {
-            try {
-              const event = JSON.parse(dataPayload) as ResearchStreamEvent;
-              onEvent(event);
-            } catch (error) {
-              console.error("解析流式事件失败：", error, dataPayload);
-            }
-          }
-        }
+      // Flush trailing frame when stream closes without double newline.
+      const event = parseSseFrame(buffer);
+      if (event) {
+        onEvent(event);
       }
       break;
     }
