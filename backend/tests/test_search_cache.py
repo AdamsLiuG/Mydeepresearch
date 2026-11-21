@@ -1224,8 +1224,8 @@ class SearchCacheTests(unittest.TestCase):
 
     def test_dispatch_search_uses_semantic_cache_for_fresh_queries_with_same_topic_context(self):
         DummySentenceTransformer.embeddings = {
-            "探索多模态大模型在 2025 年的关键突破 探索多模态大模型在 2025 年的关键突破 技术架构创新": [1.0, 0.0, 0.0],
-            "探索多模态大模型在 2025 年的关键突破 探索多模态大模型在 2025 年的关键突破 核心能力突破": [1.0, 0.0, 0.0],
+            "技术架构创新": [1.0, 0.0, 0.0],
+            "技术架构创新 核心突破": [1.0, 0.0, 0.0],
         }
         observer = RequestTrace(
             request_id="req-semantic-cache-fresh-topic",
@@ -1258,7 +1258,7 @@ class SearchCacheTests(unittest.TestCase):
             cache_context=cache_context,
         )
         second = services_search.dispatch_search(
-            "探索多模态大模型在 2025 年的关键突破 核心能力突破",
+            "探索多模态大模型在 2025 年的关键突破 技术架构创新 核心突破",
             config,
             1,
             observer=observer,
@@ -1696,6 +1696,170 @@ class SearchCacheTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(RuntimeError, message):
                         services_search.dispatch_search("same query", config, 0)
+
+    def test_aspect_delta_prevents_distinct_subtask_lexical_collision(self):
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "approximate_cache_enabled": True,
+                "approximate_cache_dense_enabled": False,
+                "approximate_cache_sparse_enabled": True,
+                "approximate_cache_sparse_threshold": 0.35,
+            },
+            load_env_file=False,
+        )
+        topic = "什么是 MCP（Model Context Protocol），它解决了什么问题？"
+        first = services_search.dispatch_search(
+            f"{topic} 基础定义与背景",
+            config,
+            0,
+            cache_context={"research_topic": topic, "task_title": "基础定义与背景"},
+        )
+        second = services_search.dispatch_search(
+            f"{topic} 生态与竞品对比",
+            config,
+            1,
+            cache_context={"research_topic": topic, "task_title": "生态与竞品对比"},
+        )
+
+        self.assertFalse(first[4])
+        self.assertFalse(second[4])
+        self.assertEqual(second[5], "miss")
+        self.assertEqual(DummySearchTool.call_count, 2)
+
+    def test_intra_request_task_isolation_blocks_cross_task_approximate_hit(self):
+        DummySentenceTransformer.embeddings = {
+            "技术架构创新": [1.0, 0.0, 0.0],
+            "生态与竞品对比": [1.0, 0.0, 0.0],
+        }
+        observer = RequestTrace(
+            request_id="req-same",
+            topic="MCP 深度研究",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "approximate_cache_enabled": True,
+                "approximate_cache_dense_threshold": 0.90,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+        first = services_search.dispatch_search(
+            "MCP 深度研究 技术架构创新",
+            config,
+            0,
+            observer=observer,
+            cache_context={
+                "research_topic": "MCP 深度研究",
+                "request_id": "req-same",
+                "task_id": "1",
+            },
+        )
+        second_same_req = services_search.dispatch_search(
+            "MCP 深度研究 生态与竞品对比",
+            config,
+            1,
+            observer=observer,
+            cache_context={
+                "research_topic": "MCP 深度研究",
+                "request_id": "req-same",
+                "task_id": "2",
+            },
+        )
+        third_cross_req = services_search.dispatch_search(
+            "MCP 深度研究 生态与竞品对比",
+            config,
+            0,
+            cache_context={
+                "research_topic": "MCP 深度研究",
+                "request_id": "req-other",
+                "task_id": "1",
+            },
+        )
+
+        self.assertFalse(first[4])
+        self.assertFalse(second_same_req[4])
+        self.assertEqual(
+            observer.snapshot()["last_search_cache_details"].get(
+                "intra_request_collisions_blocked"
+            ),
+            1,
+        )
+        self.assertTrue(third_cross_req[4])
+        self.assertEqual(DummySearchTool.call_count, 2)
+
+    def test_entity_and_year_guardrail_vetoes_conflicting_approximate_hits(self):
+        DummySentenceTransformer.embeddings = {
+            "2024 多模态大模型进展": [1.0, 0.0, 0.0],
+            "2025 多模态大模型进展": [1.0, 0.0, 0.0],
+            "qwen2 架构设计": [1.0, 0.0, 0.0],
+            "qwen3 架构设计": [1.0, 0.0, 0.0],
+        }
+        observer = RequestTrace(
+            request_id="req-guardrail",
+            topic="guardrail",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "duckduckgo",
+                "search_cache_enabled": True,
+                "search_cache_ttl_seconds": 900,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "approximate_cache_enabled": True,
+                "approximate_cache_dense_threshold": 0.90,
+                "semantic_cache_embedding_model": "dummy-minilm",
+            },
+            load_env_file=False,
+        )
+        first_year = services_search.dispatch_search(
+            "2024 多模态大模型进展",
+            config,
+            0,
+            observer=observer,
+            cache_context={"research_topic": "多模态"},
+        )
+        second_year = services_search.dispatch_search(
+            "2025 多模态大模型进展",
+            config,
+            1,
+            observer=observer,
+            cache_context={"research_topic": "多模态"},
+        )
+        self.assertFalse(first_year[4])
+        self.assertFalse(second_year[4])
+        self.assertEqual(observer.snapshot()["last_search_cache_details"].get("guardrail_vetoes"), 1)
+
+        first_ver = services_search.dispatch_search("Qwen2 架构设计", config, 0)
+        second_ver = services_search.dispatch_search("Qwen3 架构设计", config, 1)
+        self.assertFalse(first_ver[4])
+        self.assertFalse(second_ver[4])
+
+    def test_dynamic_fresh_year_classification_uses_rolling_window(self):
+        from datetime import datetime, timezone
+
+        fake_now = datetime(2028, 3, 1, tzinfo=timezone.utc)
+        self.assertTrue(services_search._has_fresh_year_signal("2027 multimodal", now=fake_now))
+        self.assertTrue(services_search._has_fresh_year_signal("2028 multimodal", now=fake_now))
+        self.assertTrue(services_search._has_fresh_year_signal("2029 roadmap", now=fake_now))
+        self.assertFalse(services_search._has_fresh_year_signal("2024 archive", now=fake_now))
 
 
 if __name__ == "__main__":

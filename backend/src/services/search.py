@@ -12,6 +12,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -59,7 +60,9 @@ _TRACKING_QUERY_PARAMS = {
 }
 _CJK_CHAR_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _ASCII_WORD_PATTERN = re.compile(r"[a-z0-9]+")
-_FRESH_YEAR_PATTERN = re.compile(r"\b202[56]\b")
+_YEAR_TOKEN_PATTERN = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+_VERSIONED_ENTITY_PATTERN = re.compile(r"\b([a-z]{2,})[-_ ]?v?(\d+(?:\.\d+)?)\b")
+_STANDALONE_VERSION_PATTERN = re.compile(r"\bv(\d+(?:\.\d+)?)\b")
 _SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 _SEMANTIC_SCHOLAR_USER_AGENT = "helloagents-deepresearch/1.0"
 _SEMANTIC_CACHE_COLLECTION_NAME = "semantic_search_cache_v1"
@@ -136,6 +139,8 @@ class SearchCacheEntry:
     ttl_seconds: int = 0
     expires_at: float = 0.0
     embedding: list[float] | None = None
+    request_id: str = ""
+    task_id: str = ""
 
     def clone(self) -> SearchCacheEntry:
         """Return a defensive copy of the cache entry."""
@@ -157,6 +162,8 @@ class SearchCacheEntry:
             ttl_seconds=self.ttl_seconds,
             expires_at=self.expires_at,
             embedding=list(self.embedding) if self.embedding else None,
+            request_id=self.request_id,
+            task_id=self.task_id,
         )
 
     def to_record(self) -> dict[str, Any]:
@@ -179,6 +186,8 @@ class SearchCacheEntry:
             "ttl_seconds": self.ttl_seconds,
             "expires_at": self.expires_at,
             "embedding": list(self.embedding) if self.embedding else None,
+            "request_id": self.request_id,
+            "task_id": self.task_id,
         }
 
     @classmethod
@@ -202,6 +211,8 @@ class SearchCacheEntry:
             ttl_seconds=max(int(record.get("ttl_seconds") or 0), 0),
             expires_at=float(record.get("expires_at") or 0.0),
             embedding=_coerce_embedding(record.get("embedding")),
+            request_id=str(record.get("request_id") or "").strip(),
+            task_id=str(record.get("task_id") or "").strip(),
         )
 
     def resolved_expires_at(self, *, fallback_ttl_seconds: int = 0) -> float:
@@ -230,6 +241,8 @@ class ApproximateCacheMatchResult:
     sparse_score: float = 0.0
     combined_score: float = 0.0
     hit_mode: str = "miss"
+    intra_request_collisions_blocked: int = 0
+    guardrail_vetoes: int = 0
 
 
 @dataclass
@@ -302,7 +315,7 @@ def _normalize_cache_context(cache_context: dict[str, Any] | None) -> dict[str, 
         return {}
 
     normalized: dict[str, str] = {}
-    for field_name in ("research_topic", "task_title", "task_intent"):
+    for field_name in ("research_topic", "task_title", "task_intent", "request_id", "task_id"):
         value = cache_context.get(field_name)
         if value is None:
             continue
@@ -320,8 +333,25 @@ def _build_topic_scope(cache_context: dict[str, str] | None) -> str:
     return _normalize_query(cache_context.get("research_topic") or "")
 
 
-def _build_approximate_text(query: str, cache_context: dict[str, str] | None) -> str:
-    """Return the normalized text used for dense and sparse approximate cache matching."""
+def _strip_topic_prefix(text: str, topic_scope: str) -> str:
+    """Strip redundant research-topic prefix so approximate similarity scores aspect deltas."""
+
+    normalized_text = _normalize_query(text)
+    if not normalized_text or not topic_scope:
+        return normalized_text
+    if normalized_text == topic_scope:
+        return ""
+    if normalized_text.startswith(topic_scope):
+        stripped = normalized_text[len(topic_scope) :].strip(" :：-—|/\\，,。；;")
+        return _normalize_query(stripped)
+    if topic_scope in normalized_text:
+        stripped = normalized_text.replace(topic_scope, " ")
+        return _normalize_query(stripped.strip(" :：-—|/\\，,。；;"))
+    return normalized_text
+
+
+def _build_full_context_text(query: str, cache_context: dict[str, str] | None) -> str:
+    """Return full topic + task + query text used for TTL classification."""
 
     parts = [
         cache_context.get("research_topic", "") if cache_context else "",
@@ -331,6 +361,81 @@ def _build_approximate_text(query: str, cache_context: dict[str, str] | None) ->
     ]
     combined = " ".join(part.strip() for part in parts if part and str(part).strip())
     return _normalize_query(combined)
+
+
+def _build_approximate_text(query: str, cache_context: dict[str, str] | None) -> str:
+    """Return normalized aspect-delta text for approximate cache matching.
+
+    When ``research_topic`` already partitions the cache into a ``topic_scope`` bucket,
+    repeating the shared topic prefix inflates lexical and embedding overlap across distinct
+    sub-tasks. Stripping the topic prefix keeps similarity focused on the sub-task aspect.
+    """
+
+    topic_scope = _build_topic_scope(cache_context)
+    if topic_scope:
+        raw_parts = [
+            cache_context.get("task_title", "") if cache_context else "",
+            cache_context.get("task_intent", "") if cache_context else "",
+            query,
+        ]
+        delta_parts: list[str] = []
+        seen_parts: set[str] = set()
+        for raw_part in raw_parts:
+            if not raw_part or not str(raw_part).strip():
+                continue
+            stripped = _strip_topic_prefix(str(raw_part), topic_scope)
+            if stripped and stripped not in seen_parts:
+                seen_parts.add(stripped)
+                delta_parts.append(stripped)
+        if delta_parts:
+            return _normalize_query(" ".join(delta_parts))
+        return _normalize_query(query)
+
+    return _build_full_context_text(query, cache_context)
+
+
+def _dynamic_fresh_years(*, now: datetime | None = None) -> set[str]:
+    """Return rolling recent years [current-1, current, current+1] for freshness checks."""
+
+    current_year = (now or datetime.now(timezone.utc)).year
+    return {str(current_year - 1), str(current_year), str(current_year + 1)}
+
+
+def _has_fresh_year_signal(normalized_text: str, *, now: datetime | None = None) -> bool:
+    years = {match.group(1) for match in _YEAR_TOKEN_PATTERN.finditer(normalized_text or "")}
+    return bool(years & _dynamic_fresh_years(now=now))
+
+
+def _extract_guardrail_tokens(text: str) -> tuple[set[str], dict[str, set[str]]]:
+    """Extract salient years and versioned entity stems for approximate-hit conflict checks."""
+
+    normalized = _normalize_query(text)
+    years = {match.group(1) for match in _YEAR_TOKEN_PATTERN.finditer(normalized)}
+    versions: dict[str, set[str]] = {}
+    for match in _VERSIONED_ENTITY_PATTERN.finditer(normalized):
+        stem = match.group(1)
+        ver = match.group(2)
+        if len(ver) == 4 and ver.startswith(("19", "20")):
+            continue
+        versions.setdefault(stem, set()).add(ver)
+    for match in _STANDALONE_VERSION_PATTERN.finditer(normalized):
+        versions.setdefault("__v__", set()).add(match.group(1))
+    return years, versions
+
+
+def _has_guardrail_conflict(query_text: str, candidate_text: str) -> bool:
+    """Reject approximate reuse when explicit years or entity versions conflict."""
+
+    left_years, left_versions = _extract_guardrail_tokens(query_text)
+    right_years, right_versions = _extract_guardrail_tokens(candidate_text)
+    if left_years and right_years and left_years != right_years:
+        return True
+
+    shared_stems = set(left_versions) & set(right_versions)
+    for stem in shared_stems:
+        if left_versions[stem] != right_versions[stem]:
+            return True
+    return False
 
 
 def _build_semantic_text(query: str, cache_context: dict[str, str] | None) -> str:
@@ -354,11 +459,11 @@ def classify_search_query_bucket(query: str, cache_context: dict[str, Any] | Non
     """Classify a query into `fresh`, `normal`, or `evergreen` cache TTL buckets."""
 
     normalized_context = _normalize_cache_context(cache_context)
-    normalized_text = (_build_approximate_text(query, normalized_context) or _normalize_query(query)).casefold()
+    normalized_text = (_build_full_context_text(query, normalized_context) or _normalize_query(query)).casefold()
     if not normalized_text:
         return "normal"
 
-    if _FRESH_YEAR_PATTERN.search(normalized_text):
+    if _has_fresh_year_signal(normalized_text):
         return "fresh"
     if _has_any_signal(
         normalized_text,
@@ -971,10 +1076,15 @@ def _select_best_approximate_match(
     config: Configuration,
     scope_key: str,
     update_scope_index: bool,
+    raw_query: str = "",
+    request_id: str = "",
+    task_id: str = "",
 ) -> ApproximateCacheMatchResult:
     best_match = ApproximateCacheMatchResult()
     live_keys: list[str] = []
     seen_keys: set[str] = set()
+    blocked_intra_request = 0
+    guardrail_vetoes = 0
 
     for candidate_key in candidate_keys:
         if candidate_key in seen_keys:
@@ -986,6 +1096,20 @@ def _select_best_approximate_match(
             continue
 
         live_keys.append(candidate_key)
+        if (
+            request_id
+            and task_id
+            and entry.request_id == request_id
+            and entry.task_id
+            and entry.task_id != task_id
+        ):
+            blocked_intra_request += 1
+            continue
+
+        if raw_query and _has_guardrail_conflict(raw_query, entry.query or entry.normalized_query):
+            guardrail_vetoes += 1
+            continue
+
         match = _score_approximate_entry(
             entry,
             query_embedding=query_embedding,
@@ -1004,6 +1128,8 @@ def _select_best_approximate_match(
     if update_scope_index and live_keys != candidate_keys:
         _set_scope_keys(config, scope_key, live_keys)
 
+    best_match.intra_request_collisions_blocked = blocked_intra_request
+    best_match.guardrail_vetoes = guardrail_vetoes
     if best_match.entry and best_match.hit_mode != "miss" and best_match.combined_score >= 1.0:
         return best_match
     best_match.entry = None
@@ -1065,6 +1191,9 @@ def _read_approximate_cache(
     config: Configuration,
     *,
     topic_scope: str = "",
+    raw_query: str = "",
+    request_id: str = "",
+    task_id: str = "",
 ) -> ApproximateCacheMatchResult:
     """Read the best approximate cache match using dense and sparse candidate union."""
 
@@ -1112,6 +1241,9 @@ def _read_approximate_cache(
         config=config,
         scope_key=scope_key,
         update_scope_index=False,
+        raw_query=raw_query,
+        request_id=request_id,
+        task_id=task_id,
     )
 
 
@@ -2190,6 +2322,8 @@ def _build_cache_observer_metadata(
     dense_score: float | None = None,
     sparse_score: float | None = None,
     combined_score: float | None = None,
+    intra_request_collisions_blocked: int = 0,
+    guardrail_vetoes: int = 0,
 ) -> dict[str, Any]:
     expires_at = None
     ttl_bucket = query_ttl_bucket
@@ -2216,6 +2350,10 @@ def _build_cache_observer_metadata(
         metadata["sparse_score"] = sparse_score
     if combined_score is not None:
         metadata["combined_score"] = combined_score
+    if intra_request_collisions_blocked > 0:
+        metadata["intra_request_collisions_blocked"] = intra_request_collisions_blocked
+    if guardrail_vetoes > 0:
+        metadata["guardrail_vetoes"] = guardrail_vetoes
     return metadata
 
 
@@ -2235,9 +2373,14 @@ def dispatch_search(
     cache_key = _build_cache_key(query, search_api, config)
     normalized_cache_context = _normalize_cache_context(cache_context)
     topic_scope = _build_topic_scope(normalized_cache_context)
+    context_request_id = normalized_cache_context.get("request_id") or (
+        str(getattr(observer, "request_id", "") or "").strip() if observer else ""
+    )
+    context_task_id = normalized_cache_context.get("task_id", "")
     approximate_text = _build_approximate_text(query, normalized_cache_context)
     ttl_bucket, ttl_seconds = _resolve_cache_ttl(query, normalized_cache_context, config)
     approximate_embedding: list[float] | None = None
+    approximate_match = ApproximateCacheMatchResult()
     if config.search_cache_enabled:
         exact_cached = _read_exact_cache(cache_key, config)
         if exact_cached:
@@ -2283,6 +2426,9 @@ def dispatch_search(
                 search_api,
                 config,
                 topic_scope=topic_scope,
+                raw_query=query,
+                request_id=context_request_id,
+                task_id=context_task_id,
             )
             if approximate_match.entry:
                 if observer:
@@ -2301,6 +2447,8 @@ def dispatch_search(
                             dense_score=approximate_match.dense_score,
                             sparse_score=approximate_match.sparse_score,
                             combined_score=approximate_match.combined_score,
+                            intra_request_collisions_blocked=approximate_match.intra_request_collisions_blocked,
+                            guardrail_vetoes=approximate_match.guardrail_vetoes,
                         ),
                     )
                 logger.info(
@@ -2386,6 +2534,8 @@ def dispatch_search(
                 cache_hit_mode="miss",
                 query_ttl_bucket=ttl_bucket,
                 query_ttl_seconds=ttl_seconds,
+                intra_request_collisions_blocked=approximate_match.intra_request_collisions_blocked,
+                guardrail_vetoes=approximate_match.guardrail_vetoes,
             ),
         )
 
@@ -2408,6 +2558,8 @@ def dispatch_search(
             ttl_seconds=ttl_seconds,
             expires_at=created_at + ttl_seconds,
             embedding=approximate_embedding,
+            request_id=context_request_id,
+            task_id=context_task_id,
         )
         _write_cache(cache_key, cache_entry, config)
 

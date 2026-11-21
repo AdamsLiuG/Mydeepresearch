@@ -194,6 +194,8 @@ class TaskExecutorMixin:
                             "research_topic": state.research_topic,
                             "task_title": task.title,
                             "task_intent": task.intent,
+                            "request_id": str(getattr(self, "request_id", "") or ""),
+                            "task_id": str(task.id),
                         },
                     ),
                     timeout_seconds=timeout_seconds,

@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from hello_agents import ToolAwareSimpleAgent
@@ -35,9 +36,12 @@ _FRESHNESS_PATTERNS = (
     "latest",
     "newest",
     "recent",
-    "2025",
-    "2026",
 )
+
+
+def _dynamic_freshness_years(*, now: datetime | None = None) -> tuple[str, ...]:
+    current_year = (now or datetime.now(timezone.utc)).year
+    return (str(current_year - 1), str(current_year), str(current_year + 1))
 
 
 @dataclass
@@ -437,7 +441,8 @@ class ReviewService:
             for part in [topic or "", task.title or "", task.intent or "", task.query or ""]
             if part and part.strip()
         )
-        return any(keyword in combined for keyword in _FRESHNESS_PATTERNS)
+        keywords = (*_FRESHNESS_PATTERNS, *_dynamic_freshness_years())
+        return any(keyword in combined for keyword in keywords)
 
     def _parse_response(
         self,
