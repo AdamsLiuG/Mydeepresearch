@@ -2,7 +2,7 @@
 pack_id: _neutral
 schema_version: 1
 version: 1
-content_hash: ""
+content_hash: "b93aae0d7f4ba1f6"
 maturity: verified
 status: active
 supersedes: ""

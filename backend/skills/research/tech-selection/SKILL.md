@@ -2,7 +2,7 @@
 pack_id: tech-selection
 schema_version: 1
 version: 1
-content_hash: ""
+content_hash: "336a20070f1a08dc"
 maturity: draft
 status: active
 supersedes: ""

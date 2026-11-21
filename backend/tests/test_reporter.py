@@ -657,6 +657,21 @@ class ReportingServiceTests(unittest.TestCase):
         self.assertNotIn("fetch_page", prompt)
         self.assertIn("不要尝试调用任何工具", prompt)
 
+    def test_precision_internal_process_filter_preserves_normal_technical_terms(self):
+        from services.summarizer import SummarizationService
+
+        technical_sentence = "当并发线程处于 blocked 状态时，网关会执行 JWT 签名校验并记录 warning 日志。"
+        self.assertFalse(ReportingService._contains_internal_process_language(technical_sentence))
+        self.assertFalse(SummarizationService._contains_internal_process_language(technical_sentence))
+        self.assertEqual(
+            ReportingService._strip_internal_process_sentences(technical_sentence),
+            technical_sentence,
+        )
+
+        leaked_sentence = "需注意部分任务审查状态为blocked或warning，报告结论采取保守表述。"
+        self.assertTrue(ReportingService._contains_internal_process_language(leaked_sentence))
+        self.assertTrue(SummarizationService._contains_internal_process_language(leaked_sentence))
+
 
 if __name__ == "__main__":
     unittest.main()

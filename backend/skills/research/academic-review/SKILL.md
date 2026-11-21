@@ -2,7 +2,7 @@
 pack_id: academic-review
 schema_version: 1
 version: 1
-content_hash: ""
+content_hash: "62c85a9194fd0d86"
 maturity: draft
 status: active
 supersedes: ""

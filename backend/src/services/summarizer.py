@@ -42,15 +42,22 @@ class SummarizationService:
     """Handles synchronous and streaming task summarization."""
 
     _STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
-    _INTERNAL_PROCESS_MARKERS = (
-        "审查提示",
-        "审查状态",
-        "blocked",
-        "warning",
-        "source_id",
-        "保守表述",
-        "校验",
-        "系统生成",
+    _INTERNAL_PROCESS_PATTERNS = (
+        re.compile(
+            r"(?:审查|评审|任务|review|status)[\s:：为是]{0,12}\b(blocked|warning|passed)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(blocked|warning|passed)\b\s*(?:或|/|、|,)\s*\b(blocked|warning|passed)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\bsource[_ ]?id\b", re.IGNORECASE),
+        re.compile(r"审查提示"),
+        re.compile(r"审查状态"),
+        re.compile(r"审查发现"),
+        re.compile(r"保守表述"),
+        re.compile(r"source[_ ]?id\s*校验|引用校验|审查校验|仅保留通过.*?(?:校验|验证)"),
+        re.compile(r"系统生成"),
     )
 
     def __init__(
@@ -577,10 +584,10 @@ class SummarizationService:
 
     @staticmethod
     def _contains_internal_process_language(value: Any) -> bool:
-        text = normalize_agent_markdown(str(value or "").strip()).lower()
+        text = normalize_agent_markdown(str(value or "").strip())
         if not text:
             return False
-        return any(marker in text for marker in SummarizationService._INTERNAL_PROCESS_MARKERS)
+        return any(pattern.search(text) for pattern in SummarizationService._INTERNAL_PROCESS_PATTERNS)
 
     @staticmethod
     def _normalize_executive_summary(value: Any) -> str:

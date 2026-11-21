@@ -46,7 +46,11 @@ from services.reporter import ReportingService
 from services.request_state import RequestStateStore
 from services.reviewer import ReviewService
 from services.search import classify_search_query_bucket
-from services.skill_pack import SkillPackService, SkillSelection
+from services.skill_pack import (
+    SkillPackService,
+    SkillSelection,
+    apply_skill_pack_overrides,
+)
 from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService
@@ -671,6 +675,9 @@ class DeepResearchAgent(
                 observer.record_degraded("skill_pack_unavailable")
             return
         self._skill_selection = selection
+        applied_overrides: dict[str, Any] = {}
+        if not selection.shadow and not selection.pack.is_neutral:
+            self._apply_request_config_overrides(selection.pack, applied_overrides)
         if state is not None:
             state.skill_pack_metadata = {
                 "pack_id": selection.pack.pack_id,
@@ -679,6 +686,7 @@ class DeepResearchAgent(
                 "match_score": round(float(selection.match_score), 4),
                 "fallback_reason": selection.fallback_reason,
                 "shadow": bool(selection.shadow),
+                "applied_overrides": applied_overrides,
             }
         if observer is not None:
             observer.record_skill_pack_selection(
@@ -688,6 +696,45 @@ class DeepResearchAgent(
                 fallback_reason=selection.fallback_reason,
                 shadow=selection.shadow,
             )
+
+    def _apply_request_config_overrides(
+        self,
+        pack: Any,
+        applied_out: dict[str, Any],
+    ) -> None:
+        """Apply request-scoped skill pack config overrides and propagate to sub-services."""
+
+        base_config = getattr(self, "_base_config", None) or self.config
+        self._base_config = base_config
+        effective_config, applied = apply_skill_pack_overrides(base_config, pack)
+        if not applied:
+            return
+        applied_out.update(applied)
+        self._swap_runtime_config(effective_config)
+
+    def _restore_request_config(self) -> None:
+        base_config = getattr(self, "_base_config", None)
+        if base_config is not None:
+            self._swap_runtime_config(base_config)
+            self._base_config = None
+
+    def _swap_runtime_config(self, target_config: Configuration) -> None:
+        self.config = target_config
+        for attr in ("planner", "summarizer", "reporting", "reflection", "reviewer"):
+            service = getattr(self, attr, None)
+            if service is not None and hasattr(service, "_config"):
+                service._config = target_config
+
+    def _active_strategy_topic_domains(self) -> set[str] | None:
+        """Return strategy-memory domain filter derived from the active skill pack."""
+
+        selection = getattr(self, "_skill_selection", None)
+        if selection is None or selection.shadow or selection.pack.is_neutral:
+            return None
+        domain = str(selection.pack.topic_domain or "").strip().lower()
+        if not domain or domain == "general":
+            return None
+        return {domain, "general"}
 
     def _skill_stage_context(self, stage: str) -> str:
         """Render the skill fragment for one stage, or empty when nothing should be injected.
@@ -746,6 +793,7 @@ class DeepResearchAgent(
                 state.research_topic or "",
                 current_request_id=self.request_id,
                 observer=observer,
+                topic_domains=self._active_strategy_topic_domains(),
             ),
             stage="planning_strategy",
             observer=observer,
@@ -790,6 +838,7 @@ class DeepResearchAgent(
                 task_titles=task_titles,
                 current_request_id=self.request_id,
                 observer=observer,
+                topic_domains=self._active_strategy_topic_domains(),
             ),
             stage="reflection_strategy",
             observer=observer,
@@ -1536,6 +1585,8 @@ class DeepResearchAgent(
                 observer=observer,
             )
             raise
+        finally:
+            self._restore_request_config()
 
     def run(
         self,

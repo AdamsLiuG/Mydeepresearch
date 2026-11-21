@@ -224,7 +224,7 @@ class Configuration(BaseModel):
         description="Maximum characters allowed for a single injected skill pack stage fragment",
     )
     skill_pack_min_match_score: float = Field(
-        default=0.60,
+        default=0.30,
         ge=0.0,
         le=1.0,
         title="Skill Pack Minimum Match Score",

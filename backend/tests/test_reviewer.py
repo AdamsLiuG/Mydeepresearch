@@ -126,6 +126,53 @@ class ReviewerTests(unittest.TestCase):
         self.assertNotIn("fetch_page", prompt)
         self.assertIn("不启用工具调用", prompt)
 
+    def test_review_prompt_includes_evidence_excerpts_and_flags_numeric_mismatch(self):
+        config = Configuration.from_env(
+            overrides={"review_agent_enabled": False},
+            load_env_file=False,
+        )
+        reviewer = ReviewService(None, config)
+        task = TodoItem(
+            id=3,
+            title="性能基准",
+            intent="核对吞吐指标",
+            query="vLLM throughput",
+            status="completed",
+            summary="- 某引擎在测试中实现了 98% 的延迟下降并达到 120GB 显存节省 [T3-S1]",
+            evidence_items=[
+                {
+                    "source_id": "T3-S1",
+                    "title": "vLLM Benchmark",
+                    "url": "https://docs.vllm.ai/bench",
+                    "domain": "docs.vllm.ai",
+                    "snippet": "In our evaluation vLLM achieved 24% latency reduction with PagedAttention.",
+                    "quality_label": "high",
+                    "freshness_label": "fresh",
+                    "published_at": "2026-03-01",
+                },
+                {
+                    "source_id": "T3-S2",
+                    "title": "Arxiv Paper",
+                    "url": "https://arxiv.org/abs/2309.06180",
+                    "domain": "arxiv.org",
+                    "snippet": "PagedAttention improves memory utilization significantly.",
+                    "quality_label": "high",
+                    "freshness_label": "fresh",
+                    "published_at": "2026-03-01",
+                },
+            ],
+        )
+        state = SummaryState(research_topic="vLLM 性能", todo_items=[task])
+
+        prompt = reviewer._build_prompt(state, [])
+        self.assertIn("关键证据摘录", prompt)
+        self.assertIn("24% latency reduction", prompt)
+
+        summary = reviewer.review_request(state)
+        self.assertEqual(summary["overall_status"], "warning")
+        self.assertTrue(any(issue["check"] == "claim_evidence_mismatch" for issue in task.review_issues))
+        self.assertEqual(task.claims[0]["support_status"], "unverified_claim")
+
 
 if __name__ == "__main__":
     unittest.main()

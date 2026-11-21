@@ -66,6 +66,51 @@ class ReviewIssue:
         }
 
 
+_SALIENT_CLAIM_NUMBER_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:19|20)\d{2}\b"
+    r"|\b\d+(?:\.\d+)?\s*(?:%|ms|s|GB|MB|TB|KB|x|倍|亿|万|千|美元|元|B|M|K)\b"
+    r"|\d+(?:\.\d+)?%"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _extract_salient_numbers(text: str) -> list[str]:
+    """Extract salient quantitative figures (years, percentages, unit numbers) from a claim."""
+    if not text:
+        return []
+    found: list[str] = []
+    for match in _SALIENT_CLAIM_NUMBER_PATTERN.finditer(text):
+        token = re.sub(r"\s+", "", match.group(0)).lower()
+        if token and token not in found:
+            found.append(token)
+    return found
+
+
+def _evidence_body_text(item: dict[str, Any]) -> str:
+    parts = [
+        str(item.get("title") or "").strip(),
+        str(item.get("snippet") or "").strip(),
+        str(item.get("raw_content") or "").strip(),
+        str(item.get("full_content") or "").strip(),
+        str(item.get("content") or "").strip(),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _number_token_supported_in_text(token: str, corpus_lower: str) -> bool:
+    if token in corpus_lower:
+        return True
+    digits_match = re.match(r"(\d+(?:\.\d+)?)", token)
+    if digits_match:
+        bare = digits_match.group(1)
+        # Allow formatted variants like "45 %" or "45.0" or "45,"
+        if re.search(rf"(?<![0-9.]){re.escape(bare)}(?![0-9])", corpus_lower):
+            return True
+    return False
+
+
 class ReviewService:
     """Run deterministic and optional LLM-assisted review checks."""
 
@@ -76,11 +121,13 @@ class ReviewService:
         *,
         retrieval_service: EvidenceRetrievalService | None = None,
         request_id_getter: Callable[[], str | None] | None = None,
+        claim_verifier: Callable[[str, list[dict[str, Any]]], tuple[bool, str] | None] | None = None,
     ) -> None:
         self._agent = review_agent
         self._config = config
         self._retrieval_service = retrieval_service
         self._request_id_getter = request_id_getter
+        self._claim_verifier = claim_verifier
 
     def review_request(
         self,
@@ -137,6 +184,19 @@ class ReviewService:
         task_blocks: list[str] = []
         for task in state.todo_items:
             sources = format_evidence_sources(task.evidence_items) or "- 暂无来源"
+            excerpt_lines: list[str] = []
+            for item in (task.evidence_items or [])[:6]:
+                sid = str(item.get("source_id") or "").strip()
+                snippet = str(
+                    item.get("snippet")
+                    or item.get("raw_content")
+                    or item.get("full_content")
+                    or item.get("content")
+                    or ""
+                ).strip()
+                if sid and snippet:
+                    excerpt_lines.append(f"  - [{sid}] {truncate_text(snippet, 240)}")
+            excerpt_text = "\n".join(excerpt_lines) or "  - 暂无正文摘录"
             repair_hits = self._repair_hits_for_task(state, task)
             repair_text = "\n".join(
                 f"  - [{hit['origin']}] {hit['title']} ({hit['quality_label']}/{hit['freshness_label']}) {hit['url']}"
@@ -153,6 +213,7 @@ class ReviewService:
                 f"- 状态：{task.status}\n"
                 f"- 总结：\n{truncate_text(task.summary or '暂无可用信息', 1200)}\n"
                 f"- 来源目录：\n{truncate_text(sources, 1200)}\n"
+                f"- 关键证据摘录：\n{excerpt_text}\n"
                 f"- 修补候选：\n{repair_text}\n"
                 f"- 规则审查结果：\n{issue_text}\n"
             )
@@ -352,6 +413,26 @@ class ReviewService:
                 support_status = "invalid_citation"
             else:
                 support_status = "supported"
+                evidence_by_id = {
+                    str(item.get("source_id") or "").strip(): item
+                    for item in evidence_items
+                    if str(item.get("source_id") or "").strip()
+                }
+                cited_records = [
+                    evidence_by_id[sid] for sid in citation_ids if sid in evidence_by_id
+                ]
+                mismatch_reason = self._verify_claim_against_evidence(claim_text, cited_records)
+                if mismatch_reason:
+                    issues.append(
+                        ReviewIssue(
+                            task_id=task.id,
+                            severity="medium",
+                            check="claim_evidence_mismatch",
+                            message=f"任务 {task.id} 存在结论与引用证据不一致风险：{mismatch_reason}",
+                            source_ids=citation_ids,
+                        )
+                    )
+                    support_status = "unverified_claim"
 
             claims.append(
                 {
@@ -530,12 +611,55 @@ class ReviewService:
             merged.append(item)
         return merged
 
+    def _verify_claim_against_evidence(
+        self,
+        claim_text: str,
+        cited_records: list[dict[str, Any]],
+    ) -> str | None:
+        """Check claim consistency against cited evidence excerpts via pluggable verifier + numeric grounding."""
+        if not cited_records:
+            return None
+
+        if self._claim_verifier is not None:
+            verdict = self._claim_verifier(claim_text, cited_records)
+            if verdict is not None:
+                supported, reason = verdict
+                if not supported:
+                    return reason or truncate_text(claim_text, 120)
+
+        corpus = " ".join(_evidence_body_text(rec) for rec in cited_records).strip()
+        # Only run numeric grounding when cited records actually carry substantive excerpt text.
+        body_without_titles = " ".join(
+            str(rec.get(field) or "").strip()
+            for rec in cited_records
+            for field in ("snippet", "raw_content", "full_content", "content")
+        ).strip()
+        if len(body_without_titles) < 20:
+            return None
+
+        salient_numbers = _extract_salient_numbers(claim_text)
+        if not salient_numbers:
+            return None
+
+        corpus_lower = corpus.lower()
+        unsupported = [
+            token
+            for token in salient_numbers
+            if not _number_token_supported_in_text(token, corpus_lower)
+        ]
+        if unsupported and len(unsupported) == len(salient_numbers):
+            return (
+                f"结论中的关键数值/年份 ({', '.join(unsupported[:3])}) "
+                f"未在所引证据摘录中出现：{truncate_text(claim_text, 100)}"
+            )
+        return None
+
     @staticmethod
     def _normalize_repair_check(check: str) -> str | None:
         normalized = str(check or "").strip().lower()
         if normalized in {"missing_angle", "weak_evidence", "stale_evidence", "invalid_citation"}:
             return normalized
-        if normalized in {"low_source_diversity", "low_quality_mix", "missing_citation"}:
+        if normalized in {"low_source_diversity", "low_quality_mix", "missing_citation", "claim_evidence_mismatch"}:
             return "weak_evidence"
         return None
 

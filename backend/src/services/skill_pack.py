@@ -398,6 +398,71 @@ def enforce_quality_gate_direction(field_name: str, baseline: Any, override: Any
     return override_value <= baseline_value
 
 
+def apply_skill_pack_overrides(
+    base_config: Any,
+    pack: SkillPack,
+) -> tuple[Any, dict[str, Any]]:
+    """Apply whitelisted pack overrides to a request-scoped config copy.
+
+    Quality gates are strictly tightening-only (verified via ``enforce_quality_gate_direction``)
+    so a pack can never weaken review/freshness bars.
+    """
+
+    if pack.is_neutral or base_config is None:
+        return base_config, {}
+
+    updates: dict[str, Any] = {}
+
+    for key, value in (pack.quality_gates or {}).items():
+        if key not in QUALITY_GATE_DIRECTIONS or not hasattr(base_config, key):
+            continue
+        baseline = getattr(base_config, key)
+        if not enforce_quality_gate_direction(key, baseline, value):
+            logger.warning(
+                "skill pack '%s' quality_gate override rejected (loosens baseline): %s=%r (baseline=%r)",
+                pack.pack_id,
+                key,
+                value,
+                baseline,
+            )
+            continue
+        updates[key] = value
+
+    for key, value in (pack.budget_knobs or {}).items():
+        if key not in BUDGET_KNOBS or not hasattr(base_config, key):
+            continue
+        updates[key] = value
+
+    for key, value in (pack.layout or {}).items():
+        if key not in LAYOUT_KNOBS or not hasattr(base_config, key):
+            continue
+        if key == "search_api" and isinstance(value, str):
+            try:
+                from config import SearchAPI
+
+                updates[key] = SearchAPI(value.strip().lower())
+            except Exception:
+                logger.warning("skill pack '%s' invalid search_api layout override: %r", pack.pack_id, value)
+                continue
+        else:
+            updates[key] = value
+
+    if not updates:
+        return base_config, {}
+
+    try:
+        updated_config = base_config.model_copy(update=updates)
+    except Exception as exc:
+        logger.warning("skill pack '%s' config override failed: %s", pack.pack_id, exc)
+        return base_config, {}
+
+    applied_summary = {
+        key: (val.value if hasattr(val, "value") else val)
+        for key, val in updates.items()
+    }
+    return updated_config, applied_summary
+
+
 class SkillPackService:
     """Load, validate and select research skill packs from the configured directory."""
 
@@ -416,7 +481,7 @@ class SkillPackService:
 
     @property
     def global_min_match_score(self) -> float:
-        return float(getattr(self._config, "skill_pack_min_match_score", 0.60) or 0.0)
+        return float(getattr(self._config, "skill_pack_min_match_score", 0.30) or 0.0)
 
     def _load_all(self) -> dict[str, SkillPack]:
         if self._packs is not None:
@@ -502,7 +567,13 @@ class SkillPackService:
         if any(sig.lower() in haystack for sig in pack.negative_signals):
             return 0.0, True
         hits = sum(1 for sig in pack.match_signals if sig.lower() in haystack)
-        return hits / max(1, len(pack.match_signals)), False
+        # Saturated denominator (cap at 3 signals) prevents long signal lists from
+        # penalizing clear domain queries while still keeping 0-hit topics at 0.0.
+        saturation_denom = min(max(1, len(pack.match_signals)), 3)
+        lexical_score = min(1.0, hits / saturation_denom)
+        if lexical_score > 0.0:
+            return lexical_score, False
+        return 0.0, False
 
     def render_block(self, pack: SkillPack, stage: str) -> str:
         """Render the ``<RESEARCH_SKILL>`` block for one stage, or empty when there is nothing."""

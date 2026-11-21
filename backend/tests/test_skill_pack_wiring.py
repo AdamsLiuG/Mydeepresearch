@@ -287,6 +287,70 @@ class ShadowAndDegradeTests(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot["skill_pack"]["pack_id"], "tech-selection")
 
+    def test_skill_pack_overrides_apply_tightening_knobs_and_filter_strategy_domains(self):
+        from dataclasses import replace
+
+        from services.skill_pack import apply_skill_pack_overrides
+
+        cfg = Configuration.from_env(
+            overrides={
+                "skill_pack_enabled": True,
+                "skill_pack_dir": REAL_PACK_DIR,
+                "review_min_sources_per_task": 2,
+                "review_min_domains_per_task": 1,
+                "freshness_reference_days": 365,
+                "task_react_max_rounds": 2,
+            },
+            load_env_file=False,
+        )
+        agent = _agent(cfg)
+        agent.request_id = "req-override-test"
+        captured_domains: list[set[str] | None] = []
+        agent._strategy_memory = type(
+            "StubStrategyMemory",
+            (),
+            {
+                "search_for_planning": staticmethod(
+                    lambda *args, **kwargs: (captured_domains.append(kwargs.get("topic_domains")) or "")
+                ),
+                "search_for_reflection": staticmethod(
+                    lambda *args, **kwargs: (captured_domains.append(kwargs.get("topic_domains")) or "")
+                ),
+            },
+        )()
+        observer = _trace()
+        from models import SummaryState
+
+        state = SummaryState(research_topic="某新规的适用范围与生效时间以及合规义务")
+        agent._select_skill_pack(state.research_topic, observer, state=state)
+
+        # policy-analysis tightens review_min_sources_per_task=3 and freshness_reference_days=180
+        self.assertEqual(agent.config.review_min_sources_per_task, 3)
+        self.assertEqual(agent.config.freshness_reference_days, 180)
+        self.assertEqual(
+            state.skill_pack_metadata["applied_overrides"].get("review_min_sources_per_task"),
+            3,
+        )
+        # Strategy memory receives topic_domains filtered by active skill pack
+        agent._planning_strategy_context(state, observer)
+        self.assertEqual(captured_domains[-1], {"policy_analysis", "general"})
+
+        # Restore restores base config cleanly
+        agent._restore_request_config()
+        self.assertEqual(agent.config.review_min_sources_per_task, 2)
+        self.assertEqual(agent.config.freshness_reference_days, 365)
+
+        # Loosening quality_gates must be rejected by enforce_quality_gate_direction
+        pack = agent._skill_selection.pack
+        loosened_pack = replace(
+            pack,
+            quality_gates={"review_min_sources_per_task": 1, "freshness_reference_days": 730},
+        )
+        effective, applied = apply_skill_pack_overrides(cfg, loosened_pack)
+        self.assertEqual(applied, {})
+        self.assertEqual(effective.review_min_sources_per_task, 2)
+        self.assertEqual(effective.freshness_reference_days, 365)
+
 
 if __name__ == "__main__":
     unittest.main()

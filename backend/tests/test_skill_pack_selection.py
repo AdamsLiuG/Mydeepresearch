@@ -95,6 +95,25 @@ class SelectionTests(unittest.TestCase):
         for stage in SKILL_STAGES:
             self.assertTrue(self.svc.render_block(pack, stage).strip())
 
+    def test_default_threshold_matches_concise_domain_topic_and_hashes_are_pinned(self):
+        cfg = Configuration.from_env(
+            overrides={
+                "skill_pack_enabled": True,
+                "skill_pack_dir": REAL_PACK_DIR,
+            },
+            load_env_file=False,
+        )
+        self.assertAlmostEqual(cfg.skill_pack_min_match_score, 0.30)
+        svc = SkillPackService(cfg)
+        # Concise real-world query hitting 1-2 signals now passes default threshold
+        sel = svc.select("数据库架构选型")
+        self.assertEqual(sel.pack.pack_id, "tech-selection")
+        self.assertFalse(sel.is_fallback)
+        # All shipped packs have verified non-empty pinned content_hash
+        for pack in svc._load_all().values():
+            self.assertTrue(pack.pinned_content_hash)
+            self.assertEqual(pack.pinned_content_hash, pack.content_hash)
+
 
 class ShadowAndFallbackTests(unittest.TestCase):
     def test_shadow_status_pack_is_marked_shadow(self):

@@ -46,18 +46,27 @@ class ReportingService:
     }
 
     _INTERNAL_PROCESS_PATTERNS = (
-        re.compile(r"\b(blocked|warning|passed)\b", re.IGNORECASE),
+        re.compile(
+            r"(?:审查|评审|任务|review|status)[\s:：为是]{0,12}\b(blocked|warning|passed)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(blocked|warning|passed)\b\s*(?:或|/|、|,)\s*\b(blocked|warning|passed)\b",
+            re.IGNORECASE,
+        ),
         re.compile(r"\bsource[_ ]?id\b", re.IGNORECASE),
         re.compile(
-            r"\b(missing_angle|weak_evidence|low_source_diversity|stale_evidence|low_quality_mix|missing_citation|invalid_citation)\b",
+            r"\b(missing_angle|weak_evidence|low_source_diversity|stale_evidence|low_quality_mix|missing_citation|invalid_citation|claim_evidence_mismatch)\b",
             re.IGNORECASE,
         ),
         re.compile(r"审查提示"),
         re.compile(r"审查状态"),
+        re.compile(r"审查发现"),
         re.compile(r"当前结果存在证据风险"),
-        re.compile(r"保守表述"),
-        re.compile(r"仅保留通过"),
-        re.compile(r"校验"),
+        re.compile(r"(?:报告结论采取|系统|明确保守)保守表述|保守表述"),
+        re.compile(r"仅保留通过.*?(?:校验|验证)"),
+        re.compile(r"source[_ ]?id\s*校验|引用校验|审查校验"),
+        re.compile(r"系统生成"),
         re.compile(r"任务\s*\d+.*状态为"),
     )
 

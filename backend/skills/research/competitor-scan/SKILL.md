@@ -2,7 +2,7 @@
 pack_id: competitor-scan
 schema_version: 1
 version: 1
-content_hash: ""
+content_hash: "a8cbf634f17ce449"
 maturity: draft
 status: active
 supersedes: ""
