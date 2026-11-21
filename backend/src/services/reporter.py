@@ -143,24 +143,51 @@ class ReportingService:
                 f"- 来源概览：\n{sources_block}\n"
             )
 
+        tools_enabled = self._tools_enabled()
         if self._config.resolved_report_layout_mode() == self._FIXED_LAYOUT_MODE:
             return self._build_fixed_prompt(
                 research_topic=state.research_topic,
                 task_blocks=task_blocks,
+                tools_enabled=tools_enabled,
             )
         return self._build_flexible_prompt(
             research_topic=state.research_topic,
             task_blocks=task_blocks,
+            tools_enabled=tools_enabled,
         )
 
+    def _tools_enabled(self) -> bool:
+        provider = str(getattr(self._config, "llm_provider", "") or "").strip().lower()
+        if provider == "vllm" or not getattr(self._config, "use_tool_calling", True):
+            return False
+        if self._agent is not None and getattr(self._agent, "enable_tool_calling", None) is False:
+            return False
+        return True
+
     @staticmethod
-    def _build_fixed_prompt(*, research_topic: str, task_blocks: list[str]) -> str:
+    def _build_fixed_prompt(
+        *,
+        research_topic: str,
+        task_blocks: list[str],
+        tools_enabled: bool = True,
+    ) -> str:
+        tool_guidance = (
+            "你必须先使用 `evidence_lookup` 检查各任务的 source_id；当任务总结缺少支撑时，"
+            "可使用 `fetch_page` 读取某个 source_id 的网页正文。请勿编造不存在的 source_id。\n"
+            if tools_enabled
+            else "请直接基于上方「任务概览」与「来源概览」中已登记的 source_id 组织报告，"
+            "不要尝试调用任何工具，也不要编造不存在的 source_id。\n"
+        )
+        citation_rule = (
+            "2. 引用只能使用 evidence_lookup 返回的 source_id；\n"
+            if tools_enabled
+            else "2. 引用只能使用上方任务概览与来源概览中已登记的 source_id；\n"
+        )
         prompt = (
             "报告布局模式：fixed（固定结构备份模式）\n"
             f"研究主题：{research_topic}\n"
             f"任务概览：\n{''.join(task_blocks)}\n"
-            "你必须先使用 `evidence_lookup` 检查各任务的 source_id；当任务总结缺少支撑时，"
-            "可使用 `fetch_page` 读取某个 source_id 的网页正文。请勿编造不存在的 source_id。\n"
+            f"{tool_guidance}"
             "请严格输出 JSON，格式如下：\n"
             "{\n"
             '  "background_overview": "背景概览正文",\n'
@@ -171,7 +198,7 @@ class ReportingService:
             "}\n"
             "要求：\n"
             "1. 所有 `key_findings` / `evidence_and_data` / `risks_and_challenges` 项都必须携带 source_ids；\n"
-            "2. 引用只能使用 evidence_lookup 返回的 source_id；\n"
+            f"{citation_rule}"
             "3. `references` 仅保留真正被引用的来源；\n"
             "4. 如果某个观点证据不足，不要强写；\n"
             "5. `背景概览 / 核心洞见 / 证据与数据 / 风险与挑战` 只讨论研究主题本身，不要写审查提示、blocked、warning、source_id 校验、系统保守表述等内部流程话术；\n"
@@ -181,13 +208,29 @@ class ReportingService:
         return prompt
 
     @staticmethod
-    def _build_flexible_prompt(*, research_topic: str, task_blocks: list[str]) -> str:
+    def _build_flexible_prompt(
+        *,
+        research_topic: str,
+        task_blocks: list[str],
+        tools_enabled: bool = True,
+    ) -> str:
+        tool_guidance = (
+            "你必须先使用 `evidence_lookup` 检查各任务的 source_id；当任务总结缺少支撑时，"
+            "可使用 `fetch_page` 读取某个 source_id 的网页正文。请勿编造不存在的 source_id。\n"
+            if tools_enabled
+            else "请直接基于上方「任务概览」与「来源概览」中已登记的 source_id 组织报告，"
+            "不要尝试调用任何工具，也不要编造不存在的 source_id。\n"
+        )
+        citation_rule = (
+            "6. 引用只能使用 evidence_lookup 返回的 source_id；\n"
+            if tools_enabled
+            else "6. 引用只能使用上方任务概览与来源概览中已登记的 source_id；\n"
+        )
         prompt = (
             "报告布局模式：flexible（核心必选章节 + 可选自定义章节/动态排序）\n"
             f"研究主题：{research_topic}\n"
             f"任务概览：\n{''.join(task_blocks)}\n"
-            "你必须先使用 `evidence_lookup` 检查各任务的 source_id；当任务总结缺少支撑时，"
-            "可使用 `fetch_page` 读取某个 source_id 的网页正文。请勿编造不存在的 source_id。\n"
+            f"{tool_guidance}"
             "请严格输出 JSON，格式如下：\n"
             "{\n"
             '  "background_overview": "背景概览正文",\n'
@@ -218,7 +261,7 @@ class ReportingService:
             "3. `section_order` 只用于安排正式正文章节顺序；系统会把 `研究过程说明（系统生成）` 和 `参考来源` 放在报告末尾；\n"
             "4. 所有 `key_findings` / `evidence_and_data` / `risks_and_challenges` 项都必须携带 source_ids；\n"
             "5. 自定义章节如果使用 `content_type=bullets`，每条 `items` 都必须携带 source_ids；如果使用 `content_type=paragraph`，章节本身必须携带 source_ids；\n"
-            "6. 引用只能使用 evidence_lookup 返回的 source_id；\n"
+            f"{citation_rule}"
             "7. `references` 仅保留真正被引用的来源；\n"
             "8. 如果某个观点证据不足，不要强写；\n"
             "9. `背景概览 / 核心洞见 / 证据与数据 / 风险与挑战 / 自定义章节` 只讨论研究主题本身，不要写审查提示、blocked、warning、source_id 校验、系统保守表述等内部流程话术；\n"

@@ -633,6 +633,30 @@ class ReportingServiceTests(unittest.TestCase):
         self.assertIn("高质量训练数据和算力门槛仍然限制扩散模型在长视频场景中的大规模落地", report)
         self.assertNotIn("审查提示：当前结果存在证据风险", report)
 
+    def test_report_prompt_omits_tool_directives_when_vllm_provider(self):
+        cfg = Configuration.from_env(
+            overrides={"llm_provider": "vllm"},
+            load_env_file=False,
+        )
+        state = SummaryState(
+            research_topic="AI Agent 架构",
+            todo_items=[
+                TodoItem(
+                    id=1,
+                    title="架构对比",
+                    intent="对比模式",
+                    query="AI agent architecture",
+                    status="completed",
+                    summary="- 结论 [T1-S1]",
+                )
+            ],
+        )
+        service = ReportingService(DummyAgent("{}"), cfg, evidence_store=EvidenceStore())
+        prompt = service._build_prompt(state)
+        self.assertNotIn("evidence_lookup", prompt)
+        self.assertNotIn("fetch_page", prompt)
+        self.assertIn("不要尝试调用任何工具", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

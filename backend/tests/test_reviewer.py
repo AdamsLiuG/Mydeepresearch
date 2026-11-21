@@ -102,6 +102,30 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(task.review_status, "passed")
         self.assertEqual(task.claims[0]["support_status"], "supported")
 
+    def test_review_prompt_omits_tool_directives_when_vllm_provider(self):
+        config = Configuration.from_env(
+            overrides={"llm_provider": "vllm", "review_agent_enabled": True},
+            load_env_file=False,
+        )
+        reviewer = ReviewService(None, config)
+        state = SummaryState(
+            research_topic="MCP 协议",
+            todo_items=[
+                TodoItem(
+                    id=1,
+                    title="概念",
+                    intent="解释概念",
+                    query="MCP",
+                    status="completed",
+                    summary="- 结论 [T1-S1]",
+                )
+            ],
+        )
+        prompt = reviewer._build_prompt(state, [])
+        self.assertNotIn("evidence_lookup", prompt)
+        self.assertNotIn("fetch_page", prompt)
+        self.assertIn("不启用工具调用", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

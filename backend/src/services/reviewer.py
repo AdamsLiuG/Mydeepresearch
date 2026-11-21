@@ -156,17 +156,32 @@ class ReviewService:
                 f"- 规则审查结果：\n{issue_text}\n"
             )
 
+        tools_enabled = self._tools_enabled()
+        tool_guidance = (
+            "你可以调用 evidence_lookup；若需要检索历史修补线索，请使用 `scope=hybrid, mode=repair`。"
+            "历史命中只能作为线索，不能直接当作当前 source_id 引用。"
+            "你也可以调用 fetch_page 重新抓取 URL，把线索提升为当前证据。"
+            if tools_enabled
+            else "当前运行模式不启用工具调用，请直接基于下方任务总结、来源目录、修补候选和规则审查结果补充指出证据问题。"
+            "历史修补候选只能作为线索，不能直接当作当前 source_id 引用。"
+        )
         return (
             f"当前日期：{get_current_date()}\n"
             f"研究主题：{state.research_topic}\n"
             "请基于以下任务结果补充指出仍然存在的证据问题。"
-            "你可以调用 evidence_lookup；若需要检索历史修补线索，请使用 `scope=hybrid, mode=repair`。"
-            "历史命中只能作为线索，不能直接当作当前 source_id 引用。"
-            "你也可以调用 fetch_page 重新抓取 URL，把线索提升为当前证据。"
+            f"{tool_guidance}"
             "不要重写报告正文，也不要重复输出规则已明确指出的问题。\n\n"
             f"{''.join(task_blocks)}"
             + str(skill_pack_context or "")
         )
+
+    def _tools_enabled(self) -> bool:
+        provider = str(getattr(self._config, "llm_provider", "") or "").strip().lower()
+        if provider == "vllm" or not getattr(self._config, "use_tool_calling", True):
+            return False
+        if self._agent is not None and getattr(self._agent, "enable_tool_calling", None) is False:
+            return False
+        return True
 
     def _rule_based_review(self, state: SummaryState) -> tuple[list[ReviewIssue], dict[int, list[dict[str, Any]]]]:
         issues: list[ReviewIssue] = []

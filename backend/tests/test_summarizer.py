@@ -212,6 +212,81 @@ class SummarizationServiceTests(unittest.TestCase):
         self.assertIn("历史研究记忆", prompt)
         self.assertIn("不能作为当前任务的 `source_id` 证据", prompt)
 
+    def test_build_prompt_omits_tool_directives_when_vllm_or_tools_disabled(self):
+        vllm_cfg = Configuration.from_env(
+            overrides={"llm_provider": "vllm"},
+            load_env_file=False,
+        )
+        service = SummarizationService(
+            lambda: DummyAgent(response=""),
+            vllm_cfg,
+        )
+        prompt = service._build_prompt(self.state, self.task, "context")
+        self.assertNotIn("evidence_lookup", prompt)
+        self.assertNotIn("fetch_page", prompt)
+        self.assertNotIn("search_web", prompt)
+        self.assertIn("不要尝试调用任何工具", prompt)
+
+    def test_summarize_task_passes_json_response_format_and_recovers_with_one_shot_retry(self):
+        class RetryingAgent:
+            def __init__(self):
+                self.calls = []
+                self.cleared = 0
+
+            def run(self, prompt: str, response_format=None) -> str:
+                self.calls.append((prompt, response_format))
+                if len(self.calls) == 1:
+                    return "好的，我将先思考一下，但没有给出引用。"
+                return (
+                    '{"executive_summary":"已修复并绑定证据。",'
+                    '"key_findings":[{"text":"通过重试成功绑定官方来源结论","source_ids":["T1-S1"]}],'
+                    '"evidence_gaps":[]}'
+                )
+
+            def clear_history(self):
+                self.cleared += 1
+
+        agent = RetryingAgent()
+        service = SummarizationService(lambda: agent, self.config)
+
+        result = service.summarize_task(self.state, self.task, "context")
+
+        self.assertEqual(len(agent.calls), 2)
+        self.assertEqual(agent.calls[0][1], {"type": "json_object"})
+        self.assertEqual(agent.calls[1][1], {"type": "json_object"})
+        self.assertIn("T1-S1", agent.calls[1][0])
+        self.assertEqual(result.payload["key_findings"][0]["source_ids"], ["T1-S1"])
+
+    def test_stream_task_summary_recovers_with_one_shot_retry(self):
+        class StreamRetryingAgent:
+            def __init__(self):
+                self.retry_called = False
+
+            def stream_run(self, prompt: str, response_format=None):
+                yield "好的，我现在需要先整理思路。"
+
+            def run(self, prompt: str, response_format=None) -> str:
+                self.retry_called = True
+                return (
+                    '{"executive_summary":"流式自修复成功。",'
+                    '"key_findings":[{"text":"流式重试恢复合法引用结论","source_ids":["T1-S2"]}],'
+                    '"evidence_gaps":[]}'
+                )
+
+            def clear_history(self):
+                return None
+
+        agent = StreamRetryingAgent()
+        service = SummarizationService(lambda: agent, self.config)
+
+        stream, finalize = service.stream_task_summary(self.state, self.task, "context")
+        emitted = "".join(stream)
+        result = finalize()
+
+        self.assertTrue(agent.retry_called)
+        self.assertIn("流式重试恢复合法引用结论", emitted)
+        self.assertEqual(result.payload["key_findings"][0]["source_ids"], ["T1-S2"])
+
 
 if __name__ == "__main__":
     unittest.main()

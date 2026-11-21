@@ -41,6 +41,7 @@ class TaskSummaryResult:
 class SummarizationService:
     """Handles synchronous and streaming task summarization."""
 
+    _STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
     _INTERNAL_PROCESS_MARKERS = (
         "审查提示",
         "审查状态",
@@ -63,6 +64,129 @@ class SummarizationService:
         self._config = config
         self._evidence_store = evidence_store
 
+    def _tools_enabled(self, agent: Any | None = None) -> bool:
+        provider = str(getattr(self._config, "llm_provider", "") or "").strip().lower()
+        if provider == "vllm" or not getattr(self._config, "use_tool_calling", True):
+            return False
+        if agent is not None and getattr(agent, "enable_tool_calling", None) is False:
+            return False
+        return True
+
+    @staticmethod
+    def _response_format_is_unsupported(exc: Exception) -> bool:
+        if isinstance(exc, TypeError):
+            return True
+        message = str(exc or "").lower()
+        return any(
+            token in message
+            for token in (
+                "response_format",
+                "json_object",
+                "unsupported parameter",
+                "extra inputs are not permitted",
+                "unexpected keyword argument",
+            )
+        )
+
+    def _run_with_json_fallback(self, agent: Any, prompt: str) -> str:
+        try:
+            return agent.run(prompt, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
+        except Exception as exc:
+            if not self._response_format_is_unsupported(exc):
+                raise
+            return agent.run(prompt)
+
+    def _stream_run_with_json_fallback(self, agent: Any, prompt: str) -> Iterator[str]:
+        try:
+            stream = agent.stream_run(prompt, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
+            for chunk in stream:
+                yield chunk
+        except Exception as exc:
+            if not self._response_format_is_unsupported(exc):
+                raise
+            for chunk in agent.stream_run(prompt):
+                yield chunk
+
+    @staticmethod
+    def _valid_source_ids(task: TodoItem) -> list[str]:
+        return [
+            str(item.get("source_id") or "").strip()
+            for item in task.evidence_items or []
+            if str(item.get("source_id") or "").strip()
+        ]
+
+    def _build_repair_prompt(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        *,
+        previous_output: str,
+        valid_source_ids: list[str],
+        error_message: str,
+    ) -> str:
+        evidence_lines = []
+        for item in (task.evidence_items or [])[:8]:
+            source_id = str(item.get("source_id") or "").strip()
+            title = str(item.get("title") or "").strip()
+            snippet = truncate_text(str(item.get("snippet") or "").strip(), 260)
+            if source_id:
+                evidence_lines.append(f"- [{source_id}] {title}：{snippet}")
+        evidence_block = "\n".join(evidence_lines) or "- 无"
+        return (
+            f"任务主题：{state.research_topic}\n"
+            f"任务名称：{task.title}\n"
+            f"你上一轮总结输出未通过结构化与引用校验（原因：{error_message}）。\n"
+            f"上一轮输出片段：{truncate_text(previous_output, 400)}\n"
+            f"允许引用的合法 source_id 白名单：{json.dumps(valid_source_ids, ensure_ascii=False)}\n"
+            f"可用证据摘要：\n{evidence_block}\n"
+            "请直接输出一个严格合法的 JSON 对象（不要包含 Markdown 代码块、解释或任何工具调用指令），"
+            "必须包含 `executive_summary`、`key_findings`（至少 1 条且每条必须绑定白名单中的 `source_ids`）"
+            "和 `evidence_gaps` 字段。"
+        )
+
+    def _retry_ungrounded_summary(
+        self,
+        agent: Any,
+        state: SummaryState,
+        task: TodoItem,
+        *,
+        previous_output: str,
+        error: ValueError,
+        observer: RequestTrace | None,
+    ) -> TaskSummaryResult:
+        valid_ids = self._valid_source_ids(task)
+        if not valid_ids:
+            raise error
+
+        repair_prompt = self._build_repair_prompt(
+            state,
+            task,
+            previous_output=previous_output,
+            valid_source_ids=valid_ids,
+            error_message=str(error),
+        )
+        agent.clear_history()
+        try:
+            repair_response = self._run_with_json_fallback(agent, repair_prompt)
+        except Exception as repair_exc:
+            if observer:
+                observer.record_llm_call(
+                    success=False,
+                    prompt_text=repair_prompt,
+                    completion_text="",
+                    error=repair_exc,
+                )
+            raise error from repair_exc
+
+        if observer:
+            observer.record_llm_call(
+                success=True,
+                prompt_text=repair_prompt,
+                completion_text=repair_response,
+            )
+
+        return self._finalize_summary(repair_response, task, research_topic=state.research_topic)
+
     def summarize_task(
         self,
         state: SummaryState,
@@ -73,37 +197,51 @@ class SummarizationService:
         skill_pack_context: str | None = None,
     ) -> TaskSummaryResult:
         """Generate a task-specific summary using the summarizer agent."""
+        agent = self._agent_factory()
         prompt = self._build_prompt(
             state,
             task,
             context,
             historical_memory_context=historical_memory_context,
             skill_pack_context=skill_pack_context,
+            tools_enabled=self._tools_enabled(agent),
         )
 
-        agent = self._agent_factory()
         try:
-            response = agent.run(prompt)
-        except Exception as exc:
+            try:
+                response = self._run_with_json_fallback(agent, prompt)
+            except Exception as exc:
+                if observer:
+                    observer.record_llm_call(
+                        success=False,
+                        prompt_text=prompt,
+                        completion_text="",
+                        error=exc,
+                    )
+                raise
+
             if observer:
                 observer.record_llm_call(
-                    success=False,
+                    success=True,
                     prompt_text=prompt,
-                    completion_text="",
-                    error=exc,
+                    completion_text=response,
                 )
-            raise
+
+            try:
+                return self._finalize_summary(response, task, research_topic=state.research_topic)
+            except ValueError as exc:
+                if "no grounded findings" not in str(exc):
+                    raise
+                return self._retry_ungrounded_summary(
+                    agent,
+                    state,
+                    task,
+                    previous_output=response,
+                    error=exc,
+                    observer=observer,
+                )
         finally:
             agent.clear_history()
-
-        if observer:
-            observer.record_llm_call(
-                success=True,
-                prompt_text=prompt,
-                completion_text=response,
-            )
-
-        return self._finalize_summary(response, task, research_topic=state.research_topic)
 
     def stream_task_summary(
         self,
@@ -116,28 +254,29 @@ class SummarizationService:
     ) -> tuple[Iterator[str], Callable[[], TaskSummaryResult]]:
         """Buffer the raw stream, sanitize it, then emit safe summary chunks."""
 
+        agent = self._agent_factory()
         prompt = self._build_prompt(
             state,
             task,
             context,
             historical_memory_context=historical_memory_context,
             skill_pack_context=skill_pack_context,
+            tools_enabled=self._tools_enabled(agent),
         )
         raw_parts: list[str] = []
         result_holder: dict[str, TaskSummaryResult] = {}
+        error_holder: dict[str, Exception] = {}
         call_failed = False
         call_recorded = False
-        agent = self._agent_factory()
 
         def finalize() -> TaskSummaryResult:
             nonlocal call_recorded
             if "result" in result_holder:
                 return result_holder["result"]
+            if "error" in error_holder:
+                raise error_holder["error"]
 
             raw_text = "".join(raw_parts)
-            result = self._finalize_summary(raw_text, task, research_topic=state.research_topic)
-            result_holder["result"] = result
-
             if observer and not call_recorded and not call_failed:
                 observer.record_llm_call(
                     success=True,
@@ -145,12 +284,33 @@ class SummarizationService:
                     completion_text=raw_text,
                 )
                 call_recorded = True
+
+            try:
+                result = self._finalize_summary(raw_text, task, research_topic=state.research_topic)
+            except ValueError as exc:
+                if "no grounded findings" not in str(exc):
+                    error_holder["error"] = exc
+                    raise
+                try:
+                    result = self._retry_ungrounded_summary(
+                        agent,
+                        state,
+                        task,
+                        previous_output=raw_text,
+                        error=exc,
+                        observer=observer,
+                    )
+                except Exception as retry_exc:
+                    error_holder["error"] = retry_exc
+                    raise
+
+            result_holder["result"] = result
             return result
 
         def generator() -> Iterator[str]:
             nonlocal call_failed, call_recorded
             try:
-                for chunk in agent.stream_run(prompt):
+                for chunk in self._stream_run_with_json_fallback(agent, prompt):
                     if chunk:
                         raw_parts.append(chunk)
                 result = finalize()
@@ -180,6 +340,7 @@ class SummarizationService:
         *,
         historical_memory_context: str | None = None,
         skill_pack_context: str | None = None,
+        tools_enabled: bool | None = None,
     ) -> str:
         """Construct the summarization prompt shared by both modes."""
         trimmed_context = truncate_text(
@@ -199,6 +360,20 @@ class SummarizationService:
                 "绝不能作为当前任务的 `source_id` 证据，也不能直接写入 `source_ids`。\n"
             )
 
+        effective_tools_enabled = (
+            self._tools_enabled() if tools_enabled is None else bool(tools_enabled)
+        )
+        if effective_tools_enabled:
+            tool_guidance = (
+                "请先调用 `evidence_lookup` 读取当前任务的来源目录；当摘要不足以支撑结论时，可调用 "
+                "`fetch_page` 读取某个 source_id 对应网页正文，必要时再调用 `search_web` 补充搜索。\n"
+            )
+        else:
+            tool_guidance = (
+                "当前运行模式已提供完整来源目录与任务上下文，请直接基于上方材料提炼结论，"
+                "不要尝试调用任何工具或输出工具调用指令。\n"
+            )
+
         return (
             f"任务主题：{state.research_topic}\n"
             f"任务名称：{task.title}\n"
@@ -208,8 +383,7 @@ class SummarizationService:
             f"任务上下文：\n{trimmed_context}\n"
             f"{memory_block}"
             f"{build_note_guidance(task)}\n"
-            "请先调用 `evidence_lookup` 读取当前任务的来源目录；当摘要不足以支撑结论时，可调用 "
-            "`fetch_page` 读取某个 source_id 对应网页正文，必要时再调用 `search_web` 补充搜索。\n"
+            f"{tool_guidance}"
             "最终必须只输出 JSON，格式如下：\n"
             "{\n"
             '  "executive_summary": "1 段较完整的任务概述，说明本任务最重要的结论、依据与意义",\n'
