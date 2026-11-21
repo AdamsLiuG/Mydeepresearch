@@ -34,12 +34,14 @@ from services.evidence import (
     EvidenceStore,
     FetchPageTool,
     SearchWebTool,
+    render_references,
 )
 from services.evidence_index import (
     EvidenceMemoryService,
     EvidenceRetrievalService,
     EvidenceRuntimeIndex,
 )
+from services.hitl import HitlService
 from services.note_memory import NoteMemoryService
 from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
@@ -1750,6 +1752,138 @@ class DeepResearchAgent(
         state, phase = self._state_from_snapshot(snapshot)
         topic = state.research_topic or str(snapshot.get("topic") or "").strip()
         return self.run(topic, initial_state=state, resume_phase=phase)
+
+    def plan_only(self, topic: str) -> dict[str, Any]:
+        """Generate an editable research plan and persist it with awaiting_approval status."""
+
+        observer = self._start_request_trace(topic)
+        state = SummaryState(research_topic=topic)
+        self._select_skill_pack(topic, observer, state=state)
+        try:
+            planning_span = observer.start_stage("planning", scope="request", metadata={"topic": topic})
+            try:
+                historical_memory_context = self._planning_memory_context(state, observer)
+                state.todo_items = self.planner.plan_todo_list(
+                    state,
+                    observer=observer,
+                    historical_memory_context=historical_memory_context,
+                    strategy_memory_context=self._planning_strategy_context(state, observer),
+                    skill_pack_context=self._skill_stage_context("planning"),
+                )
+                planning_span.complete(status="success", metadata={"task_count": len(state.todo_items)})
+            except Exception as exc:
+                planning_span.complete(status="failed", error=exc)
+                observer.complete_request(status="failed", error=exc)
+                raise
+
+            if not state.todo_items:
+                state.todo_items = [self.planner.create_fallback_task(state)]
+
+            self._apply_task_budget(state, observer)
+            observer.set_task_totals(total_tasks=len(state.todo_items))
+            observer.complete_request(status="awaiting_approval")
+            self._persist_request_state(state, phase="awaiting_approval", status="awaiting_approval")
+            return {
+                "request_id": self.request_id,
+                "topic": topic,
+                "status": "awaiting_approval",
+                "phase": "awaiting_approval",
+                "skill_pack": dict(state.skill_pack_metadata or {}),
+                "todo_items": [self._serialize_task(task) for task in state.todo_items],
+                "estimated_duration_seconds": HitlService.estimate_duration_seconds(
+                    len(state.todo_items), self.config
+                ),
+            }
+        finally:
+            self._restore_request_config()
+
+    def drilldown_section(
+        self,
+        request_id: str,
+        *,
+        section_title: str,
+        question: str,
+    ) -> dict[str, Any]:
+        """Run a targeted incremental sub-task grounded in existing evidence and merge into a report section."""
+
+        snapshot = self._load_resume_snapshot(request_id)
+        state, _ = self._state_from_snapshot(snapshot)
+        topic = state.research_topic or str(snapshot.get("topic") or "").strip()
+        observer = self._start_request_trace(topic)
+
+        next_id = max((int(task.id) for task in state.todo_items), default=0) + 1
+        drilldown_query = " ".join(part for part in (topic, section_title, question) if part.strip()).strip()
+        target_task = TodoItem(
+            id=next_id,
+            title=section_title.strip() or f"深入追问 {next_id}",
+            intent=question.strip(),
+            query=drilldown_query,
+            origin="drilldown",
+            round=max((int(getattr(t, "round", 1) or 1) for t in state.todo_items), default=1) + 1,
+        )
+        state.todo_items.append(target_task)
+        observer.set_task_totals(total_tasks=len(state.todo_items))
+
+        for _ in self._execute_task(state, target_task, emit_stream=False):
+            pass
+
+        valid_ids = {
+            str(item.get("source_id") or "").strip()
+            for task in state.todo_items
+            for item in (task.evidence_items or [])
+            if str(item.get("source_id") or "").strip()
+        }
+        if self._evidence_store is not None:
+            for item in self._evidence_store.list_task_evidence(target_task.id):
+                sid = str(item.get("source_id") or "").strip()
+                if sid:
+                    valid_ids.add(sid)
+
+        addendum = HitlService.sanitize_citations(target_task.summary or "", valid_ids)
+        new_references = [
+            render_references([item]).splitlines()[-1]
+            for item in (target_task.evidence_items or [])
+            if item.get("source_id")
+        ]
+        # Build formatted markdown reference bullets cleanly using existing render_references helper
+        rendered_refs = render_references(target_task.evidence_items or [])
+        ref_lines = [
+            line.strip()
+            for line in rendered_refs.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        updated_report = HitlService.merge_section_drilldown(
+            state.structured_report or state.running_summary or "",
+            section_title=section_title,
+            addendum_markdown=addendum or "未检索到可直接补充的新增证据。",
+            new_references=ref_lines if addendum else None,
+        )
+        state.structured_report = updated_report
+        state.running_summary = updated_report
+        observer.attach_result(
+            report_markdown=updated_report,
+            todo_items=[self._serialize_task(task) for task in state.todo_items],
+            report_note_id=state.report_note_id,
+            report_note_path=state.report_note_path,
+        )
+        completed_status = self._request_status(state, updated_report)
+        observer.complete_request(status=completed_status)
+        self._persist_request_state(
+            state,
+            phase="completed",
+            status=completed_status,
+            report_markdown=updated_report,
+        )
+        del new_references
+        return {
+            "request_id": self.request_id,
+            "section_title": section_title,
+            "question": question,
+            "task_id": target_task.id,
+            "addendum_markdown": addendum,
+            "new_sources": list(target_task.evidence_items or []),
+            "updated_report_markdown": updated_report,
+        }
 
     def run_stream(
         self,

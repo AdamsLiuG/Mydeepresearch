@@ -21,7 +21,9 @@ from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
+from services.hitl import HitlService
 from services.request_state import RequestStateStore
+from services.skill_pack import SkillPackService
 
 DeepResearchAgent: Any | None = None
 
@@ -83,6 +85,45 @@ class ResearchResponse(BaseModel):
     todo_items: list[dict[str, Any]] = Field(
         default_factory=list,
         description="Structured TODO items with summaries and sources",
+    )
+
+
+class ClarifyRequest(BaseModel):
+    """Payload for HITL topic ambiguity check."""
+
+    topic: str = Field(..., description="Research topic supplied by the user")
+    search_api: SearchAPI | None = Field(
+        default=None,
+        description="Optional search backend override",
+    )
+
+
+class EditableTaskPayload(BaseModel):
+    """Editable task entry supplied by a user during HITL plan review."""
+
+    id: int | None = None
+    title: str
+    intent: str = ""
+    query: str = ""
+    depends_on: list[int] = Field(default_factory=list)
+    origin: str = "planned"
+    round: int = 1
+
+
+class PlanUpdateRequest(BaseModel):
+    """Payload for updating a persisted awaiting_approval task plan."""
+
+    tasks: list[EditableTaskPayload] = Field(..., min_length=1)
+
+
+class DrilldownRequest(BaseModel):
+    """Payload for targeted incremental section drill-down on an existing request."""
+
+    section_title: str = Field(..., min_length=1, description="Report section heading to expand")
+    question: str = Field(..., min_length=1, description="Focused follow-up question for drill-down")
+    search_api: SearchAPI | None = Field(
+        default=None,
+        description="Optional search backend override",
     )
 
 
@@ -415,6 +456,108 @@ def create_app(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
         )
+
+    @app.post("/research/clarify")
+    async def clarify_research(payload: ClarifyRequest) -> Dict[str, Any]:
+        try:
+            config = _build_config(
+                ResearchRequest(topic=payload.topic, search_api=payload.search_api)
+            )
+            skill_pack = SkillPackService(config)
+            return HitlService.clarify_topic(
+                payload.topic,
+                config=config,
+                skill_pack_service=skill_pack,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/research/plan")
+    def create_editable_plan(payload: ResearchRequest, request: Request) -> Dict[str, Any]:
+        request_id = _request_id(request)
+        try:
+            config = _build_config(payload)
+            agent = app.state.agent_factory(config=config, request_id=request_id)
+            return agent.plan_only(payload.topic)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "HITL plan_only failed topic=%s",
+                payload.topic,
+                extra={"request_id": request_id},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Planning failed (request_id={request_id})",
+            ) from exc
+
+    @app.put("/requests/{request_id}/plan")
+    async def update_editable_plan(
+        request_id: str,
+        payload: PlanUpdateRequest,
+    ) -> Dict[str, Any]:
+        store = app.state.request_state_store
+        if store is None:
+            raise HTTPException(status_code=404, detail="request state store is disabled")
+
+        snapshot = await asyncio.to_thread(store.load, request_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
+
+        config = Configuration.from_env()
+        try:
+            normalized_tasks = HitlService.validate_editable_tasks(
+                [item.model_dump() for item in payload.tasks],
+                max_tasks=config.resolved_max_total_tasks(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        updated_snapshot = dict(snapshot)
+        updated_snapshot["todo_items"] = normalized_tasks
+        updated_snapshot["phase"] = "awaiting_approval"
+        updated_snapshot["status"] = "awaiting_approval"
+        saved = await asyncio.to_thread(store.save, request_id, updated_snapshot)
+        return {
+            "request_id": request_id,
+            "topic": saved.get("topic", ""),
+            "status": saved.get("status", "awaiting_approval"),
+            "phase": saved.get("phase", "awaiting_approval"),
+            "todo_items": saved.get("todo_items", []),
+            "estimated_duration_seconds": HitlService.estimate_duration_seconds(
+                len(normalized_tasks), config
+            ),
+        }
+
+    @app.post("/requests/{request_id}/drilldown")
+    def drilldown_report_section(
+        request_id: str,
+        payload: DrilldownRequest,
+    ) -> Dict[str, Any]:
+        try:
+            config = _build_config(
+                ResearchRequest(topic="drilldown", search_api=payload.search_api)
+            )
+            agent = app.state.agent_factory(config=config, request_id=request_id)
+            return agent.drilldown_section(
+                request_id,
+                section_title=payload.section_title,
+                question=payload.question,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "Drilldown failed request_id=%s section=%s",
+                request_id,
+                payload.section_title,
+                extra={"request_id": request_id},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Drilldown failed (request_id={request_id})",
+            ) from exc
 
     @app.get("/requests")
     async def list_persisted_requests(
