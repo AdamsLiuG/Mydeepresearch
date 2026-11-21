@@ -6,6 +6,7 @@ from typing import Any
 
 from metrics import RequestTrace
 from models import SummaryState, TodoItem
+from services.dag_scheduler import normalize_depends_on
 from services.evidence import format_evidence_sources
 
 
@@ -126,6 +127,8 @@ class StateManagerMixin:
                 if isinstance(payload.get("react_observation"), dict)
                 else {}
             ),
+            depends_on=normalize_depends_on(payload.get("depends_on")),
+            upstream_context=str(payload.get("upstream_context") or "").strip(),
         )
 
     def _state_from_snapshot(self, payload: dict[str, Any]) -> tuple[SummaryState, str]:

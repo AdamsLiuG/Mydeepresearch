@@ -28,6 +28,7 @@ from prompts import (
     todo_planner_system_prompt,
 )
 from repair_orchestrator import RepairOrchestratorMixin
+from services.dag_scheduler import build_upstream_context, partition_into_waves
 from services.evidence import (
     EvidenceLookupTool,
     EvidenceStore,
@@ -1259,12 +1260,46 @@ class DeepResearchAgent(
                 task for task in state.todo_items if task.status not in {"completed"}
             ]
             if pending_tasks:
-                if emit_stream:
-                    for event in self._execute_task_batch_stream(state, pending_tasks, channel_map):
-                        yield event
+                completed_ids = {
+                    int(task.id) for task in state.todo_items if task.status == "completed"
+                }
+                waves = partition_into_waves(pending_tasks, completed_ids=completed_ids)
+                if len(waves) <= 1:
+                    if emit_stream:
+                        for event in self._execute_task_batch_stream(state, pending_tasks, channel_map):
+                            yield event
+                    else:
+                        self._execute_task_batch_sync(state, pending_tasks)
+                    self._persist_request_state(state, phase="task_execution", status="in_progress")
                 else:
-                    self._execute_task_batch_sync(state, pending_tasks)
-                self._persist_request_state(state, phase="task_execution", status="in_progress")
+                    total_waves = len(waves)
+                    for wave_index, wave_tasks in enumerate(waves, start=1):
+                        if self._is_cancelled():
+                            break
+                        if wave_index > 1:
+                            for downstream_task in wave_tasks:
+                                downstream_task.upstream_context = build_upstream_context(
+                                    downstream_task,
+                                    state.todo_items,
+                                )
+                        if emit_stream:
+                            yield {
+                                "type": "wave_started",
+                                "wave": wave_index,
+                                "total_waves": total_waves,
+                                "task_ids": [task.id for task in wave_tasks],
+                            }
+                            for event in self._execute_task_batch_stream(state, wave_tasks, channel_map):
+                                yield event
+                            yield {
+                                "type": "wave_completed",
+                                "wave": wave_index,
+                                "total_waves": total_waves,
+                                "task_ids": [task.id for task in wave_tasks],
+                            }
+                        else:
+                            self._execute_task_batch_sync(state, wave_tasks)
+                        self._persist_request_state(state, phase="task_execution", status="in_progress")
 
             if self._is_cancelled():
                 observer.record_degraded("client_disconnected")
@@ -1807,6 +1842,7 @@ class DeepResearchAgent(
             "react_last_action": task.react_last_action,
             "react_stop_reason": task.react_stop_reason,
             "react_observation": dict(task.react_observation or {}),
+            "depends_on": list(getattr(task, "depends_on", []) or []),
         }
 
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:

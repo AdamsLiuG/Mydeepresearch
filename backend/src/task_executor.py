@@ -1373,6 +1373,12 @@ class TaskExecutorMixin:
             )
         )
         historical_memory_context = self._task_memory_context(state, task, observer)
+        upstream_context = str(getattr(task, "upstream_context", "") or "").strip()
+        if upstream_context:
+            context = (
+                f"### 前置依赖任务摘要（仅作子问题定位线索，不可直接作为本任务独立证据）\n"
+                f"{upstream_context}\n\n{context}"
+            )
 
         with self._state_lock:
             state.web_research_results.append(context)

@@ -402,6 +402,11 @@ def create_app(
                 "note_path": item.note_path,
                 "origin": getattr(item, "origin", "planned"),
                 "round": getattr(item, "round", 1),
+                **(
+                    {"depends_on": list(getattr(item, "depends_on", []) or [])}
+                    if getattr(item, "depends_on", None)
+                    else {}
+                ),
             }
             for item in result.todo_items
         ]
@@ -477,6 +482,11 @@ def create_app(
                 "note_path": item.note_path,
                 "origin": getattr(item, "origin", "planned"),
                 "round": getattr(item, "round", 1),
+                **(
+                    {"depends_on": list(getattr(item, "depends_on", []) or [])}
+                    if getattr(item, "depends_on", None)
+                    else {}
+                ),
             }
             for item in result.todo_items
         ]

@@ -36,6 +36,8 @@ class TodoItem:
     react_last_action: str | None = field(default=None)
     react_stop_reason: str | None = field(default=None)
     react_observation: dict[str, Any] = field(default_factory=dict)
+    depends_on: list[int] = field(default_factory=list)
+    upstream_context: str = field(default="")
 
 
 @dataclass(kw_only=True)

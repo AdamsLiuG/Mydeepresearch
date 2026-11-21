@@ -18,6 +18,7 @@ from prompts import (
     supplemental_planner_instructions,
     todo_planner_instructions,
 )
+from services.dag_scheduler import normalize_depends_on, sanitize_task_dependencies
 from utils import strip_thinking_tokens
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,14 @@ class PlanningService:
         todo_items: List[TodoItem] = []
 
         for idx, item in enumerate(tasks_payload, start=1):
-            title = str(item.get("title") or f"任务{idx}").strip()
+            raw_id = item.get("id")
+            try:
+                task_id = int(raw_id) if raw_id is not None and not isinstance(raw_id, bool) else idx
+            except (TypeError, ValueError):
+                task_id = idx
+            if task_id <= 0 or any(existing.id == task_id for existing in todo_items):
+                task_id = idx
+            title = str(item.get("title") or f"任务{task_id}").strip()
             intent = str(item.get("intent") or "聚焦主题的关键问题").strip()
             query = self._canonical_query_for_task(
                 research_topic=state.research_topic,
@@ -141,17 +149,20 @@ class PlanningService:
                 intent=intent,
                 raw_query=str(item.get("query") or "").strip(),
             )
+            depends_on = normalize_depends_on(item.get("depends_on"))
 
             task = TodoItem(
-                id=idx,
+                id=task_id,
                 title=title,
                 intent=intent,
                 query=query,
                 origin="planned",
                 round=1,
+                depends_on=depends_on,
             )
             todo_items.append(task)
 
+        sanitize_task_dependencies(todo_items)
         state.todo_items = todo_items
 
         titles = [task.title for task in todo_items]
@@ -1076,13 +1087,22 @@ class PlanningService:
                 continue
 
             seen_titles.add(title_key)
-            sanitized.append(
-                {
-                    "title": title,
-                    "intent": intent or "聚焦主题的关键问题",
-                    "query": query,
-                }
-            )
+            sanitized_item: dict[str, Any] = {
+                "title": title,
+                "intent": intent or "聚焦主题的关键问题",
+                "query": query,
+            }
+            if "id" in item and not isinstance(item.get("id"), bool):
+                try:
+                    parsed_id = int(item.get("id"))
+                except (TypeError, ValueError):
+                    parsed_id = 0
+                if parsed_id > 0:
+                    sanitized_item["id"] = parsed_id
+            depends_on = normalize_depends_on(item.get("depends_on"))
+            if depends_on:
+                sanitized_item["depends_on"] = depends_on
+            sanitized.append(sanitized_item)
 
         return sanitized, rejected_count
 
