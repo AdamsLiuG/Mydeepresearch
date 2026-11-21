@@ -20,6 +20,7 @@ from services.evidence import (
     format_evidence_sources,
 )
 from services.evidence_index import EvidenceRetrievalHit
+from services.policy_controller import PolicyStateFeatures, build_policy_controller
 from services.reviewer import ReviewService
 from services.search import classify_search_query_bucket, dispatch_search
 from services.summarizer import TaskSummaryResult
@@ -775,6 +776,117 @@ class TaskExecutorMixin:
 
         return TaskReactDecision(action="stop", reason="继续补证据的收益有限，结束当前任务。")
 
+    def _consult_policy_controller(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        observation: TaskReactObservation,
+        evidence_items: list[dict[str, Any]],
+        fallback: TaskReactDecision,
+        *,
+        observer: RequestTrace | None,
+    ) -> TaskReactDecision | None:
+        controller = getattr(self, "_policy_controller", None)
+        if controller is None:
+            controller = build_policy_controller(self.config)
+
+        max_rounds = max(int(self.config.task_react_max_rounds or 1), 1)
+        round_index = (
+            int(getattr(task, "react_additional_search_count", 0) or 0)
+            + int(getattr(task, "react_fetch_count", 0) or 0)
+            + 1
+        )
+        searches_left = max(
+            max(int(self.config.task_react_max_additional_searches_per_task or 0), 0)
+            - int(getattr(task, "react_additional_search_count", 0) or 0),
+            0,
+        )
+        fetches_left = max(
+            max(int(self.config.task_react_max_fetches_per_task or 0), 0)
+            - int(getattr(task, "react_fetch_count", 0) or 0),
+            0,
+        )
+        high_quality_sources = sum(
+            1
+            for item in evidence_items
+            if str(item.get("quality_label") or "").lower() in {"high", "authoritative", "official"}
+        )
+        top_item = self._top_evidence_item(evidence_items)
+        can_fetch = bool(
+            top_item
+            and str(top_item.get("url") or "").strip()
+            and not str(top_item.get("full_content") or "").strip()
+        )
+        features = PolicyStateFeatures(
+            task_id=task.id,
+            round_index=round_index,
+            max_rounds=max_rounds,
+            evidence_count=len(evidence_items),
+            distinct_domains=int(getattr(observation, "source_diversity", 0) or 0),
+            high_quality_sources=high_quality_sources,
+            has_gap_signals=bool(getattr(observation, "gap_signals", [])),
+            searches_left=searches_left,
+            fetches_left=fetches_left,
+            remaining_budget_ratio=round(max(0.0, (max_rounds - round_index + 1) / max_rounds), 4),
+            task_title=task.title,
+            task_intent=task.intent,
+            gap_signals=tuple(str(sig) for sig in (getattr(observation, "gap_signals", []) or ())),
+            can_fetch=can_fetch,
+        )
+        decision = controller.decide(features)
+        if observer is not None:
+            observer.record_policy_decision(
+                {
+                    "task_id": task.id,
+                    "round": round_index,
+                    "features": features.to_dict(),
+                    "decision": decision.to_dict(),
+                }
+            )
+
+        if not bool(getattr(self.config, "policy_model_enabled", False)) or decision.source != "model":
+            return None
+
+        if decision.action == "stop":
+            return TaskReactDecision(action="stop", reason=decision.reason)
+        if decision.action == "fetch" and fetches_left > 0:
+            if decision.target_url:
+                return TaskReactDecision(
+                    action="fetch_page_for_archive_hit",
+                    url=decision.target_url,
+                    reason=decision.reason,
+                )
+            if fallback.action in {"fetch_page_for_top_source", "fetch_page_for_archive_hit"}:
+                return TaskReactDecision(
+                    action=fallback.action,
+                    source_id=fallback.source_id,
+                    url=fallback.url,
+                    reason=decision.reason,
+                )
+            if top_item and str(top_item.get("source_id") or "").strip():
+                return TaskReactDecision(
+                    action="fetch_page_for_top_source",
+                    source_id=str(top_item.get("source_id")).strip(),
+                    reason=decision.reason,
+                )
+        if decision.action in {"search", "reflect"} and searches_left > 0:
+            candidate_query = (
+                self._normalize_query_candidate(decision.query_override or "")
+                or fallback.query
+                or task.query
+            )
+            mapped_action = (
+                fallback.action
+                if fallback.action in {"rewrite_query", "broaden_query", "diversify_source_query"}
+                else "broaden_query"
+            )
+            return TaskReactDecision(
+                action=mapped_action,
+                query=candidate_query,
+                reason=decision.reason,
+            )
+        return None
+
     def _plan_task_react_decision(
         self,
         state: SummaryState,
@@ -786,6 +898,16 @@ class TaskExecutorMixin:
         observer: RequestTrace | None,
     ) -> TaskReactDecision:
         fallback = self._fallback_task_react_decision(state, task, observation, evidence_items, repair_hits)
+        routed = self._consult_policy_controller(
+            state,
+            task,
+            observation,
+            evidence_items,
+            fallback,
+            observer=observer,
+        )
+        if routed is not None:
+            return routed
         if fallback.action == "stop":
             return fallback
 

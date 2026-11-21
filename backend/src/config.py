@@ -517,6 +517,32 @@ class Configuration(BaseModel):
         title="Event Bus Max Events Per Request",
         description="Maximum buffered SSE events retained per request for Last-Event-ID replay",
     )
+    policy_model_enabled: bool = Field(
+        default=False,
+        title="Policy Model Enabled",
+        description="Enable pluggable small-model policy controller during ReAct routing",
+    )
+    policy_model_id: str | None = Field(
+        default=None,
+        title="Policy Model ID",
+        description="Model identifier served by the OpenAI-compatible policy endpoint",
+    )
+    policy_model_base_url: str | None = Field(
+        default=None,
+        title="Policy Model Base URL",
+        description="OpenAI-compatible base URL for policy controller inference",
+    )
+    policy_model_api_key: str | None = Field(
+        default=None,
+        title="Policy Model API Key",
+        description="Optional API key for the policy controller endpoint",
+    )
+    policy_model_timeout_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        title="Policy Model Timeout Seconds",
+        description="Request timeout in seconds for external policy model calls",
+    )
     search_cache_enabled: bool = Field(
         default=True,
         title="Search Cache Enabled",
@@ -1155,6 +1181,11 @@ class Configuration(BaseModel):
             "redis_url": os.getenv("REDIS_URL"),
             "database_url": os.getenv("DATABASE_URL"),
             "event_bus_max_events_per_request": os.getenv("EVENT_BUS_MAX_EVENTS_PER_REQUEST"),
+            "policy_model_enabled": os.getenv("POLICY_MODEL_ENABLED"),
+            "policy_model_id": os.getenv("POLICY_MODEL_ID"),
+            "policy_model_base_url": os.getenv("POLICY_MODEL_BASE_URL"),
+            "policy_model_api_key": os.getenv("POLICY_MODEL_API_KEY"),
+            "policy_model_timeout_seconds": os.getenv("POLICY_MODEL_TIMEOUT_SECONDS"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
             "search_cache_dynamic_ttl_enabled": os.getenv("SEARCH_CACHE_DYNAMIC_TTL_ENABLED"),

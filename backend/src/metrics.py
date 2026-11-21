@@ -526,7 +526,12 @@ class RequestTrace:
         self.skill_pack_match_score = 0.0
         self.skill_pack_fallback_reason = ""
         self.skill_pack_shadow = False
+        self.policy_decisions: list[dict[str, Any]] = []
         metrics_registry.increment("request_total")
+
+    def record_policy_decision(self, decision: dict[str, Any]) -> None:
+        with self._lock:
+            self.policy_decisions.append(_clone_dict(decision))
 
     def start_stage(
         self,
@@ -990,6 +995,7 @@ class RequestTrace:
                 "skill_pack_match_score": self.skill_pack_match_score,
                 "skill_pack_fallback_reason": self.skill_pack_fallback_reason,
                 "skill_pack_shadow": self.skill_pack_shadow,
+                "policy_decisions": _clone_dict({"items": self.policy_decisions}).get("items", []),
                 "report_markdown": self.report_markdown,
                 "todo_items": _clone_dict({"items": self.todo_items}).get("items", []),
                 "report_note_id": self.report_note_id,

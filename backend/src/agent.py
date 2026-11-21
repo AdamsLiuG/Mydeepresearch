@@ -45,6 +45,7 @@ from services.hitl import HitlService
 from services.note_memory import NoteMemoryService
 from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
+from services.policy_controller import build_policy_controller
 from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
 from services.reviewer import ReviewService
@@ -407,6 +408,7 @@ class DeepResearchAgent(
             config=self.config,
         )
         self._request_state_store = build_request_state_store(self.config)
+        self._policy_controller = build_policy_controller(self.config)
         self._note_memory = NoteMemoryService(self.config)
         self._strategy_synthesizer = StrategySynthesizer(
             lambda: self._create_tool_aware_agent(
