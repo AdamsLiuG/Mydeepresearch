@@ -1659,6 +1659,91 @@ def _result_identity(result: dict[str, Any]) -> str | None:
     return None
 
 
+_RRF_K = 10.0
+_FUSION_BACKEND_WEIGHTS: dict[str, float] = {
+    "semanticscholar": 1.20,
+    "tavily": 1.00,
+    "perplexity": 1.00,
+    "serpapi": 1.00,
+    "searxng": 1.00,
+    "duckduckgo": 0.90,
+}
+_FUSION_AUTHORITATIVE_HOST_HINTS = (
+    ".gov",
+    ".edu",
+    "arxiv.org",
+    "semanticscholar.org",
+    "doi.org",
+    "ieee.org",
+    "acm.org",
+    "nature.com",
+    "science.org",
+    "pubmed.ncbi.nlm.nih.gov",
+    "ietf.org",
+    "rfc-editor.org",
+    "w3.org",
+    "github.com",
+)
+_FUSION_AGGREGATOR_HOST_HINTS = (
+    "pinterest.",
+    "quora.com",
+    "reddit.com",
+    "csdn.net",
+    "jianshu.com",
+    "baidu.com",
+    "sohu.com",
+    "163.com",
+    "sina.com",
+)
+
+
+def _fusion_source_prior(url: str) -> float:
+    """Return a gentle reliability prior based on URL domain/path structure."""
+
+    raw = str(url or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return 0.0
+    host = (parsed.hostname or "").strip().lower()
+    path = (parsed.path or "").strip().lower()
+    if not host:
+        return 0.0
+    if any(hint in host for hint in _FUSION_AGGREGATOR_HOST_HINTS):
+        return -0.02
+    if (
+        any(host.endswith(hint) or host == hint.lstrip(".") for hint in _FUSION_AUTHORITATIVE_HOST_HINTS)
+        or host.startswith("docs.")
+        or "/docs/" in path
+        or path.endswith("/docs")
+        or "/paper/" in path
+    ):
+        return 0.035
+    return 0.0
+
+
+def _compute_fusion_rrf_score(item: dict[str, Any]) -> float:
+    """Compute weighted RRF score combining per-backend ranks and source reliability prior."""
+
+    backend_ranks = list(item.get("_backend_ranks") or [])
+    if not backend_ranks:
+        rank = max(0, int(item.get("_best_rank", 0)))
+        order = max(0, int(item.get("_backend_order", 0)))
+        backend_ranks = [("default", order, rank)]
+
+    rrf_total = 0.0
+    for backend_name, backend_order, result_rank in backend_ranks:
+        normalized_backend = str(backend_name or "").strip().lower()
+        base_weight = _FUSION_BACKEND_WEIGHTS.get(normalized_backend, 1.0)
+        # Preserve configured backend order gently as a tie-breaker on equal ranks.
+        order_factor = max(0.85, 1.0 - (0.015 * max(0, int(backend_order))))
+        rrf_total += (base_weight * order_factor) / (_RRF_K + float(max(0, int(result_rank)) + 1))
+
+    return round(rrf_total + _fusion_source_prior(str(item.get("url") or "")), 6)
+
+
 def _merge_fused_result(
     merged_results: dict[str, dict[str, Any]],
     result: dict[str, Any],
@@ -1678,6 +1763,7 @@ def _merge_fused_result(
         candidate["provider_count"] = 1
         candidate["_backend_order"] = backend_order
         candidate["_best_rank"] = result_rank
+        candidate["_backend_ranks"] = [(backend_label, backend_order, result_rank)]
         merged_results[key] = candidate
         return
 
@@ -1686,6 +1772,20 @@ def _merge_fused_result(
         backend_sources.append(backend_label)
         existing["backend_sources"] = backend_sources
         existing["provider_count"] = len(backend_sources)
+
+    backend_ranks = list(existing.get("_backend_ranks") or [])
+    if not any(entry[0] == backend_label for entry in backend_ranks):
+        backend_ranks.append((backend_label, backend_order, result_rank))
+    else:
+        backend_ranks = [
+            (
+                label,
+                min(order, backend_order) if label == backend_label else order,
+                min(rank, result_rank) if label == backend_label else rank,
+            )
+            for label, order, rank in backend_ranks
+        ]
+    existing["_backend_ranks"] = backend_ranks
 
     existing["_backend_order"] = min(int(existing.get("_backend_order", backend_order)), backend_order)
     existing["_best_rank"] = min(int(existing.get("_best_rank", result_rank)), result_rank)
@@ -1701,11 +1801,16 @@ def _merge_fused_result(
 
 
 def _sort_fused_results_by_rules(merged_results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """Apply the baseline rule-based ordering for fused advanced results."""
+    """Apply weighted RRF + source reliability prior ordering for fused advanced results."""
+
+    items = list(merged_results.values())
+    for item in items:
+        item["fusion_score"] = _compute_fusion_rrf_score(item)
 
     return sorted(
-        merged_results.values(),
+        items,
         key=lambda item: (
+            -float(item.get("fusion_score", 0.0)),
             -int(item.get("provider_count", 1)),
             int(item.get("_backend_order", 10_000)),
             int(item.get("_best_rank", 10_000)),
@@ -2293,6 +2398,7 @@ def _fuse_advanced_search_results(
         normalized_item = deepcopy(item)
         normalized_item.pop("_backend_order", None)
         normalized_item.pop("_best_rank", None)
+        normalized_item.pop("_backend_ranks", None)
         fused_results.append(normalized_item)
 
     backend_label = (

@@ -30,6 +30,10 @@ _COLLECTION_NAME = "deep_research_evidence_v1"
 _DEFAULT_QUERY_MULTIPLIER = 4
 _WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?")
 _CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_CJK_RUN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+_MARKDOWN_HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？；!?;]\s*|\.(?=\s|$)")
+_RUNTIME_RRF_K = 20.0
 _TRACKING_QUERY_PARAMS = {
     "fbclid",
     "gclid",
@@ -147,9 +151,41 @@ def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").replace("\xa0", " ").split()).strip()
 
 
+def _clean_structured_text(value: Any) -> str:
+    """Clean text while preserving Markdown headings and paragraph breaks."""
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    lines: list[str] = []
+    blank_run = 0
+    for line in raw.split("\n"):
+        cleaned_line = re.sub(r"[ \t]+", " ", line).strip()
+        if not cleaned_line:
+            blank_run += 1
+            if blank_run == 1 and lines:
+                lines.append("")
+            continue
+        blank_run = 0
+        lines.append(cleaned_line)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
 def _normalized_signal_text(value: Any) -> str:
     cleaned = _clean_text(value).lower()
     return re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", cleaned).strip()
+
+
+def _tokenize_list(value: Any) -> list[str]:
+    """Return bilingual tokens (ASCII words + CJK unigrams and bigrams) for BM25."""
+    cleaned = _normalized_signal_text(value)
+    if not cleaned:
+        return []
+    tokens: list[str] = _WORD_PATTERN.findall(cleaned)
+    for run in _CJK_RUN_PATTERN.findall(cleaned):
+        tokens.extend(list(run))
+        if len(run) >= 2:
+            tokens.extend(run[idx : idx + 2] for idx in range(len(run) - 1))
+    return tokens
 
 
 def _tokenize(value: Any) -> set[str]:
@@ -157,6 +193,52 @@ def _tokenize(value: Any) -> set[str]:
     ascii_tokens = set(_WORD_PATTERN.findall(cleaned))
     cjk_tokens = {char for char in cleaned if _CJK_PATTERN.fullmatch(char)}
     return ascii_tokens | cjk_tokens
+
+
+def _bm25_scores(
+    query_text: str,
+    documents: list[str],
+    *,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> list[float]:
+    """Compute Okapi BM25 scores over candidate chunk documents."""
+    query_tokens = _tokenize_list(query_text)
+    if not query_tokens or not documents:
+        return [0.0 for _ in documents]
+
+    doc_tokens_list = [_tokenize_list(doc) for doc in documents]
+    n_docs = len(doc_tokens_list)
+    avg_dl = sum(len(tokens) for tokens in doc_tokens_list) / max(n_docs, 1)
+    if avg_dl <= 0:
+        return [0.0 for _ in documents]
+
+    unique_query_terms = set(query_tokens)
+    doc_freq: dict[str, int] = {term: 0 for term in unique_query_terms}
+    for tokens in doc_tokens_list:
+        token_set = set(tokens)
+        for term in unique_query_terms:
+            if term in token_set:
+                doc_freq[term] += 1
+
+    scores: list[float] = []
+    for tokens in doc_tokens_list:
+        if not tokens:
+            scores.append(0.0)
+            continue
+        tf_map: dict[str, int] = {}
+        for token in tokens:
+            if token in unique_query_terms:
+                tf_map[token] = tf_map.get(token, 0) + 1
+        doc_len = len(tokens)
+        score = 0.0
+        for term, freq in tf_map.items():
+            df = doc_freq.get(term, 0)
+            idf = math.log(1.0 + ((n_docs - df + 0.5) / (df + 0.5)))
+            denom = freq + k1 * (1.0 - b + b * (doc_len / avg_dl))
+            score += idf * ((freq * (k1 + 1.0)) / max(denom, 1e-9))
+        scores.append(score)
+    return scores
 
 
 def _lexical_similarity(left: Any, right: Any) -> float:
@@ -221,48 +303,143 @@ def _sha256_text(value: Any) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
 
+def _find_bilingual_split_boundary(text: str, start: int, end: int, min_boundary: int) -> int:
+    """Find the best bilingual sentence/newline/space split position before end."""
+    window = text[min_boundary:end]
+    if not window:
+        return end
+
+    # 1. Prefer paragraph break inside the tail window.
+    para_idx = window.rfind("\n\n")
+    if para_idx >= 0:
+        return min_boundary + para_idx + 2
+
+    # 2. Prefer bilingual sentence punctuation (Chinese or English).
+    sentence_matches = list(_SENTENCE_BOUNDARY_PATTERN.finditer(window))
+    if sentence_matches:
+        return min_boundary + sentence_matches[-1].end()
+
+    # 3. Prefer line break.
+    newline_idx = window.rfind("\n")
+    if newline_idx >= 0:
+        return min_boundary + newline_idx + 1
+
+    # 4. Fallback to whitespace boundary for space-delimited languages.
+    space_idx = window.rfind(" ")
+    if space_idx >= 0:
+        return min_boundary + space_idx + 1
+
+    return end
+
+
+def _split_heading_sections(cleaned: str) -> list[tuple[str, int, str]]:
+    """Split structured markdown text into (heading_breadcrumb, start_offset, section_body) tuples."""
+    lines = cleaned.split("\n")
+    sections: list[tuple[str, int, str]] = []
+    heading_stack: list[tuple[int, str]] = []
+    current_lines: list[str] = []
+    current_start = 0
+    current_heading = ""
+    cursor = 0
+
+    for line in lines:
+        line_len = len(line)
+        heading_match = _MARKDOWN_HEADING_PATTERN.match(line)
+        if heading_match:
+            if current_lines:
+                body = "\n".join(current_lines).strip()
+                if body:
+                    sections.append((current_heading, current_start, body))
+                current_lines = []
+            level = len(heading_match.group(1))
+            title = heading_match.group(2).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, f"{'#' * level} {title}"))
+            current_heading = " > ".join(item[1] for item in heading_stack)
+            current_start = cursor
+            current_lines.append(line)
+        else:
+            if not current_lines:
+                current_start = cursor
+            current_lines.append(line)
+        cursor += line_len + 1  # account for '\n'
+
+    if current_lines:
+        body = "\n".join(current_lines).strip()
+        if body:
+            sections.append((current_heading, current_start, body))
+
+    return sections or [("", 0, cleaned)]
+
+
 def _chunk_text(
     text: str,
     *,
     max_chars: int,
     overlap: int,
-    max_chunks: int = 12,
+    max_chunks: int = 32,
 ) -> list[tuple[int, int, str]]:
-    cleaned = _clean_text(text)
+    """Split text using Markdown heading breadcrumbs, paragraph breaks, and bilingual sentence boundaries."""
+    cleaned = _clean_structured_text(text)
     if not cleaned:
         return []
-    if len(cleaned) < 400:
-        return [(0, len(cleaned), cleaned)]
-
     normalized_max = max(200, int(max_chars or 900))
     normalized_overlap = max(0, min(int(overlap or 0), normalized_max // 2))
+    normalized_max_chunks = max(1, int(max_chunks or 32))
+
+    if len(cleaned) <= normalized_max and len(cleaned) < 400:
+        return [(0, len(cleaned), cleaned)]
+
     chunks: list[tuple[int, int, str]] = []
-    start = 0
-    while start < len(cleaned) and len(chunks) < max_chunks:
-        end = min(len(cleaned), start + normalized_max)
-        if end < len(cleaned):
-            boundary = cleaned.rfind(" ", start + int(normalized_max * 0.65), end)
-            if boundary > start + int(normalized_max * 0.5):
-                end = boundary
-        segment = cleaned[start:end].strip()
-        if segment:
-            chunks.append((start, end, segment))
-        if end >= len(cleaned):
+    sections = _split_heading_sections(cleaned)
+
+    for heading_breadcrumb, section_offset, section_body in sections:
+        if len(chunks) >= normalized_max_chunks:
             break
-        start = max(start + 1, end - normalized_overlap)
+        prefix = f"[{heading_breadcrumb}]\n" if heading_breadcrumb else ""
+        if len(section_body) <= normalized_max:
+            chunks.append((section_offset, section_offset + len(section_body), section_body))
+            continue
+
+        start = 0
+        body_len = len(section_body)
+        is_first_in_section = True
+        while start < body_len and len(chunks) < normalized_max_chunks:
+            active_prefix = "" if is_first_in_section or not prefix else prefix
+            budget = max(120, normalized_max - len(active_prefix))
+            end = min(body_len, start + budget)
+            if end < body_len:
+                min_boundary = start + int(budget * 0.5)
+                candidate_end = _find_bilingual_split_boundary(section_body, start, end, min_boundary)
+                if candidate_end > start:
+                    end = candidate_end
+            segment = section_body[start:end].strip()
+            if segment:
+                chunk_text = (
+                    f"{active_prefix}{segment}"
+                    if active_prefix and not segment.startswith(heading_breadcrumb)
+                    else segment
+                )
+                chunks.append((section_offset + start, section_offset + end, chunk_text))
+                is_first_in_section = False
+            if end >= body_len:
+                break
+            start = max(start + 1, end - normalized_overlap)
+
     return chunks or [(0, len(cleaned), cleaned)]
 
 
 def _record_text(record: Any) -> str:
     for key in ("full_content", "raw_content", "snippet"):
-        value = _clean_text(getattr(record, key, ""))
+        value = _clean_structured_text(getattr(record, key, ""))
         if value:
             return value
     return ""
 
 
 def _record_has_full_content(record: Any) -> bool:
-    return bool(_clean_text(getattr(record, "full_content", "")))
+    return bool(_clean_structured_text(getattr(record, "full_content", "")))
 
 
 def _record_archive_doc_key(record: Any) -> str | None:
@@ -382,6 +559,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
             text,
             max_chars=self._config.evidence_chunk_chars,
             overlap=self._config.evidence_chunk_overlap,
+            max_chunks=self._config.evidence_runtime_max_chunks,
         )
         chunks: list[EvidenceChunk] = []
         for index, (start, end, window) in enumerate(windows, start=1):
@@ -465,13 +643,61 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         query_embedding: list[float] | None,
         citation_eligible: bool,
     ) -> list[tuple[EvidenceChunk, float, dict[str, float]]]:
+        if not chunks:
+            return []
+
+        bm25_values = _bm25_scores(query_text, [chunk.text for chunk in chunks])
+        dense_values = [
+            _dot_similarity(query_embedding, embeddings.get(chunk.chunk_id))
+            for chunk in chunks
+        ]
+        lexical_values = [
+            _lexical_similarity(query_text, chunk.text)
+            for chunk in chunks
+        ]
+
+        has_dense = any(val > 0.0 for val in dense_values)
+        dense_order = sorted(
+            range(len(chunks)),
+            key=lambda idx: dense_values[idx],
+            reverse=True,
+        )
+        bm25_order = sorted(
+            range(len(chunks)),
+            key=lambda idx: (bm25_values[idx], lexical_values[idx]),
+            reverse=True,
+        )
+
+        dense_ranks = {
+            idx: rank
+            for rank, idx in enumerate(dense_order, start=1)
+            if dense_values[idx] > 0.0
+        }
+        bm25_ranks = {
+            idx: rank
+            for rank, idx in enumerate(bm25_order, start=1)
+            if bm25_values[idx] > 0.0 or lexical_values[idx] > 0.0
+        }
+
+        max_rrf_denom = 1.0 / (_RUNTIME_RRF_K + 1.0)
         scored: list[tuple[EvidenceChunk, float, dict[str, float]]] = []
-        for chunk in chunks:
-            dense = _dot_similarity(query_embedding, embeddings.get(chunk.chunk_id))
-            lexical = _lexical_similarity(query_text, chunk.text)
+        for idx, chunk in enumerate(chunks):
+            dense = dense_values[idx]
+            lexical = lexical_values[idx]
+            bm25 = bm25_values[idx]
             quality = _quality_prior(chunk.quality_label)
             freshness = _freshness_prior(chunk.freshness_label)
-            score = (0.60 * dense) + (0.25 * lexical) + (0.10 * quality) + (0.05 * freshness)
+
+            dense_rrf = (1.0 / (_RUNTIME_RRF_K + dense_ranks[idx])) / max_rrf_denom if idx in dense_ranks else 0.0
+            bm25_rrf = (1.0 / (_RUNTIME_RRF_K + bm25_ranks[idx])) / max_rrf_denom if idx in bm25_ranks else 0.0
+            if has_dense:
+                rrf_component = (0.55 * dense_rrf) + (0.45 * bm25_rrf)
+            else:
+                rrf_component = bm25_rrf
+
+            # Blend rank-based RRF with raw signal amplitude + quality/freshness priors.
+            signal_blend = (0.60 * dense + 0.40 * lexical) if has_dense else lexical
+            score = (0.65 * rrf_component) + (0.20 * signal_blend) + (0.10 * quality) + (0.05 * freshness)
             if score <= 0:
                 continue
             scored.append(
@@ -481,6 +707,8 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                     {
                         "dense": dense,
                         "lexical": lexical,
+                        "bm25": bm25,
+                        "rrf": rrf_component,
                         "quality": quality,
                         "freshness": freshness,
                         "citation_eligible": 1.0 if citation_eligible else 0.0,
@@ -671,6 +899,7 @@ class EvidenceMemoryService(EvidenceStoreListener):
             text,
             max_chars=self._config.evidence_chunk_chars,
             overlap=self._config.evidence_chunk_overlap,
+            max_chunks=self._config.evidence_runtime_max_chunks,
         )
         archive_chunks = [
             EvidenceChunk(
@@ -897,7 +1126,7 @@ class EvidenceMemoryService(EvidenceStoreListener):
                     chunk_id=f"{source_id}::{str(item.get('chunk_id') or '').split('::')[-1]}",
                     task_id=task_id,
                     source_id=source_id,
-                    text=_clean_text(item.get("text")),
+                    text=_clean_structured_text(item.get("text")),
                     start_char=int(item.get("start_char") or 0),
                     end_char=int(item.get("end_char") or 0),
                     has_full_content=bool(item.get("has_full_content")),

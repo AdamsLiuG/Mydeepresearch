@@ -237,13 +237,22 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.search_api, config.SearchAPI.SEMANTICSCHOLAR)
         self.assertEqual(cfg.semantic_scholar_api_key, "secret-key")
 
-    def test_advanced_backends_reject_semanticscholar(self):
+    def test_advanced_backends_allow_semanticscholar_and_reject_unknown(self):
         with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={
+                    "search_api": "advanced",
+                    "advanced_search_backends": ["searxng", "semanticscholar"],
+                },
+                load_env_file=False,
+            )
+            self.assertEqual(cfg.advanced_search_backends, ["searxng", "semanticscholar"])
+
             with self.assertRaisesRegex(ValueError, "Unsupported advanced_search_backends"):
                 config.Configuration.from_env(
                     overrides={
                         "search_api": "advanced",
-                        "advanced_search_backends": ["searxng", "semanticscholar"],
+                        "advanced_search_backends": ["searxng", "unknown_backend"],
                     },
                     load_env_file=False,
                 )

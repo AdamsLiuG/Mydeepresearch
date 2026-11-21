@@ -56,6 +56,16 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - optional dependency
     markdownify = None  # type: ignore
 
+try:  # pragma: no cover - optional dependency
+    import trafilatura
+except Exception:  # pragma: no cover - optional dependency
+    trafilatura = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    import fitz as pymupdf
+except Exception:  # pragma: no cover - optional dependency
+    pymupdf = None  # type: ignore
+
 TRACKING_QUERY_PARAMS = {
     "fbclid",
     "gclid",
@@ -70,6 +80,14 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 HTML_SCRIPT_PATTERN = re.compile(
     r"<(script|style)\b[^>]*>.*?</\1>",
     re.IGNORECASE | re.DOTALL,
+)
+HTML_BOILERPLATE_PATTERN = re.compile(
+    r"<(script|style|noscript|nav|header|footer|aside)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+HTML_BLOCK_BREAK_PATTERN = re.compile(
+    r"</?(?:p|div|section|article|main|h[1-6]|li|tr|blockquote|pre|br)\b[^>]*>",
+    re.IGNORECASE,
 )
 HTML_TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 DATE_PATTERN = re.compile(
@@ -490,6 +508,79 @@ def _clean_text(value: str) -> str:
     return " ".join(value.split()).strip()
 
 
+def _clean_structured_text(value: str) -> str:
+    """Normalize extracted text/markdown while preserving headings, lists, and paragraph breaks."""
+    if not value:
+        return ""
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    lines: list[str] = []
+    blank_run = 0
+    for raw_line in normalized.split("\n"):
+        cleaned_line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not cleaned_line:
+            blank_run += 1
+            if blank_run == 1 and lines:
+                lines.append("")
+            continue
+        blank_run = 0
+        lines.append(cleaned_line)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _extract_structured_html_text(html: str) -> str:
+    """Extract clean Markdown/structured text from HTML without flattening structure."""
+    if not html:
+        return ""
+
+    # Strip boilerplate navigation/header/footer/aside/script/style blocks first.
+    sanitized_html = HTML_BOILERPLATE_PATTERN.sub(" ", html)
+
+    if trafilatura is not None:
+        try:
+            extracted = trafilatura.extract(
+                sanitized_html,
+                include_formatting=True,
+                include_tables=True,
+                include_links=False,
+            )
+            cleaned = _clean_structured_text(extracted or "")
+            if cleaned:
+                return cleaned
+        except Exception:  # pragma: no cover - optional dependency failure
+            pass
+
+    if markdownify is not None:
+        try:
+            converted = markdownify(sanitized_html, heading_style="ATX")
+            cleaned = _clean_structured_text(converted or "")
+            if cleaned:
+                return cleaned
+        except Exception:  # pragma: no cover - optional dependency failure
+            pass
+
+    with_breaks = HTML_BLOCK_BREAK_PATTERN.sub("\n", sanitized_html)
+    without_tags = HTML_TAG_PATTERN.sub(" ", with_breaks)
+    return _clean_structured_text(without_tags)
+
+
+def _extract_pdf_text(raw_bytes: bytes) -> str:
+    """Extract structured text from PDF bytes when PyMuPDF is available."""
+    if pymupdf is None or not raw_bytes:
+        return ""
+    doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
+    try:
+        pages: list[str] = []
+        for page in doc:
+            page_text = _clean_structured_text(page.get_text("text") or "")
+            if page_text:
+                pages.append(page_text)
+        return "\n\n".join(pages)
+    finally:
+        doc.close()
+
+
 def _extract_title(html: str) -> str:
     if not html:
         return ""
@@ -602,7 +693,10 @@ def _fetch_page_text(
             response.raise_for_status()
             content_type_header = str(response.headers.get("Content-Type") or "").strip()
             media_type = content_type_header.split(";", 1)[0].strip().lower()
-            if media_type and media_type not in _ALLOWED_FETCH_CONTENT_TYPES:
+            allowed_types = set(_ALLOWED_FETCH_CONTENT_TYPES)
+            if pymupdf is not None:
+                allowed_types.add("application/pdf")
+            if media_type and media_type not in allowed_types:
                 raise ValueError(f"unsupported content type: {media_type}")
 
             content_length_raw = str(response.headers.get("Content-Length") or "").strip()
@@ -624,18 +718,17 @@ def _fetch_page_text(
                     raise ValueError(f"fetched page exceeds max byte limit ({max_allowed} bytes)")
                 chunks.append(chunk)
 
+            raw_payload = b"".join(chunks)
+            if media_type == "application/pdf":
+                return "", _extract_pdf_text(raw_payload)
+
             encoding = response.encoding or "utf-8"
-            html = b"".join(chunks).decode(encoding, errors="replace")
+            html = raw_payload.decode(encoding, errors="replace")
+            if media_type in {"text/plain", "text/markdown", "application/json"}:
+                return "", _clean_structured_text(html)
+
             title = _extract_title(html)
-            sanitized_html = HTML_SCRIPT_PATTERN.sub(" ", html)
-
-            if markdownify is not None:
-                try:
-                    return title, _clean_text(markdownify(sanitized_html))
-                except Exception:  # pragma: no cover - optional dependency failure
-                    pass
-
-            return title, _clean_text(sanitized_html)
+            return title, _extract_structured_html_text(html)
 
     raise ValueError("too many redirects")
 

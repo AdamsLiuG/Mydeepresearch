@@ -713,6 +713,90 @@ class EvidenceStoreTests(unittest.TestCase):
                 self.assertIn("Safe text", text)
                 self.assertNotIn("evil()", text)
 
+    def test_structured_html_extraction_preserves_headings_and_strips_boilerplate(self):
+        from services.evidence import _extract_structured_html_text
+
+        html = (
+            "<html><body>"
+            "<nav>Site Navigation Menu</nav>"
+            "<header>Top Banner</header>"
+            "<main>"
+            "<h1>Architecture Overview</h1>"
+            "<p>First paragraph explains the core pipeline.</p>"
+            "<h2>Benchmark Results</h2>"
+            "<p>Second paragraph reports latency metrics.</p>"
+            "</main>"
+            "<footer>Copyright 2026</footer>"
+            "<script>window.track()</script>"
+            "</body></html>"
+        )
+        extracted = _extract_structured_html_text(html)
+        self.assertIn("Architecture Overview", extracted)
+        self.assertIn("Benchmark Results", extracted)
+        self.assertIn("\n", extracted)
+        self.assertNotIn("Site Navigation Menu", extracted)
+        self.assertNotIn("Copyright 2026", extracted)
+        self.assertNotIn("window.track()", extracted)
+
+    def test_bilingual_structure_aware_chunking_and_bm25_rrf_runtime_scoring(self):
+        from services.evidence_index import _chunk_text
+
+        zh_section = (
+            "# 核心架构\n"
+            + ("这是第一段关于向量检索与重排架构的详细说明，包含混合打分机制。" * 12)
+            + "\n\n## 延迟优化\n"
+            + ("这是第二段关于并发缓存隔离和异步流水线的详细基准测试结果。" * 15)
+        )
+        chunks = _chunk_text(zh_section, max_chars=240, overlap=30, max_chunks=32)
+        self.assertGreater(len(chunks), 3)
+        # Continuation chunks inside a section carry heading breadcrumb context
+        self.assertTrue(any("## 延迟优化" in chunk_text for _, _, chunk_text in chunks))
+        # Chunks respect Chinese sentence boundaries instead of mid-clause slicing
+        mid_chunks = [text for _, _, text in chunks[:-1]]
+        self.assertTrue(any(text.endswith("。") for text in mid_chunks))
+
+        # Long document supports more than legacy 12 chunks
+        very_long_doc = "\n\n".join(
+            f"## 章节 {idx}\n" + ("长文段落内容用于验证切片上限扩展到三十二个以上。" * 10)
+            for idx in range(1, 20)
+        )
+        many_chunks = _chunk_text(very_long_doc, max_chars=220, overlap=20, max_chunks=32)
+        self.assertGreater(len(many_chunks), 12)
+
+        # Runtime index scores relevant chunk highest using BM25 + RRF even without embeddings
+        cfg = Configuration.from_env(
+            overrides={"evidence_runtime_enabled": True, "evidence_chunk_chars": 240, "evidence_chunk_overlap": 20},
+            load_env_file=False,
+        )
+        runtime_index = EvidenceRuntimeIndex(cfg)
+        store = EvidenceStore(listeners=[runtime_index])
+        store.record_search_results(
+            task_id=1,
+            query="hybrid retrieval",
+            search_payload={
+                "results": [
+                    {
+                        "title": "Doc A",
+                        "url": "https://docs.example.com/a",
+                        "content": "# 混合检索\nBM25 与稠密向量的 RRF 融合排序能显著降低噪声。",
+                    },
+                    {
+                        "title": "Doc B",
+                        "url": "https://docs.example.com/b",
+                        "content": "# 饮食指南\n本文介绍冬季蔬菜种植与烹饪步骤。",
+                    },
+                ]
+            },
+            backend="tavily",
+        )
+        with patch("services.evidence_index.encode_text", return_value=None):
+            hits = runtime_index.query(text="RRF 融合排序 BM25", task_id=1, top_k=2)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0].title, "Doc A")
+        self.assertIn("bm25", hits[0].score_breakdown)
+        self.assertIn("rrf", hits[0].score_breakdown)
+        self.assertGreater(hits[0].score, hits[1].score)
+
 
 if __name__ == "__main__":
     unittest.main()

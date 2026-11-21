@@ -1861,6 +1861,87 @@ class SearchCacheTests(unittest.TestCase):
         self.assertTrue(services_search._has_fresh_year_signal("2029 roadmap", now=fake_now))
         self.assertFalse(services_search._has_fresh_year_signal("2024 archive", now=fake_now))
 
+    def test_weighted_rrf_prioritizes_top_authoritative_result_over_low_rank_duplicate(self):
+        merged: dict[str, dict] = {}
+        # Low-rank aggregator appearing at rank 9 in two engines
+        services_search._merge_fused_result(
+            merged,
+            {"title": "Forum Re-post", "url": "https://blog.csdn.net/noise/1", "content": "repost"},
+            backend_label="searxng",
+            backend_order=0,
+            result_rank=9,
+        )
+        services_search._merge_fused_result(
+            merged,
+            {"title": "Forum Re-post", "url": "https://blog.csdn.net/noise/1", "content": "repost"},
+            backend_label="duckduckgo",
+            backend_order=1,
+            result_rank=9,
+        )
+        # Single top-ranked authoritative paper from Semantic Scholar
+        services_search._merge_fused_result(
+            merged,
+            {
+                "title": "FlashAttention-3",
+                "url": "https://arxiv.org/abs/2407.08608",
+                "content": "primary paper abstract",
+            },
+            backend_label="semanticscholar",
+            backend_order=2,
+            result_rank=0,
+        )
+
+        ranked = services_search._sort_fused_results_by_rules(merged)
+        self.assertEqual(ranked[0]["url"], "https://arxiv.org/abs/2407.08608")
+        self.assertGreater(ranked[0]["fusion_score"], ranked[1]["fusion_score"])
+
+    def test_advanced_fusion_executes_semanticscholar_alongside_web_backends(self):
+        DummySearchTool.responses = {
+            "searxng": {
+                "results": [
+                    {"title": "Web Summary", "url": "https://example.com/web", "content": "summary"},
+                ],
+                "backend": "searxng",
+                "answer": None,
+                "notices": [],
+            }
+        }
+        config = Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng", "semanticscholar"],
+                "search_cache_enabled": False,
+                "semantic_cache_enabled": False,
+            },
+            load_env_file=False,
+        )
+        paper_payload = {
+            "results": [
+                {
+                    "title": "Agentic Search Paper",
+                    "url": "https://arxiv.org/abs/2601.12345",
+                    "content": "Academic evaluation of retrieval fusion",
+                }
+            ],
+            "backend": "semanticscholar",
+            "answer": None,
+            "notices": [],
+        }
+        with patch.object(
+            services_search,
+            "_execute_semantic_scholar_backend",
+            return_value=(paper_payload, [], None, "semanticscholar"),
+        ):
+            payload, _, _, backend_label, _, _ = services_search.dispatch_search(
+                "agentic search paper",
+                config,
+                0,
+            )
+
+        self.assertEqual(backend_label, "advanced[searxng, semanticscholar]")
+        self.assertEqual(payload["results"][0]["url"], "https://arxiv.org/abs/2601.12345")
+        self.assertIn("fusion_score", payload["results"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

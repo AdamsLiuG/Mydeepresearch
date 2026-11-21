@@ -89,6 +89,7 @@ class SearchAPI(Enum):
             cls.SERPAPI.value,
             cls.DUCKDUCKGO.value,
             cls.SEARXNG.value,
+            cls.SEMANTICSCHOLAR.value,
         }
 
 
@@ -317,6 +318,12 @@ class Configuration(BaseModel):
         ge=0,
         title="Evidence Chunk Overlap",
         description="Chunk overlap used by runtime and persistent evidence indexing",
+    )
+    evidence_runtime_max_chunks: int = Field(
+        default=32,
+        ge=1,
+        title="Evidence Runtime Max Chunks",
+        description="Maximum number of chunks indexed per evidence document",
     )
     evidence_runtime_embedding_model: str | None = Field(
         default=None,
@@ -1018,6 +1025,7 @@ class Configuration(BaseModel):
             "evidence_runtime_top_k": os.getenv("EVIDENCE_RUNTIME_TOP_K"),
             "evidence_chunk_chars": os.getenv("EVIDENCE_CHUNK_CHARS"),
             "evidence_chunk_overlap": os.getenv("EVIDENCE_CHUNK_OVERLAP"),
+            "evidence_runtime_max_chunks": os.getenv("EVIDENCE_RUNTIME_MAX_CHUNKS"),
             "evidence_runtime_embedding_model": os.getenv("EVIDENCE_RUNTIME_EMBEDDING_MODEL"),
             "evidence_memory_enabled": os.getenv("EVIDENCE_MEMORY_ENABLED"),
             "evidence_memory_dir": os.getenv("EVIDENCE_MEMORY_DIR"),
