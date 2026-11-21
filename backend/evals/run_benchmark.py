@@ -18,7 +18,7 @@ if str(BACKEND_SRC) not in sys.path:
 
 from config import Configuration
 from evals.compare_variants import compare_result_files, render_markdown
-from evals.judges import HeuristicJudge, LLMJudge
+from evals.judges import HeuristicJudge, HybridJudge, LLMJudge
 from evals.loader import load_benchmark_cases
 from evals.runner import run_benchmark_suite
 
@@ -87,7 +87,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge",
         default="heuristic",
-        choices=("heuristic", "llm"),
+        choices=("heuristic", "llm", "hybrid"),
         help="Benchmark judge to use for result scoring.",
     )
     parser.add_argument(
@@ -131,6 +131,17 @@ def build_judge(args: argparse.Namespace, *, config: Configuration):
             judge_version=args.judge_version,
             load_env_file=False,
         )
+    if args.judge == "hybrid":
+        llm_judge = LLMJudge(
+            config=config,
+            model=args.judge_model,
+            provider=args.judge_provider,
+            base_url=args.judge_base_url,
+            timeout_seconds=args.judge_timeout_seconds,
+            judge_version=args.judge_version,
+            load_env_file=False,
+        )
+        return HybridJudge(heuristic_judge=HeuristicJudge(), llm_judge=llm_judge)
     return HeuristicJudge()
 
 

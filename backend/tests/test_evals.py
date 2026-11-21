@@ -228,6 +228,88 @@ class BenchmarkCLITests(unittest.TestCase):
 
         self.assertEqual(metrics["section_completeness"], 0.5)
 
+    def test_hybrid_judge_blends_heuristic_and_llm_scores_and_degrades_safely(self):
+        from evals.judges import HybridJudge
+
+        case = BenchmarkCase(
+            id="hybrid-case",
+            topic="MCP protocol",
+            expected_keywords=["MCP", "tool"],
+            expected_sections=["背景", "结论"],
+            freshness_sensitive=False,
+        )
+        report = "# 背景\nMCP standardizes tool context [T1-S1].\n\n# 结论\nMCP is adopted widely [T1-S1]."
+        todo_items = [
+            SimpleNamespace(
+                id=1,
+                status="completed",
+                evidence_items=[{"source_id": "T1-S1", "domain": "modelcontextprotocol.io"}],
+            )
+        ]
+        trace = {"elapsed_ms": 100.0, "estimated_cost": 0.0, "status": "success"}
+
+        class FakeLLMJudge:
+            def evaluate(self, **kwargs):
+                return {
+                    "factuality_score": 0.9,
+                    "coverage_score": 0.8,
+                    "citation_grounding_score": 0.9,
+                    "freshness_score": 1.0,
+                    "conservativeness_score": 0.9,
+                    "overall_verdict": "pass",
+                    "judge_status": "ok",
+                }
+
+        hybrid = HybridJudge(heuristic_judge=HeuristicJudge(), llm_judge=FakeLLMJudge())
+        metrics = hybrid.evaluate(
+            case=case,
+            report_markdown=report,
+            todo_items=todo_items,
+            trace_snapshot=trace,
+        )
+        self.assertEqual(metrics["judge_type"], "hybrid")
+        self.assertEqual(metrics["llm_judge_status"], "ok")
+        self.assertAlmostEqual(metrics["llm_composite_score"], 0.9)
+        self.assertGreater(metrics["hybrid_score"], 0.5)
+        self.assertIn("keyword_coverage", metrics)
+
+        class BrokenLLMJudge:
+            def evaluate(self, **kwargs):
+                raise RuntimeError("judge endpoint unreachable")
+
+        fallback_hybrid = HybridJudge(heuristic_judge=HeuristicJudge(), llm_judge=BrokenLLMJudge())
+        degraded = fallback_hybrid.evaluate(
+            case=case,
+            report_markdown=report,
+            todo_items=todo_items,
+            trace_snapshot=trace,
+        )
+        self.assertEqual(degraded["judge_type"], "hybrid_fallback_heuristic")
+        self.assertEqual(degraded["llm_judge_status"], "degraded")
+        self.assertEqual(degraded["hybrid_score"], degraded["heuristic_composite_score"])
+
+        cli_args = parse_args(["--judge", "hybrid", "--judge-model", "judge-model"])
+        built = build_judge(cli_args, config=Configuration.from_env(load_env_file=False))
+        self.assertIsInstance(built, HybridJudge)
+
+    def test_golden_multidomain_24cases_dataset_loads_with_full_coverage(self):
+        golden_path = BACKEND_ROOT / "evals" / "benchmarks" / "golden_multidomain_24cases.jsonl"
+        cases = load_benchmark_cases(golden_path)
+        self.assertEqual(len(cases), 24)
+        self.assertEqual(len({case.id for case in cases}), 24)
+        packs = {case.metadata.get("skill_pack") for case in cases}
+        self.assertTrue(
+            {"tech-selection", "academic-review", "competitor-scan", "policy-analysis", "_neutral"}.issubset(
+                packs
+            )
+        )
+        languages = {case.metadata.get("language") for case in cases}
+        self.assertEqual(languages, {"zh", "en"})
+        self.assertTrue(any(case.freshness_sensitive for case in cases))
+        self.assertTrue(
+            any(str(case.metadata.get("category") or "").startswith("adversarial") for case in cases)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

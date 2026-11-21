@@ -454,6 +454,26 @@ class Configuration(BaseModel):
         title="Async Memory Refresh Enabled",
         description="When enabled, run post-report strategy memory synthesis in a background thread",
     )
+    langfuse_enabled: bool = Field(
+        default=False,
+        title="Langfuse Observability Enabled",
+        description="Opt-in export of request traces and stage spans to Langfuse",
+    )
+    langfuse_public_key: str | None = Field(
+        default=None,
+        title="Langfuse Public Key",
+        description="Optional Langfuse public key",
+    )
+    langfuse_secret_key: str | None = Field(
+        default=None,
+        title="Langfuse Secret Key",
+        description="Optional Langfuse secret key",
+    )
+    langfuse_host: str | None = Field(
+        default=None,
+        title="Langfuse Host",
+        description="Optional Langfuse host URL",
+    )
     search_cache_enabled: bool = Field(
         default=True,
         title="Search Cache Enabled",
@@ -1080,6 +1100,10 @@ class Configuration(BaseModel):
             "cors_origins": os.getenv("CORS_ORIGINS"),
             "sse_heartbeat_interval_seconds": os.getenv("SSE_HEARTBEAT_INTERVAL_SECONDS"),
             "async_memory_refresh_enabled": os.getenv("ASYNC_MEMORY_REFRESH_ENABLED"),
+            "langfuse_enabled": os.getenv("LANGFUSE_ENABLED"),
+            "langfuse_public_key": os.getenv("LANGFUSE_PUBLIC_KEY"),
+            "langfuse_secret_key": os.getenv("LANGFUSE_SECRET_KEY"),
+            "langfuse_host": os.getenv("LANGFUSE_HOST"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
             "search_cache_dynamic_ttl_enabled": os.getenv("SEARCH_CACHE_DYNAMIC_TTL_ENABLED"),

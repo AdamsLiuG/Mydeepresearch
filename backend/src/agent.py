@@ -40,6 +40,7 @@ from services.evidence_index import (
     EvidenceRuntimeIndex,
 )
 from services.note_memory import NoteMemoryService
+from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
 from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
@@ -417,6 +418,7 @@ class DeepResearchAgent(
         )
         self._skill_pack = SkillPackService(self.config)
         self._skill_selection: SkillSelection | None = None
+        self._observability = LangfuseTraceAdapter(self.config)
 
         self.note_tool = (
             NoteTool(workspace=self.config.notes_workspace)
@@ -918,6 +920,12 @@ class DeepResearchAgent(
     def _is_cancelled(self) -> bool:
         cancel_event = getattr(self, "_cancel_event", None)
         return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _export_observability_trace(self, snapshot: dict[str, Any] | None) -> None:
+        adapter = getattr(self, "_observability", None)
+        if adapter is None or not snapshot:
+            return
+        adapter.export_request_trace(snapshot)
 
     def _flush_strategy_memory_usage(self, *, observer: RequestTrace | None) -> None:
         """Persist which strategy cards this request actually used, then decay unused drafts.
@@ -1633,8 +1641,9 @@ class DeepResearchAgent(
                 report_note_id=state.report_note_id,
                 report_note_path=state.report_note_path,
             )
-            observer.complete_request(status=request_status)
+            snapshot = observer.complete_request(status=request_status)
             request_completed = True
+            self._export_observability_trace(snapshot)
             self._persist_request_state(
                 state,
                 phase="completed",
@@ -1657,7 +1666,8 @@ class DeepResearchAgent(
                 yield {"type": "done"}
         except Exception as exc:
             if not request_completed:
-                observer.complete_request(status="failed", error=exc)
+                failed_snapshot = observer.complete_request(status="failed", error=exc)
+                self._export_observability_trace(failed_snapshot)
             self._persist_request_state(
                 state,
                 phase="failed",
