@@ -62,6 +62,7 @@ class StateManagerMixin:
             "report_repair_completed": bool(state.report_repair_completed),
             "report_repair_cycles": int(state.report_repair_cycles or 0),
             "topic_cache_warmup_completed": bool(state.topic_cache_warmup_completed),
+            "skill_pack": dict(state.skill_pack_metadata or {}),
             "cache_diagnostics": cache_diagnostics,
             "request_metrics": observer_snapshot,
         }
@@ -149,6 +150,11 @@ class StateManagerMixin:
             report_repair_completed=bool(payload.get("report_repair_completed")),
             report_repair_cycles=max(0, int(payload.get("report_repair_cycles") or 0)),
             topic_cache_warmup_completed=bool(payload.get("topic_cache_warmup_completed")),
+            skill_pack_metadata=(
+                dict(payload.get("skill_pack") or {})
+                if isinstance(payload.get("skill_pack"), dict)
+                else {}
+            ),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
         for task in state.todo_items:

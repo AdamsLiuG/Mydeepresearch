@@ -536,6 +536,30 @@ class Configuration(BaseModel):
         title="Max Agent Tasks",
         description="Maximum number of planned tasks the agent will execute for a single request",
     )
+    initial_plan_max_tasks: int | None = Field(
+        default=None,
+        ge=1,
+        title="Initial Plan Max Tasks",
+        description="Optional cap for the initial planning stage so reflection/repair reserves remain available",
+    )
+    reflection_reserve_tasks: int = Field(
+        default=2,
+        ge=0,
+        title="Reflection Reserve Tasks",
+        description="Reserved task headroom for request-level reflection when multi-stage budgets are active",
+    )
+    repair_reserve_tasks: int = Field(
+        default=2,
+        ge=0,
+        title="Repair Reserve Tasks",
+        description="Reserved task headroom for review-driven report repair when multi-stage budgets are active",
+    )
+    max_total_tasks: int | None = Field(
+        default=None,
+        ge=1,
+        title="Max Total Tasks",
+        description="Optional hard total task ceiling across planning, reflection, and report repair",
+    )
     request_reflection_enabled: bool = Field(
         default=True,
         title="Request Reflection Enabled",
@@ -880,7 +904,48 @@ class Configuration(BaseModel):
             if not memory_path.is_absolute():
                 memory_path = backend_root() / memory_path
             self.evidence_memory_dir = str(memory_path.resolve(strict=False))
+
+        skill_pack_dir = (self.skill_pack_dir or "").strip()
+        if skill_pack_dir:
+            pack_path = Path(skill_pack_dir).expanduser()
+            if not pack_path.is_absolute():
+                pack_path = backend_root() / pack_path
+            self.skill_pack_dir = str(pack_path.resolve(strict=False))
         return self
+
+    def resolved_max_total_tasks(self) -> int:
+        """Return the hard total task ceiling across planning, reflection, and repair."""
+        if self.max_total_tasks is not None:
+            return max(1, int(self.max_total_tasks))
+
+        base = max(1, int(self.max_agent_tasks or 1))
+        if base < 5:
+            return base
+
+        reserve = 0
+        if self.request_reflection_enabled:
+            reserve += max(0, int(self.reflection_reserve_tasks or 0))
+        if self.report_repair_enabled:
+            reserve += max(0, int(self.repair_reserve_tasks or 0))
+        if reserve <= 0:
+            return base
+
+        return min(max(base, 4 + reserve), max(base + 2, 7))
+
+    def resolved_initial_plan_max_tasks(self) -> int:
+        """Return the task budget allocated to initial planning."""
+        total_cap = self.resolved_max_total_tasks()
+        if self.initial_plan_max_tasks is not None:
+            return min(max(1, int(self.initial_plan_max_tasks)), total_cap)
+
+        base = max(1, int(self.max_agent_tasks or 1))
+        has_post_stage_reserve = (
+            (self.request_reflection_enabled and int(self.reflection_reserve_tasks or 0) > 0)
+            or (self.report_repair_enabled and int(self.repair_reserve_tasks or 0) > 0)
+        )
+        if base >= 5 and has_post_stage_reserve:
+            return min(4, total_cap)
+        return min(base, total_cap)
 
     @classmethod
     def from_env(
@@ -984,6 +1049,10 @@ class Configuration(BaseModel):
             "task_context_char_limit": os.getenv("TASK_CONTEXT_CHAR_LIMIT"),
             "task_summary_max_concurrency": os.getenv("TASK_SUMMARY_MAX_CONCURRENCY"),
             "max_agent_tasks": os.getenv("MAX_AGENT_TASKS"),
+            "initial_plan_max_tasks": os.getenv("INITIAL_PLAN_MAX_TASKS"),
+            "reflection_reserve_tasks": os.getenv("REFLECTION_RESERVE_TASKS"),
+            "repair_reserve_tasks": os.getenv("REPAIR_RESERVE_TASKS"),
+            "max_total_tasks": os.getenv("MAX_TOTAL_TASKS"),
             "request_reflection_enabled": os.getenv("REQUEST_REFLECTION_ENABLED"),
             "reflection_max_additional_tasks": os.getenv("REFLECTION_MAX_ADDITIONAL_TASKS"),
             "review_stage_enabled": os.getenv("REVIEW_STAGE_ENABLED"),

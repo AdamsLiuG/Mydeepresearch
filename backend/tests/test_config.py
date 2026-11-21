@@ -213,6 +213,20 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.perf_sample_interval_seconds, 0.25)
         self.assertEqual(cfg.request_state_dir, expected_state_dir)
 
+    def test_skill_pack_dir_is_normalized_and_budget_tiers_resolve(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(
+                overrides={"skill_pack_dir": "./skills/research"},
+                load_env_file=False,
+            )
+
+        expected_skills_dir = str(
+            (config.backend_root() / "skills/research").resolve(strict=False)
+        )
+        self.assertEqual(cfg.skill_pack_dir, expected_skills_dir)
+        self.assertEqual(cfg.resolved_initial_plan_max_tasks(), 4)
+        self.assertEqual(cfg.resolved_max_total_tasks(), 7)
+
     def test_semanticscholar_search_api_and_key_are_supported(self):
         with patch.dict(os.environ, {"SEMANTIC_SCHOLAR_API_KEY": "secret-key"}, clear=True):
             cfg = config.Configuration.from_env(

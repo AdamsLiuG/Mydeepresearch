@@ -231,6 +231,7 @@ class PlanningService:
         max_additional_tasks: int,
         observer: RequestTrace | None = None,
         historical_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
     ) -> List[TodoItem]:
         """Generate targeted repair tasks from high-priority review findings."""
 
@@ -268,6 +269,7 @@ class PlanningService:
             max_additional_tasks=max_additional_tasks,
         )
         prompt += self._historical_memory_block(historical_memory_context)
+        prompt += str(skill_pack_context or "")
         response = self._invoke_planner(prompt, observer=observer)
         logger.info("Repair planner raw output (truncated): %s", response[:500])
 

@@ -868,9 +868,9 @@ class TaskExecutorMixin:
         state: SummaryState,
         observer: RequestTrace | None,
     ) -> str | None:
-        """Trim planned tasks to the configured execution budget."""
+        """Trim planned tasks to the configured initial planning budget."""
 
-        max_tasks = max(int(self.config.max_agent_tasks or 1), 1)
+        max_tasks = self.config.resolved_initial_plan_max_tasks()
         if len(state.todo_items) <= max_tasks:
             return None
 

@@ -168,6 +168,7 @@ class MetricsRegistry:
             "summarization_latency_ms": LatencyStats(),
             "reflection_latency_ms": LatencyStats(),
             "review_latency_ms": LatencyStats(),
+            "repair_latency_ms": LatencyStats(),
             "report_latency_ms": LatencyStats(),
             "total_latency_ms": LatencyStats(),
         }
@@ -193,6 +194,7 @@ class MetricsRegistry:
                 "summarization_latency_ms": LatencyStats(),
                 "reflection_latency_ms": LatencyStats(),
                 "review_latency_ms": LatencyStats(),
+                "repair_latency_ms": LatencyStats(),
                 "report_latency_ms": LatencyStats(),
                 "total_latency_ms": LatencyStats(),
             }

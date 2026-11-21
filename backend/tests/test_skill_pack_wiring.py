@@ -193,6 +193,100 @@ class ShadowAndDegradeTests(unittest.TestCase):
             self.assertIsNone(agent._skill_selection)
             self.assertIn("skill_pack_unavailable", observer.degraded_reasons)
 
+    def test_run_stream_selects_injects_and_persists_skill_pack(self):
+        from types import SimpleNamespace
+
+        from models import TodoItem
+        from services.evidence import EvidenceStore
+        from services.request_state import RequestStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Configuration.from_env(
+                overrides={
+                    "enable_notes": False,
+                    "skill_pack_enabled": True,
+                    "skill_pack_dir": REAL_PACK_DIR,
+                    "skill_pack_min_match_score": 0.20,
+                    "request_reflection_enabled": False,
+                    "review_stage_enabled": False,
+                    "report_repair_enabled": False,
+                    "request_state_enabled": True,
+                    "request_state_dir": tmp,
+                },
+                load_env_file=False,
+            )
+            instance = agent_module.DeepResearchAgent.__new__(agent_module.DeepResearchAgent)
+            instance.config = cfg
+            instance.request_id = "req-stream-skill"
+            instance._request_trace = None
+            instance._skill_pack = SkillPackService(cfg)
+            instance._skill_selection = None
+            instance._evidence_store = EvidenceStore()
+            instance._request_state_store = RequestStateStore(tmp)
+            instance._note_memory = SimpleNamespace(
+                search_for_planning=lambda *args, **kwargs: "",
+                refresh_notes=lambda *args, **kwargs: None,
+            )
+            instance._strategy_memory = SimpleNamespace(
+                search_for_planning=lambda *args, **kwargs: "",
+                search_for_reflection=lambda *args, **kwargs: "",
+                refresh_request=lambda *args, **kwargs: None,
+                run_maintenance=lambda *args, **kwargs: None,
+            )
+            instance._evidence_memory = None
+            instance._evidence_runtime_index = None
+            instance._tool_tracker = SimpleNamespace(
+                drain=lambda *args, **kwargs: [],
+                set_event_sink=lambda sink: None,
+            )
+            instance._tool_event_sink = None
+            instance._tool_event_sink_enabled = False
+            instance.note_tool = None
+            captured: dict[str, str] = {}
+
+            def fake_plan(state, **kwargs):
+                captured["planning"] = str(kwargs.get("skill_pack_context") or "")
+                return [
+                    TodoItem(
+                        id=1,
+                        title="技术选型对比",
+                        intent="对比框架",
+                        query="向量数据库 方案对比",
+                    )
+                ]
+
+            def fake_execute_task(state, task, emit_stream=False, step=None):
+                task.status = "completed"
+                task.summary = "已整理选型要点"
+                task.sources_summary = "* Doc : https://example.com"
+                if False:
+                    yield {}
+
+            def fake_report(state, **kwargs):
+                captured["report"] = str(kwargs.get("skill_pack_context") or "")
+                return "# 报告\n\n选型结论。"
+
+            instance.planner = SimpleNamespace(
+                plan_todo_list=fake_plan,
+                create_fallback_task=lambda state: TodoItem(
+                    id=1, title="兜底", intent="兜底", query=state.research_topic
+                ),
+            )
+            instance.reporting = SimpleNamespace(generate_report=fake_report)
+            instance._execute_task = fake_execute_task
+            instance._warm_topic_search_cache = lambda state, observer=None: None
+
+            events = list(instance.run_stream("向量数据库技术选型与性能权衡的方案对比"))
+
+            self.assertEqual(instance._skill_selection.pack.pack_id, "tech-selection")
+            self.assertEqual(instance._request_trace.skill_pack_id, "tech-selection")
+            self.assertIn("tech-selection", captured["planning"])
+            self.assertIn("tech-selection", captured["report"])
+            self.assertTrue(any(ev.get("type") == "final_report" for ev in events))
+            snapshot = instance._request_state_store.load("req-stream-skill")
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot["skill_pack"]["pack_id"], "tech-selection")
+
 
 if __name__ == "__main__":
     unittest.main()

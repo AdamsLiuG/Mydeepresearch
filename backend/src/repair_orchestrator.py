@@ -74,7 +74,7 @@ class RepairOrchestratorMixin:
         if not repair_candidates:
             return [], None, []
 
-        remaining_budget = self._remaining_task_budget(state)
+        remaining_budget = self._remaining_task_budget(state, stage="repair")
         if remaining_budget <= 0:
             observer.record_report_repair(added_tasks=0, triggered=True)
             observer.record_degraded("report_repair_budget_exhausted")
@@ -91,6 +91,7 @@ class RepairOrchestratorMixin:
             max_additional_tasks=max_repair_tasks,
             observer=observer,
             historical_memory_context=self._planning_memory_context(state, observer),
+            skill_pack_context=self._skill_stage_context("planning"),
         )
         observer.record_report_repair(added_tasks=len(repair_tasks), triggered=True)
 

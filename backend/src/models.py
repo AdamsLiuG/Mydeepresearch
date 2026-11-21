@@ -56,6 +56,7 @@ class SummaryState:
     report_repair_completed: bool = field(default=False)
     report_repair_cycles: int = field(default=0)
     topic_cache_warmup_completed: bool = field(default=False)
+    skill_pack_metadata: dict = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)

@@ -1498,6 +1498,184 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertEqual(refs[0]["title"], "Recovered Resume Source")
         self.assertEqual(refs[0]["url"], "https://example.com/resume")
 
+    def test_three_tier_budget_prevents_reflection_and_repair_starvation(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "max_agent_tasks": 5,
+                "request_reflection_enabled": True,
+                "reflection_max_additional_tasks": 2,
+                "report_repair_enabled": True,
+                "report_repair_max_tasks": 2,
+                "report_repair_max_cycles": 1,
+                "task_react_enabled": False,
+            },
+            load_env_file=False,
+        )
+        agent.planner = SimpleNamespace(
+            plan_todo_list=lambda state, **kwargs: [
+                TodoItem(id=i, title=f"任务{i}", intent=f"维度{i}", query=f"topic angle {i}")
+                for i in range(1, 6)
+            ],
+            plan_additional_tasks=lambda state, **kwargs: [
+                TodoItem(
+                    id=5,
+                    title="反思补充1",
+                    intent="补缺1",
+                    query="topic reflection 1",
+                    origin="replanned",
+                    round=2,
+                ),
+                TodoItem(
+                    id=6,
+                    title="反思补充2",
+                    intent="补缺2",
+                    query="topic reflection 2",
+                    origin="replanned",
+                    round=2,
+                ),
+            ][: kwargs["max_additional_tasks"]],
+            plan_repair_tasks=lambda state, **kwargs: [
+                TodoItem(
+                    id=7,
+                    title="定向修补1",
+                    intent="修补证据",
+                    query="topic repair 1",
+                    origin="repair",
+                    round=3,
+                )
+            ][: kwargs["max_additional_tasks"]],
+            create_fallback_task=lambda state: TodoItem(
+                id=99, title="兜底", intent="兜底", query=state.research_topic
+            ),
+        )
+        agent.reflection = SimpleNamespace(
+            assess_request=lambda state, **kwargs: SimpleNamespace(
+                needs_more_research=True,
+                coverage_status="insufficient",
+                missing_angles=["补缺1", "补缺2"],
+                reason="覆盖不足",
+                gap_signals=kwargs.get("gap_signals") or [],
+            )
+        )
+        review_calls = {"count": 0}
+
+        def fake_review(state, observer=None, skill_pack_context=None):
+            review_calls["count"] += 1
+            if review_calls["count"] == 1:
+                state.review_summary = {
+                    "overall_status": "blocked",
+                    "reason": "证据缺口",
+                    "issue_count": 1,
+                    "severity_counts": {"high": 1, "medium": 0, "low": 0},
+                    "issues": [],
+                    "repair_candidates": [
+                        {
+                            "task_id": 1,
+                            "severity": "high",
+                            "check": "insufficient_sources",
+                            "message": "来源不足",
+                            "source_ids": [],
+                        }
+                    ],
+                }
+            else:
+                state.review_summary = {
+                    "overall_status": "passed",
+                    "reason": "修补完成",
+                    "issue_count": 0,
+                    "severity_counts": {"high": 0, "medium": 0, "low": 0},
+                    "issues": [],
+                    "repair_candidates": [],
+                }
+            state.review_completed = True
+            return state.review_summary
+
+        agent.reviewer = SimpleNamespace(review_request=fake_review)
+
+        def fake_execute_task(state, task, emit_stream=False, step=None):
+            if task.id == 1:
+                task.status = "failed"
+            else:
+                task.status = "completed"
+                task.summary = "有引用总结 [T1-S1]"
+                task.sources_summary = "* Example : https://example.com"
+            if False:
+                yield {}
+
+        agent._execute_task = fake_execute_task
+
+        result = agent.run("AI agent")
+        snapshot = agent._request_trace.snapshot()
+
+        # Initial 5 tasks trimmed to 4 -> Reflection adds 2 (total 6) -> Repair still gets 1 (total 7)
+        self.assertEqual(len(result.todo_items), 7)
+        self.assertEqual(snapshot["reflection_added_tasks"], 2)
+        self.assertTrue(snapshot["report_repair_triggered"])
+        self.assertEqual(snapshot["report_repair_added_tasks"], 1)
+        repair_spans = [
+            span for span in snapshot["stages"] if span.get("stage") == "repair"
+        ]
+        self.assertEqual(len(repair_spans), 1)
+
+    def test_reflection_gap_signals_detect_low_quality_single_domain_and_stale_evidence(self):
+        agent = self._build_agent()
+        agent._request_trace = RequestTrace(
+            request_id="req-quality-gaps",
+            topic="2026 最新多模态模型进展",
+            search_api="duckduckgo",
+            provider="ollama",
+            model="llama3.2",
+            pricing_catalog={},
+        )
+        state = SummaryState(
+            research_topic="2026 最新多模态模型进展",
+            todo_items=[
+                TodoItem(
+                    id=1,
+                    title="任务1",
+                    intent="进展",
+                    query="2026 最新多模态",
+                    status="completed",
+                    summary="总结1",
+                    sources_summary="* Post1 : https://forum.example.com/1",
+                    evidence_items=[
+                        {
+                            "source_id": "T1-S1",
+                            "domain": "forum.example.com",
+                            "source_type": "forum_general",
+                            "quality_label": "low",
+                            "freshness_label": "stale",
+                        }
+                    ],
+                ),
+                TodoItem(
+                    id=2,
+                    title="任务2",
+                    intent="局限",
+                    query="2026 最新多模态局限",
+                    status="completed",
+                    summary="总结2",
+                    sources_summary="* Post2 : https://forum.example.com/2",
+                    evidence_items=[
+                        {
+                            "source_id": "T2-S1",
+                            "domain": "forum.example.com",
+                            "source_type": "content_farm_or_aggregator",
+                            "quality_label": "low",
+                            "freshness_label": "aging",
+                        }
+                    ],
+                ),
+            ],
+        )
+
+        signals = agent._reflection_gap_signals(state)
+        self.assertIn("low_global_domain_diversity", signals)
+        self.assertIn("low_evidence_authority", signals)
+        self.assertIn("stale_global_evidence", signals)
+
 
 if __name__ == "__main__":
     unittest.main()
