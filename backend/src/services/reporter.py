@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from typing import Any
 
 from hello_agents import ToolAwareSimpleAgent
@@ -131,6 +132,100 @@ class ReportingService:
 
         report_text = normalize_agent_markdown(cleaned)
         return report_text or "报告生成失败，请检查输入。"
+
+    def stream_generate_report(
+        self,
+        state: SummaryState,
+        observer: RequestTrace | None = None,
+        skill_pack_context: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield progressive outline + validated report_chunk events while populating state.structured_report."""
+
+        outline_sections = [
+            self._CORE_SECTION_TITLES["background_overview"],
+            self._CORE_SECTION_TITLES["key_findings"],
+            self._CORE_SECTION_TITLES["evidence_and_data"],
+            *[
+                str(task.title).strip()
+                for task in state.todo_items
+                if str(task.title or "").strip()
+            ],
+            self._CORE_SECTION_TITLES["risks_and_challenges"],
+            self._CORE_SECTION_TITLES["references"],
+        ]
+        yield {
+            "type": "report_outline",
+            "sections": outline_sections,
+        }
+
+        report = self.generate_report(
+            state,
+            observer=observer,
+            skill_pack_context=skill_pack_context,
+        )
+        valid_source_ids = self._collect_valid_source_ids(state)
+        sanitized_report = self._sanitize_chunk_citations(report, valid_source_ids)
+        state.structured_report = sanitized_report
+
+        chunks = self._split_report_chunks(sanitized_report)
+        total_chunks = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            yield {
+                "type": "report_chunk",
+                "content": chunk,
+                "index": index,
+                "total_chunks": total_chunks,
+            }
+
+    def _collect_valid_source_ids(self, state: SummaryState) -> set[str]:
+        valid: set[str] = set()
+        for task in state.todo_items:
+            for item in task.evidence_items or []:
+                sid = str(item.get("source_id") or "").strip()
+                if sid:
+                    valid.add(sid)
+        if self._evidence_store is not None:
+            for task in state.todo_items:
+                for item in self._evidence_store.list_task_evidence(task.id):
+                    sid = str(item.get("source_id") or "").strip()
+                    if sid:
+                        valid.add(sid)
+        return valid
+
+    @staticmethod
+    def _sanitize_chunk_citations(text: str, valid_source_ids: set[str]) -> str:
+        """Strip any unknown [T{task}-S{seq}] citation tokens not present in the request whitelist."""
+        if not text:
+            return ""
+        if not valid_source_ids:
+            return text
+
+        def _replace(match: re.Match[str]) -> str:
+            token = match.group(1)
+            return match.group(0) if token in valid_source_ids else ""
+
+        cleaned = re.sub(r"\[(T\d+-S\d+)\]", _replace, text)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        return cleaned
+
+    @staticmethod
+    def _split_report_chunks(report: str, *, max_chunk_chars: int = 800) -> list[str]:
+        """Split markdown report into readable section/paragraph chunks without breaking citations."""
+        normalized = str(report or "").strip()
+        if not normalized:
+            return []
+        paragraphs = [part for part in re.split(r"(\n{2,})", normalized) if part]
+        chunks: list[str] = []
+        buffer = ""
+        for part in paragraphs:
+            if buffer and len(buffer) + len(part) > max_chunk_chars:
+                chunks.append(buffer)
+                buffer = part
+            else:
+                buffer += part
+        if buffer:
+            chunks.append(buffer)
+        return chunks
 
     def _build_prompt(self, state: SummaryState) -> str:
         task_blocks: list[str] = []

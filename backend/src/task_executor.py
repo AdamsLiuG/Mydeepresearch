@@ -585,10 +585,12 @@ class TaskExecutorMixin:
                 for item in evidence_items
             )
         )
-        high_quality_source = any(
-            str(item.get("quality_label") or "").strip() == "high"
+        high_quality_count = sum(
+            1
             for item in evidence_items
+            if str(item.get("quality_label") or "").strip() == "high"
         )
+        high_quality_source = high_quality_count > 0
         full_content_available = any(
             bool(str(item.get("full_content") or "").strip())
             or len(str(item.get("snippet") or "").strip()) >= 240
@@ -615,8 +617,16 @@ class TaskExecutorMixin:
             and source_diversity >= max(int(self.config.review_min_domains_per_task or 1), 1)
             and freshness_ok
         )
+        high_confidence = (
+            evidence_sufficiency
+            and source_diversity >= 3
+            and high_quality_count >= 2
+        )
 
-        if evidence_sufficiency:
+        if high_confidence:
+            stop_reason = "high_confidence_early_stop"
+            continue_reason = ""
+        elif evidence_sufficiency:
             stop_reason = "evidence_sufficient"
             continue_reason = ""
         elif source_count == 0:
@@ -1296,7 +1306,11 @@ class TaskExecutorMixin:
 
             if react_enabled and observer:
                 observer.record_task_react_stop(task.react_stop_reason)
-                if task.react_stop_reason not in {"evidence_sufficient", "no_gap_signals"}:
+                if task.react_stop_reason not in {
+                    "evidence_sufficient",
+                    "no_gap_signals",
+                    "high_confidence_early_stop",
+                }:
                     observer.record_degraded(f"task_react_incomplete:{task.id}:{task.react_stop_reason}")
             if react_enabled and emit_stream:
                 yield {

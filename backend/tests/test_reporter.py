@@ -672,6 +672,50 @@ class ReportingServiceTests(unittest.TestCase):
         self.assertTrue(ReportingService._contains_internal_process_language(leaked_sentence))
         self.assertTrue(SummarizationService._contains_internal_process_language(leaked_sentence))
 
+    def test_stream_generate_report_emits_outline_and_sanitized_chunks(self):
+        fake_agent = DummyAgent(
+            "# 最终报告\n\n## 背景概览\n有效结论 [T1-S1] 与伪造引用 [T9-S9]。\n\n## 风险与挑战\n需要持续观察。"
+        )
+        cfg = Configuration.from_env(load_env_file=False)
+        store = EvidenceStore()
+        store.record_search_results(
+            task_id=1,
+            query="demo",
+            search_payload={
+                "results": [
+                    {"title": "Official Doc", "url": "https://docs.example.com/a", "content": "verified body"}
+                ]
+            },
+            backend="tavily",
+        )
+        service = ReportingService(fake_agent, cfg, evidence_store=store)
+        state = SummaryState(
+            research_topic="测试主题",
+            todo_items=[
+                TodoItem(
+                    id=1,
+                    title="架构分析",
+                    intent="分析架构",
+                    query="demo",
+                    status="completed",
+                    summary="核心架构结论 [T1-S1]",
+                    evidence_items=store.list_task_evidence(1),
+                )
+            ],
+        )
+
+        events = list(service.stream_generate_report(state))
+        self.assertEqual(events[0]["type"], "report_outline")
+        self.assertIn("背景概览", events[0]["sections"])
+        self.assertIn("架构分析", events[0]["sections"])
+
+        chunk_events = [ev for ev in events if ev["type"] == "report_chunk"]
+        self.assertGreaterEqual(len(chunk_events), 1)
+        combined = "".join(ev["content"] for ev in chunk_events)
+        self.assertIn("[T1-S1]", combined)
+        self.assertNotIn("[T9-S9]", combined)
+        self.assertEqual(state.structured_report, combined)
+
 
 if __name__ == "__main__":
     unittest.main()

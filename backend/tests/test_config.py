@@ -292,6 +292,33 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(cfg.report_layout_mode, "fixed")
         self.assertEqual(cfg.resolved_report_layout_mode(), "fixed")
 
+    def test_fast_llm_config_tiering_defaults_and_env_resolution(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg_default = config.Configuration.from_env(
+                overrides={"llm_model_id": "Qwen/Qwen3-32B"},
+                load_env_file=False,
+            )
+            self.assertFalse(cfg_default.resolved_fast_llm_enabled())
+            self.assertEqual(cfg_default.resolved_fast_llm_model(), "Qwen/Qwen3-32B")
+
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_MODEL_ID": "Qwen/Qwen3-32B",
+                "FAST_LLM_MODEL_ID": "Qwen/Qwen3-7B-Instruct",
+                "FAST_LLM_PROVIDER": "vllm",
+                "FAST_LLM_BASE_URL": "http://localhost:8002/v1",
+                "FAST_LLM_TEMPERATURE": "0.1",
+            },
+            clear=True,
+        ):
+            cfg_tiered = config.Configuration.from_env(load_env_file=False)
+            self.assertTrue(cfg_tiered.resolved_fast_llm_enabled())
+            self.assertEqual(cfg_tiered.resolved_fast_llm_model(), "Qwen/Qwen3-7B-Instruct")
+            self.assertEqual(cfg_tiered.fast_llm_provider, "vllm")
+            self.assertEqual(cfg_tiered.fast_llm_base_url, "http://localhost:8002/v1")
+            self.assertAlmostEqual(cfg_tiered.fast_llm_temperature, 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

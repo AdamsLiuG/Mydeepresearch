@@ -396,6 +396,33 @@ class Configuration(BaseModel):
         title="LLM Context Window",
         description="Approximate maximum prompt context supported by the active model",
     )
+    fast_llm_provider: str | None = Field(
+        default=None,
+        title="Fast LLM Provider",
+        description="Optional lightweight/fast LLM provider for planning, summarization, and reflection",
+    )
+    fast_llm_model_id: str | None = Field(
+        default=None,
+        title="Fast LLM Model ID",
+        description="Optional fast-tier model identifier; when unset, primary LLM is used for all stages",
+    )
+    fast_llm_base_url: str | None = Field(
+        default=None,
+        title="Fast LLM Base URL",
+        description="Optional base URL for the fast-tier LLM endpoint",
+    )
+    fast_llm_api_key: str | None = Field(
+        default=None,
+        title="Fast LLM API Key",
+        description="Optional API key for the fast-tier LLM endpoint",
+    )
+    fast_llm_temperature: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        title="Fast LLM Temperature",
+        description="Sampling temperature for fast-tier LLM calls",
+    )
     host: str = Field(
         default="0.0.0.0",
         title="Server Host",
@@ -981,6 +1008,11 @@ class Configuration(BaseModel):
             "llm_model_id": os.getenv("LLM_MODEL_ID"),
             "llm_context_window": os.getenv("LLM_CONTEXT_WINDOW"),
             "llm_base_url": os.getenv("LLM_BASE_URL"),
+            "fast_llm_provider": os.getenv("FAST_LLM_PROVIDER"),
+            "fast_llm_model_id": os.getenv("FAST_LLM_MODEL_ID"),
+            "fast_llm_base_url": os.getenv("FAST_LLM_BASE_URL"),
+            "fast_llm_api_key": os.getenv("FAST_LLM_API_KEY"),
+            "fast_llm_temperature": os.getenv("FAST_LLM_TEMPERATURE"),
             "lmstudio_base_url": os.getenv("LMSTUDIO_BASE_URL"),
             "ollama_base_url": os.getenv("OLLAMA_BASE_URL"),
             "max_web_research_loops": os.getenv("MAX_WEB_RESEARCH_LOOPS"),
@@ -1334,3 +1366,14 @@ class Configuration(BaseModel):
     def resolved_report_layout_mode(self) -> str:
         """Return the normalized report layout mode."""
         return str(self.report_layout_mode or "flexible").strip().lower() or "flexible"
+
+    def resolved_fast_llm_enabled(self) -> bool:
+        """Return True when a dedicated fast-tier LLM model is configured."""
+        return bool((self.fast_llm_model_id or "").strip())
+
+    def resolved_fast_llm_model(self) -> str:
+        """Return the fast-tier model id, falling back to the primary model."""
+        explicit = (self.fast_llm_model_id or "").strip()
+        if explicit:
+            return explicit
+        return (self.llm_model_id or self.local_llm or "").strip()

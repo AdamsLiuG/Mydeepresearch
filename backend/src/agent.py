@@ -370,6 +370,8 @@ class DeepResearchAgent(
         self.request_id = request_id or "local-request"
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
+        self.fast_llm = self._init_fast_llm(allow_reasoning_fallback=True)
+        self._fast_content_only_llm = self._init_fast_llm(allow_reasoning_fallback=False)
         self._summary_slots = Semaphore(self.config.task_summary_max_concurrency)
         self._evidence_memory = EvidenceMemoryService(self.config)
         self._evidence_runtime = EvidenceRuntimeIndex(
@@ -404,7 +406,7 @@ class DeepResearchAgent(
             lambda: self._create_tool_aware_agent(
                 name="策略记忆提炼器",
                 system_prompt="你是一名策略记忆提炼器，只输出严格 JSON。",
-                llm=self._content_only_llm,
+                llm=self._fast_content_only_llm,
                 enable_tool_calling=False,
             ),
             self.config,
@@ -451,6 +453,7 @@ class DeepResearchAgent(
         self.todo_agent = self._create_tool_aware_agent(
             name="研究规划专家",
             system_prompt=todo_planner_system_prompt.strip(),
+            llm=self.fast_llm,
         )
         self.report_agent = self._create_tool_aware_agent(
             name="报告撰写专家",
@@ -460,7 +463,7 @@ class DeepResearchAgent(
         self.reflection_agent = self._create_tool_aware_agent(
             name="研究覆盖评估专家",
             system_prompt=request_reflection_system_prompt.strip(),
-            llm=self._content_only_llm,
+            llm=self._fast_content_only_llm,
             enable_tool_calling=False,
         )
         self.review_agent = self._create_tool_aware_agent(
@@ -471,13 +474,13 @@ class DeepResearchAgent(
         self.task_react_agent = self._create_tool_aware_agent(
             name="任务证据修补规划器",
             system_prompt=task_react_plan_prompt.strip(),
-            llm=self._content_only_llm,
+            llm=self._fast_content_only_llm,
         )
 
         self._summarizer_factory: Callable[[], ToolAwareSimpleAgent] = lambda: self._create_tool_aware_agent(  # noqa: E501
             name="任务总结专家",
             system_prompt=task_summarizer_instructions.strip(),
-            llm=self._content_only_llm,
+            llm=self._fast_content_only_llm,
         )
 
         self.planner = PlanningService(self.todo_agent, self.config)
@@ -531,6 +534,42 @@ class DeepResearchAgent(
                 llm_kwargs["base_url"] = self.config.llm_base_url
             if self.config.llm_api_key:
                 llm_kwargs["api_key"] = self.config.llm_api_key
+
+        llm_kwargs["allow_reasoning_fallback"] = allow_reasoning_fallback
+        return SafeHelloAgentsLLM(**llm_kwargs)
+
+    def _init_fast_llm(self, *, allow_reasoning_fallback: bool = True) -> HelloAgentsLLM:
+        """Instantiate an optional fast-tier LLM for planning/summarization/reflection.
+
+        Falls back directly to the primary LLM instance when ``fast_llm_model_id`` is unset.
+        """
+        if not self.config.resolved_fast_llm_enabled():
+            return self.llm if allow_reasoning_fallback else self._content_only_llm
+
+        llm_kwargs: dict[str, Any] = {
+            "temperature": float(self.config.fast_llm_temperature or 0.0),
+            "model": self.config.resolved_fast_llm_model(),
+        }
+        provider = (self.config.fast_llm_provider or self.config.llm_provider or "").strip()
+        if provider:
+            llm_kwargs["provider"] = provider
+
+        base_url = (self.config.fast_llm_base_url or "").strip()
+        if not base_url:
+            if provider == "ollama":
+                base_url = self.config.sanitized_ollama_url()
+            elif provider == "lmstudio":
+                base_url = self.config.lmstudio_base_url
+            elif self.config.llm_base_url:
+                base_url = self.config.llm_base_url
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+
+        api_key = (self.config.fast_llm_api_key or self.config.llm_api_key or "").strip()
+        if api_key:
+            llm_kwargs["api_key"] = api_key
+        elif provider == "ollama":
+            llm_kwargs["api_key"] = "ollama"
 
         llm_kwargs["allow_reasoning_fallback"] = allow_reasoning_fallback
         return SafeHelloAgentsLLM(**llm_kwargs)
@@ -1498,11 +1537,21 @@ class DeepResearchAgent(
                     report_started["step"] = final_step
                     yield report_started
                 try:
-                    report = self.reporting.generate_report(
-                        state,
-                        observer=observer,
-                        skill_pack_context=self._skill_stage_context("report"),
-                    )
+                    if emit_stream and hasattr(self.reporting, "stream_generate_report"):
+                        for report_event in self.reporting.stream_generate_report(
+                            state,
+                            observer=observer,
+                            skill_pack_context=self._skill_stage_context("report"),
+                        ):
+                            report_event.setdefault("step", final_step)
+                            yield report_event
+                        report = state.structured_report or ""
+                    else:
+                        report = self.reporting.generate_report(
+                            state,
+                            observer=observer,
+                            skill_pack_context=self._skill_stage_context("report"),
+                        )
                     completed_event = report_span.complete(
                         status="success",
                         metadata={"report_length": len(report or "")},

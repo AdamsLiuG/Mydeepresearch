@@ -1724,6 +1724,82 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertEqual(len(fake_reject.calls), 2)
         self.assertNotIn("stream_options", fake_reject.calls[1])
 
+    def test_model_tiering_routes_fast_and_strong_llms_by_stage(self):
+        cfg = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "request_state_enabled": False,
+                "llm_provider": "custom",
+                "llm_model_id": "Qwen/Qwen3-32B",
+                "llm_base_url": "http://localhost:8001/v1",
+                "fast_llm_model_id": "Qwen/Qwen3-7B-Instruct",
+                "fast_llm_base_url": "http://localhost:8002/v1",
+            },
+            load_env_file=False,
+        )
+        created_models: list[tuple[str, bool]] = []
+
+        def fake_safe_llm(**kwargs):
+            model = str(kwargs.get("model") or "")
+            allow_reasoning = bool(kwargs.get("allow_reasoning_fallback", True))
+            created_models.append((model, allow_reasoning))
+            return type("FakeLLM", (), {"model": model, "allow_reasoning_fallback": allow_reasoning})()
+
+        with patch.object(agent_module, "SafeHelloAgentsLLM", side_effect=fake_safe_llm):
+            tiered_agent = agent_module.DeepResearchAgent(config=cfg)
+
+        def _agent_llm_model(sub_agent):
+            llm_obj = getattr(sub_agent, "llm", None) or sub_agent.kwargs["llm"]
+            return llm_obj.model
+
+        self.assertEqual(_agent_llm_model(tiered_agent.todo_agent), "Qwen/Qwen3-7B-Instruct")
+        self.assertEqual(_agent_llm_model(tiered_agent.reflection_agent), "Qwen/Qwen3-7B-Instruct")
+        self.assertEqual(_agent_llm_model(tiered_agent.task_react_agent), "Qwen/Qwen3-7B-Instruct")
+        self.assertEqual(_agent_llm_model(tiered_agent._summarizer_factory()), "Qwen/Qwen3-7B-Instruct")
+        self.assertEqual(_agent_llm_model(tiered_agent.report_agent), "Qwen/Qwen3-32B")
+        self.assertEqual(_agent_llm_model(tiered_agent.review_agent), "Qwen/Qwen3-32B")
+
+    def test_high_confidence_early_stop_skips_extra_react_rounds(self):
+        agent = self._build_agent()
+        agent.config = Configuration.from_env(
+            overrides={
+                "enable_notes": False,
+                "task_react_enabled": True,
+                "task_react_max_rounds": 3,
+                "review_min_sources_per_task": 2,
+                "review_min_domains_per_task": 2,
+            },
+            load_env_file=False,
+        )
+        state = SummaryState(research_topic="Python 3.13 特性")
+        task = TodoItem(id=1, title="官方文档与论文", intent="收集权威资料", query="Python 3.13")
+        evidence_items = [
+            {
+                "source_id": "T1-S1",
+                "domain": "docs.python.org",
+                "quality_label": "high",
+                "freshness_label": "fresh",
+                "snippet": "Python 3.13 release highlights" * 10,
+            },
+            {
+                "source_id": "T1-S2",
+                "domain": "arxiv.org",
+                "quality_label": "high",
+                "freshness_label": "fresh",
+                "snippet": "Benchmark paper" * 10,
+            },
+            {
+                "source_id": "T1-S3",
+                "domain": "github.com",
+                "quality_label": "medium",
+                "freshness_label": "fresh",
+                "snippet": "Release notes" * 10,
+            },
+        ]
+        observation = agent._observe_task_evidence(state, task, evidence_items)
+        self.assertTrue(observation.evidence_sufficiency)
+        self.assertEqual(observation.stop_reason, "high_confidence_early_stop")
+
 
 if __name__ == "__main__":
     unittest.main()
