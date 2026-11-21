@@ -26,7 +26,6 @@ from config import Configuration
 from services.skill_pack import (
     NEUTRAL_PACK_ID,
     SKILL_STAGES,
-    STATUS_SHADOW,
     SkillPackService,
 )
 

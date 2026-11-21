@@ -1,6 +1,5 @@
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
@@ -13,11 +12,9 @@ if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
 from services.skill_pack import (
-    LAYOUT_KNOBS,
     NEUTRAL_PACK_ID,
     SKILL_STAGES,
     SkillPackError,
-    SkillPackService,
     compute_content_hash,
     enforce_quality_gate_direction,
     load_pack,
