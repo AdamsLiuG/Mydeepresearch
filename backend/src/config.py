@@ -474,6 +474,49 @@ class Configuration(BaseModel):
         title="Langfuse Host",
         description="Optional Langfuse host URL",
     )
+    auth_enabled: bool = Field(
+        default=False,
+        title="Multi-Tenant Auth Enabled",
+        description="Opt-in API key authentication for multi-tenant HTTP access",
+    )
+    tenant_api_keys: dict[str, str] = Field(
+        default_factory=dict,
+        title="Tenant API Keys",
+        description="Mapping of API key to tenant_id (JSON object via TENANT_API_KEYS)",
+    )
+    default_tenant_id: str = Field(
+        default="default",
+        title="Default Tenant ID",
+        description="Fallback tenant namespace used when multi-tenant auth is disabled",
+    )
+    tenant_rate_limit_rpm: int = Field(
+        default=0,
+        ge=0,
+        title="Tenant Rate Limit RPM",
+        description="Optional per-tenant requests-per-minute limit (0 disables rate limiting)",
+    )
+    tenant_max_concurrent_requests: int = Field(
+        default=0,
+        ge=0,
+        title="Tenant Max Concurrent Requests",
+        description="Optional per-tenant in-flight request limit (0 disables concurrency cap)",
+    )
+    redis_url: str | None = Field(
+        default=None,
+        title="Redis URL",
+        description="Optional Redis URL for Redis Streams SSE event replay",
+    )
+    database_url: str | None = Field(
+        default=None,
+        title="Database URL",
+        description="Optional PostgreSQL DSN for persistent request snapshot storage",
+    )
+    event_bus_max_events_per_request: int = Field(
+        default=500,
+        ge=50,
+        title="Event Bus Max Events Per Request",
+        description="Maximum buffered SSE events retained per request for Last-Event-ID replay",
+    )
     search_cache_enabled: bool = Field(
         default=True,
         title="Search Cache Enabled",
@@ -899,7 +942,7 @@ class Configuration(BaseModel):
     def _normalize_cors_origins(cls, value: Any) -> Any:
         return _normalize_origin_values(value)
 
-    @field_validator("llm_pricing_json", mode="before")
+    @field_validator("llm_pricing_json", "tenant_api_keys", mode="before")
     @classmethod
     def _normalize_pricing_catalog(cls, value: Any) -> Any:
         if value in (None, "", {}):
@@ -1104,6 +1147,14 @@ class Configuration(BaseModel):
             "langfuse_public_key": os.getenv("LANGFUSE_PUBLIC_KEY"),
             "langfuse_secret_key": os.getenv("LANGFUSE_SECRET_KEY"),
             "langfuse_host": os.getenv("LANGFUSE_HOST"),
+            "auth_enabled": os.getenv("AUTH_ENABLED"),
+            "tenant_api_keys": os.getenv("TENANT_API_KEYS"),
+            "default_tenant_id": os.getenv("DEFAULT_TENANT_ID"),
+            "tenant_rate_limit_rpm": os.getenv("TENANT_RATE_LIMIT_RPM"),
+            "tenant_max_concurrent_requests": os.getenv("TENANT_MAX_CONCURRENT_REQUESTS"),
+            "redis_url": os.getenv("REDIS_URL"),
+            "database_url": os.getenv("DATABASE_URL"),
+            "event_bus_max_events_per_request": os.getenv("EVENT_BUS_MAX_EVENTS_PER_REQUEST"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
             "search_cache_dynamic_ttl_enabled": os.getenv("SEARCH_CACHE_DYNAMIC_TTL_ENABLED"),

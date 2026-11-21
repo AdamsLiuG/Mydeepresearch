@@ -64,16 +64,40 @@ class StateManagerMixin:
             "report_repair_cycles": int(state.report_repair_cycles or 0),
             "topic_cache_warmup_completed": bool(state.topic_cache_warmup_completed),
             "skill_pack": dict(state.skill_pack_metadata or {}),
+            "tenant_id": str(getattr(self, "tenant_id", "default") or "default").strip()
+            or "default",
             "cache_diagnostics": cache_diagnostics,
             "request_metrics": observer_snapshot,
         }
-        self._request_state_store.save(self.request_id, payload)
+        tenant_id = str(getattr(self, "tenant_id", "default") or "default").strip() or "default"
+        if self._store_supports_tenant_id("save"):
+            self._request_state_store.save(self.request_id, payload, tenant_id=tenant_id)
+        else:
+            self._request_state_store.save(self.request_id, payload)
         self._refresh_note_memory_for_state(state, observer=self._request_trace)
+
+    def _store_supports_tenant_id(self, method_name: str) -> bool:
+        import inspect
+
+        method = getattr(self._request_state_store, method_name, None)
+        if method is None:
+            return False
+        try:
+            params = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return False
+        return "tenant_id" in params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
 
     def _load_resume_snapshot(self, request_id: str) -> dict[str, Any]:
         if self._request_state_store is None:
             raise ValueError("request_state store is disabled")
-        payload = self._request_state_store.load(request_id)
+        tenant_id = str(getattr(self, "tenant_id", "default") or "default").strip() or "default"
+        if self._store_supports_tenant_id("load"):
+            payload = self._request_state_store.load(request_id, tenant_id=tenant_id)
+        else:
+            payload = self._request_state_store.load(request_id)
         if not payload:
             raise ValueError(f"resume snapshot not found: {request_id}")
         return payload

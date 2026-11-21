@@ -10,4 +10,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/notes:/app/notes
+      - ./backend/.cache:/app/.cache
+      - ./backend/.memory:/app/.memory
+      - ./backend/.state:/app/.state
     restart: unless-stopped

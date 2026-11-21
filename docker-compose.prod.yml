@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: helloagents-deepresearch-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deepresearch}
+      POSTGRES_USER: ${POSTGRES_USER:-deepresearch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deepresearch_change_me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - deepresearch_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deepresearch} -d ${POSTGRES_DB:-deepresearch}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: helloagents-deepresearch-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - deepresearch_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: helloagents-deepresearch-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - deepresearch_qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: helloagents-deepresearch-backend
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://deepresearch:deepresearch_change_me@postgres:5432/deepresearch}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SEMANTIC_CACHE_QDRANT_URL: ${SEMANTIC_CACHE_QDRANT_URL:-http://qdrant:6333}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/notes:/app/notes
+      - ./backend/.cache:/app/.cache
+      - ./backend/.memory:/app/.memory
+      - ./backend/.state:/app/.state
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    container_name: helloagents-deepresearch-frontend
+    working_dir: /app/frontend
+    command: sh -c "npm ci && npm run build && npx vite preview --host 0.0.0.0 --port 5173"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  deepresearch_pg_data:
+  deepresearch_redis_data:
+  deepresearch_qdrant_data:

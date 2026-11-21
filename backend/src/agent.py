@@ -47,7 +47,6 @@ from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
 from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
-from services.request_state import RequestStateStore
 from services.reviewer import ReviewService
 from services.search import classify_search_query_bucket
 from services.skill_pack import (
@@ -55,6 +54,7 @@ from services.skill_pack import (
     SkillSelection,
     apply_skill_pack_overrides,
 )
+from services.storage_backends import build_request_state_store
 from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService
@@ -368,10 +368,19 @@ class DeepResearchAgent(
         config: Configuration | None = None,
         *,
         request_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> None:
         """Initialise the coordinator with configuration and shared tools."""
         self.config = config or Configuration.from_env()
         self.request_id = request_id or "local-request"
+        self.tenant_id = (
+            str(
+                tenant_id
+                or getattr(self.config, "default_tenant_id", "default")
+                or "default"
+            ).strip()
+            or "default"
+        )
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
         self.fast_llm = self._init_fast_llm(allow_reasoning_fallback=True)
@@ -397,14 +406,7 @@ class DeepResearchAgent(
             memory_service=self._evidence_memory if self._evidence_memory.enabled else None,
             config=self.config,
         )
-        self._request_state_store = (
-            RequestStateStore(
-                self.config.request_state_dir,
-                recent_limit=self.config.request_state_recent_limit,
-            )
-            if self.config.request_state_enabled
-            else None
-        )
+        self._request_state_store = build_request_state_store(self.config)
         self._note_memory = NoteMemoryService(self.config)
         self._strategy_synthesizer = StrategySynthesizer(
             lambda: self._create_tool_aware_agent(

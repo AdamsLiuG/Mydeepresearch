@@ -30,11 +30,19 @@ class RequestStateStore:
             raise ValueError("request_id is required")
         return self._directory / f"{safe_request_id}.json"
 
-    def save(self, request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def save(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         self._directory.mkdir(parents=True, exist_ok=True)
         path = self.path_for(request_id)
         stored_payload = dict(payload)
         stored_payload.setdefault("request_id", request_id)
+        resolved_tenant = str(tenant_id or stored_payload.get("tenant_id") or "default").strip() or "default"
+        stored_payload["tenant_id"] = resolved_tenant
         stored_payload["updated_at"] = _utc_now()
         # Use a unique temp file per save so concurrent task snapshots for the
         # same request_id cannot clobber each other's atomic replace step.
@@ -50,7 +58,7 @@ class RequestStateStore:
                 temp_path.unlink(missing_ok=True)
         return stored_payload
 
-    def load(self, request_id: str) -> dict[str, Any] | None:
+    def load(self, request_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         path = self.path_for(request_id)
         if not path.exists():
             return None
@@ -60,6 +68,11 @@ class RequestStateStore:
             return None
         if not isinstance(payload, dict):
             return None
+
+        if tenant_id is not None:
+            record_tenant = str(payload.get("tenant_id") or "default").strip() or "default"
+            if record_tenant != str(tenant_id).strip():
+                return None
 
         resolved_error = self._resolved_error(payload)
         if resolved_error:
@@ -71,6 +84,7 @@ class RequestStateStore:
         *,
         limit: int | None = None,
         include_content: bool = False,
+        tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not self._directory.exists():
             return []
@@ -83,13 +97,19 @@ class RequestStateStore:
         )
 
         snapshots: list[dict[str, Any]] = []
-        for path in paths[:max_items]:
+        for path in paths:
+            if len(snapshots) >= max_items:
+                break
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             if not isinstance(payload, dict):
                 continue
+            if tenant_id is not None:
+                record_tenant = str(payload.get("tenant_id") or "default").strip() or "default"
+                if record_tenant != str(tenant_id).strip():
+                    continue
             snapshots.append(self._summarize(payload, include_content=include_content))
         return snapshots
 

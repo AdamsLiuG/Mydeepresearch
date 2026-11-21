@@ -196,6 +196,16 @@ class TaskExecutorMixin:
                             "task_intent": task.intent,
                             "request_id": str(getattr(self, "request_id", "") or ""),
                             "task_id": str(task.id),
+                            **(
+                                {
+                                    "tenant_id": str(
+                                        getattr(self, "tenant_id", "") or ""
+                                    ).strip()
+                                }
+                                if str(getattr(self, "tenant_id", "") or "").strip()
+                                not in {"", "default"}
+                                else {}
+                            ),
                         },
                     ),
                     timeout_seconds=timeout_seconds,

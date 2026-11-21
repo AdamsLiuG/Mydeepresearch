@@ -141,6 +141,7 @@ class SearchCacheEntry:
     embedding: list[float] | None = None
     request_id: str = ""
     task_id: str = ""
+    tenant_id: str = ""
 
     def clone(self) -> SearchCacheEntry:
         """Return a defensive copy of the cache entry."""
@@ -164,6 +165,7 @@ class SearchCacheEntry:
             embedding=list(self.embedding) if self.embedding else None,
             request_id=self.request_id,
             task_id=self.task_id,
+            tenant_id=self.tenant_id,
         )
 
     def to_record(self) -> dict[str, Any]:
@@ -188,6 +190,7 @@ class SearchCacheEntry:
             "embedding": list(self.embedding) if self.embedding else None,
             "request_id": self.request_id,
             "task_id": self.task_id,
+            "tenant_id": self.tenant_id,
         }
 
     @classmethod
@@ -213,6 +216,7 @@ class SearchCacheEntry:
             embedding=_coerce_embedding(record.get("embedding")),
             request_id=str(record.get("request_id") or "").strip(),
             task_id=str(record.get("task_id") or "").strip(),
+            tenant_id=str(record.get("tenant_id") or "").strip(),
         )
 
     def resolved_expires_at(self, *, fallback_ttl_seconds: int = 0) -> float:
@@ -315,7 +319,7 @@ def _normalize_cache_context(cache_context: dict[str, Any] | None) -> dict[str, 
         return {}
 
     normalized: dict[str, str] = {}
-    for field_name in ("research_topic", "task_title", "task_intent", "request_id", "task_id"):
+    for field_name in ("research_topic", "task_title", "task_intent", "request_id", "task_id", "tenant_id"):
         value = cache_context.get(field_name)
         if value is None:
             continue
@@ -582,15 +586,29 @@ def _resolved_search_fetch_full_page(search_api: str, config: Configuration) -> 
     return bool(config.fetch_full_page)
 
 
+def _normalized_tenant_namespace(tenant_id: str | None) -> str:
+    cleaned = str(tenant_id or "").strip()
+    if not cleaned or cleaned == "default":
+        return ""
+    return cleaned
+
+
 def _build_scope_key(
     search_api: str,
     fetch_full_page: bool,
     cache_signature: dict[str, Any] | None = None,
     topic_scope: str = "",
+    *,
+    tenant_id: str = "",
 ) -> str:
     """Return the namespace key used to group semantically comparable entries."""
 
     base = f"scope::{search_api}::{int(fetch_full_page)}"
+    tenant_ns = _normalized_tenant_namespace(tenant_id)
+    if tenant_ns:
+        tenant_digest = hashlib.sha256(tenant_ns.encode("utf-8")).hexdigest()[:16]
+        base = f"{base}::t={tenant_digest}"
+
     signature_text = _canonical_cache_signature(cache_signature)
     if signature_text:
         signature_digest = hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
@@ -604,16 +622,25 @@ def _build_scope_key(
     return f"{base}::{digest}"
 
 
-def _build_cache_key(query: str, search_api: str, config: Configuration) -> str:
+def _build_cache_key(
+    query: str,
+    search_api: str,
+    config: Configuration,
+    *,
+    tenant_id: str = "",
+) -> str:
     """Return the persistent key for an exact query match."""
 
     fetch_full_page = _resolved_search_fetch_full_page(search_api, config)
-    payload = {
+    payload: dict[str, Any] = {
         "query": _normalize_query(query),
         "search_api": search_api,
         "fetch_full_page": fetch_full_page,
         "cache_signature": config.resolved_search_cache_signature(search_api),
     }
+    tenant_ns = _normalized_tenant_namespace(tenant_id)
+    if tenant_ns:
+        payload["tenant_id"] = tenant_ns
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return f"search::{search_api}::{int(fetch_full_page)}::{digest}"
@@ -834,6 +861,7 @@ def _read_exact_cache(key: str, config: Configuration) -> SearchCacheEntry | Non
                 entry.fetch_full_page,
                 entry.cache_signature,
                 entry.topic_scope,
+                tenant_id=entry.tenant_id,
             )
             _delete_cache_entry(key, config, scope_key=scope_key)
             return None
@@ -965,6 +993,7 @@ def _write_cache(key: str, entry: SearchCacheEntry, config: Configuration) -> No
         entry.fetch_full_page,
         entry.cache_signature,
         entry.topic_scope,
+        tenant_id=entry.tenant_id,
     )
     if disk_cache is not None:
         disk_cache.set(key, entry.to_record(), expire=max(int(entry.ttl_seconds or 0), 1))
@@ -1232,6 +1261,7 @@ def _read_approximate_cache(
     raw_query: str = "",
     request_id: str = "",
     task_id: str = "",
+    tenant_id: str = "",
 ) -> ApproximateCacheMatchResult:
     """Read the best approximate cache match using dense and sparse candidate union."""
 
@@ -1249,6 +1279,7 @@ def _read_approximate_cache(
         _resolved_search_fetch_full_page(search_api, config),
         config.resolved_search_cache_signature(search_api),
         topic_scope,
+        tenant_id=tenant_id,
     )
     dense_candidate_keys: list[str] = []
     if query_embedding is not None and config.resolved_approximate_cache_dense_enabled():
@@ -2514,8 +2545,9 @@ def dispatch_search(
     search_api = get_config_value(config.search_api)
     effective_fetch_full_page = _resolved_search_fetch_full_page(search_api, config)
     cache_signature = config.resolved_search_cache_signature(search_api)
-    cache_key = _build_cache_key(query, search_api, config)
     normalized_cache_context = _normalize_cache_context(cache_context)
+    context_tenant_id = normalized_cache_context.get("tenant_id", "")
+    cache_key = _build_cache_key(query, search_api, config, tenant_id=context_tenant_id)
     topic_scope = _build_topic_scope(normalized_cache_context)
     context_request_id = normalized_cache_context.get("request_id") or (
         str(getattr(observer, "request_id", "") or "").strip() if observer else ""
@@ -2573,6 +2605,7 @@ def dispatch_search(
                 raw_query=query,
                 request_id=context_request_id,
                 task_id=context_task_id,
+                tenant_id=context_tenant_id,
             )
             if approximate_match.entry:
                 if observer:
@@ -2704,6 +2737,7 @@ def dispatch_search(
             embedding=approximate_embedding,
             request_id=context_request_id,
             task_id=context_task_id,
+            tenant_id=context_tenant_id,
         )
         _write_cache(cache_key, cache_entry, config)
 

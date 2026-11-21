@@ -21,9 +21,16 @@ from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
+from services.event_bus import build_stream_event_bus
 from services.hitl import HitlService
-from services.request_state import RequestStateStore
 from services.skill_pack import SkillPackService
+from services.storage_backends import build_request_state_store
+from services.tenant import (
+    TenantContext,
+    TenantRateLimiter,
+    authenticate_tenant,
+    extract_api_key,
+)
 
 DeepResearchAgent: Any | None = None
 
@@ -330,24 +337,27 @@ def create_app(
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
     app.state.base_config = base_config
     app.state.agent_factory = resolved_agent_factory
-    app.state.request_state_store = (
-        RequestStateStore(
-            base_config.request_state_dir,
-            recent_limit=base_config.request_state_recent_limit,
-        )
-        if base_config.request_state_enabled
-        else None
+    app.state.request_state_store = build_request_state_store(base_config)
+    app.state.event_bus = build_stream_event_bus(base_config)
+    app.state.rate_limiter = TenantRateLimiter(
+        rpm_limit=base_config.tenant_rate_limit_rpm,
+        max_concurrent=base_config.tenant_max_concurrent_requests,
     )
 
-    # TODO(security): add multi-tenant authentication/authorization and per-tenant
-    # rate limiting in P2 before exposing this service outside trusted local networks.
     allow_wildcard_cors = "*" in base_config.cors_origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=base_config.cors_origins,
         allow_credentials=not allow_wildcard_cors,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Request-ID", "Authorization", "Accept"],
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_headers=[
+            "Content-Type",
+            "X-Request-ID",
+            "Authorization",
+            "X-API-Key",
+            "Last-Event-ID",
+            "Accept",
+        ],
     )
 
     @app.middleware("http")
@@ -397,21 +407,141 @@ def create_app(
         )
         return response
 
+    def _accepts_kwarg(fn: Callable[..., Any] | None, arg_name: str) -> bool:
+        if fn is None:
+            return False
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == arg_name:
+                return True
+        return False
+
+    def _resolve_tenant(request: Request) -> TenantContext:
+        api_key = extract_api_key(request.headers)
+        try:
+            return authenticate_tenant(api_key, app.state.base_config)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=401,
+                detail=str(exc),
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from exc
+
+    def _acquire_rate_limit(tenant: TenantContext) -> None:
+        cfg = app.state.base_config
+        allowed, retry_after, reason = app.state.rate_limiter.try_acquire(
+            tenant.tenant_id,
+            rpm_limit=getattr(cfg, "tenant_rate_limit_rpm", 0),
+            max_concurrent=getattr(cfg, "tenant_max_concurrent_requests", 0),
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Tenant rate limit exceeded ({reason})",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    def _release_rate_limit(tenant: TenantContext) -> None:
+        app.state.rate_limiter.release(tenant.tenant_id)
+
+    def _instantiate_agent(
+        *,
+        config: Configuration,
+        request_id: str,
+        tenant_id: str,
+    ) -> Any:
+        factory = app.state.agent_factory
+        kwargs: dict[str, Any] = {"config": config, "request_id": request_id}
+        if _accepts_kwarg(factory, "tenant_id"):
+            kwargs["tenant_id"] = tenant_id
+        agent = factory(**kwargs)
+        if not hasattr(agent, "tenant_id"):
+            try:
+                setattr(agent, "tenant_id", tenant_id)
+            except Exception:
+                pass
+        return agent
+
+    def _store_supports_tenant_id(store: Any, method_name: str) -> bool:
+        return _accepts_kwarg(getattr(store, method_name, None), "tenant_id")
+
+    def _store_load(
+        store: Any,
+        request_id: str,
+        *,
+        tenant_id: str | None,
+    ) -> dict[str, Any] | None:
+        if _store_supports_tenant_id(store, "load"):
+            return store.load(request_id, tenant_id=tenant_id)
+        return store.load(request_id)
+
+    def _store_save(
+        store: Any,
+        request_id: str,
+        payload: dict[str, Any],
+        *,
+        tenant_id: str | None,
+    ) -> dict[str, Any]:
+        if _store_supports_tenant_id(store, "save"):
+            return store.save(request_id, payload, tenant_id=tenant_id)
+        return store.save(request_id, payload)
+
+    def _store_list_recent(
+        store: Any,
+        *,
+        limit: int | None,
+        include_content: bool,
+        tenant_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if _store_supports_tenant_id(store, "list_recent"):
+            return store.list_recent(
+                limit=limit,
+                include_content=include_content,
+                tenant_id=tenant_id,
+            )
+        return store.list_recent(limit=limit, include_content=include_content)
+
+    def _ensure_request_ownership(request_id: str, tenant: TenantContext) -> None:
+        store = app.state.request_state_store
+        if store is None or not _store_supports_tenant_id(store, "load"):
+            return
+        unfiltered = store.load(request_id, tenant_id=None)
+        if unfiltered is None:
+            return
+        owned = store.load(request_id, tenant_id=tenant.tenant_id)
+        if owned is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"request snapshot not found: {request_id}",
+            )
+
     @app.get("/healthz")
     async def health_check() -> Dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/metrics/json")
-    async def metrics_json() -> Dict[str, Any]:
+    async def metrics_json(request: Request) -> Dict[str, Any]:
+        _resolve_tenant(request)
         return metrics_registry.snapshot()
 
     @app.post("/research", response_model=ResearchResponse)
     def run_research(payload: ResearchRequest, request: Request) -> ResearchResponse:
         request_id = _request_id(request)
+        tenant = _resolve_tenant(request)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(payload)
-            agent = app.state.agent_factory(config=config, request_id=request_id)
+            agent = _instantiate_agent(
+                config=config,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+            )
             result = agent.run(payload.topic)
+        except HTTPException:
+            raise
         except ValueError as exc:  # Likely due to unsupported configuration
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -424,6 +554,8 @@ def create_app(
                 status_code=500,
                 detail=f"Research failed (request_id={request_id})",
             ) from exc
+        finally:
+            _release_rate_limit(tenant)
 
         todo_payload = [
             {
@@ -458,7 +590,9 @@ def create_app(
         )
 
     @app.post("/research/clarify")
-    async def clarify_research(payload: ClarifyRequest) -> Dict[str, Any]:
+    async def clarify_research(payload: ClarifyRequest, request: Request) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(topic=payload.topic, search_api=payload.search_api)
@@ -469,16 +603,28 @@ def create_app(
                 config=config,
                 skill_pack_service=skill_pack,
             )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            _release_rate_limit(tenant)
 
     @app.post("/research/plan")
     def create_editable_plan(payload: ResearchRequest, request: Request) -> Dict[str, Any]:
         request_id = _request_id(request)
+        tenant = _resolve_tenant(request)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(payload)
-            agent = app.state.agent_factory(config=config, request_id=request_id)
+            agent = _instantiate_agent(
+                config=config,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+            )
             return agent.plan_only(payload.topic)
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -491,17 +637,26 @@ def create_app(
                 status_code=500,
                 detail=f"Planning failed (request_id={request_id})",
             ) from exc
+        finally:
+            _release_rate_limit(tenant)
 
     @app.put("/requests/{request_id}/plan")
     async def update_editable_plan(
         request_id: str,
         payload: PlanUpdateRequest,
+        request: Request,
     ) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
         store = app.state.request_state_store
         if store is None:
             raise HTTPException(status_code=404, detail="request state store is disabled")
 
-        snapshot = await asyncio.to_thread(store.load, request_id)
+        snapshot = await asyncio.to_thread(
+            _store_load,
+            store,
+            request_id,
+            tenant_id=tenant.tenant_id,
+        )
         if snapshot is None:
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
 
@@ -515,10 +670,17 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         updated_snapshot = dict(snapshot)
+        updated_snapshot["tenant_id"] = tenant.tenant_id
         updated_snapshot["todo_items"] = normalized_tasks
         updated_snapshot["phase"] = "awaiting_approval"
         updated_snapshot["status"] = "awaiting_approval"
-        saved = await asyncio.to_thread(store.save, request_id, updated_snapshot)
+        saved = await asyncio.to_thread(
+            _store_save,
+            store,
+            request_id,
+            updated_snapshot,
+            tenant_id=tenant.tenant_id,
+        )
         return {
             "request_id": request_id,
             "topic": saved.get("topic", ""),
@@ -534,17 +696,27 @@ def create_app(
     def drilldown_report_section(
         request_id: str,
         payload: DrilldownRequest,
+        request: Request,
     ) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
+        _ensure_request_ownership(request_id, tenant)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(topic="drilldown", search_api=payload.search_api)
             )
-            agent = app.state.agent_factory(config=config, request_id=request_id)
+            agent = _instantiate_agent(
+                config=config,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+            )
             return agent.drilldown_section(
                 request_id,
                 section_title=payload.section_title,
                 question=payload.question,
             )
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -558,33 +730,99 @@ def create_app(
                 status_code=500,
                 detail=f"Drilldown failed (request_id={request_id})",
             ) from exc
+        finally:
+            _release_rate_limit(tenant)
 
     @app.get("/requests")
     async def list_persisted_requests(
+        request: Request,
         limit: int | None = None,
         include_content: bool = False,
     ) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
         store = app.state.request_state_store
         if store is None:
             return {"items": []}
-        return {"items": await asyncio.to_thread(store.list_recent, limit=limit, include_content=include_content)}
+        items = await asyncio.to_thread(
+            _store_list_recent,
+            store,
+            limit=limit,
+            include_content=include_content,
+            tenant_id=tenant.tenant_id,
+        )
+        return {"items": items}
 
     @app.get("/requests/{request_id}")
-    async def get_persisted_request(request_id: str) -> Dict[str, Any]:
+    async def get_persisted_request(request_id: str, request: Request) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
         store = app.state.request_state_store
         if store is None:
             raise HTTPException(status_code=404, detail="request state store is disabled")
 
-        payload = await asyncio.to_thread(store.load, request_id)
+        payload = await asyncio.to_thread(
+            _store_load,
+            store,
+            request_id,
+            tenant_id=tenant.tenant_id,
+        )
         if payload is None:
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
         return payload
 
+    @app.get("/requests/{request_id}/events")
+    async def replay_request_events(
+        request_id: str,
+        request: Request,
+        last_event_id: str | None = None,
+    ) -> Any:
+        tenant = _resolve_tenant(request)
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
+        resolved_last_id = (
+            last_event_id
+            if last_event_id is not None
+            else request.headers.get("last-event-id")
+        )
+        envelopes = app.state.event_bus.replay_since(
+            tenant.tenant_id,
+            request_id,
+            last_event_id=resolved_last_id,
+        )
+        accept = str(request.headers.get("accept") or "").lower()
+        if "text/event-stream" in accept:
+            async def _replay_iter() -> AsyncIterator[str]:
+                for envelope in envelopes:
+                    yield (
+                        f"id: {envelope.event_id}\n"
+                        f"data: {json.dumps(envelope.payload, ensure_ascii=False)}\n\n"
+                    )
+
+            return StreamingResponse(
+                _replay_iter(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        return {
+            "request_id": request_id,
+            "tenant_id": tenant.tenant_id,
+            "events": [
+                {"id": envelope.event_id, "data": envelope.payload}
+                for envelope in envelopes
+            ],
+        }
+
     @app.post("/requests/{request_id}/resume", response_model=ResearchResponse)
     def resume_research(
         request_id: str,
+        request: Request,
         payload: ResumeRequest | None = None,
     ) -> ResearchResponse:
+        tenant = _resolve_tenant(request)
+        _ensure_request_ownership(request_id, tenant)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(
@@ -592,8 +830,14 @@ def create_app(
                     search_api=payload.search_api if payload else None,
                 )
             )
-            agent = app.state.agent_factory(config=config, request_id=request_id)
+            agent = _instantiate_agent(
+                config=config,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+            )
             result = agent.run_resume(request_id)
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -606,6 +850,8 @@ def create_app(
                 status_code=500,
                 detail=f"Resume failed (request_id={request_id})",
             ) from exc
+        finally:
+            _release_rate_limit(tenant)
 
         todo_payload = [
             {
@@ -643,12 +889,21 @@ def create_app(
         *,
         request: Request | None,
         request_id: str,
+        tenant_id: str = "default",
         heartbeat_seconds: float,
         error_log_label: str,
+        on_complete: Callable[[], None] | None = None,
     ) -> StreamingResponse:
         cancel_event = Event()
         event_queue: Queue[tuple[str, Any]] = Queue()
         heartbeat_interval = max(0.05, float(heartbeat_seconds or 15.0))
+
+        def _publish_and_format(event_payload: dict[str, Any]) -> str:
+            event_id = app.state.event_bus.publish(tenant_id, request_id, event_payload)
+            return (
+                f"id: {event_id}\n"
+                f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
+            )
 
         def producer() -> None:
             try:
@@ -692,20 +947,22 @@ def create_app(
                         continue
 
                     if kind == "event":
-                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        yield _publish_and_format(payload)
                         last_emitted = time.monotonic()
                     elif kind == "error":
                         error_payload = {
                             "type": "error",
                             "detail": f"{payload} (request_id={request_id})",
                         }
-                        yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                        yield _publish_and_format(error_payload)
                         break
                     else:
                         break
             finally:
                 cancel_event.set()
                 await asyncio.to_thread(worker.join, 1.0)
+                if on_complete is not None:
+                    on_complete()
 
         return StreamingResponse(
             event_iterator(),
@@ -719,24 +976,28 @@ def create_app(
         )
 
     def _supports_cancel_event(fn: Callable[..., Any]) -> bool:
-        try:
-            sig = inspect.signature(fn)
-        except (TypeError, ValueError):
-            return False
-        for param in sig.parameters.values():
-            if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "cancel_event":
-                return True
-        return False
+        return _accepts_kwarg(fn, "cancel_event")
 
     @app.post("/research/stream")
     async def stream_research(payload: ResearchRequest, request: Request) -> StreamingResponse:
         request_id = _request_id(request)
+        tenant = _resolve_tenant(request)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(payload)
-            agent = app.state.agent_factory(config=config, request_id=request_id)
+            agent = _instantiate_agent(
+                config=config,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+            )
+        except HTTPException:
+            _release_rate_limit(tenant)
+            raise
         except ValueError as exc:
+            _release_rate_limit(tenant)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
+            _release_rate_limit(tenant)
             logger.exception(
                 "Failed to initialise streaming research topic=%s",
                 payload.topic,
@@ -756,8 +1017,10 @@ def create_app(
             _start,
             request=request,
             request_id=request_id,
+            tenant_id=tenant.tenant_id,
             heartbeat_seconds=config.sse_heartbeat_interval_seconds,
             error_log_label=f"Streaming research failed topic={payload.topic}",
+            on_complete=lambda: _release_rate_limit(tenant),
         )
 
     @app.post("/requests/{request_id}/resume/stream")
@@ -766,6 +1029,9 @@ def create_app(
         request: Request,
         payload: ResumeRequest | None = None,
     ) -> StreamingResponse:
+        tenant = _resolve_tenant(request)
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
+        _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(
@@ -773,10 +1039,19 @@ def create_app(
                     search_api=payload.search_api if payload else None,
                 )
             )
-            agent = app.state.agent_factory(config=config, request_id=request_id)
+            agent = _instantiate_agent(
+                config=config,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+            )
+        except HTTPException:
+            _release_rate_limit(tenant)
+            raise
         except ValueError as exc:
+            _release_rate_limit(tenant)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
+            _release_rate_limit(tenant)
             logger.exception(
                 "Failed to initialise streaming resume request_id=%s",
                 request_id,
@@ -796,8 +1071,10 @@ def create_app(
             _start,
             request=request,
             request_id=request_id,
+            tenant_id=tenant.tenant_id,
             heartbeat_seconds=config.sse_heartbeat_interval_seconds,
             error_log_label=f"Streaming resume failed request_id={request_id}",
+            on_complete=lambda: _release_rate_limit(tenant),
         )
 
     return app
