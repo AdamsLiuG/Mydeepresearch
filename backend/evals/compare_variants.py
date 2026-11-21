@@ -14,22 +14,43 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-# Metrics where a higher value is better; the sign of the delta is interpreted with this.
-HIGHER_IS_BETTER = (
+# Bounded [0, 1] quality ratios (weight 1.0 in normalized quality gain).
+RATIO_QUALITY_METRICS = (
     "section_completeness",
     "keyword_coverage",
-    "citation_count",
-    "citation_marker_count",
     "reference_match_rate",
     "grounded_bullet_ratio",
+)
+
+# Optional semantic quality scores from LLMJudge (also [0, 1], weight 1.0 when present).
+LLM_JUDGE_QUALITY_METRICS = (
+    "factuality_score",
+    "coverage_score",
+    "citation_grounding_score",
+    "freshness_score",
+    "conservativeness_score",
+)
+
+# Unbounded count metrics (relative-normalized and down-weighted so raw counts never drown ratios).
+COUNT_QUALITY_METRICS = (
+    "citation_count",
+    "citation_marker_count",
     "completed_task_count",
 )
+
+COUNT_METRIC_WEIGHT = 0.25
+
+# Metrics where a higher value is better; the sign of the delta is interpreted with this.
+HIGHER_IS_BETTER = RATIO_QUALITY_METRICS + COUNT_QUALITY_METRICS
 
 # Metrics that represent a cost paid; a positive delta is a regression.
 LOWER_IS_BETTER = (
     "total_latency_ms",
     "estimated_cost",
 )
+
+DEFAULT_MAX_LATENCY_REGRESSION_RATIO = 0.50
+DEFAULT_MAX_COST_REGRESSION_RATIO = 0.50
 
 # Reported for context only, never scored.
 INFORMATIONAL = (
@@ -88,6 +109,37 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return round(len(left & right) / len(union), 4)
 
 
+def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def _case_normalized_quality_delta(
+    base_result: Mapping[str, Any],
+    cand_result: Mapping[str, Any],
+) -> float:
+    """Compute a scale-safe weighted quality delta for a single case."""
+    base_metrics = base_result.get("metrics") or {}
+    cand_metrics = cand_result.get("metrics") or {}
+
+    weighted_sum = 0.0
+    for name in RATIO_QUALITY_METRICS:
+        weighted_sum += _metric_value(cand_result, name) - _metric_value(base_result, name)
+
+    for name in LLM_JUDGE_QUALITY_METRICS:
+        if name in base_metrics or name in cand_metrics:
+            weighted_sum += _metric_value(cand_result, name) - _metric_value(base_result, name)
+
+    for name in COUNT_QUALITY_METRICS:
+        base_val = _metric_value(base_result, name)
+        cand_val = _metric_value(cand_result, name)
+        if base_val == 0.0 and cand_val == 0.0:
+            continue
+        rel_delta = _clamp((cand_val - base_val) / max(abs(base_val), 1.0))
+        weighted_sum += COUNT_METRIC_WEIGHT * rel_delta
+
+    return round(weighted_sum, 6)
+
+
 def compare_cases(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -98,7 +150,15 @@ def compare_cases(
     baseline_index = _index_results(baseline)
     candidate_index = _index_results(candidate)
     shared_ids = sorted(set(baseline_index) & set(candidate_index))
-    names = tuple(metric_names or (HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL))
+    default_names = list(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
+    for llm_metric in LLM_JUDGE_QUALITY_METRICS:
+        if any(
+            llm_metric in (baseline_index[cid].get("metrics") or {})
+            or llm_metric in (candidate_index[cid].get("metrics") or {})
+            for cid in shared_ids
+        ):
+            default_names.append(llm_metric)
+    names = tuple(metric_names or default_names)
 
     comparisons: list[dict[str, Any]] = []
     for case_id in shared_ids:
@@ -110,6 +170,7 @@ def compare_cases(
         }
         base_titles = _task_titles(base_result)
         cand_titles = _task_titles(cand_result)
+        net_quality_delta = _case_normalized_quality_delta(base_result, cand_result)
         comparisons.append(
             {
                 "id": case_id,
@@ -118,6 +179,7 @@ def compare_cases(
                 "plan_changed": base_titles != cand_titles,
                 "baseline_error": base_result.get("error"),
                 "candidate_error": cand_result.get("error"),
+                "net_quality_delta": net_quality_delta,
                 "deltas": deltas,
             }
         )
@@ -136,38 +198,58 @@ def build_comparison(
     *,
     baseline_label: str | None = None,
     candidate_label: str | None = None,
+    max_latency_regression_ratio: float = DEFAULT_MAX_LATENCY_REGRESSION_RATIO,
+    max_cost_regression_ratio: float = DEFAULT_MAX_COST_REGRESSION_RATIO,
 ) -> dict[str, Any]:
-    """Build the full comparison payload, including an aggregate verdict."""
+    """Build the full comparison payload, including normalized quality & cost guardrails."""
     comparisons = compare_cases(baseline, candidate)
-    metric_names = tuple(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
+    baseline_index = _index_results(baseline)
+    candidate_index = _index_results(candidate)
+    shared_ids = [case["id"] for case in comparisons]
+
+    metric_names = list(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
+    for llm_metric in LLM_JUDGE_QUALITY_METRICS:
+        if any(llm_metric in case["deltas"] for case in comparisons):
+            metric_names.append(llm_metric)
+
     aggregate = {
         name: _mean([case["deltas"].get(name, 0.0) for case in comparisons])
         for name in metric_names
     }
 
-    improved = sum(
-        1
-        for case in comparisons
-        if any(case["deltas"].get(name, 0.0) > 0 for name in HIGHER_IS_BETTER)
-    )
-    regressed = sum(
-        1
-        for case in comparisons
-        if any(case["deltas"].get(name, 0.0) < 0 for name in HIGHER_IS_BETTER)
-    )
-    quality_gain = sum(aggregate.get(name, 0.0) for name in HIGHER_IS_BETTER)
+    improved = sum(1 for case in comparisons if case["net_quality_delta"] > 1e-6)
+    regressed = sum(1 for case in comparisons if case["net_quality_delta"] < -1e-6)
+    normalized_quality_gain = _mean([case["net_quality_delta"] for case in comparisons])
+
+    regression_guardrails_tripped: list[str] = []
+    if shared_ids:
+        base_latency_mean = _mean([_metric_value(baseline_index[cid], "total_latency_ms") for cid in shared_ids])
+        cand_latency_mean = _mean([_metric_value(candidate_index[cid], "total_latency_ms") for cid in shared_ids])
+        if (
+            base_latency_mean > 0
+            and max_latency_regression_ratio >= 0
+            and (cand_latency_mean - base_latency_mean) / base_latency_mean > max_latency_regression_ratio
+        ):
+            regression_guardrails_tripped.append("latency_regression_exceeded")
+
+        base_cost_mean = _mean([_metric_value(baseline_index[cid], "estimated_cost") for cid in shared_ids])
+        cand_cost_mean = _mean([_metric_value(candidate_index[cid], "estimated_cost") for cid in shared_ids])
+        if (
+            base_cost_mean > 0
+            and max_cost_regression_ratio >= 0
+            and (cand_cost_mean - base_cost_mean) / base_cost_mean > max_cost_regression_ratio
+        ):
+            regression_guardrails_tripped.append("cost_regression_exceeded")
 
     if not comparisons:
         verdict = "inconclusive"
-    elif quality_gain > 0 and improved >= regressed:
-        verdict = "pass"
-    elif quality_gain < 0:
+    elif normalized_quality_gain < -1e-6 or regression_guardrails_tripped:
         verdict = "fail"
+    elif normalized_quality_gain > 1e-6 and improved >= regressed:
+        verdict = "pass"
     else:
         verdict = "inconclusive"
 
-    baseline_index = _index_results(baseline)
-    candidate_index = _index_results(candidate)
     return {
         "baseline_label": baseline_label or baseline.get("variant") or "baseline",
         "candidate_label": candidate_label or candidate.get("variant") or "candidate",
@@ -177,6 +259,8 @@ def build_comparison(
         "plan_changed_cases": sum(1 for case in comparisons if case["plan_changed"]),
         "improved_cases": improved,
         "regressed_cases": regressed,
+        "normalized_quality_gain": normalized_quality_gain,
+        "regression_guardrails_tripped": regression_guardrails_tripped,
         "verdict": verdict,
         "aggregate_deltas": aggregate,
         "cases": comparisons,

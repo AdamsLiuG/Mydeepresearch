@@ -166,6 +166,41 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(aggregate_snapshot["cache_approximate_hybrid_hit_total"], 1)
         self.assertEqual(aggregate_snapshot["cache_semantic_hit_total"], 3)
 
+    def test_cjk_token_estimation_and_reported_usage_extraction(self):
+        from types import SimpleNamespace
+
+        from metrics import _estimate_tokens, build_token_usage, extract_llm_usage
+
+        self.assertEqual(_estimate_tokens("a" * 400), 100)
+        chinese_tokens = _estimate_tokens("多模态大模型在推理加速与证据治理上的关键进展" * 10)
+        self.assertGreaterEqual(chinese_tokens, 200)
+
+        # Reported usage overrides heuristic estimation
+        reported = build_token_usage(
+            prompt_text="short",
+            completion_text="tiny",
+            provider="custom",
+            model="demo",
+            pricing_catalog={},
+            usage={"prompt_tokens": 1234, "completion_tokens": 567},
+        )
+        self.assertEqual(reported["token_source"], "reported")
+        self.assertEqual(reported["prompt_tokens"], 1234)
+        self.assertEqual(reported["completion_tokens"], 567)
+        self.assertEqual(reported["total_tokens"], 1801)
+
+        # extract_llm_usage consumes thread-local usage once
+        state = {"usage": {"prompt_tokens": 42, "completion_tokens": 18, "total_tokens": 60}}
+
+        def consume():
+            val = state["usage"]
+            state["usage"] = None
+            return val
+
+        fake_agent = SimpleNamespace(llm=SimpleNamespace(consume_last_usage=consume))
+        self.assertEqual(extract_llm_usage(fake_agent)["total_tokens"], 60)
+        self.assertIsNone(extract_llm_usage(fake_agent))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -206,6 +206,28 @@ class BenchmarkCLITests(unittest.TestCase):
 
         self.assertIsInstance(judge, LLMJudge)
 
+    def test_heuristic_section_completeness_matches_headings_not_body_substrings(self):
+        case = BenchmarkCase(
+            id="judge-heading-only",
+            topic="AI agent",
+            expected_keywords=["agent"],
+            expected_sections=["背景", "核心结论"],
+            freshness_sensitive=False,
+        )
+        report = (
+            "# 背景\n"
+            "正文里虽然提到了核心结论两个词，但并没有真正创建核心结论章节标题。\n"
+        )
+
+        metrics = HeuristicJudge().evaluate(
+            case=case,
+            report_markdown=report,
+            todo_items=[SimpleNamespace(id=1, status="completed")],
+            trace_snapshot={"elapsed_ms": 50.0, "estimated_cost": 0.0, "status": "success"},
+        )
+
+        self.assertEqual(metrics["section_completeness"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

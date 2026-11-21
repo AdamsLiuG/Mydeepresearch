@@ -233,6 +233,88 @@ class CompareVariantsTests(unittest.TestCase):
         self.assertIn("Verdict: **pass**", rendered)
         self.assertIn("reference_match_rate", rendered)
 
+    def test_single_case_is_never_counted_as_both_improved_and_regressed(self):
+        baseline = _payload(
+            "memory-off",
+            [_case("a", titles=["t"], reference_match_rate=0.5, keyword_coverage=0.8)],
+        )
+        candidate = _payload(
+            "memory-both",
+            [_case("a", titles=["t"], reference_match_rate=0.9, keyword_coverage=0.7)],
+        )
+
+        comparison = build_comparison(baseline, candidate)
+
+        self.assertEqual(comparison["improved_cases"], 1)
+        self.assertEqual(comparison["regressed_cases"], 0)
+        self.assertLessEqual(
+            comparison["improved_cases"] + comparison["regressed_cases"],
+            comparison["compared_cases"],
+        )
+
+    def test_unbounded_citation_count_does_not_mask_major_ratio_regression(self):
+        baseline = _payload(
+            "memory-off",
+            [
+                _case(
+                    "a",
+                    titles=["t"],
+                    reference_match_rate=1.0,
+                    grounded_bullet_ratio=0.9,
+                    citation_count=4,
+                )
+            ],
+        )
+        candidate = _payload(
+            "memory-both",
+            [
+                _case(
+                    "a",
+                    titles=["t"],
+                    reference_match_rate=0.4,
+                    grounded_bullet_ratio=0.5,
+                    citation_count=20,
+                )
+            ],
+        )
+
+        comparison = build_comparison(baseline, candidate)
+
+        self.assertEqual(comparison["verdict"], "fail")
+        self.assertEqual(comparison["regressed_cases"], 1)
+
+    def test_severe_latency_or_cost_regression_fails_verdict(self):
+        baseline = _payload(
+            "memory-off",
+            [
+                _case(
+                    "a",
+                    titles=["t"],
+                    reference_match_rate=0.8,
+                    total_latency_ms=10000.0,
+                    estimated_cost=0.01,
+                )
+            ],
+        )
+        candidate = _payload(
+            "memory-both",
+            [
+                _case(
+                    "a",
+                    titles=["t"],
+                    reference_match_rate=0.9,
+                    total_latency_ms=30000.0,
+                    estimated_cost=0.05,
+                )
+            ],
+        )
+
+        comparison = build_comparison(baseline, candidate)
+
+        self.assertEqual(comparison["verdict"], "fail")
+        self.assertIn("latency_regression_exceeded", comparison["regression_guardrails_tripped"])
+        self.assertIn("cost_regression_exceeded", comparison["regression_guardrails_tripped"])
+
 
 class VariantLoaderTests(unittest.TestCase):
     def test_shipped_variants_are_loadable(self):

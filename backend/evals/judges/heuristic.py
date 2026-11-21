@@ -21,18 +21,18 @@ def _contains_section(report_text: str, section: str) -> bool:
     if not section:
         return False
 
-    normalized_report = _normalize(report_text)
     normalized_section = _normalize(section)
-    if not normalized_report or not normalized_section:
+    if not report_text or not normalized_section:
         return False
 
-    heading_markers = (
-        f"# {normalized_section}",
-        f"## {normalized_section}",
-        f"### {normalized_section}",
-        normalized_section,
-    )
-    return any(marker in normalized_report for marker in heading_markers)
+    for line in report_text.splitlines():
+        heading = _HEADING_PATTERN.match(line)
+        if not heading:
+            continue
+        title = _normalize(heading.group(1))
+        if title == normalized_section or normalized_section in title:
+            return True
+    return False
 
 
 def _extract_reference_section(report_text: str) -> str:

@@ -9,7 +9,7 @@ from typing import Any
 from hello_agents import ToolAwareSimpleAgent
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState
 from services.evidence import (
     derive_grounded_findings_from_evidence,
@@ -105,6 +105,7 @@ class ReportingService:
                 success=True,
                 prompt_text=prompt,
                 completion_text=response,
+                usage=extract_llm_usage(self._agent),
             )
 
         cleaned = response.strip()

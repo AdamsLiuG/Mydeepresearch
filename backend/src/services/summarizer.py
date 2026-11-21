@@ -11,7 +11,7 @@ from typing import Any
 from hello_agents import ToolAwareSimpleAgent
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from services.evidence import (
     derive_grounded_findings_from_evidence,
@@ -183,6 +183,7 @@ class SummarizationService:
                 success=True,
                 prompt_text=repair_prompt,
                 completion_text=repair_response,
+                usage=extract_llm_usage(agent),
             )
 
         return self._finalize_summary(repair_response, task, research_topic=state.research_topic)
@@ -225,6 +226,7 @@ class SummarizationService:
                     success=True,
                     prompt_text=prompt,
                     completion_text=response,
+                    usage=extract_llm_usage(agent),
                 )
 
             try:
@@ -282,6 +284,7 @@ class SummarizationService:
                     success=True,
                     prompt_text=prompt,
                     completion_text=raw_text,
+                    usage=extract_llm_usage(agent),
                 )
                 call_recorded = True
 

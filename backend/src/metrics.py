@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -11,6 +13,7 @@ from time import perf_counter
 from typing import Any
 
 CHARS_PER_TOKEN = 4
+_CJK_TOKEN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
 
 DEFAULT_PRICING_CATALOG: dict[str, dict[str, dict[str, float]]] = {
     "default": {
@@ -30,7 +33,30 @@ def _estimate_tokens(text: str) -> int:
     cleaned = (text or "").strip()
     if not cleaned:
         return 0
-    return max(1, (len(cleaned) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN)
+    cjk_count = len(_CJK_TOKEN_PATTERN.findall(cleaned))
+    non_cjk_count = max(0, len(cleaned) - cjk_count)
+    if cjk_count == 0:
+        return max(1, (non_cjk_count + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN)
+    return max(1, int(math.ceil(cjk_count * 1.2 + non_cjk_count / CHARS_PER_TOKEN)))
+
+
+def extract_llm_usage(agent_or_llm: Any) -> dict[str, int] | None:
+    """Read and clear thread-local reported token usage from an agent or LLM."""
+    if agent_or_llm is None:
+        return None
+    consumer = getattr(agent_or_llm, "consume_last_usage", None)
+    if callable(consumer):
+        usage = consumer()
+        if isinstance(usage, dict):
+            return usage
+    llm = getattr(agent_or_llm, "llm", None)
+    if llm is not None:
+        llm_consumer = getattr(llm, "consume_last_usage", None)
+        if callable(llm_consumer):
+            usage = llm_consumer()
+            if isinstance(usage, dict):
+                return usage
+    return None
 
 
 def _safe_error(error: Any) -> str | None:

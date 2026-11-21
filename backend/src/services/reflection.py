@@ -10,6 +10,7 @@ from typing import Any
 from hello_agents import ToolAwareSimpleAgent
 
 from config import Configuration
+from metrics import extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import get_current_date, request_reflection_instructions
 from utils import strip_thinking_tokens, truncate_text
@@ -86,6 +87,7 @@ class ReflectionService:
                 success=True,
                 prompt_text=prompt,
                 completion_text=response,
+                usage=extract_llm_usage(self._agent),
             )
 
         return self._parse_response(

@@ -1676,6 +1676,54 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertIn("low_evidence_authority", signals)
         self.assertIn("stale_global_evidence", signals)
 
+    def test_safe_llm_captures_stream_usage_and_falls_back_when_stream_options_rejected(self):
+        from types import SimpleNamespace
+
+        class FakeCompletions:
+            def __init__(self, *, reject_stream_options: bool = False):
+                self.reject_stream_options = reject_stream_options
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                if self.reject_stream_options and "stream_options" in kwargs:
+                    raise RuntimeError("unknown parameter: stream_options")
+                return [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="你好", reasoning=None))],
+                        usage=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[],
+                        usage={"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165},
+                    ),
+                ]
+
+        llm = agent_module.SafeHelloAgentsLLM.__new__(agent_module.SafeHelloAgentsLLM)
+        llm.model = "demo-model"
+        llm.provider = "custom"
+        llm.temperature = 0.0
+        llm.max_tokens = 256
+        llm.allow_reasoning_fallback = True
+        llm._usage_local = agent_module.local()
+        fake = FakeCompletions(reject_stream_options=False)
+        llm._client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
+
+        output = llm.invoke([{"role": "user", "content": "hi"}])
+        usage = llm.consume_last_usage()
+
+        self.assertEqual(output, "你好")
+        self.assertEqual(fake.calls[0].get("stream_options"), {"include_usage": True})
+        self.assertEqual(usage, {"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165})
+        self.assertIsNone(llm.consume_last_usage())
+
+        fake_reject = FakeCompletions(reject_stream_options=True)
+        llm._client = SimpleNamespace(chat=SimpleNamespace(completions=fake_reject))
+        output2 = llm.invoke([{"role": "user", "content": "hi"}])
+        self.assertEqual(output2, "你好")
+        self.assertEqual(len(fake_reject.calls), 2)
+        self.assertNotIn("stream_options", fake_reject.calls[1])
+
 
 if __name__ == "__main__":
     unittest.main()

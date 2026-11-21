@@ -10,7 +10,7 @@ from typing import Any, List
 from hello_agents import ToolAwareSimpleAgent
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import (
     get_current_date,
@@ -1017,6 +1017,7 @@ class PlanningService:
                     success=True,
                     prompt_text=prompt,
                     completion_text=response,
+                    usage=extract_llm_usage(self._agent),
                 )
             return response
         finally:

@@ -11,7 +11,7 @@ from threading import Semaphore, Thread
 from time import sleep
 from typing import Any, Callable, Iterator
 
-from metrics import RequestTrace
+from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from services.evidence import (
     EvidenceStore,
@@ -817,6 +817,7 @@ class TaskExecutorMixin:
                 success=True,
                 prompt_text=prompt,
                 completion_text=response,
+                usage=extract_llm_usage(self.task_react_agent),
             )
 
         cleaned = str(response or "").strip()

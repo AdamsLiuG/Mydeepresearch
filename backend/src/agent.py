@@ -6,7 +6,7 @@ import ipaddress
 import logging
 import re
 from pathlib import Path
-from threading import Lock, Semaphore
+from threading import Lock, Semaphore, local
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
@@ -64,6 +64,80 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
     def __init__(self, *args: Any, allow_reasoning_fallback: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.allow_reasoning_fallback = allow_reasoning_fallback
+        self._usage_local = local()
+
+    def consume_last_usage(self) -> dict[str, int] | None:
+        """Return and clear the most recent API-reported token usage on this thread."""
+        usage = getattr(self._usage_local, "last_usage", None)
+        self._usage_local.last_usage = None
+        return dict(usage) if isinstance(usage, dict) else None
+
+    @staticmethod
+    def _extract_chunk_usage(chunk: Any) -> dict[str, int] | None:
+        raw_usage = getattr(chunk, "usage", None)
+        if raw_usage is None:
+            return None
+        if isinstance(raw_usage, dict):
+            usage_dict = raw_usage
+        elif hasattr(raw_usage, "model_dump"):
+            usage_dict = raw_usage.model_dump(exclude_none=True)
+        else:
+            usage_dict = {
+                "prompt_tokens": getattr(raw_usage, "prompt_tokens", None),
+                "completion_tokens": getattr(raw_usage, "completion_tokens", None),
+                "total_tokens": getattr(raw_usage, "total_tokens", None),
+            }
+        prompt_tokens = int(usage_dict.get("prompt_tokens") or 0)
+        completion_tokens = int(usage_dict.get("completion_tokens") or 0)
+        total_tokens = int(usage_dict.get("total_tokens") or (prompt_tokens + completion_tokens))
+        if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+            return None
+        parsed: dict[str, int] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        prompt_details = usage_dict.get("prompt_tokens_details")
+        if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens") is not None:
+            parsed["cached_tokens"] = max(0, int(prompt_details.get("cached_tokens") or 0))
+        return parsed
+
+    @staticmethod
+    def _stream_options_unsupported(exc: Exception) -> bool:
+        if isinstance(exc, TypeError):
+            return True
+        message = str(exc or "").lower()
+        return any(
+            token in message
+            for token in (
+                "stream_options",
+                "include_usage",
+                "extra_forbidden",
+                "extra inputs are not permitted",
+                "unknown parameter",
+                "unrecognized request argument",
+            )
+        )
+
+    def _create_stream_completion(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> Any:
+        request_kwargs = self._build_request_kwargs(messages, **kwargs)
+        try:
+            return self._client.chat.completions.create(
+                **request_kwargs,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+        except Exception as exc:
+            if not self._stream_options_unsupported(exc):
+                raise
+            return self._client.chat.completions.create(
+                **request_kwargs,
+                stream=True,
+            )
 
     @staticmethod
     def _should_bypass_env_proxy(base_url: str | None) -> bool:
@@ -209,13 +283,14 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         """Aggregate a streaming response to avoid long blocking reads with local vLLM."""
         visible_parts: list[str] = []
         reasoning_parts: list[str] = []
+        self._usage_local.last_usage = None
 
-        response = self._client.chat.completions.create(
-            **self._build_request_kwargs(messages, **kwargs),
-            stream=True,
-        )
+        response = self._create_stream_completion(messages, **kwargs)
 
         for chunk in response:
+            chunk_usage = self._extract_chunk_usage(chunk)
+            if chunk_usage is not None:
+                self._usage_local.last_usage = chunk_usage
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 visible_parts.append(content)
@@ -235,13 +310,14 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         """Stream visible content, falling back to reasoning text if no answer content exists."""
         saw_visible_content = False
         buffered_reasoning: list[str] = []
+        self._usage_local.last_usage = None
 
-        response = self._client.chat.completions.create(
-            **self._build_request_kwargs(messages, **kwargs),
-            stream=True,
-        )
+        response = self._create_stream_completion(messages, **kwargs)
 
         for chunk in response:
+            chunk_usage = self._extract_chunk_usage(chunk)
+            if chunk_usage is not None:
+                self._usage_local.last_usage = chunk_usage
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 saw_visible_content = True

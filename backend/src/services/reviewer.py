@@ -12,7 +12,7 @@ from typing import Any
 from hello_agents import ToolAwareSimpleAgent
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import get_current_date
 from services.evidence import extract_citation_ids, format_evidence_sources
@@ -112,6 +112,7 @@ class ReviewService:
                         success=True,
                         prompt_text=prompt,
                         completion_text=response,
+                        usage=extract_llm_usage(self._agent),
                     )
                 llm_issues, llm_summary = self._parse_response(response)
                 issues = self._merge_issues(issues, llm_issues)
