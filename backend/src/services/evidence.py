@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import re
+import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -497,19 +499,145 @@ def _extract_title(html: str) -> str:
     return _clean_text(match.group(1))
 
 
-def _fetch_page_text(url: str, timeout_seconds: float) -> tuple[str, str]:
-    response = requests.get(url, timeout=timeout_seconds)
-    response.raise_for_status()
-    html = response.text or ""
-    title = _extract_title(html)
+_ALLOWED_FETCH_SCHEMES = {"http", "https"}
+_ALLOWED_FETCH_CONTENT_TYPES = {
+    "text/html",
+    "text/plain",
+    "application/xhtml+xml",
+    "text/markdown",
+    "application/json",
+}
+_MAX_FETCH_BYTES = 5 * 1024 * 1024
+_MAX_FETCH_REDIRECTS = 5
+_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
-    if markdownify is not None:
-        try:
-            return title, _clean_text(markdownify(html))
-        except Exception:  # pragma: no cover - optional dependency failure
-            pass
 
-    return title, _clean_text(html)
+def _is_public_ip(ip_str: str) -> bool:
+    """Return True only when ip_str is a globally routable public IP address."""
+    try:
+        address = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        return False
+    return True
+
+
+def _validate_fetch_url(url: str) -> str:
+    """Validate URL scheme and resolved IPs to block SSRF against local/private networks."""
+    cleaned = (url or "").strip()
+    parsed = urlsplit(cleaned)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_FETCH_SCHEMES:
+        raise ValueError(f"unsupported URL scheme: {scheme or '<empty>'}")
+
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise ValueError("URL hostname is required")
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        raise ValueError(f"blocked private/local hostname: {hostname}")
+
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        if not _is_public_ip(hostname):
+            raise ValueError(f"blocked non-public IP address: {hostname}")
+        return cleaned
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        addr_infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"failed to resolve hostname {hostname}: {exc}") from exc
+
+    resolved_ips = {
+        str(info[4][0])
+        for info in addr_infos
+        if info and len(info) >= 5 and info[4]
+    }
+    if not resolved_ips:
+        raise ValueError(f"no IP addresses resolved for hostname: {hostname}")
+    for ip_str in resolved_ips:
+        if not _is_public_ip(ip_str):
+            raise ValueError(f"blocked non-public resolved IP {ip_str} for {hostname}")
+
+    return cleaned
+
+
+def _fetch_page_text(
+    url: str,
+    timeout_seconds: float,
+    *,
+    max_bytes: int = _MAX_FETCH_BYTES,
+) -> tuple[str, str]:
+    """Safely fetch a web page with SSRF validation, redirect checks, and size caps."""
+    current_url = _validate_fetch_url(url)
+    max_allowed = max(1, int(max_bytes))
+
+    for redirect_count in range(_MAX_FETCH_REDIRECTS + 1):
+        with requests.get(
+            current_url,
+            timeout=timeout_seconds,
+            allow_redirects=False,
+            stream=True,
+        ) as response:
+            if response.status_code in _REDIRECT_STATUS_CODES:
+                location = str(response.headers.get("Location") or "").strip()
+                if not location:
+                    raise ValueError("redirect response missing Location header")
+                if redirect_count >= _MAX_FETCH_REDIRECTS:
+                    raise ValueError("too many redirects")
+                current_url = _validate_fetch_url(urljoin(current_url, location))
+                continue
+
+            response.raise_for_status()
+            content_type_header = str(response.headers.get("Content-Type") or "").strip()
+            media_type = content_type_header.split(";", 1)[0].strip().lower()
+            if media_type and media_type not in _ALLOWED_FETCH_CONTENT_TYPES:
+                raise ValueError(f"unsupported content type: {media_type}")
+
+            content_length_raw = str(response.headers.get("Content-Length") or "").strip()
+            if content_length_raw:
+                try:
+                    if int(content_length_raw) > max_allowed:
+                        raise ValueError(f"fetched page exceeds max byte limit ({max_allowed} bytes)")
+                except ValueError as exc:
+                    if "exceeds max byte limit" in str(exc):
+                        raise
+
+            chunks: list[bytes] = []
+            total_bytes = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total_bytes += len(chunk)
+                if total_bytes > max_allowed:
+                    raise ValueError(f"fetched page exceeds max byte limit ({max_allowed} bytes)")
+                chunks.append(chunk)
+
+            encoding = response.encoding or "utf-8"
+            html = b"".join(chunks).decode(encoding, errors="replace")
+            title = _extract_title(html)
+            sanitized_html = HTML_SCRIPT_PATTERN.sub(" ", html)
+
+            if markdownify is not None:
+                try:
+                    return title, _clean_text(markdownify(sanitized_html))
+                except Exception:  # pragma: no cover - optional dependency failure
+                    pass
+
+            return title, _clean_text(sanitized_html)
+
+    raise ValueError("too many redirects")
 
 
 def _safe_now() -> datetime:

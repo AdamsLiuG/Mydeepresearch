@@ -419,6 +419,9 @@ class ApiTests(unittest.TestCase):
         self.assertIn("counters", payload)
         self.assertIn("latencies_ms", payload)
         self.assertIn("success_rate", payload)
+        self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(response.headers.get("x-frame-options"), "DENY")
+        self.assertEqual(response.headers.get("referrer-policy"), "no-referrer")
 
     def test_stream_endpoint_returns_500_when_agent_init_fails(self):
         with isolated_configuration():

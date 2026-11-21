@@ -614,6 +614,105 @@ class EvidenceStoreTests(unittest.TestCase):
         self.assertTrue(restored["quality_reasons"])
         self.assertIn(restored["quality_label"], {"medium", "high"})
 
+    def test_fetch_page_blocks_ssrf_schemes_and_private_ips(self):
+        from services.evidence import _fetch_page_text, _validate_fetch_url
+
+        for blocked_url in (
+            "file:///etc/passwd",
+            "ftp://example.com/a",
+            "http://127.0.0.1:8000/healthz",
+            "http://localhost:8000/metrics/json",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/internal",
+            "http://192.168.1.1/admin",
+        ):
+            with self.assertRaises(ValueError, msg=blocked_url):
+                _validate_fetch_url(blocked_url)
+
+        with patch(
+            "services.evidence.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("169.254.169.254", 80))],
+        ):
+            with self.assertRaisesRegex(ValueError, "non-public"):
+                _fetch_page_text("https://evil.example.com/metadata", timeout_seconds=1.0)
+
+    def test_fetch_page_validates_redirects_content_type_and_size_limit(self):
+        from services.evidence import _fetch_page_text
+
+        class FakeResponse:
+            def __init__(self, *, status_code=200, headers=None, chunks=None):
+                self.status_code = status_code
+                self.headers = headers or {}
+                self._chunks = chunks or [b"<html><title>Doc</title><script>evil()</script><p>Safe text</p></html>"]
+                self.encoding = "utf-8"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def iter_content(self, chunk_size=65536):
+                yield from self._chunks
+
+        public_addr = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        # Redirect to loopback must be blocked
+        with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
+            with patch(
+                "services.evidence.requests.get",
+                return_value=FakeResponse(
+                    status_code=302,
+                    headers={"Location": "http://127.0.0.1/secret"},
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "non-public"):
+                    _fetch_page_text("https://example.com/start", timeout_seconds=1.0)
+
+        # Oversized body must be rejected
+        with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
+            with patch(
+                "services.evidence.requests.get",
+                return_value=FakeResponse(
+                    status_code=200,
+                    headers={"Content-Type": "text/html"},
+                    chunks=[b"a" * 600, b"b" * 600],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "exceeds max byte limit"):
+                    _fetch_page_text("https://example.com/huge", timeout_seconds=1.0, max_bytes=1024)
+
+        # Disallowed binary content type must be rejected
+        with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
+            with patch(
+                "services.evidence.requests.get",
+                return_value=FakeResponse(
+                    status_code=200,
+                    headers={"Content-Type": "application/octet-stream"},
+                    chunks=[b"\x00\x01"],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "unsupported content type"):
+                    _fetch_page_text("https://example.com/bin", timeout_seconds=1.0)
+
+        # Safe HTML strips <script> before extraction
+        with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
+            with patch(
+                "services.evidence.requests.get",
+                return_value=FakeResponse(
+                    status_code=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                ),
+            ):
+                title, text = _fetch_page_text("https://example.com/ok", timeout_seconds=1.0)
+                self.assertEqual(title, "Doc")
+                self.assertIn("Safe text", text)
+                self.assertNotIn("evil()", text)
+
 
 if __name__ == "__main__":
     unittest.main()

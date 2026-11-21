@@ -293,12 +293,15 @@ def create_app(
         else None
     )
 
+    # TODO(security): add multi-tenant authentication/authorization and per-tenant
+    # rate limiting in P2 before exposing this service outside trusted local networks.
+    allow_wildcard_cors = "*" in base_config.cors_origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=base_config.cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_credentials=not allow_wildcard_cors,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "X-Request-ID", "Authorization", "Accept"],
     )
 
     @app.middleware("http")
@@ -331,6 +334,13 @@ def create_app(
 
         duration_ms = (time.perf_counter() - start_time) * 1000
         response.headers["X-Request-ID"] = request_id
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        )
         logger.info(
             "Request completed method=%s path=%s status=%s duration_ms=%.2f",
             request.method,

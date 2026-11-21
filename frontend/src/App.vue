@@ -674,6 +674,7 @@
 
 <script lang="ts" setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import DOMPurify from "dompurify";
 import { marked } from "marked";
 
 import {
@@ -917,10 +918,16 @@ function renderMarkdownBlock(value: string): string {
     return "<p>暂无可用信息</p>";
   }
 
-  return marked.parse(escapeHtml(text), {
+  const rawHtml = marked.parse(escapeHtml(text), {
     breaks: true,
     gfm: true
   }) as string;
+
+  return DOMPurify.sanitize(rawHtml, {
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|#|\/)/i,
+    FORBID_TAGS: ["script", "style", "iframe", "object", "embed"],
+    FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover"]
+  });
 }
 
 const requestMetricElapsedMs = computed(() =>

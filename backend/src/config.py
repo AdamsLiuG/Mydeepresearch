@@ -405,7 +405,7 @@ class Configuration(BaseModel):
         description="Application log verbosity",
     )
     cors_origins: list[str] = Field(
-        default_factory=lambda: ["*"],
+        default_factory=lambda: ["http://localhost:5174", "http://127.0.0.1:5174"],
         title="CORS Origins",
         description="Allowed CORS origins for the HTTP API",
     )

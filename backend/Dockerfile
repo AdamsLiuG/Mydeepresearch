@@ -10,8 +10,13 @@ WORKDIR /app
 COPY backend/pyproject.toml /app/pyproject.toml
 COPY backend/README.md /app/README.md
 COPY backend/src /app/src
+COPY backend/skills /app/skills
 
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip && pip install . \
+    && useradd --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8000
 
