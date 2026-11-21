@@ -123,7 +123,7 @@
           </section>
 
           <div class="form-actions">
-            <button class="submit" type="submit" :disabled="loading">
+            <button class="submit" type="submit" :disabled="loading || hitlBusy">
               <span class="submit-label">
                 <svg
                   v-if="loading"
@@ -137,6 +137,15 @@
               </span>
             </button>
             <button
+              v-if="!loading"
+              type="button"
+              class="secondary-btn"
+              :disabled="hitlBusy || !form.topic.trim()"
+              @click="handleClarifyAndPlan"
+            >
+              {{ hitlBusy ? "规划中..." : "先规划确认 (HITL)" }}
+            </button>
+            <button
               v-if="loading"
               type="button"
               class="secondary-btn"
@@ -146,6 +155,16 @@
             </button>
           </div>
         </form>
+
+        <PlanReviewPanel
+          :plan="editablePlan"
+          :clarification="clarificationData"
+          :busy="hitlBusy"
+          :error="hitlError"
+          @save-plan="handleSaveEditablePlan"
+          @approve-plan="handleApprovePlan"
+          @dismiss="dismissPlanReview"
+        />
 
         <p v-if="error" class="error-chip">
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -212,66 +231,17 @@
           </button>
         </div>
 
-        <section class="sidebar-history">
-          <div class="sidebar-history-head">
-            <h3>最近研究历史</h3>
-            <span class="history-count">{{ recentResearchHistory.length }} 条</span>
-          </div>
-          <ul v-if="recentResearchHistory.length" class="sidebar-history-list">
-            <li
-              v-for="item in recentResearchHistory"
-              :key="item.requestId"
-              :class="['sidebar-history-item', { selected: selectedHistoryRequestId === item.requestId }]"
-            >
-              <div class="sidebar-history-main">
-                <p class="sidebar-history-topic" :title="item.topic">
-                  {{ item.topic }}
-                </p>
-                <div class="sidebar-history-meta">
-                  <span class="history-status-chip" :class="item.status">
-                    {{ formatRequestStatus(item.status) }}
-                  </span>
-                  <span>{{ formatElapsed(item.elapsedMs) }}</span>
-                </div>
-                <p
-                  v-if="item.error"
-                  class="sidebar-history-error"
-                  :title="item.error"
-                >
-                  {{ item.error }}
-                </p>
-              </div>
-              <div class="sidebar-history-actions">
-                <button
-                  type="button"
-                  class="history-view-btn"
-                  @click="viewHistoryResearch(item)"
-                  :disabled="loading || historyDetailLoadingRequestId === item.requestId || !item.canViewContent"
-                >
-                  {{ historyDetailLoadingRequestId === item.requestId ? "加载中..." : "查看内容" }}
-                </button>
-                <button
-                  type="button"
-                  class="history-repeat-btn"
-                  @click="repeatResearch(item)"
-                  :disabled="loading"
-                >
-                  再次研究
-                </button>
-                <button
-                  v-if="item.canResume"
-                  type="button"
-                  class="history-repeat-btn"
-                  @click="resumePersistedResearch(item)"
-                  :disabled="loading"
-                >
-                  恢复执行
-                </button>
-              </div>
-            </li>
-          </ul>
-          <p v-else class="sidebar-history-empty">暂无历史研究记录</p>
-        </section>
+        <HistorySidebar
+          :items="recentResearchHistory"
+          :selected-request-id="selectedHistoryRequestId"
+          :loading="loading"
+          :loading-detail-request-id="historyDetailLoadingRequestId"
+          :format-status="formatRequestStatus"
+          :format-elapsed="formatElapsed"
+          @view="viewHistoryResearch"
+          @repeat="repeatResearch"
+          @resume="resumePersistedResearch"
+        />
       </aside>
 
       <!-- 右侧：研究结果 -->
@@ -608,17 +578,16 @@
           </article>
         </div>
 
-        <div
-          v-if="reportMarkdown"
-          class="report-block"
-          :class="{ 'block-highlight': reportHighlight }"
-        >
-          <h3>最终报告</h3>
-          <div
-            class="markdown-block"
-            v-html="reportMarkdownHtml"
-          ></div>
-        </div>
+        <ReportViewer
+          :report-markdown="reportMarkdown"
+          :report-html="reportMarkdownHtml"
+          :highlight="reportHighlight"
+          :request-id="currentDrilldownRequestId"
+          :drilldown-loading="drilldownLoading"
+          :drilldown-answer-html="drilldownAnswerHtml"
+          :drilldown-error="drilldownError"
+          @drilldown="handleSectionDrilldown"
+        />
         </template>
 
         <section
@@ -674,93 +643,34 @@
 
 <script lang="ts" setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
-import DOMPurify from "dompurify";
-import { marked } from "marked";
 
+import HistorySidebar from "./components/HistorySidebar.vue";
+import PlanReviewPanel from "./components/PlanReviewPanel.vue";
+import ReportViewer from "./components/ReportViewer.vue";
 import {
+  clarifyResearch,
+  createResearchPlan,
+  drilldownReportSection,
   fetchPersistedRequest,
   fetchPersistedRequests,
   fetchMetricsSnapshot,
   resumeResearchStream,
   runResearchStream,
-  type ResearchStreamEvent
+  updateResearchPlan,
+  type ClarifyResponse,
+  type EditablePlanResponse,
+  type ResearchStreamEvent,
+  type ResearchTaskPlanItem
 } from "./services/api";
-
-interface SourceItem {
-  sourceId: string;
-  title: string;
-  url: string;
-  snippet: string;
-  raw: string;
-  domain: string;
-  sourceType: string;
-  qualityLabel: string;
-  freshnessLabel: string;
-  publishedAt: string;
-  providerCount: number;
-}
-
-interface ReviewIssue {
-  task_id?: number | null;
-  severity: string;
-  check: string;
-  message: string;
-  source_ids: string[];
-  origin?: string;
-}
-
-interface ClaimItem {
-  text: string;
-  source_ids: string[];
-  support_status: string;
-}
-
-interface ToolCallLog {
-  eventId: number;
-  agent: string;
-  tool: string;
-  parameters: Record<string, unknown>;
-  result: string;
-  noteId: string | null;
-  notePath: string | null;
-  timestamp: number;
-}
-
-interface TodoTaskView {
-  id: number;
-  title: string;
-  intent: string;
-  query: string;
-  status: string;
-  summary: string;
-  sourcesSummary: string;
-  sourceItems: SourceItem[];
-  notices: string[];
-  claims: ClaimItem[];
-  reviewIssues: ReviewIssue[];
-  reviewStatus: string;
-  noteId: string | null;
-  notePath: string | null;
-  toolCalls: ToolCallLog[];
-  origin: string;
-  round: number;
-}
-
-interface RecentResearchView {
-  requestId: string;
-  topic: string;
-  status: string;
-  elapsedMs: number;
-  searchApi: string;
-  reportMarkdown: string;
-  todoItems: TodoTaskView[];
-  requestMetrics: UnknownRecord;
-  error?: string;
-  canViewContent: boolean;
-  canResume: boolean;
-  phase?: string;
-  updatedAt?: string;
-}
+import type {
+  ClaimItem,
+  RecentResearchView,
+  ReviewIssue,
+  SourceItem,
+  TodoTaskView,
+  ToolCallLog
+} from "./types/research";
+import { renderMarkdownBlock } from "./utils/markdown";
 
 interface DemoScenario {
   id: string;
@@ -789,8 +699,17 @@ const reportMarkdown = ref("");
 const latestRequestMetrics = ref<UnknownRecord | null>(null);
 const latestAggregateMetrics = ref<UnknownRecord | null>(null);
 const selectedHistoryRequestId = ref<string | null>(null);
+const activeRequestId = ref<string | null>(null);
+const lastEventId = ref<string | null>(null);
 const persistedHistory = ref<RecentResearchView[]>([]);
 const historyDetailLoadingRequestId = ref<string | null>(null);
+const clarificationData = ref<ClarifyResponse | null>(null);
+const editablePlan = ref<EditablePlanResponse | null>(null);
+const hitlBusy = ref(false);
+const hitlError = ref("");
+const drilldownLoading = ref(false);
+const drilldownAnswerMarkdown = ref("");
+const drilldownError = ref("");
 
 const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
@@ -896,6 +815,18 @@ const currentTaskSummaryHtml = computed(() =>
 const reportMarkdownHtml = computed(() =>
   renderMarkdownBlock(reportMarkdown.value || "暂无生成的报告")
 );
+const currentDrilldownRequestId = computed(
+  () =>
+    activeRequestId.value ||
+    selectedHistoryRequestId.value ||
+    editablePlan.value?.request_id ||
+    null
+);
+const drilldownAnswerHtml = computed(() =>
+  drilldownAnswerMarkdown.value
+    ? renderMarkdownBlock(drilldownAnswerMarkdown.value)
+    : ""
+);
 
 function getNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -903,31 +834,6 @@ function getNumber(value: unknown): number {
 
 function getString(value: unknown, fallback = "-"): string {
   return typeof value === "string" && value.trim() ? value.trim() : fallback;
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
-function renderMarkdownBlock(value: string): string {
-  const text = typeof value === "string" ? value.trim() : "";
-  if (!text) {
-    return "<p>暂无可用信息</p>";
-  }
-
-  const rawHtml = marked.parse(escapeHtml(text), {
-    breaks: true,
-    gfm: true
-  }) as string;
-
-  return DOMPurify.sanitize(rawHtml, {
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|#|\/)/i,
-    FORBID_TAGS: ["script", "style", "iframe", "object", "embed"],
-    FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover"]
-  });
 }
 
 const requestMetricElapsedMs = computed(() =>
@@ -1523,10 +1429,14 @@ async function refreshPersistedHistory(signal?: AbortSignal) {
 function resetWorkflowState() {
   todoTasks.value = [];
   activeTaskId.value = null;
+  activeRequestId.value = null;
+  lastEventId.value = null;
   reportMarkdown.value = "";
   progressLogs.value = [];
   latestRequestMetrics.value = null;
   selectedHistoryRequestId.value = null;
+  drilldownAnswerMarkdown.value = "";
+  drilldownError.value = "";
   summaryHighlight.value = false;
   sourcesHighlight.value = false;
   reportHighlight.value = false;
@@ -1600,6 +1510,7 @@ async function resumePersistedResearch(item: RecentResearchView) {
   isExpanded.value = true;
   resetWorkflowState();
   selectedHistoryRequestId.value = item.requestId;
+  activeRequestId.value = item.requestId;
   form.topic = item.topic;
   form.searchApi = item.searchApi;
 
@@ -1611,7 +1522,12 @@ async function resumePersistedResearch(item: RecentResearchView) {
       item.requestId,
       { search_api: item.searchApi || undefined },
       handleResearchEvent,
-      { signal: controller.signal }
+      {
+        signal: controller.signal,
+        onEventId: (eventId) => {
+          lastEventId.value = eventId;
+        }
+      }
     );
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
@@ -2331,6 +2247,10 @@ function handleResearchEvent(event: ResearchStreamEvent) {
     return;
   }
 
+  if (typeof event.request_id === "string" && event.request_id.trim()) {
+    activeRequestId.value = event.request_id.trim();
+  }
+
   if (event.type === "error") {
     const detail =
       typeof event.detail === "string" && event.detail.trim()
@@ -2338,6 +2258,145 @@ function handleResearchEvent(event: ResearchStreamEvent) {
         : "研究过程中发生错误";
     error.value = detail;
     progressLogs.value.push("研究失败，已停止流程");
+  }
+}
+
+async function handleClarifyAndPlan() {
+  const topic = form.topic.trim();
+  if (!topic) {
+    error.value = "请输入研究主题";
+    return;
+  }
+
+  hitlBusy.value = true;
+  hitlError.value = "";
+  error.value = "";
+
+  try {
+    const searchApi = form.searchApi || undefined;
+    const [clarification, plan] = await Promise.all([
+      clarifyResearch(topic, searchApi),
+      createResearchPlan({ topic, search_api: searchApi })
+    ]);
+    clarificationData.value = clarification;
+    editablePlan.value = plan;
+    activeRequestId.value = plan.request_id;
+  } catch (err) {
+    hitlError.value = err instanceof Error ? err.message : "生成规划失败";
+  } finally {
+    hitlBusy.value = false;
+  }
+}
+
+async function handleSaveEditablePlan(tasks: ResearchTaskPlanItem[]) {
+  if (!editablePlan.value) {
+    return;
+  }
+  hitlBusy.value = true;
+  hitlError.value = "";
+  try {
+    editablePlan.value = await updateResearchPlan(
+      editablePlan.value.request_id,
+      tasks
+    );
+  } catch (err) {
+    hitlError.value = err instanceof Error ? err.message : "保存规划修改失败";
+  } finally {
+    hitlBusy.value = false;
+  }
+}
+
+async function handleApprovePlan() {
+  if (!editablePlan.value || loading.value) {
+    return;
+  }
+  const targetRequestId = editablePlan.value.request_id;
+  const approvedTopic = editablePlan.value.topic || form.topic.trim();
+
+  cancelHistoryDetailLoad();
+  if (currentController) {
+    currentController.abort();
+    currentController = null;
+  }
+
+  editablePlan.value = null;
+  clarificationData.value = null;
+  loading.value = true;
+  error.value = "";
+  isExpanded.value = true;
+  resetWorkflowState();
+  activeRequestId.value = targetRequestId;
+  selectedHistoryRequestId.value = targetRequestId;
+  if (approvedTopic) {
+    form.topic = approvedTopic;
+  }
+
+  const controller = new AbortController();
+  currentController = controller;
+
+  try {
+    await resumeResearchStream(
+      targetRequestId,
+      { search_api: form.searchApi || undefined },
+      handleResearchEvent,
+      {
+        signal: controller.signal,
+        onEventId: (eventId) => {
+          lastEventId.value = eventId;
+        }
+      }
+    );
+    if (!reportMarkdown.value) {
+      reportMarkdown.value = "暂无生成的报告";
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      progressLogs.value.push("已取消当前研究任务");
+    } else {
+      error.value = err instanceof Error ? err.message : "批准启动失败";
+    }
+  } finally {
+    loading.value = false;
+    void refreshGlobalMetrics();
+    void refreshPersistedHistory();
+    if (currentController === controller) {
+      currentController = null;
+    }
+  }
+}
+
+function dismissPlanReview() {
+  editablePlan.value = null;
+  clarificationData.value = null;
+  hitlError.value = "";
+}
+
+async function handleSectionDrilldown(payload: {
+  sectionTitle: string;
+  question: string;
+}) {
+  const targetRequestId =
+    activeRequestId.value ||
+    selectedHistoryRequestId.value ||
+    editablePlan.value?.request_id;
+  if (!targetRequestId) {
+    drilldownError.value = "未找到可用于章节追问的 request_id";
+    return;
+  }
+  drilldownLoading.value = true;
+  drilldownError.value = "";
+  try {
+    const result = await drilldownReportSection(
+      targetRequestId,
+      payload.sectionTitle,
+      payload.question,
+      form.searchApi || undefined
+    );
+    drilldownAnswerMarkdown.value = result.answer_markdown || "暂无追问结果";
+  } catch (err) {
+    drilldownError.value = err instanceof Error ? err.message : "章节追问失败";
+  } finally {
+    drilldownLoading.value = false;
   }
 }
 
@@ -2353,6 +2412,9 @@ const handleSubmit = async () => {
     currentController = null;
   }
 
+  editablePlan.value = null;
+  clarificationData.value = null;
+  hitlError.value = "";
   loading.value = true;
   error.value = "";
   isExpanded.value = true;
@@ -2370,7 +2432,12 @@ const handleSubmit = async () => {
     await runResearchStream(
       payload,
       handleResearchEvent,
-      { signal: controller.signal }
+      {
+        signal: controller.signal,
+        onEventId: (eventId) => {
+          lastEventId.value = eventId;
+        }
+      }
     );
 
     if (!reportMarkdown.value) {

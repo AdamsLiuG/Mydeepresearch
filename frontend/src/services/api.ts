@@ -1,3 +1,32 @@
+import { createSseFrameParser, parseSseJson } from "./sseParser";
+import type {
+  ClarifyResponse,
+  EditablePlanResponse,
+  MetricsSnapshot,
+  PersistedRequestSummary,
+  ReplayEventItem,
+  ResearchRequest,
+  ResearchStreamEvent,
+  ResearchTaskPlanItem,
+  ResumeRequest,
+  SectionDrilldownResponse,
+  StreamOptions
+} from "../types/research";
+
+export type {
+  ClarifyResponse,
+  EditablePlanResponse,
+  MetricsSnapshot,
+  PersistedRequestSummary,
+  ReplayEventItem,
+  ResearchRequest,
+  ResearchStreamEvent,
+  ResearchTaskPlanItem,
+  ResumeRequest,
+  SectionDrilldownResponse,
+  StreamOptions
+} from "../types/research";
+
 function resolveBaseURL(): string {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim();
   if (configured) {
@@ -13,35 +42,20 @@ function resolveBaseURL(): string {
 
 const baseURL = resolveBaseURL();
 
-export interface ResearchRequest {
-  topic: string;
-  search_api?: string;
-}
-
-export interface ResumeRequest {
-  search_api?: string;
-}
-
-export interface ResearchStreamEvent {
-  type: string;
-  [key: string]: unknown;
-}
-
-export interface StreamOptions {
-  signal?: AbortSignal;
-}
-
-export interface MetricsSnapshot {
-  generated_at?: string;
-  cache_hit_total?: number;
-  cache_miss_total?: number;
-  cache_approximate_hit_total?: number;
-  cache_approximate_dense_hit_total?: number;
-  cache_approximate_sparse_hit_total?: number;
-  cache_approximate_hybrid_hit_total?: number;
-  counters?: Record<string, number>;
-  recent_requests?: Record<string, unknown>[];
-  [key: string]: unknown;
+function buildHeaders(
+  base: Record<string, string>,
+  options: StreamOptions = {}
+): Record<string, string> {
+  const headers: Record<string, string> = { ...base };
+  const apiKey = options.apiKey?.trim();
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
+  const lastEventId = options.lastEventId?.trim();
+  if (lastEventId) {
+    headers["Last-Event-ID"] = lastEventId;
+  }
+  return headers;
 }
 
 export async function runResearchStream(
@@ -76,10 +90,13 @@ async function streamFromEndpoint(
   try {
     response = await fetch(`${baseURL}${endpoint}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream"
-      },
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream"
+        },
+        options
+      ),
       body: JSON.stringify(payload),
       signal: options.signal
     });
@@ -106,61 +123,32 @@ async function streamFromEndpoint(
 
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
-  let buffer = "";
+  const parser = createSseFrameParser(options.lastEventId);
 
-  const parseSseFrame = (rawFrame: string): ResearchStreamEvent | null => {
-    const dataLines: string[] = [];
-    for (const line of rawFrame.split("\n")) {
-      // Ignore empty lines and SSE heartbeat/comment lines (e.g. ": keepalive").
-      if (!line || line.startsWith(":")) {
-        continue;
+  const dispatchFrames = (frames: ReturnType<typeof parser.feed>): boolean => {
+    for (const frame of frames) {
+      if (frame.id) {
+        options.onEventId?.(frame.id);
       }
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trimStart());
+      const event = parseSseJson<ResearchStreamEvent>(frame);
+      if (event) {
+        onEvent(event);
+        if (event.type === "error" || event.type === "done") {
+          return true;
+        }
       }
     }
-    const dataPayload = dataLines.join("\n").trim();
-    if (!dataPayload) {
-      return null;
-    }
-    try {
-      return JSON.parse(dataPayload) as ResearchStreamEvent;
-    } catch (error) {
-      console.error("解析流式事件失败：", error, dataPayload);
-      return null;
-    }
+    return false;
   };
 
   while (true) {
     const { value, done } = await reader.read();
-    const chunk = decoder
-      .decode(value || new Uint8Array(), { stream: !done })
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n");
-    buffer += chunk;
-
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const rawFrame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-
-      const event = parseSseFrame(rawFrame);
-      if (event) {
-        onEvent(event);
-        if (event.type === "error" || event.type === "done") {
-          return;
-        }
-      }
-
-      boundary = buffer.indexOf("\n\n");
+    const chunk = decoder.decode(value || new Uint8Array(), { stream: !done });
+    if (dispatchFrames(parser.feed(chunk))) {
+      return;
     }
-
     if (done) {
-      // Flush trailing frame when stream closes without double newline.
-      const event = parseSseFrame(buffer);
-      if (event) {
-        onEvent(event);
-      }
+      dispatchFrames(parser.flush());
       break;
     }
   }
@@ -171,9 +159,7 @@ export async function fetchMetricsSnapshot(
 ): Promise<MetricsSnapshot> {
   const response = await fetch(`${baseURL}/metrics/json`, {
     method: "GET",
-    headers: {
-      Accept: "application/json"
-    },
+    headers: buildHeaders({ Accept: "application/json" }, options),
     signal: options.signal
   });
 
@@ -191,13 +177,11 @@ export async function fetchMetricsSnapshot(
 export async function fetchPersistedRequests(
   limit?: number,
   options: StreamOptions = {}
-): Promise<Record<string, unknown>[]> {
+): Promise<PersistedRequestSummary[]> {
   const search = typeof limit === "number" && Number.isFinite(limit) ? `?limit=${limit}` : "";
   const response = await fetch(`${baseURL}/requests${search}`, {
     method: "GET",
-    headers: {
-      Accept: "application/json"
-    },
+    headers: buildHeaders({ Accept: "application/json" }, options),
     signal: options.signal
   });
 
@@ -207,7 +191,7 @@ export async function fetchPersistedRequests(
   }
 
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  return Array.isArray(payload.items) ? (payload.items as Record<string, unknown>[]) : [];
+  return Array.isArray(payload.items) ? (payload.items as PersistedRequestSummary[]) : [];
 }
 
 export async function fetchPersistedRequest(
@@ -216,9 +200,7 @@ export async function fetchPersistedRequest(
 ): Promise<Record<string, unknown>> {
   const response = await fetch(`${baseURL}/requests/${encodeURIComponent(requestId)}`, {
     method: "GET",
-    headers: {
-      Accept: "application/json"
-    },
+    headers: buildHeaders({ Accept: "application/json" }, options),
     signal: options.signal
   });
 
@@ -229,4 +211,140 @@ export async function fetchPersistedRequest(
 
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   return payload && typeof payload === "object" ? payload : {};
+}
+
+export async function clarifyResearch(
+  topic: string,
+  searchApi?: string,
+  options: StreamOptions = {}
+): Promise<ClarifyResponse> {
+  const response = await fetch(`${baseURL}/research/clarify`, {
+    method: "POST",
+    headers: buildHeaders(
+      {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      options
+    ),
+    body: JSON.stringify({
+      topic,
+      ...(searchApi ? { search_api: searchApi } : {})
+    }),
+    signal: options.signal
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `主题澄清请求失败，状态码：${response.status}`);
+  }
+  return (await response.json()) as ClarifyResponse;
+}
+
+export async function createResearchPlan(
+  payload: ResearchRequest,
+  options: StreamOptions = {}
+): Promise<EditablePlanResponse> {
+  const response = await fetch(`${baseURL}/research/plan`, {
+    method: "POST",
+    headers: buildHeaders(
+      {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      options
+    ),
+    body: JSON.stringify(payload),
+    signal: options.signal
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `生成研究计划失败，状态码：${response.status}`);
+  }
+  return (await response.json()) as EditablePlanResponse;
+}
+
+export async function updateResearchPlan(
+  requestId: string,
+  tasks: ResearchTaskPlanItem[],
+  options: StreamOptions = {}
+): Promise<EditablePlanResponse> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/plan`,
+    {
+      method: "PUT",
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        options
+      ),
+      body: JSON.stringify({ tasks }),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `更新研究计划失败，状态码：${response.status}`);
+  }
+  return (await response.json()) as EditablePlanResponse;
+}
+
+export async function drilldownReportSection(
+  requestId: string,
+  sectionTitle: string,
+  question: string,
+  searchApi?: string,
+  options: StreamOptions = {}
+): Promise<SectionDrilldownResponse> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/drilldown`,
+    {
+      method: "POST",
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        options
+      ),
+      body: JSON.stringify({
+        section_title: sectionTitle,
+        question,
+        ...(searchApi ? { search_api: searchApi } : {})
+      }),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `章节追问失败，状态码：${response.status}`);
+  }
+  return (await response.json()) as SectionDrilldownResponse;
+}
+
+export async function replayRequestEvents(
+  requestId: string,
+  lastEventId?: string,
+  options: StreamOptions = {}
+): Promise<ReplayEventItem[]> {
+  const query = lastEventId
+    ? `?last_event_id=${encodeURIComponent(lastEventId)}`
+    : "";
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/events${query}`,
+    {
+      method: "GET",
+      headers: buildHeaders({ Accept: "application/json" }, { ...options, lastEventId }),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `事件回放失败，状态码：${response.status}`);
+  }
+  const payload = (await response.json().catch(() => ({}))) as {
+    events?: ReplayEventItem[];
+  };
+  return Array.isArray(payload.events) ? payload.events : [];
 }
