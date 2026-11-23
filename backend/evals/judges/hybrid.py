@@ -37,11 +37,21 @@ class HybridJudge(Judge):
 
     @staticmethod
     def _heuristic_composite(metrics: Mapping[str, Any]) -> float:
+        citation_integrity = (
+            metrics.get("citation_integrity")
+            if "citation_integrity" in metrics
+            else metrics.get("reference_match_rate", 0.0)
+        )
+        citation_density = (
+            metrics.get("citation_density_score")
+            if "citation_density_score" in metrics
+            else metrics.get("grounded_bullet_ratio", 0.0)
+        )
         parts = [
             float(metrics.get("keyword_coverage") or 0.0),
             float(metrics.get("section_completeness") or 0.0),
-            float(metrics.get("citation_integrity") or 0.0),
-            float(metrics.get("citation_density_score") or 0.0),
+            float(citation_integrity or 0.0),
+            float(citation_density or 0.0),
         ]
         return round(sum(parts) / len(parts), 4)
 

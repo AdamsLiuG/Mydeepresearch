@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import time
+from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1766,8 +1767,19 @@ _FUSION_AGGREGATOR_HOST_HINTS = (
 )
 
 
-def _fusion_source_prior(url: str) -> float:
-    """Return a gentle reliability prior based on URL domain/path structure."""
+def _host_matches_hint(host: str, hint: str) -> bool:
+    normalized = str(hint or "").strip().lower()
+    if not normalized:
+        return False
+    bare = normalized.lstrip(".")
+    return host == bare or host.endswith(f".{bare}") or (normalized.startswith(".") and host.endswith(normalized))
+
+
+def _fusion_source_prior(
+    url: str,
+    retrieval_profile: Mapping[str, Any] | None = None,
+) -> float:
+    """Return a gentle reliability prior based on URL domain/path structure and active skill profile."""
 
     raw = str(url or "").strip()
     if not raw:
@@ -1780,6 +1792,18 @@ def _fusion_source_prior(url: str) -> float:
     path = (parsed.path or "").strip().lower()
     if not host:
         return 0.0
+
+    profile = retrieval_profile if isinstance(retrieval_profile, Mapping) else {}
+    profile_dep = tuple(str(h).strip().lower() for h in (profile.get("deprioritized_hosts") or ()) if str(h).strip())
+    profile_auth = tuple(str(h).strip().lower() for h in (profile.get("authoritative_hosts") or ()) if str(h).strip())
+    prior_penalty = float(profile.get("prior_penalty", -0.025) if "prior_penalty" in profile else -0.025)
+    prior_boost = float(profile.get("prior_boost", 0.045) if "prior_boost" in profile else 0.045)
+
+    if profile_dep and any(_host_matches_hint(host, hint) for hint in profile_dep):
+        return prior_penalty
+    if profile_auth and any(_host_matches_hint(host, hint) for hint in profile_auth):
+        return prior_boost
+
     if any(hint in host for hint in _FUSION_AGGREGATOR_HOST_HINTS):
         return -0.02
     if (
@@ -1793,7 +1817,10 @@ def _fusion_source_prior(url: str) -> float:
     return 0.0
 
 
-def _compute_fusion_rrf_score(item: dict[str, Any]) -> float:
+def _compute_fusion_rrf_score(
+    item: dict[str, Any],
+    retrieval_profile: Mapping[str, Any] | None = None,
+) -> float:
     """Compute weighted RRF score combining per-backend ranks and source reliability prior."""
 
     backend_ranks = list(item.get("_backend_ranks") or [])
@@ -1802,15 +1829,21 @@ def _compute_fusion_rrf_score(item: dict[str, Any]) -> float:
         order = max(0, int(item.get("_backend_order", 0)))
         backend_ranks = [("default", order, rank)]
 
+    profile = retrieval_profile if isinstance(retrieval_profile, Mapping) else {}
+    profile_weights = profile.get("backend_weights") if isinstance(profile.get("backend_weights"), Mapping) else {}
+
     rrf_total = 0.0
     for backend_name, backend_order, result_rank in backend_ranks:
         normalized_backend = str(backend_name or "").strip().lower()
-        base_weight = _FUSION_BACKEND_WEIGHTS.get(normalized_backend, 1.0)
+        if normalized_backend in profile_weights:
+            base_weight = float(profile_weights[normalized_backend])
+        else:
+            base_weight = _FUSION_BACKEND_WEIGHTS.get(normalized_backend, 1.0)
         # Preserve configured backend order gently as a tie-breaker on equal ranks.
         order_factor = max(0.85, 1.0 - (0.015 * max(0, int(backend_order))))
         rrf_total += (base_weight * order_factor) / (_RRF_K + float(max(0, int(result_rank)) + 1))
 
-    return round(rrf_total + _fusion_source_prior(str(item.get("url") or "")), 6)
+    return round(rrf_total + _fusion_source_prior(str(item.get("url") or ""), retrieval_profile=profile), 6)
 
 
 def _merge_fused_result(
@@ -1869,12 +1902,15 @@ def _merge_fused_result(
         existing["url"] = candidate["url"]
 
 
-def _sort_fused_results_by_rules(merged_results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def _sort_fused_results_by_rules(
+    merged_results: dict[str, dict[str, Any]],
+    retrieval_profile: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Apply weighted RRF + source reliability prior ordering for fused advanced results."""
 
     items = list(merged_results.values())
     for item in items:
-        item["fusion_score"] = _compute_fusion_rrf_score(item)
+        item["fusion_score"] = _compute_fusion_rrf_score(item, retrieval_profile=retrieval_profile)
 
     return sorted(
         items,
@@ -2458,7 +2494,10 @@ def _fuse_advanced_search_results(
                     result_rank=result_rank,
                 )
 
-    ranked_results = _sort_fused_results_by_rules(merged_results)
+    ranked_results = _sort_fused_results_by_rules(
+        merged_results,
+        retrieval_profile=getattr(config, "active_retrieval_profile", None),
+    )
     ranked_results, ranking, rerank_notices = _rerank_advanced_results(query, ranked_results, config)
     notices.extend(rerank_notices)
 

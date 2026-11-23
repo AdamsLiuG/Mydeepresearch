@@ -48,6 +48,19 @@
                 </option>
               </select>
             </label>
+            <label class="field option">
+              <span>交付格式 (Format Skill)</span>
+              <select v-model="form.outputFormat">
+                <option value="">标准研究报告</option>
+                <option
+                  v-for="fmt in outputFormatOptions"
+                  :key="fmt.value"
+                  :value="fmt.value"
+                >
+                  {{ fmt.label }}
+                </option>
+              </select>
+            </label>
           </section>
 
           <section class="demo-presets">
@@ -684,8 +697,15 @@ type UnknownRecord = Record<string, unknown>;
 
 const form = reactive({
   topic: "",
-  searchApi: ""
+  searchApi: "",
+  outputFormat: ""
 });
+
+const outputFormatOptions = [
+  { value: "exec-brief", label: "高管一页纸决策简报 (exec-brief)" },
+  { value: "engineering-rfc", label: "工程架构选型 RFC (engineering-rfc)" },
+  { value: "deep-whitepaper", label: "深度研究白皮书 (deep-whitepaper)" }
+];
 
 const loading = ref(false);
 const error = ref("");
@@ -2274,9 +2294,10 @@ async function handleClarifyAndPlan() {
 
   try {
     const searchApi = form.searchApi || undefined;
+    const outputFormat = form.outputFormat || undefined;
     const [clarification, plan] = await Promise.all([
       clarifyResearch(topic, searchApi),
-      createResearchPlan({ topic, search_api: searchApi })
+      createResearchPlan({ topic, search_api: searchApi, output_format: outputFormat })
     ]);
     clarificationData.value = clarification;
     editablePlan.value = plan;
@@ -2425,7 +2446,8 @@ const handleSubmit = async () => {
 
   const payload = {
     topic: form.topic.trim(),
-    search_api: form.searchApi || undefined
+    search_api: form.searchApi || undefined,
+    output_format: form.outputFormat || undefined
   };
 
   try {

@@ -3,6 +3,7 @@ import {
   clarifyResearch,
   createResearchPlan,
   drilldownReportSection,
+  fetchSkillsCatalog,
   replayRequestEvents,
   runResearchStream,
   updateResearchPlan
@@ -63,6 +64,17 @@ describe("frontend API client", () => {
           { status: 200 }
         );
       }
+      if (url.endsWith("/skills")) {
+        return new Response(
+          JSON.stringify({
+            enabled: true,
+            domain_packs: [{ pack_id: "tech-selection" }],
+            format_packs: [{ pack_id: "exec-brief" }],
+            registered_verifiers: ["numeric-audit"]
+          }),
+          { status: 200 }
+        );
+      }
       if (url.includes("/requests/req-hitl-1/events")) {
         expect((init?.headers as Record<string, string>)["Last-Event-ID"]).toBe("2");
         expect((init?.headers as Record<string, string>)["X-API-Key"]).toBe("secret-k");
@@ -103,6 +115,10 @@ describe("frontend API client", () => {
       apiKey: "secret-k"
     });
     expect(replayed).toEqual([{ id: "3", data: { type: "done" } }]);
+
+    const catalog = await fetchSkillsCatalog({ apiKey: "secret-k" });
+    expect(catalog.enabled).toBe(true);
+    expect(catalog.format_packs[0].pack_id).toBe("exec-brief");
   });
 
   it("tracks SSE event ids via onEventId callback during streaming", async () => {
@@ -117,13 +133,19 @@ describe("frontend API client", () => {
 
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => new Response(stream, { status: 200 }))
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect(JSON.parse(String(init?.body || "{}"))).toEqual({
+          topic: "Agent Eval",
+          output_format: "engineering-rfc"
+        });
+        return new Response(stream, { status: 200 });
+      })
     );
 
     const events: string[] = [];
     const ids: string[] = [];
     await runResearchStream(
-      { topic: "Agent Eval" },
+      { topic: "Agent Eval", output_format: "engineering-rfc" },
       (ev) => events.push(ev.type),
       { onEventId: (id) => ids.push(id) }
     );

@@ -2,7 +2,7 @@
 pack_id: tech-selection
 schema_version: 1
 version: 1
-content_hash: "336a20070f1a08dc"
+content_hash: "84cd11f7d879ead0"
 maturity: draft
 status: active
 supersedes: ""
@@ -35,6 +35,35 @@ quality_gates:
 budget_knobs:
   task_react_max_rounds: 3
 layout: {}
+retrieval_profile:
+  preferred_backends:
+    - tavily
+    - duckduckgo
+    - semanticscholar
+  backend_weights:
+    tavily: 1.15
+    semanticscholar: 1.05
+    duckduckgo: 0.90
+  authoritative_hosts:
+    - github.com
+    - docs.python.org
+    - kubernetes.io
+    - postgresql.org
+    - arxiv.org
+    - ietf.org
+  deprioritized_hosts:
+    - csdn.net
+    - jianshu.com
+    - baidu.com
+  prior_boost: 0.045
+  prior_penalty: -0.025
+verifiers:
+  - numeric-audit
+  - comparison-matrix
+composable_with:
+  - policy-analysis
+  - financial-research
+  - competitor-scan
 derived_from: ""
 eval: {}
 owner: research-team

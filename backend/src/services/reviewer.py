@@ -17,6 +17,7 @@ from models import SummaryState, TodoItem
 from prompts import get_current_date
 from services.evidence import extract_citation_ids, format_evidence_sources
 from services.evidence_index import EvidenceRetrievalService
+from services.skill_verifiers import run_skill_verifiers
 from services.text_processing import (
     looks_like_meta_reasoning,
     normalize_agent_markdown,
@@ -135,10 +136,33 @@ class ReviewService:
         *,
         observer: RequestTrace | None = None,
         skill_pack_context: str | None = None,
+        active_verifiers: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """Review task summaries and evidence before final report generation."""
 
         issues, claims_by_task = self._rule_based_review(state)
+        resolved_verifiers = (
+            list(active_verifiers)
+            if active_verifiers is not None
+            else list(getattr(self._config, "active_skill_verifiers", []) or [])
+        )
+        verifier_issue_dicts, executed_verifiers = run_skill_verifiers(
+            state,
+            self._config,
+            resolved_verifiers,
+        )
+        verifier_issues = [
+            ReviewIssue(
+                task_id=item.get("task_id"),
+                severity=str(item.get("severity") or "medium"),
+                check=str(item.get("check") or "skill_verifier"),
+                message=str(item.get("message") or ""),
+                source_ids=list(item.get("source_ids") or []),
+                origin=str(item.get("origin") or "skill_verifier"),
+            )
+            for item in verifier_issue_dicts
+        ]
+        issues.extend(verifier_issues)
         llm_summary: dict[str, Any] = {}
 
         if self._config.review_agent_enabled and self._agent is not None:
@@ -171,6 +195,8 @@ class ReviewService:
             issues=issues,
             claims_by_task=claims_by_task,
             llm_summary=llm_summary,
+            executed_verifiers=executed_verifiers,
+            verifier_issue_count=len(verifier_issues),
         )
         return summary
 
@@ -659,7 +685,16 @@ class ReviewService:
         normalized = str(check or "").strip().lower()
         if normalized in {"missing_angle", "weak_evidence", "stale_evidence", "invalid_citation"}:
             return normalized
-        if normalized in {"low_source_diversity", "low_quality_mix", "missing_citation", "claim_evidence_mismatch"}:
+        if normalized == "timeline_inconsistency":
+            return "stale_evidence"
+        if normalized in {
+            "low_source_diversity",
+            "low_quality_mix",
+            "missing_citation",
+            "claim_evidence_mismatch",
+            "numeric_audit_mismatch",
+            "comparison_asymmetry",
+        }:
             return "weak_evidence"
         return None
 
@@ -697,6 +732,8 @@ class ReviewService:
         issues: list[ReviewIssue],
         claims_by_task: dict[int, list[dict[str, Any]]],
         llm_summary: dict[str, Any],
+        executed_verifiers: list[str] | None = None,
+        verifier_issue_count: int = 0,
     ) -> dict[str, Any]:
         issues_by_task: dict[int, list[dict[str, Any]]] = {}
         severity_counts = {"high": 0, "medium": 0, "low": 0}
@@ -748,6 +785,8 @@ class ReviewService:
             "severity_counts": severity_counts,
             "issues": [issue.to_dict() for issue in issues],
             "repair_candidates": self._build_repair_candidates(issues),
+            "verifiers_executed": list(executed_verifiers or []),
+            "verifier_issue_count": int(verifier_issue_count or 0),
         }
         state.review_summary = summary
         state.review_completed = True

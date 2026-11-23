@@ -1,6 +1,30 @@
 export interface ResearchRequest {
   topic: string;
   search_api?: string;
+  output_format?: string;
+}
+
+export interface SkillsCatalogResponse {
+  enabled: boolean;
+  domain_packs: Array<{
+    pack_id: string;
+    title: string;
+    topic_domain: string;
+    applicable_when: string;
+    verifiers: string[];
+    composable_with: string[];
+    version: number;
+    status: string;
+  }>;
+  format_packs: Array<{
+    pack_id: string;
+    title: string;
+    applicable_when: string;
+    outline_sections: string[];
+    version: number;
+    status: string;
+  }>;
+  registered_verifiers: string[];
 }
 
 export interface ResumeRequest {

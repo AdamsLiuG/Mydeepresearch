@@ -2,7 +2,7 @@
 pack_id: competitor-scan
 schema_version: 1
 version: 1
-content_hash: "a8cbf634f17ce449"
+content_hash: "d1964de9f5ad21c4"
 maturity: draft
 status: active
 supersedes: ""
@@ -34,6 +34,34 @@ quality_gates:
   review_min_domains_per_task: 2
 budget_knobs: {}
 layout: {}
+retrieval_profile:
+  preferred_backends:
+    - tavily
+    - serpapi
+    - duckduckgo
+  backend_weights:
+    tavily: 1.15
+    serpapi: 1.05
+    duckduckgo: 0.90
+  authoritative_hosts:
+    - techcrunch.com
+    - bloomberg.com
+    - reuters.com
+    - gartner.com
+    - github.com
+  deprioritized_hosts:
+    - csdn.net
+    - jianshu.com
+    - sohu.com
+  prior_boost: 0.04
+  prior_penalty: -0.025
+verifiers:
+  - numeric-audit
+  - comparison-matrix
+composable_with:
+  - financial-research
+  - tech-selection
+  - policy-analysis
 derived_from: ""
 eval: {}
 owner: research-team

@@ -12,17 +12,47 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from services.skill_verifiers import REGISTERED_VERIFIER_IDS
+
 logger = logging.getLogger(__name__)
 
 NEUTRAL_PACK_ID = "_neutral"
 CURRENT_SCHEMA_VERSION = 1
 MAX_ACTIVE_PACKS = 9
+
+SKILL_KIND_DOMAIN = "domain"
+SKILL_KIND_FORMAT = "format"
+SKILL_KINDS = {SKILL_KIND_DOMAIN, SKILL_KIND_FORMAT}
+
+ALLOWED_RETRIEVAL_BACKENDS = {
+    "searxng",
+    "tavily",
+    "serpapi",
+    "duckduckgo",
+    "perplexity",
+    "semanticscholar",
+}
+RETRIEVAL_PROFILE_KEYS = {
+    "preferred_backends",
+    "backend_weights",
+    "authoritative_hosts",
+    "deprioritized_hosts",
+    "prior_boost",
+    "prior_penalty",
+}
+_HOST_HINT_PATTERN = re.compile(
+    r"^\.?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)*$"
+)
+_IP_HINT_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_FORBIDDEN_HOST_TOKENS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", ".local", ".internal"}
 
 # The skill stage vocabulary is defined here on purpose, independent of the RequestTrace stage
 # literals. Report-repair reuses ``stage="reflection"`` in the trace, but a skill fragment for
@@ -114,10 +144,19 @@ class SkillPack:
     content_hash: str = ""
     pinned_content_hash: str = ""
     source_path: str = ""
+    skill_kind: str = SKILL_KIND_DOMAIN
+    retrieval_profile: dict[str, Any] = field(default_factory=dict)
+    verifiers: list[str] = field(default_factory=list)
+    composable_with: list[str] = field(default_factory=list)
+    outline_sections: list[str] = field(default_factory=list)
 
     @property
     def is_neutral(self) -> bool:
         return self.pack_id == NEUTRAL_PACK_ID
+
+    @property
+    def is_format(self) -> bool:
+        return self.skill_kind == SKILL_KIND_FORMAT
 
     def fragment_for(self, stage: str) -> str:
         return str(self.body_sections.get(stage, "")).strip()
@@ -125,12 +164,17 @@ class SkillPack:
 
 @dataclass
 class SkillSelection:
-    """Outcome of selecting a pack for one request."""
+    """Outcome of selecting a pack bundle for one request."""
 
     pack: SkillPack
     match_score: float
     fallback_reason: str = ""
     shadow: bool = False
+    secondary_pack: SkillPack | None = None
+    secondary_match_score: float = 0.0
+    format_pack: SkillPack | None = None
+    routing_method: str = "lexical"
+    active_verifiers: list[str] = field(default_factory=list)
 
     @property
     def is_fallback(self) -> bool:
@@ -226,6 +270,16 @@ def compute_content_hash(pack: SkillPack) -> str:
         "layout": pack.layout,
         "body_sections": {key: pack.body_sections[key] for key in sorted(pack.body_sections)},
     }
+    if pack.skill_kind != SKILL_KIND_DOMAIN:
+        canonical["skill_kind"] = pack.skill_kind
+    if pack.retrieval_profile:
+        canonical["retrieval_profile"] = pack.retrieval_profile
+    if pack.verifiers:
+        canonical["verifiers"] = sorted(pack.verifiers)
+    if pack.composable_with:
+        canonical["composable_with"] = sorted(pack.composable_with)
+    if pack.outline_sections:
+        canonical["outline_sections"] = list(pack.outline_sections)
     serialised = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(serialised.encode("utf-8")).hexdigest()[:16]
 
@@ -275,6 +329,11 @@ def load_pack(path: Path) -> SkillPack:
         eval_meta=_as_dict(frontmatter.get("eval")),
         pinned_content_hash=str(frontmatter.get("content_hash") or "").strip(),
         source_path=str(path),
+        skill_kind=str(frontmatter.get("skill_kind") or SKILL_KIND_DOMAIN).strip().lower(),
+        retrieval_profile=_as_dict(frontmatter.get("retrieval_profile")),
+        verifiers=_as_list(frontmatter.get("verifiers")),
+        composable_with=_as_list(frontmatter.get("composable_with")),
+        outline_sections=_as_list(frontmatter.get("outline_sections")),
     )
     pack.content_hash = compute_content_hash(pack)
     return pack
@@ -313,6 +372,8 @@ def validate_pack(
         errors.append(f"status '{pack.status}' is not one of {sorted(_STATUS_VALUES)}")
     if pack.maturity not in _MATURITY_VALUES:
         errors.append(f"maturity '{pack.maturity}' is not one of {sorted(_MATURITY_VALUES)}")
+    if pack.skill_kind not in SKILL_KINDS:
+        errors.append(f"skill_kind '{pack.skill_kind}' is not one of {sorted(SKILL_KINDS)}")
 
     # --- structure ---
     unknown_stages = [stage for stage in pack.stage_scope if stage not in SKILL_STAGES]
@@ -323,6 +384,8 @@ def validate_pack(
             "body sections "
             f"{sorted(pack.body_sections)} must equal stage_scope {sorted(pack.stage_scope)}"
         )
+    if pack.is_format and (not pack.stage_scope or set(pack.stage_scope) != {STAGE_REPORT}):
+        errors.append("format skill pack stage_scope must equal ['report']")
     for stage, fragment in pack.body_sections.items():
         if len(fragment) > char_limit:
             errors.append(f"stage '{stage}' fragment exceeds char limit {char_limit}")
@@ -330,6 +393,9 @@ def validate_pack(
     # --- safety ---
     errors.extend(_validate_quality_gates(pack))
     errors.extend(_validate_budget_and_layout(pack))
+    errors.extend(_validate_retrieval_profile(pack))
+    errors.extend(_validate_verifiers(pack))
+    errors.extend(_validate_composable_with(pack))
     for stage, fragment in pack.body_sections.items():
         errors.extend(_validate_fragment_safety(stage, fragment))
 
@@ -338,10 +404,21 @@ def validate_pack(
     if overlap:
         errors.append(f"match_signals and negative_signals overlap: {overlap}")
     if is_neutral:
-        if pack.quality_gates or pack.budget_knobs or pack.layout:
+        if (
+            pack.quality_gates
+            or pack.budget_knobs
+            or pack.layout
+            or pack.retrieval_profile
+            or pack.verifiers
+            or pack.composable_with
+        ):
             errors.append("neutral pack must not override any knobs")
         if pack.match_signals:
             errors.append("neutral pack must not declare match_signals")
+    if pack.is_format and (
+        pack.quality_gates or pack.budget_knobs or pack.retrieval_profile or pack.verifiers or pack.composable_with
+    ):
+        errors.append("format skill pack must not declare domain quality/budget/retrieval/verifier knobs")
     if pack.maturity == MATURITY_PROMOTED and _as_dict(pack.eval_meta).get("verdict") != "pass":
         errors.append("promoted pack requires an eval with verdict=pass")
 
@@ -364,6 +441,122 @@ def _validate_budget_and_layout(pack: SkillPack) -> list[str]:
     for key in pack.layout:
         if key not in LAYOUT_KNOBS:
             errors.append(f"layout key '{key}' is not in the override whitelist")
+    return errors
+
+
+def _validate_host_hint_list(hosts: Any, field_name: str) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    normalized: list[str] = []
+    if not isinstance(hosts, list):
+        return [f"retrieval_profile.{field_name} must be a list"], normalized
+    for raw in hosts:
+        host = str(raw or "").strip().lower()
+        if not host:
+            continue
+        if (
+            "://" in host
+            or "/" in host
+            or ":" in host
+            or _IP_HINT_PATTERN.match(host.lstrip("."))
+            or any(bad in host for bad in _FORBIDDEN_HOST_TOKENS)
+            or not _HOST_HINT_PATTERN.match(host)
+        ):
+            errors.append(f"retrieval_profile.{field_name} contains unsafe/invalid host hint {raw!r}")
+            continue
+        normalized.append(host)
+    return errors, normalized
+
+
+def _validate_retrieval_profile(pack: SkillPack) -> list[str]:
+    profile = pack.retrieval_profile
+    if not profile:
+        return []
+    errors: list[str] = []
+    for key in profile:
+        if key not in RETRIEVAL_PROFILE_KEYS:
+            errors.append(f"retrieval_profile key '{key}' is not in the override whitelist")
+
+    if "preferred_backends" in profile:
+        pref = profile["preferred_backends"]
+        if not isinstance(pref, list) or not pref:
+            errors.append("retrieval_profile.preferred_backends must be a non-empty list")
+        else:
+            for backend in pref:
+                b = str(backend or "").strip().lower()
+                if b not in ALLOWED_RETRIEVAL_BACKENDS:
+                    errors.append(f"retrieval_profile.preferred_backends has unsupported backend {backend!r}")
+
+    if "backend_weights" in profile:
+        weights = profile["backend_weights"]
+        if not isinstance(weights, dict):
+            errors.append("retrieval_profile.backend_weights must be a mapping")
+        else:
+            for backend, weight in weights.items():
+                b = str(backend or "").strip().lower()
+                if b not in ALLOWED_RETRIEVAL_BACKENDS:
+                    errors.append(f"retrieval_profile.backend_weights has unsupported backend {backend!r}")
+                    continue
+                try:
+                    w = float(weight)
+                except (TypeError, ValueError):
+                    errors.append(f"retrieval_profile.backend_weights[{backend!r}] must be numeric")
+                    continue
+                if not (0.2 <= w <= 2.0):
+                    errors.append(f"retrieval_profile.backend_weights[{backend!r}] must be in [0.2, 2.0]")
+
+    auth_hosts: list[str] = []
+    dep_hosts: list[str] = []
+    if "authoritative_hosts" in profile:
+        host_errs, auth_hosts = _validate_host_hint_list(profile["authoritative_hosts"], "authoritative_hosts")
+        errors.extend(host_errs)
+    if "deprioritized_hosts" in profile:
+        host_errs, dep_hosts = _validate_host_hint_list(profile["deprioritized_hosts"], "deprioritized_hosts")
+        errors.extend(host_errs)
+    overlap = sorted(set(auth_hosts) & set(dep_hosts))
+    if overlap:
+        errors.append(f"retrieval_profile authoritative/deprioritized hosts overlap: {overlap}")
+
+    if "prior_boost" in profile:
+        try:
+            boost = float(profile["prior_boost"])
+            if not (0.0 <= boost <= 0.08):
+                errors.append("retrieval_profile.prior_boost must be in [0.0, 0.08]")
+        except (TypeError, ValueError):
+            errors.append("retrieval_profile.prior_boost must be numeric")
+    if "prior_penalty" in profile:
+        try:
+            penalty = float(profile["prior_penalty"])
+            if not (-0.08 <= penalty <= 0.0):
+                errors.append("retrieval_profile.prior_penalty must be in [-0.08, 0.0]")
+        except (TypeError, ValueError):
+            errors.append("retrieval_profile.prior_penalty must be numeric")
+    return errors
+
+
+def _validate_verifiers(pack: SkillPack) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+    for verifier_id in pack.verifiers:
+        vid = str(verifier_id or "").strip().lower()
+        if vid not in REGISTERED_VERIFIER_IDS:
+            errors.append(f"verifiers contains unknown id '{verifier_id}'")
+            continue
+        if vid in seen:
+            errors.append(f"verifiers contains duplicate id '{vid}'")
+        seen.add(vid)
+    return errors
+
+
+def _validate_composable_with(pack: SkillPack) -> list[str]:
+    errors: list[str] = []
+    for target in pack.composable_with:
+        tid = str(target or "").strip()
+        if tid == pack.pack_id:
+            errors.append("composable_with must not reference pack itself")
+        elif tid == NEUTRAL_PACK_ID:
+            errors.append("composable_with must not reference '_neutral'")
+        elif not _PACK_ID_PATTERN.match(tid):
+            errors.append(f"composable_with entry '{tid}' must be kebab-case")
     return errors
 
 
@@ -398,54 +591,102 @@ def enforce_quality_gate_direction(field_name: str, baseline: Any, override: Any
     return override_value <= baseline_value
 
 
+def _merge_verifier_ids(*pack_lists: SkillPack | None) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for pack in pack_lists:
+        if pack is None or getattr(pack, "status", STATUS_ACTIVE) == STATUS_SHADOW:
+            continue
+        for vid in getattr(pack, "verifiers", []) or ():
+            normalized = str(vid or "").strip().lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                merged.append(normalized)
+    return merged
+
+
 def apply_skill_pack_overrides(
     base_config: Any,
     pack: SkillPack,
+    *,
+    secondary_pack: SkillPack | None = None,
+    format_pack: SkillPack | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Apply whitelisted pack overrides to a request-scoped config copy.
 
     Quality gates are strictly tightening-only (verified via ``enforce_quality_gate_direction``)
-    so a pack can never weaken review/freshness bars.
+    so a pack (or secondary constraint pack) can never weaken review/freshness bars.
     """
 
-    if pack.is_neutral or base_config is None:
+    if base_config is None:
         return base_config, {}
 
     updates: dict[str, Any] = {}
+    knob_updates: dict[str, Any] = {}
 
-    for key, value in (pack.quality_gates or {}).items():
-        if key not in QUALITY_GATE_DIRECTIONS or not hasattr(base_config, key):
-            continue
-        baseline = getattr(base_config, key)
-        if not enforce_quality_gate_direction(key, baseline, value):
-            logger.warning(
-                "skill pack '%s' quality_gate override rejected (loosens baseline): %s=%r (baseline=%r)",
-                pack.pack_id,
-                key,
-                value,
-                baseline,
-            )
-            continue
-        updates[key] = value
+    if not pack.is_neutral:
+        source_packs = [pack]
+        if (
+            secondary_pack is not None
+            and not secondary_pack.is_neutral
+            and secondary_pack.status != STATUS_SHADOW
+        ):
+            source_packs.append(secondary_pack)
 
-    for key, value in (pack.budget_knobs or {}).items():
-        if key not in BUDGET_KNOBS or not hasattr(base_config, key):
-            continue
-        updates[key] = value
+        for current_pack in source_packs:
+            for key, value in (current_pack.quality_gates or {}).items():
+                if key not in QUALITY_GATE_DIRECTIONS or not hasattr(base_config, key):
+                    continue
+                current_baseline = knob_updates.get(key, getattr(base_config, key))
+                if not enforce_quality_gate_direction(key, current_baseline, value):
+                    if current_pack is pack:
+                        logger.warning(
+                            "skill pack '%s' quality_gate override rejected (loosens baseline): %s=%r (baseline=%r)",
+                            current_pack.pack_id,
+                            key,
+                            value,
+                            current_baseline,
+                        )
+                    continue
+                knob_updates[key] = value
+                updates[key] = value
 
-    for key, value in (pack.layout or {}).items():
-        if key not in LAYOUT_KNOBS or not hasattr(base_config, key):
-            continue
-        if key == "search_api" and isinstance(value, str):
-            try:
-                from config import SearchAPI
-
-                updates[key] = SearchAPI(value.strip().lower())
-            except Exception:
-                logger.warning("skill pack '%s' invalid search_api layout override: %r", pack.pack_id, value)
+        for key, value in (pack.budget_knobs or {}).items():
+            if key not in BUDGET_KNOBS or not hasattr(base_config, key):
                 continue
-        else:
+            knob_updates[key] = value
             updates[key] = value
+
+        for key, value in (pack.layout or {}).items():
+            if key not in LAYOUT_KNOBS or not hasattr(base_config, key):
+                continue
+            if key == "search_api" and isinstance(value, str):
+                try:
+                    from config import SearchAPI
+
+                    resolved_api = SearchAPI(value.strip().lower())
+                    knob_updates[key] = resolved_api
+                    updates[key] = resolved_api
+                except Exception:
+                    logger.warning("skill pack '%s' invalid search_api layout override: %r", pack.pack_id, value)
+                    continue
+            else:
+                knob_updates[key] = value
+                updates[key] = value
+
+        if pack.retrieval_profile and hasattr(base_config, "active_retrieval_profile"):
+            updates["active_retrieval_profile"] = deepcopy(pack.retrieval_profile)
+
+        merged_verifiers = _merge_verifier_ids(pack, secondary_pack)
+        if merged_verifiers and hasattr(base_config, "active_skill_verifiers"):
+            updates["active_skill_verifiers"] = merged_verifiers
+
+    if (
+        format_pack is not None
+        and format_pack.status != STATUS_SHADOW
+        and hasattr(base_config, "active_output_format_id")
+    ):
+        updates["active_output_format_id"] = format_pack.pack_id
 
     if not updates:
         return base_config, {}
@@ -458,18 +699,38 @@ def apply_skill_pack_overrides(
 
     applied_summary = {
         key: (val.value if hasattr(val, "value") else val)
-        for key, val in updates.items()
+        for key, val in knob_updates.items()
     }
     return updated_config, applied_summary
+
+
+def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = sum(a * a for a in vec_a) ** 0.5
+    norm_b = sum(b * b for b in vec_b) ** 0.5
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
 
 
 class SkillPackService:
     """Load, validate and select research skill packs from the configured directory."""
 
-    def __init__(self, config: Any) -> None:
+    def __init__(
+        self,
+        config: Any,
+        *,
+        llm_router: Callable[[str, list[dict[str, Any]]], dict[str, Any] | None] | None = None,
+    ) -> None:
         self._config = config
         self._packs_dir = Path(getattr(config, "skill_pack_dir", "./skills/research"))
+        self._formats_dir = Path(getattr(config, "skill_format_dir", "./skills/formats"))
         self._packs: dict[str, SkillPack] | None = None
+        self._formats: dict[str, SkillPack] | None = None
+        self._llm_router = llm_router
+        self._semantic_pack_vectors: dict[tuple[str, str], list[float]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -483,13 +744,31 @@ class SkillPackService:
     def global_min_match_score(self) -> float:
         return float(getattr(self._config, "skill_pack_min_match_score", 0.30) or 0.0)
 
-    def _load_all(self) -> dict[str, SkillPack]:
-        if self._packs is not None:
-            return self._packs
+    @property
+    def composable_enabled(self) -> bool:
+        return bool(getattr(self._config, "skill_pack_composable_enabled", True))
 
+    @property
+    def secondary_min_match_score(self) -> float:
+        return float(getattr(self._config, "skill_pack_secondary_min_match_score", 0.50) or 0.50)
+
+    @property
+    def semantic_routing_enabled(self) -> bool:
+        return bool(getattr(self._config, "skill_pack_semantic_routing_enabled", False))
+
+    @property
+    def llm_router_enabled(self) -> bool:
+        return bool(getattr(self._config, "skill_pack_llm_router_enabled", False))
+
+    def _load_directory_packs(
+        self,
+        directory: Path,
+        *,
+        expected_kind: str | None = None,
+    ) -> dict[str, SkillPack]:
         packs: dict[str, SkillPack] = {}
-        if self._packs_dir.is_dir():
-            for entry in sorted(self._packs_dir.iterdir()):
+        if directory.is_dir():
+            for entry in sorted(directory.iterdir()):
                 if not entry.is_dir():
                     continue
                 skill_file = entry / "SKILL.md"
@@ -497,6 +776,14 @@ class SkillPackService:
                     continue
                 try:
                     pack = load_pack(skill_file)
+                    if expected_kind is not None and pack.skill_kind != expected_kind:
+                        logger.warning(
+                            "skill pack kind mismatch dir=%s expected=%s got=%s",
+                            entry.name,
+                            expected_kind,
+                            pack.skill_kind,
+                        )
+                        continue
                     errors = validate_pack(
                         pack,
                         char_limit=self.char_limit,
@@ -511,18 +798,174 @@ class SkillPackService:
                 if pack.status == STATUS_DISABLED:
                     continue
                 packs[pack.pack_id] = pack
-        self._packs = packs
         return packs
+
+    def _load_all(self) -> dict[str, SkillPack]:
+        if self._packs is not None:
+            return self._packs
+        self._packs = self._load_directory_packs(self._packs_dir)
+        return self._packs
+
+    def _load_formats(self) -> dict[str, SkillPack]:
+        if self._formats is not None:
+            return self._formats
+        self._formats = self._load_directory_packs(
+            self._formats_dir,
+            expected_kind=SKILL_KIND_FORMAT,
+        )
+        return self._formats
 
     def neutral_pack(self) -> SkillPack | None:
         return self._load_all().get(NEUTRAL_PACK_ID)
 
-    def select(self, topic: str, *, signals: list[str] | None = None) -> SkillSelection | None:
-        """Choose exactly one pack for a request, always resolving to a concrete pack or None.
+    def select_format(
+        self,
+        topic: str,
+        *,
+        signals: list[str] | None = None,
+        output_format: str | None = None,
+    ) -> SkillPack | None:
+        formats = self._load_formats()
+        if not formats:
+            return None
 
-        Returns None only when the neutral fallback pack itself is missing/invalid, which the
-        caller treats as "skill packs unavailable" and proceeds with built-in prompts.
-        """
+        requested = str(
+            output_format
+            or getattr(self._config, "default_output_format", "")
+            or ""
+        ).strip().lower()
+        if requested:
+            return formats.get(requested)
+
+        haystack = " ".join(
+            part.lower()
+            for part in [topic or "", " ".join(signals or [])]
+            if part and part.strip()
+        )
+        best: SkillPack | None = None
+        best_score = 0.0
+        for pack in formats.values():
+            score, disqualified = self._score(pack, haystack)
+            if disqualified:
+                continue
+            threshold = max(pack.min_match_score, self.global_min_match_score)
+            if score >= threshold and score > best_score:
+                best = pack
+                best_score = score
+        return best
+
+    def _select_secondary(
+        self,
+        primary: SkillPack,
+        packs: dict[str, SkillPack],
+        haystack: str,
+    ) -> tuple[SkillPack | None, float]:
+        if (
+            not self.composable_enabled
+            or primary.is_neutral
+            or primary.status == STATUS_SHADOW
+            or not primary.composable_with
+        ):
+            return None, 0.0
+
+        best_sec: SkillPack | None = None
+        best_score = 0.0
+        threshold = max(0.0, self.secondary_min_match_score)
+        for target_id in primary.composable_with:
+            candidate = packs.get(target_id)
+            if (
+                candidate is None
+                or candidate.is_neutral
+                or candidate.status == STATUS_SHADOW
+                or candidate.pack_id == primary.pack_id
+            ):
+                continue
+            score = self._positive_signal_score(candidate, haystack)
+            if score >= threshold and score > best_score:
+                best_sec = candidate
+                best_score = score
+        return best_sec, round(best_score, 4) if best_sec is not None else 0.0
+
+    def _semantic_fallback_select(
+        self,
+        topic: str,
+        candidates: list[SkillPack],
+    ) -> tuple[SkillPack | None, float]:
+        if not candidates or not str(topic or "").strip():
+            return None, 0.0
+        try:
+            from services.embeddings import encode_text
+        except Exception:
+            return None, 0.0
+
+        topic_vec = encode_text(topic)
+        if not topic_vec:
+            return None, 0.0
+
+        best: SkillPack | None = None
+        best_score = 0.0
+        for pack in candidates:
+            cache_key = (pack.pack_id, pack.content_hash)
+            pack_vec = self._semantic_pack_vectors.get(cache_key)
+            if pack_vec is None:
+                descriptor = " ".join(
+                    part for part in (pack.title, pack.applicable_when, " ".join(pack.match_signals)) if part
+                ).strip()
+                if not descriptor:
+                    continue
+                pack_vec = encode_text(descriptor) or []
+                self._semantic_pack_vectors[cache_key] = pack_vec
+            if not pack_vec:
+                continue
+            score = round(0.75 * _cosine_similarity(topic_vec, pack_vec), 4)
+            threshold = max(pack.min_match_score, self.global_min_match_score)
+            if score >= threshold and score > best_score:
+                best = pack
+                best_score = score
+        return best, best_score
+
+    def _llm_tiebreak_select(
+        self,
+        topic: str,
+        candidates: list[SkillPack],
+    ) -> tuple[SkillPack | None, float]:
+        if self._llm_router is None or not candidates:
+            return None, 0.0
+        candidate_meta = [
+            {
+                "pack_id": pack.pack_id,
+                "title": pack.title,
+                "applicable_when": pack.applicable_when,
+            }
+            for pack in candidates
+        ]
+        try:
+            decision = self._llm_router(topic, candidate_meta)
+        except Exception as exc:
+            logger.warning("skill pack LLM router failed: %s", exc)
+            return None, 0.0
+        if not isinstance(decision, dict):
+            return None, 0.0
+        chosen_id = str(decision.get("pack_id") or "").strip()
+        by_id = {pack.pack_id: pack for pack in candidates}
+        chosen = by_id.get(chosen_id)
+        if chosen is None:
+            return None, 0.0
+        raw_conf = decision.get("confidence", chosen.min_match_score or self.global_min_match_score)
+        try:
+            score = round(max(0.0, min(1.0, float(raw_conf))), 4)
+        except (TypeError, ValueError):
+            score = round(max(chosen.min_match_score, self.global_min_match_score), 4)
+        return chosen, score
+
+    def select(
+        self,
+        topic: str,
+        *,
+        signals: list[str] | None = None,
+        output_format: str | None = None,
+    ) -> SkillSelection | None:
+        """Choose domain pack bundle (+ optional secondary & format pack) for one request."""
 
         packs = self._load_all()
         neutral = packs.get(NEUTRAL_PACK_ID)
@@ -534,22 +977,74 @@ class SkillPackService:
 
         best: SkillPack | None = None
         best_score = 0.0
+        best_hits = 0
+        non_disqualified: list[tuple[SkillPack, float]] = []
+        eligible_packs: list[SkillPack] = []
+
         for pack in packs.values():
-            if pack.is_neutral:
+            if pack.is_neutral or pack.is_format:
                 continue
             score, disqualified = self._score(pack, haystack)
             if disqualified:
                 continue
+            hits = self._positive_hit_count(pack, haystack)
+            eligible_packs.append(pack)
+            non_disqualified.append((pack, score))
             threshold = max(pack.min_match_score, self.global_min_match_score)
-            if score >= threshold and score > best_score:
+            if score >= threshold and (score, hits) > (best_score, best_hits):
                 best = pack
                 best_score = score
+                best_hits = hits
+
+        routing_method = "lexical"
+        format_pack = self.select_format(topic, signals=signals, output_format=output_format)
+
+        if (
+            best is not None
+            and self.llm_router_enabled
+            and self._llm_router is not None
+            and len(non_disqualified) >= 2
+        ):
+            sorted_candidates = sorted(non_disqualified, key=lambda item: item[1], reverse=True)
+            top_pack, top_score = sorted_candidates[0]
+            runner_up_pack, runner_up_score = sorted_candidates[1]
+            runner_threshold = max(runner_up_pack.min_match_score, self.global_min_match_score)
+            if runner_up_score >= runner_threshold and (top_score - runner_up_score) < 0.05:
+                chosen, chosen_score = self._llm_tiebreak_select(
+                    topic,
+                    [top_pack, runner_up_pack],
+                )
+                if chosen is not None:
+                    best = chosen
+                    best_score = chosen_score
+                    routing_method = "llm_tiebreak"
+
+        if best is None and self.semantic_routing_enabled:
+            sem_pack, sem_score = self._semantic_fallback_select(topic, eligible_packs)
+            if sem_pack is not None:
+                best = sem_pack
+                best_score = sem_score
+                routing_method = "hybrid_semantic"
+
+        if best is None and self.llm_router_enabled and self._llm_router is not None:
+            llm_pack, llm_score = self._llm_tiebreak_select(topic, eligible_packs)
+            if llm_pack is not None:
+                best = llm_pack
+                best_score = llm_score
+                routing_method = "llm_tiebreak"
 
         if best is not None:
+            secondary_pack, secondary_score = self._select_secondary(best, packs, haystack)
+            active_verifiers = _merge_verifier_ids(best, secondary_pack) if best.status != STATUS_SHADOW else []
             return SkillSelection(
                 pack=best,
                 match_score=round(best_score, 4),
                 shadow=best.status == STATUS_SHADOW,
+                secondary_pack=secondary_pack,
+                secondary_match_score=secondary_score,
+                format_pack=format_pack,
+                routing_method=routing_method,
+                active_verifiers=active_verifiers,
             )
 
         if neutral is None:
@@ -559,18 +1054,29 @@ class SkillPackService:
             match_score=0.0,
             fallback_reason="no_pack_met_min_match_score",
             shadow=neutral.status == STATUS_SHADOW,
+            format_pack=format_pack,
+            routing_method=routing_method,
+            active_verifiers=[],
         )
+
+    def _positive_hit_count(self, pack: SkillPack, haystack: str) -> int:
+        if not pack.match_signals:
+            return 0
+        return sum(1 for sig in pack.match_signals if sig.lower() in haystack)
+
+    def _positive_signal_score(self, pack: SkillPack, haystack: str) -> float:
+        if not pack.match_signals:
+            return 0.0
+        hits = self._positive_hit_count(pack, haystack)
+        saturation_denom = min(max(1, len(pack.match_signals)), 3)
+        return min(1.0, hits / saturation_denom)
 
     def _score(self, pack: SkillPack, haystack: str) -> tuple[float, bool]:
         if not pack.match_signals:
             return 0.0, False
         if any(sig.lower() in haystack for sig in pack.negative_signals):
             return 0.0, True
-        hits = sum(1 for sig in pack.match_signals if sig.lower() in haystack)
-        # Saturated denominator (cap at 3 signals) prevents long signal lists from
-        # penalizing clear domain queries while still keeping 0-hit topics at 0.0.
-        saturation_denom = min(max(1, len(pack.match_signals)), 3)
-        lexical_score = min(1.0, hits / saturation_denom)
+        lexical_score = self._positive_signal_score(pack, haystack)
         if lexical_score > 0.0:
             return lexical_score, False
         return 0.0, False
@@ -588,3 +1094,71 @@ class SkillPackService:
             f"{fragment}\n"
             "</RESEARCH_SKILL>\n"
         )
+
+    def render_secondary_block(self, pack: SkillPack | None, stage: str) -> str:
+        """Render a compact secondary constraint fragment for review/report stages only."""
+
+        if pack is None or pack.is_neutral or stage not in {STAGE_REVIEW, STAGE_REPORT}:
+            return ""
+        fragment = pack.fragment_for(stage)
+        if not fragment:
+            return ""
+        max_len = max(120, self.char_limit // 2)
+        if len(fragment) > max_len:
+            fragment = fragment[:max_len].rstrip()
+        return (
+            f'\n\n<SECONDARY_RESEARCH_SKILL pack="{pack.pack_id}" version="{pack.version}">\n'
+            "以下是补充的跨领域合规/约束检查要点，仅用于补充审核与呈现边界，"
+            "不是当前主题事实，不能作为 source_id 引用。\n"
+            f"{fragment}\n"
+            "</SECONDARY_RESEARCH_SKILL>\n"
+        )
+
+    def render_format_block(self, format_pack: SkillPack | None, stage: str) -> str:
+        """Render the orthogonal ``<OUTPUT_FORMAT_SKILL>`` block for the report stage only."""
+
+        if format_pack is None or stage != STAGE_REPORT:
+            return ""
+        fragment = format_pack.fragment_for(STAGE_REPORT)
+        if not fragment:
+            return ""
+        return (
+            f'\n\n<OUTPUT_FORMAT_SKILL format="{format_pack.pack_id}" version="{format_pack.version}">\n'
+            "以下是最终报告的交付形态与版式要求，请在严格保留全部事实引用规范的前提下遵照组织结构。\n"
+            f"{fragment}\n"
+            "</OUTPUT_FORMAT_SKILL>\n"
+        )
+
+    def list_catalog(self) -> dict[str, Any]:
+        """Return available domain packs, output format packs, and registered verifier IDs."""
+
+        domain_packs = [
+            {
+                "pack_id": pack.pack_id,
+                "title": pack.title,
+                "topic_domain": pack.topic_domain,
+                "applicable_when": pack.applicable_when,
+                "verifiers": list(pack.verifiers),
+                "composable_with": list(pack.composable_with),
+                "version": pack.version,
+                "status": pack.status,
+            }
+            for pack in self._load_all().values()
+        ]
+        format_packs = [
+            {
+                "pack_id": pack.pack_id,
+                "title": pack.title,
+                "applicable_when": pack.applicable_when,
+                "outline_sections": list(pack.outline_sections),
+                "version": pack.version,
+                "status": pack.status,
+            }
+            for pack in self._load_formats().values()
+        ]
+        return {
+            "enabled": self.enabled,
+            "domain_packs": domain_packs,
+            "format_packs": format_packs,
+            "registered_verifiers": list(REGISTERED_VERIFIER_IDS),
+        }

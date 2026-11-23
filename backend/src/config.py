@@ -230,6 +230,53 @@ class Configuration(BaseModel):
         title="Skill Pack Minimum Match Score",
         description="Global floor for pack selection; below this the neutral fallback pack is used",
     )
+    skill_format_dir: str = Field(
+        default="./skills/formats",
+        title="Skill Format Directory",
+        description="Directory holding orthogonal output format skill packs",
+    )
+    skill_pack_composable_enabled: bool = Field(
+        default=True,
+        title="Skill Pack Composable Enabled",
+        description="Allow composing 1 primary domain pack with 0..1 secondary constraint pack",
+    )
+    skill_pack_secondary_min_match_score: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        title="Skill Pack Secondary Minimum Match Score",
+        description="Minimum positive match score to attach a composable secondary constraint skill",
+    )
+    skill_pack_semantic_routing_enabled: bool = Field(
+        default=False,
+        title="Skill Pack Semantic Routing Enabled",
+        description="Enable embedding similarity fallback when lexical skill routing is below threshold",
+    )
+    skill_pack_llm_router_enabled: bool = Field(
+        default=False,
+        title="Skill Pack LLM Router Enabled",
+        description="Enable lightweight LLM tie-breaker routing when candidate skill packs tie closely",
+    )
+    default_output_format: str | None = Field(
+        default=None,
+        title="Default Output Format Skill",
+        description="Optional default output format skill id (e.g., exec-brief, engineering-rfc, deep-whitepaper)",
+    )
+    active_retrieval_profile: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Active Retrieval Profile",
+        description="Request-scoped retrieval overrides applied by the active skill pack",
+    )
+    active_skill_verifiers: list[str] = Field(
+        default_factory=list,
+        title="Active Skill Verifiers",
+        description="Request-scoped deterministic verifier ids enabled by active skill packs",
+    )
+    active_output_format_id: str | None = Field(
+        default=None,
+        title="Active Output Format Skill ID",
+        description="Request-scoped output format skill id bound during planning/reporting",
+    )
     note_memory_enabled: bool = Field(
         default=False,
         title="Note Memory Enabled",
@@ -1045,6 +1092,13 @@ class Configuration(BaseModel):
             if not pack_path.is_absolute():
                 pack_path = backend_root() / pack_path
             self.skill_pack_dir = str(pack_path.resolve(strict=False))
+
+        skill_format_dir = (self.skill_format_dir or "").strip()
+        if skill_format_dir:
+            format_path = Path(skill_format_dir).expanduser()
+            if not format_path.is_absolute():
+                format_path = backend_root() / format_path
+            self.skill_format_dir = str(format_path.resolve(strict=False))
         return self
 
     def resolved_max_total_tasks(self) -> int:
@@ -1141,6 +1195,12 @@ class Configuration(BaseModel):
             "skill_pack_dir": os.getenv("SKILL_PACK_DIR"),
             "skill_prompt_char_limit": os.getenv("SKILL_PROMPT_CHAR_LIMIT"),
             "skill_pack_min_match_score": os.getenv("SKILL_PACK_MIN_MATCH_SCORE"),
+            "skill_format_dir": os.getenv("SKILL_FORMAT_DIR"),
+            "skill_pack_composable_enabled": os.getenv("SKILL_PACK_COMPOSABLE_ENABLED"),
+            "skill_pack_secondary_min_match_score": os.getenv("SKILL_PACK_SECONDARY_MIN_MATCH_SCORE"),
+            "skill_pack_semantic_routing_enabled": os.getenv("SKILL_PACK_SEMANTIC_ROUTING_ENABLED"),
+            "skill_pack_llm_router_enabled": os.getenv("SKILL_PACK_LLM_ROUTER_ENABLED"),
+            "default_output_format": os.getenv("DEFAULT_OUTPUT_FORMAT"),
             "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
             "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
             "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),

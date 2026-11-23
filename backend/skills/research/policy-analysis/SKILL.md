@@ -2,7 +2,7 @@
 pack_id: policy-analysis
 schema_version: 1
 version: 1
-content_hash: "efaee0e97adb4458"
+content_hash: "8691e21d27a37aa2"
 maturity: draft
 status: active
 supersedes: ""
@@ -35,6 +35,35 @@ quality_gates:
   freshness_reference_days: 180
 budget_knobs: {}
 layout: {}
+retrieval_profile:
+  preferred_backends:
+    - tavily
+    - serpapi
+    - duckduckgo
+  backend_weights:
+    tavily: 1.15
+    serpapi: 1.05
+    duckduckgo: 0.85
+  authoritative_hosts:
+    - .gov
+    - gov.cn
+    - europa.eu
+    - nist.gov
+    - cac.gov.cn
+    - un.org
+  deprioritized_hosts:
+    - csdn.net
+    - jianshu.com
+    - quora.com
+    - reddit.com
+  prior_boost: 0.05
+  prior_penalty: -0.03
+verifiers:
+  - timeline-audit
+composable_with:
+  - financial-research
+  - tech-selection
+  - competitor-scan
 derived_from: ""
 eval: {}
 owner: research-team

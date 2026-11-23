@@ -72,6 +72,10 @@ class ResearchRequest(BaseModel):
         default=None,
         description="Override the default search backend configured via env",
     )
+    output_format: str | None = Field(
+        default=None,
+        description="Optional output format skill id (e.g., exec-brief, engineering-rfc, deep-whitepaper)",
+    )
 
 
 class ResumeRequest(BaseModel):
@@ -150,6 +154,8 @@ def _build_config(payload: ResearchRequest) -> Configuration:
 
     if payload.search_api is not None:
         overrides["search_api"] = payload.search_api
+    if getattr(payload, "output_format", None) is not None and str(payload.output_format).strip():
+        overrides["default_output_format"] = str(payload.output_format).strip().lower()
 
     return Configuration.from_env(overrides=overrides)
 
@@ -526,6 +532,11 @@ def create_app(
     async def metrics_json(request: Request) -> Dict[str, Any]:
         _resolve_tenant(request)
         return metrics_registry.snapshot()
+
+    @app.get("/skills")
+    async def list_skills_catalog(request: Request) -> Dict[str, Any]:
+        _resolve_tenant(request)
+        return SkillPackService(app.state.base_config).list_catalog()
 
     @app.post("/research", response_model=ResearchResponse)
     def run_research(payload: ResearchRequest, request: Request) -> ResearchResponse:

@@ -138,24 +138,37 @@ class ReportingService:
         state: SummaryState,
         observer: RequestTrace | None = None,
         skill_pack_context: str | None = None,
+        outline_sections: list[str] | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield progressive outline + validated report_chunk events while populating state.structured_report."""
 
-        outline_sections = [
-            self._CORE_SECTION_TITLES["background_overview"],
-            self._CORE_SECTION_TITLES["key_findings"],
-            self._CORE_SECTION_TITLES["evidence_and_data"],
-            *[
-                str(task.title).strip()
-                for task in state.todo_items
-                if str(task.title or "").strip()
-            ],
-            self._CORE_SECTION_TITLES["risks_and_challenges"],
-            self._CORE_SECTION_TITLES["references"],
+        task_titles = [
+            str(task.title).strip()
+            for task in state.todo_items
+            if str(task.title or "").strip()
         ]
+        if outline_sections:
+            raw_outline = [
+                *(str(sec).strip() for sec in outline_sections if str(sec or "").strip()),
+                *task_titles,
+                self._CORE_SECTION_TITLES["references"],
+            ]
+        else:
+            raw_outline = [
+                self._CORE_SECTION_TITLES["background_overview"],
+                self._CORE_SECTION_TITLES["key_findings"],
+                self._CORE_SECTION_TITLES["evidence_and_data"],
+                *task_titles,
+                self._CORE_SECTION_TITLES["risks_and_challenges"],
+                self._CORE_SECTION_TITLES["references"],
+            ]
+        resolved_outline: list[str] = []
+        for title in raw_outline:
+            if title and title not in resolved_outline:
+                resolved_outline.append(title)
         yield {
             "type": "report_outline",
-            "sections": outline_sections,
+            "sections": resolved_outline,
         }
 
         report = self.generate_report(

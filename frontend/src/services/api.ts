@@ -10,6 +10,7 @@ import type {
   ResearchTaskPlanItem,
   ResumeRequest,
   SectionDrilldownResponse,
+  SkillsCatalogResponse,
   StreamOptions
 } from "../types/research";
 
@@ -24,6 +25,7 @@ export type {
   ResearchTaskPlanItem,
   ResumeRequest,
   SectionDrilldownResponse,
+  SkillsCatalogResponse,
   StreamOptions
 } from "../types/research";
 
@@ -347,4 +349,19 @@ export async function replayRequestEvents(
     events?: ReplayEventItem[];
   };
   return Array.isArray(payload.events) ? payload.events : [];
+}
+
+export async function fetchSkillsCatalog(
+  options: StreamOptions = {}
+): Promise<SkillsCatalogResponse> {
+  const response = await fetch(`${baseURL}/skills`, {
+    method: "GET",
+    headers: buildHeaders({ Accept: "application/json" }, options),
+    signal: options.signal
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `获取 Skill 目录失败，状态码：${response.status}`);
+  }
+  return (await response.json()) as SkillsCatalogResponse;
 }

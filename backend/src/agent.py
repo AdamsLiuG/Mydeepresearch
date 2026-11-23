@@ -699,19 +699,18 @@ class DeepResearchAgent(
         observer: RequestTrace | None,
         *,
         state: SummaryState | None = None,
+        output_format: str | None = None,
     ) -> None:
-        """Pick exactly one research skill pack for this request, once, before planning.
-
-        Kept separate from the stage helpers so selection is a single, observable decision:
-        which pack (or neutral fallback) governs the whole request is recorded on the trace,
-        which is what lets eval reports stratify outcomes by pack.
-        """
+        """Pick research skill pack bundle (primary + secondary + output format) before planning."""
 
         self._skill_selection = None
         if not self._skill_pack.enabled:
             return
         try:
-            selection = self._skill_pack.select(topic or "")
+            selection = self._skill_pack.select(
+                topic or "",
+                output_format=output_format or getattr(self.config, "default_output_format", None),
+            )
         except Exception as exc:  # pragma: no cover - selection must never fail a request
             logger.warning("skill pack selection failed error=%s", exc)
             if observer is not None:
@@ -724,8 +723,15 @@ class DeepResearchAgent(
             return
         self._skill_selection = selection
         applied_overrides: dict[str, Any] = {}
-        if not selection.shadow and not selection.pack.is_neutral:
-            self._apply_request_config_overrides(selection.pack, applied_overrides)
+        secondary_pack = getattr(selection, "secondary_pack", None)
+        format_pack = getattr(selection, "format_pack", None)
+        if not selection.shadow and (not selection.pack.is_neutral or format_pack is not None):
+            self._apply_request_config_overrides(
+                selection.pack,
+                applied_overrides,
+                secondary_pack=secondary_pack,
+                format_pack=format_pack,
+            )
         if state is not None:
             state.skill_pack_metadata = {
                 "pack_id": selection.pack.pack_id,
@@ -735,6 +741,14 @@ class DeepResearchAgent(
                 "fallback_reason": selection.fallback_reason,
                 "shadow": bool(selection.shadow),
                 "applied_overrides": applied_overrides,
+                "secondary_pack_id": secondary_pack.pack_id if secondary_pack is not None else None,
+                "secondary_match_score": round(
+                    float(getattr(selection, "secondary_match_score", 0.0) or 0.0),
+                    4,
+                ),
+                "format_pack_id": format_pack.pack_id if format_pack is not None else None,
+                "routing_method": str(getattr(selection, "routing_method", "lexical") or "lexical"),
+                "active_verifiers": list(getattr(selection, "active_verifiers", []) or []),
             }
         if observer is not None:
             observer.record_skill_pack_selection(
@@ -749,13 +763,21 @@ class DeepResearchAgent(
         self,
         pack: Any,
         applied_out: dict[str, Any],
+        *,
+        secondary_pack: Any = None,
+        format_pack: Any = None,
     ) -> None:
         """Apply request-scoped skill pack config overrides and propagate to sub-services."""
 
         base_config = getattr(self, "_base_config", None) or self.config
         self._base_config = base_config
-        effective_config, applied = apply_skill_pack_overrides(base_config, pack)
-        if not applied:
+        effective_config, applied = apply_skill_pack_overrides(
+            base_config,
+            pack,
+            secondary_pack=secondary_pack,
+            format_pack=format_pack,
+        )
+        if effective_config is base_config and not applied:
             return
         applied_out.update(applied)
         self._swap_runtime_config(effective_config)
@@ -785,16 +807,32 @@ class DeepResearchAgent(
         return {domain, "general"}
 
     def _skill_stage_context(self, stage: str) -> str:
-        """Render the skill fragment for one stage, or empty when nothing should be injected.
-
-        A pack with ``status: shadow`` is recorded at selection time but never injected, mirroring
-        memory shadow mode so a candidate pack can be observed before it influences behaviour.
-        """
+        """Render primary + optional secondary/format skill blocks for one stage."""
 
         selection = self._skill_selection
         if selection is None or selection.shadow:
             return ""
-        return self._skill_pack.render_block(selection.pack, stage)
+        parts = [self._skill_pack.render_block(selection.pack, stage)]
+        secondary_pack = getattr(selection, "secondary_pack", None)
+        if secondary_pack is not None:
+            parts.append(self._skill_pack.render_secondary_block(secondary_pack, stage))
+        format_pack = getattr(selection, "format_pack", None)
+        if format_pack is not None:
+            parts.append(self._skill_pack.render_format_block(format_pack, stage))
+        return "".join(part for part in parts if part)
+
+    @staticmethod
+    def _callable_accepts_kwarg(fn: Any, kwarg_name: str) -> bool:
+        import inspect
+
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        return any(
+            p.kind == inspect.Parameter.VAR_KEYWORD or p.name == kwarg_name
+            for p in sig.parameters.values()
+        )
 
     def _shadow_gate(
         self,
@@ -1134,11 +1172,18 @@ class DeepResearchAgent(
             state.review_completed = True
             return state.review_summary
 
-        review_summary = self.reviewer.review_request(
-            state,
-            observer=observer,
-            skill_pack_context=self._skill_stage_context("review"),
+        active_verifiers = list(
+            getattr(self._skill_selection, "active_verifiers", None)
+            or getattr(self.config, "active_skill_verifiers", None)
+            or []
         )
+        review_kwargs: dict[str, Any] = {
+            "observer": observer,
+            "skill_pack_context": self._skill_stage_context("review"),
+        }
+        if active_verifiers and self._callable_accepts_kwarg(self.reviewer.review_request, "active_verifiers"):
+            review_kwargs["active_verifiers"] = active_verifiers
+        review_summary = self.reviewer.review_request(state, **review_kwargs)
 
         if review_summary.get("overall_status") == "blocked":
             observer.record_degraded("review_blocked")
@@ -1622,10 +1667,21 @@ class DeepResearchAgent(
                     yield report_started
                 try:
                     if emit_stream and hasattr(self.reporting, "stream_generate_report"):
+                        stream_kwargs: dict[str, Any] = {
+                            "observer": observer,
+                            "skill_pack_context": self._skill_stage_context("report"),
+                        }
+                        selection = getattr(self, "_skill_selection", None)
+                        fmt_pack = getattr(selection, "format_pack", None) if selection is not None and not selection.shadow else None
+                        fmt_outline = getattr(fmt_pack, "outline_sections", None) if fmt_pack is not None else None
+                        if fmt_outline and self._callable_accepts_kwarg(
+                            self.reporting.stream_generate_report,
+                            "outline_sections",
+                        ):
+                            stream_kwargs["outline_sections"] = list(fmt_outline)
                         for report_event in self.reporting.stream_generate_report(
                             state,
-                            observer=observer,
-                            skill_pack_context=self._skill_stage_context("report"),
+                            **stream_kwargs,
                         ):
                             report_event.setdefault("step", final_step)
                             yield report_event

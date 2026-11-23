@@ -2,7 +2,7 @@
 pack_id: academic-review
 schema_version: 1
 version: 1
-content_hash: "62c85a9194fd0d86"
+content_hash: "199248ee9f94e727"
 maturity: draft
 status: active
 supersedes: ""
@@ -34,6 +34,35 @@ quality_gates:
   review_min_sources_per_task: 3
 budget_knobs: {}
 layout: {}
+retrieval_profile:
+  preferred_backends:
+    - semanticscholar
+    - tavily
+    - duckduckgo
+  backend_weights:
+    semanticscholar: 1.35
+    tavily: 1.00
+    duckduckgo: 0.85
+  authoritative_hosts:
+    - arxiv.org
+    - semanticscholar.org
+    - acm.org
+    - ieee.org
+    - nature.com
+    - science.org
+    - doi.org
+    - .edu
+  deprioritized_hosts:
+    - csdn.net
+    - jianshu.com
+    - quora.com
+  prior_boost: 0.05
+  prior_penalty: -0.03
+verifiers:
+  - timeline-audit
+composable_with:
+  - tech-selection
+  - policy-analysis
 derived_from: ""
 eval: {}
 owner: research-team
