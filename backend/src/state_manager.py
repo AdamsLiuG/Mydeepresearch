@@ -67,6 +67,12 @@ class StateManagerMixin:
             "fact_ledger": dict(getattr(state, "fact_ledger", None) or {}),
             "evidence_index_cards": list(getattr(state, "evidence_index_cards", None) or []),
             "frozen_prefix_version": int(getattr(state, "frozen_prefix_version", 0) or 0),
+            "pending_tool_approval": (
+                dict(state.pending_tool_approval)
+                if isinstance(getattr(state, "pending_tool_approval", None), dict)
+                else None
+            ),
+            "approved_tool_calls": dict(getattr(state, "approved_tool_calls", None) or {}),
             "tenant_id": str(getattr(self, "tenant_id", "default") or "default").strip()
             or "default",
             "cache_diagnostics": cache_diagnostics,
@@ -193,6 +199,16 @@ class StateManagerMixin:
             ),
             evidence_index_cards=list(payload.get("evidence_index_cards") or []),
             frozen_prefix_version=int(payload.get("frozen_prefix_version") or 0),
+            pending_tool_approval=(
+                dict(payload.get("pending_tool_approval"))
+                if isinstance(payload.get("pending_tool_approval"), dict)
+                else None
+            ),
+            approved_tool_calls=(
+                dict(payload.get("approved_tool_calls") or {})
+                if isinstance(payload.get("approved_tool_calls"), dict)
+                else {}
+            ),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
         for task in state.todo_items:

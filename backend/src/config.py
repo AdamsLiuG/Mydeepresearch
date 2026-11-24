@@ -342,6 +342,64 @@ class Configuration(BaseModel):
         title="Evidence Lazy Load Char Budget",
         description="Character ceiling for lazy chunk hydration per call",
     )
+    mcp_enabled: bool = Field(
+        default=False,
+        title="MCP Enabled",
+        description="Master flag enabling dynamic MCP server integration",
+    )
+    mcp_config_path: str = Field(
+        default="./config/mcp_servers.yaml",
+        title="MCP Servers Config Path",
+        description="Path to YAML registry defining external MCP servers",
+    )
+    mcp_enforce_readonly: bool = Field(
+        default=True,
+        title="MCP Enforce Readonly",
+        description="Fail-Closed gate blocking MCP tools lacking readOnlyHint=True",
+    )
+    mcp_allow_hitl_write_tools: bool = Field(
+        default=False,
+        title="MCP Allow HITL Write Tools",
+        description="When True, whitelisted write tools trigger HITL approval instead of flat rejection",
+    )
+    mcp_allowed_private_hosts: list[str] = Field(
+        default_factory=list,
+        title="MCP Allowed Private Hosts",
+        description="Whitelist of internal sidecar hostnames or CIDRs allowed past SSRF check",
+    )
+    mcp_allow_insecure_http: bool = Field(
+        default=False,
+        title="MCP Allow Insecure HTTP",
+        description="Allow http:// MCP endpoints for controlled local/sidecar deployments",
+    )
+    mcp_tool_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0.1,
+        title="MCP Tool Timeout Seconds",
+        description="Timeout ceiling for a single MCP tool invocation",
+    )
+    mcp_tool_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=0,
+        title="MCP Tool Cache TTL Seconds",
+        description="TTL for cached tools/list discovery metadata per MCP server",
+    )
+    mcp_max_tools_per_stage: int = Field(
+        default=6,
+        ge=0,
+        title="MCP Max Tools Per Stage",
+        description="Anti-Tool-Bloat hard limit on MCP tools exposed to one stage prompt",
+    )
+    mcp_tenant_token_secret: str | None = Field(
+        default=None,
+        title="MCP Tenant Token Secret",
+        description="Optional HMAC-SHA256 secret used to sign scoped tenant tokens across MCP boundary",
+    )
+    active_mcp_tool_scopes: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Active MCP Tool Scopes",
+        description="Request-scoped MCP tool whitelist bound from active SkillPack",
+    )
     note_memory_enabled: bool = Field(
         default=False,
         title="Note Memory Enabled",
@@ -1075,7 +1133,7 @@ class Configuration(BaseModel):
 
         return value
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins", "mcp_allowed_private_hosts", mode="before")
     @classmethod
     def _normalize_cors_origins(cls, value: Any) -> Any:
         return _normalize_origin_values(value)
@@ -1164,6 +1222,13 @@ class Configuration(BaseModel):
             if not format_path.is_absolute():
                 format_path = backend_root() / format_path
             self.skill_format_dir = str(format_path.resolve(strict=False))
+
+        mcp_cfg = (self.mcp_config_path or "").strip()
+        if mcp_cfg:
+            mcp_path = Path(mcp_cfg).expanduser()
+            if not mcp_path.is_absolute():
+                mcp_path = backend_root() / mcp_path
+            self.mcp_config_path = str(mcp_path.resolve(strict=False))
         return self
 
     def resolved_max_total_tasks(self) -> int:
@@ -1278,6 +1343,16 @@ class Configuration(BaseModel):
             "evidence_pointer_disclosure_enabled": os.getenv("EVIDENCE_POINTER_DISCLOSURE_ENABLED"),
             "evidence_lazy_load_max_chunks_per_source": os.getenv("EVIDENCE_LAZY_LOAD_MAX_CHUNKS_PER_SOURCE"),
             "evidence_lazy_load_char_budget": os.getenv("EVIDENCE_LAZY_LOAD_CHAR_BUDGET"),
+            "mcp_enabled": os.getenv("MCP_ENABLED"),
+            "mcp_config_path": os.getenv("MCP_CONFIG_PATH"),
+            "mcp_enforce_readonly": os.getenv("MCP_ENFORCE_READONLY"),
+            "mcp_allow_hitl_write_tools": os.getenv("MCP_ALLOW_HITL_WRITE_TOOLS"),
+            "mcp_allowed_private_hosts": os.getenv("MCP_ALLOWED_PRIVATE_HOSTS"),
+            "mcp_allow_insecure_http": os.getenv("MCP_ALLOW_INSECURE_HTTP"),
+            "mcp_tool_timeout_seconds": os.getenv("MCP_TOOL_TIMEOUT_SECONDS"),
+            "mcp_tool_cache_ttl_seconds": os.getenv("MCP_TOOL_CACHE_TTL_SECONDS"),
+            "mcp_max_tools_per_stage": os.getenv("MCP_MAX_TOOLS_PER_STAGE"),
+            "mcp_tenant_token_secret": os.getenv("MCP_TENANT_TOKEN_SECRET"),
             "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
             "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
             "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),

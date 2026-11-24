@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 from models import SummaryState, TodoItem
 from services.evidence import extract_citation_ids
+from services.mcp_bridge import MCPHitlApprovalRequired
 from services.summarizer import TaskSummaryResult
 from services.text_processing import strip_citation_markers
 
@@ -98,8 +99,10 @@ class StreamCoordinatorMixin:
 
             channel = channel_map.get(target_task_id) if target_task_id is not None else None
             if channel:
-                payload.setdefault("step", channel["step"])
-                payload["stream_token"] = channel["token"]
+                if "step" in channel:
+                    payload.setdefault("step", channel["step"])
+                if "token" in channel:
+                    payload["stream_token"] = channel["token"]
             if step_override is not None:
                 payload["step"] = step_override
             event_queue.put(payload)
@@ -142,6 +145,15 @@ class StreamCoordinatorMixin:
                     if _cancelled():
                         break
                     enqueue(event, task=task)
+            except MCPHitlApprovalRequired as hitl_exc:
+                task.status = "awaiting_approval"
+                enqueue(
+                    {
+                        "type": "__tool_approval_required__",
+                        "task_id": task.id,
+                        "exception": hitl_exc,
+                    }
+                )
             except Exception as exc:  # pragma: no cover - defensive guardrail
                 logger.exception("Task execution failed", exc_info=exc)
                 task.status = "failed"
@@ -186,6 +198,8 @@ class StreamCoordinatorMixin:
                 if event.get("type") == "__task_done__":
                     finished_workers += 1
                     continue
+                if event.get("type") == "__tool_approval_required__":
+                    raise event["exception"]
                 yield event
 
             if not _cancelled():

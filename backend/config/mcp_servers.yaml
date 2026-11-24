@@ -1,0 +1,36 @@
+servers:
+  - server_id: finarag
+    transport: stdio
+    enabled: false
+    command:
+      - python3
+      - -m
+      - services.finarag_mcp_server
+      - --transport
+      - stdio
+    cwd: "."
+    env_allowlist:
+      - FINARAG_DATA_ROOT
+      - FINARAG_TENANT_ACL_PATH
+      - MCP_TENANT_TOKEN_SECRET
+    trust_tier: curated_private
+    tenant_scoped: true
+    allow_cross_request_archive: false
+    tool_timeout_seconds: 12.0
+    pool_size: 2
+    max_retries: 1
+    circuit_failure_threshold: 5
+    circuit_recovery_seconds: 60.0
+
+  - server_id: repo-metrics
+    transport: streamable_http
+    enabled: false
+    endpoint_url: "https://mcp-metrics.internal.example/mcp"
+    trust_tier: internal_metrics
+    tenant_scoped: true
+    allow_cross_request_archive: false
+    tool_timeout_seconds: 8.0
+    pool_size: 4
+    max_retries: 1
+    circuit_failure_threshold: 5
+    circuit_recovery_seconds: 60.0

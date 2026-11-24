@@ -63,6 +63,8 @@ class SummaryState:
     fact_ledger: dict[str, Any] = field(default_factory=dict)
     evidence_index_cards: list[dict[str, Any]] = field(default_factory=list)
     frozen_prefix_version: int = field(default=0)
+    pending_tool_approval: dict[str, Any] | None = field(default=None)
+    approved_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)

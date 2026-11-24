@@ -22,6 +22,7 @@ from services.evidence import (
 )
 from services.evidence_index import EvidenceRetrievalHit
 from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.mcp_bridge import MCPHitlApprovalRequired
 from services.policy_controller import PolicyStateFeatures, build_policy_controller
 from services.reviewer import ReviewService
 from services.search import classify_search_query_bucket, dispatch_search
@@ -1296,6 +1297,8 @@ class TaskExecutorMixin:
                                 round_notices,
                                 [f"补证据轮次补充多样化来源检索：{task.query}"],
                             )
+                except MCPHitlApprovalRequired:
+                    raise
                 except Exception as exc:
                     if search_span:
                         completed = search_span.complete(
@@ -1340,6 +1343,13 @@ class TaskExecutorMixin:
                         query=task.query,
                         search_payload=search_result,
                         backend=backend,
+                    )
+                if round_index == 1:
+                    self._dispatch_mcp_scope_prefetch(
+                        state,
+                        task,
+                        evidence_store,
+                        observer=observer,
                     )
 
                 if search_span:
@@ -1614,6 +1624,8 @@ class TaskExecutorMixin:
                         for event in self._drain_tool_events(state, step=step):
                             yield event
                     summary_result = self._coerce_summary_result(summary_getter())
+                except MCPHitlApprovalRequired:
+                    raise
                 except Exception as exc:
                     if summary_span:
                         completed = summary_span.complete(status="failed", error=exc)
@@ -1661,7 +1673,8 @@ class TaskExecutorMixin:
                             skill_pack_context=self._skill_stage_context("task_execution"),
                         )
                     )
-
+                except MCPHitlApprovalRequired:
+                    raise
                 except Exception as exc:
                     if summary_span:
                         summary_span.complete(status="failed", error=exc)
@@ -1726,6 +1739,88 @@ class TaskExecutorMixin:
         else:
             self._drain_tool_events(state)
         self._persist_request_state(state, phase="task_execution", status="in_progress")
+
+    def _dispatch_mcp_scope_prefetch(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        evidence_store: EvidenceStore,
+        *,
+        observer: RequestTrace | None = None,
+    ) -> None:
+        """Deterministically prefetch private MCP evidence when the active skill declares auto_query_tools."""
+
+        if not bool(getattr(self.config, "mcp_enabled", False)):
+            return
+        scopes = getattr(self.config, "active_mcp_tool_scopes", None) or {}
+        auto_tools = list(scopes.get("auto_query_tools") or [])
+        if not auto_tools:
+            return
+        ensurer = getattr(self, "_ensure_mcp_bridge", None)
+        bridge = ensurer() if callable(ensurer) else None
+        if bridge is None:
+            return
+
+        tenant_id = str(getattr(self, "tenant_id", "default") or "default")
+        request_id = str(getattr(self, "request_id", "local") or "local")
+        approved_registry = getattr(state, "approved_tool_calls", None)
+        query_text = (task.query or task.intent or task.title or state.research_topic or "").strip()
+
+        for tool_ref in auto_tools:
+            ref = str(tool_ref or "").strip()
+            if not ref or ":" not in ref:
+                continue
+            server_id, tool_name = ref.split(":", 1)
+            args: dict[str, Any] = {"query": query_text}
+            if server_id == "finarag":
+                companies_res = bridge.call_tool(
+                    server_id="finarag",
+                    tool_name="finarag_list_companies",
+                    arguments={"limit": 50},
+                    tenant_id=tenant_id,
+                    request_id=request_id,
+                    task_id=task.id,
+                    approved_registry=approved_registry,
+                    observer=observer,
+                )
+                companies = (
+                    (companies_res.structured_payload or {}).get("companies") or []
+                    if companies_res.ok
+                    else []
+                )
+                matched_company = None
+                haystack = f"{state.research_topic or ''} {task.title or ''} {query_text}".casefold()
+                for item in companies:
+                    cname = str((item or {}).get("company_name") or "").strip()
+                    if cname and cname.casefold() in haystack:
+                        matched_company = cname
+                        break
+                if matched_company:
+                    args["company_name"] = matched_company
+                elif companies:
+                    args["company_name"] = str((companies[0] or {}).get("company_name") or "").strip()
+                if not args.get("company_name"):
+                    continue
+
+            call_res = bridge.call_tool(
+                server_id=server_id,
+                tool_name=tool_name,
+                arguments=args,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                task_id=task.id,
+                approved_registry=approved_registry,
+                observer=observer,
+            )
+            if call_res.ok and call_res.normalized_evidence:
+                evidence_store.record_mcp_results(
+                    task_id=task.id,
+                    query=query_text,
+                    server_id=server_id,
+                    tool_name=tool_name,
+                    items=call_res.normalized_evidence,
+                    tenant_id=tenant_id,
+                )
 
     def _record_task_failure(
         self,

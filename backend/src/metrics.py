@@ -188,6 +188,11 @@ class MetricsRegistry:
             "cached_prompt_tokens": 0,
             "cache_creation_tokens": 0,
             "uncached_prompt_tokens": 0,
+            "mcp_call_total": 0,
+            "mcp_success_total": 0,
+            "mcp_timeout_total": 0,
+            "mcp_circuit_open_total": 0,
+            "mcp_hitl_intercept_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
         self._estimated_cost = 0.0

@@ -175,6 +175,9 @@ SOURCE_TYPE_BONUS = {
     "social_general": -1.0,
     "content_farm_or_aggregator": -2.0,
     "web_general": 0.0,
+    "mcp_curated_filing": 3.8,
+    "mcp_internal_metrics": 3.2,
+    "mcp_external": 1.8,
     "mcp_filing": 3.5,
     "mcp_tool": 2.5,
     "sandbox_computation": 3.5,
@@ -1752,6 +1755,7 @@ class EvidenceStore:
         items: list[dict[str, Any]],
         query: str = "",
         tenant_id: str = "default",
+        trust_tier: str = "curated_private",
     ) -> list[dict[str, Any]]:
         """Normalize MCP tool outputs into first-class [Tn-Mm] evidence records."""
 
@@ -1794,9 +1798,17 @@ class EvidenceStore:
                 source_id = f"{prefix}{next_m}"
                 next_m += 1
                 raw_type = str(item.get("source_type") or "").strip()
-                source_type = raw_type if raw_type.startswith("mcp_") else "mcp_tool"
+                tier_fallback = {
+                    "curated_private": "mcp_curated_filing",
+                    "internal_metrics": "mcp_internal_metrics",
+                    "external_mcp": "mcp_external",
+                }.get(str(trust_tier or "").strip(), "mcp_tool")
+                source_type = raw_type if raw_type.startswith("mcp_") else tier_fallback
                 page_no_raw = item.get("page_no")
                 page_no = int(page_no_raw) if isinstance(page_no_raw, int) and not isinstance(page_no_raw, bool) else None
+                parsed_domain = extract_domain(url)
+                if not parsed_domain or "://" in url and parsed_domain == server_id:
+                    parsed_domain = f"{server_id}.mcp.internal"
                 rec = EvidenceRecord(
                     source_id=source_id,
                     task_id=task_id,
@@ -1809,7 +1821,7 @@ class EvidenceStore:
                     backend=f"mcp:{server_id}",
                     backend_sources=[f"mcp:{server_id}"],
                     provider_count=1,
-                    domain=extract_domain(url) or server_id,
+                    domain=parsed_domain or f"{server_id}.mcp.internal",
                     source_type=source_type,
                     source_origin="mcp",
                     mcp_server_id=server_id,

@@ -149,6 +149,7 @@ class SkillPack:
     verifiers: list[str] = field(default_factory=list)
     composable_with: list[str] = field(default_factory=list)
     outline_sections: list[str] = field(default_factory=list)
+    mcp_tool_scopes: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_neutral(self) -> bool:
@@ -280,6 +281,8 @@ def compute_content_hash(pack: SkillPack) -> str:
         canonical["composable_with"] = sorted(pack.composable_with)
     if pack.outline_sections:
         canonical["outline_sections"] = list(pack.outline_sections)
+    if pack.mcp_tool_scopes:
+        canonical["mcp_tool_scopes"] = pack.mcp_tool_scopes
     serialised = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(serialised.encode("utf-8")).hexdigest()[:16]
 
@@ -334,6 +337,7 @@ def load_pack(path: Path) -> SkillPack:
         verifiers=_as_list(frontmatter.get("verifiers")),
         composable_with=_as_list(frontmatter.get("composable_with")),
         outline_sections=_as_list(frontmatter.get("outline_sections")),
+        mcp_tool_scopes=_as_dict(frontmatter.get("mcp_tool_scopes")),
     )
     pack.content_hash = compute_content_hash(pack)
     return pack
@@ -396,6 +400,7 @@ def validate_pack(
     errors.extend(_validate_retrieval_profile(pack))
     errors.extend(_validate_verifiers(pack))
     errors.extend(_validate_composable_with(pack))
+    errors.extend(_validate_mcp_tool_scopes(pack))
     for stage, fragment in pack.body_sections.items():
         errors.extend(_validate_fragment_safety(stage, fragment))
 
@@ -411,12 +416,18 @@ def validate_pack(
             or pack.retrieval_profile
             or pack.verifiers
             or pack.composable_with
+            or pack.mcp_tool_scopes
         ):
             errors.append("neutral pack must not override any knobs")
         if pack.match_signals:
             errors.append("neutral pack must not declare match_signals")
     if pack.is_format and (
-        pack.quality_gates or pack.budget_knobs or pack.retrieval_profile or pack.verifiers or pack.composable_with
+        pack.quality_gates
+        or pack.budget_knobs
+        or pack.retrieval_profile
+        or pack.verifiers
+        or pack.composable_with
+        or pack.mcp_tool_scopes
     ):
         errors.append("format skill pack must not declare domain quality/budget/retrieval/verifier knobs")
     if pack.maturity == MATURITY_PROMOTED and _as_dict(pack.eval_meta).get("verdict") != "pass":
@@ -441,6 +452,43 @@ def _validate_budget_and_layout(pack: SkillPack) -> list[str]:
     for key in pack.layout:
         if key not in LAYOUT_KNOBS:
             errors.append(f"layout key '{key}' is not in the override whitelist")
+    return errors
+
+
+def _validate_mcp_tool_scopes(pack: SkillPack) -> list[str]:
+    scopes = pack.mcp_tool_scopes
+    if not scopes:
+        return []
+    errors: list[str] = []
+    allowed_keys = {
+        "allowed_servers",
+        "allowed_tools",
+        "auto_query_tools",
+        "stage_allowlist",
+        "readonly_only",
+        "max_tools_injected",
+    }
+    for key in scopes:
+        if key not in allowed_keys:
+            errors.append(f"mcp_tool_scopes key '{key}' is not in the allowed whitelist")
+    for list_key in ("allowed_servers", "allowed_tools", "auto_query_tools"):
+        raw = scopes.get(list_key)
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            errors.append(f"mcp_tool_scopes.{list_key} must be a list")
+            continue
+        for item in raw:
+            tok = str(item or "").strip()
+            if "*" in tok:
+                errors.append(f"mcp_tool_scopes.{list_key} must not contain wildcard '*'")
+    if "max_tools_injected" in scopes:
+        try:
+            cap = int(scopes["max_tools_injected"])
+            if cap < 0 or cap > 12:
+                errors.append("mcp_tool_scopes.max_tools_injected must be in [0, 12]")
+        except (TypeError, ValueError):
+            errors.append("mcp_tool_scopes.max_tools_injected must be an integer")
     return errors
 
 
@@ -680,6 +728,24 @@ def apply_skill_pack_overrides(
         merged_verifiers = _merge_verifier_ids(pack, secondary_pack)
         if merged_verifiers and hasattr(base_config, "active_skill_verifiers"):
             updates["active_skill_verifiers"] = merged_verifiers
+
+        merged_scopes: dict[str, Any] = {}
+        for current_pack in source_packs:
+            raw_scopes = getattr(current_pack, "mcp_tool_scopes", None) or {}
+            if not raw_scopes:
+                continue
+            if not merged_scopes:
+                merged_scopes = deepcopy(raw_scopes)
+            else:
+                for list_key in ("allowed_servers", "allowed_tools", "auto_query_tools"):
+                    existing_vals = list(merged_scopes.get(list_key) or [])
+                    for item in raw_scopes.get(list_key) or ():
+                        if item not in existing_vals:
+                            existing_vals.append(item)
+                    if existing_vals:
+                        merged_scopes[list_key] = existing_vals
+        if merged_scopes and hasattr(base_config, "active_mcp_tool_scopes"):
+            updates["active_mcp_tool_scopes"] = merged_scopes
 
     if (
         format_pack is not None

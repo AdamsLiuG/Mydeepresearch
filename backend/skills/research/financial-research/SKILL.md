@@ -2,7 +2,7 @@
 pack_id: financial-research
 schema_version: 1
 version: 1
-content_hash: "9e526371dfa0990e"
+content_hash: "af0f77b64780bd41"
 maturity: draft
 status: active
 supersedes: ""
@@ -64,6 +64,21 @@ retrieval_profile:
 verifiers:
   - numeric-audit
   - timeline-audit
+mcp_tool_scopes:
+  allowed_servers:
+    - finarag
+  allowed_tools:
+    - finarag:finarag_list_companies
+    - finarag:finarag_filings
+    - finarag:finarag_structured_query
+    - finarag:finarag_get_report_pages
+  auto_query_tools:
+    - finarag:finarag_filings
+  stage_allowlist:
+    - task_execution
+    - review
+  readonly_only: true
+  max_tools_injected: 4
 composable_with:
   - competitor-scan
   - policy-analysis

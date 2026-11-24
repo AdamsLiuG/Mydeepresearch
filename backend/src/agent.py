@@ -52,6 +52,11 @@ from services.fact_ledger import (
     build_evidence_index_cards,
 )
 from services.hitl import HitlService
+from services.mcp_bridge import (
+    MCPBridgeManager,
+    MCPHitlApprovalRequired,
+    ScopedToolRegistry,
+)
 from services.note_memory import NoteMemoryService
 from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
@@ -451,6 +456,36 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 class CacheAwareToolAgent(ToolAwareSimpleAgent):
     """ToolAwareSimpleAgent subclass supporting KV-Cache structured PromptEnvelope dispatch."""
 
+    def _execute_tool_call(self, tool_name: str, parameters: str) -> str:  # type: ignore[override]
+        if not self.tool_registry:
+            return "❌ 错误：未配置工具注册表"
+        tool = self.tool_registry.get_tool(tool_name)
+        if not tool:
+            return f"❌ 错误：未找到工具 '{tool_name}'"
+        try:
+            parsed = self._sanitize_parameters(self._parse_tool_parameters(tool_name, parameters))
+            result = tool.run(parsed)
+            formatted = f"🔧 工具 {tool_name} 执行结果：\n{result}"
+        except MCPHitlApprovalRequired:
+            raise
+        except Exception as exc:
+            parsed = {}
+            formatted = f"❌ 工具调用失败：{exc}"
+        if getattr(self, "_tool_call_listener", None):
+            try:
+                self._tool_call_listener(
+                    {
+                        "agent_name": self.name,
+                        "tool_name": tool_name,
+                        "raw_parameters": parameters,
+                        "parsed_parameters": parsed,
+                        "result": formatted,
+                    }
+                )
+            except Exception:
+                logger.exception("Tool call listener failed")
+        return formatted
+
     def _extract_tool_section(self) -> str:
         if not getattr(self, "enable_tool_calling", False) or getattr(self, "tool_registry", None) is None:
             return ""
@@ -688,6 +723,7 @@ class DeepResearchAgent(
         *,
         request_id: str | None = None,
         tenant_id: str | None = None,
+        mcp_bridge: MCPBridgeManager | None = None,
     ) -> None:
         """Initialise the coordinator with configuration and shared tools."""
         self.config = config or Configuration.from_env()
@@ -700,6 +736,8 @@ class DeepResearchAgent(
             ).strip()
             or "default"
         )
+        self._mcp_bridge = mcp_bridge
+        self._active_state: SummaryState | None = None
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
         self.fast_llm = self._init_fast_llm(allow_reasoning_fallback=True)
@@ -770,6 +808,13 @@ class DeepResearchAgent(
         self.tools_registry.register_tool(self.evidence_lookup_tool)
         if self.note_tool:
             self.tools_registry.register_tool(self.note_tool)
+        self._core_tools = [
+            self.search_web_tool,
+            self.fetch_page_tool,
+            self.evidence_lookup_tool,
+            *([self.note_tool] if self.note_tool else []),
+        ]
+        self._base_tools_registry = self.tools_registry
 
         self._tool_tracker = ToolCallTracker(
             self.config.notes_workspace if self.config.enable_notes else None
@@ -1082,6 +1127,61 @@ class DeepResearchAgent(
                 fallback_reason=selection.fallback_reason,
                 shadow=selection.shadow,
             )
+        self._refresh_scoped_tools_for_request()
+
+    def _ensure_mcp_bridge(self) -> MCPBridgeManager | None:
+        if not bool(getattr(self.config, "mcp_enabled", False)):
+            return None
+        if getattr(self, "_mcp_bridge", None) is None:
+            self._mcp_bridge = MCPBridgeManager(self.config)
+        return self._mcp_bridge
+
+    def _build_stage_tool_registry(self, stage: str) -> ToolRegistry | None:
+        bridge = self._ensure_mcp_bridge()
+        base_reg = getattr(self, "_base_tools_registry", None)
+        if base_reg is None:
+            base_reg = getattr(self, "tools_registry", None)
+        if bridge is None:
+            return base_reg
+        try:
+            mcp_adapters = bridge.build_tool_adapters(
+                evidence_store=self._evidence_store,
+                tenant_id_getter=lambda: self.tenant_id,
+                request_id_getter=lambda: self.request_id,
+                approved_registry_getter=lambda: getattr(self._active_state, "approved_tool_calls", None),
+                observer_getter=lambda: self._request_trace,
+            )
+        except Exception as exc:
+            logger.warning("MCP adapter discovery failed stage=%s error=%s", stage, exc)
+            mcp_adapters = []
+        return ScopedToolRegistry(
+            core_tools=getattr(self, "_core_tools", ()),
+            mcp_adapters=mcp_adapters,
+            active_scopes=getattr(self.config, "active_mcp_tool_scopes", None),
+            stage=stage,
+            max_mcp_tools=int(getattr(self.config, "mcp_max_tools_per_stage", 6) or 6),
+            enforce_readonly=bool(getattr(self.config, "mcp_enforce_readonly", True)),
+        )
+
+    def _refresh_scoped_tools_for_request(self) -> None:
+        base_reg = getattr(self, "_base_tools_registry", None)
+        if base_reg is None:
+            base_reg = getattr(self, "tools_registry", None)
+        if not bool(getattr(self.config, "mcp_enabled", False)):
+            if base_reg is not None:
+                self.tools_registry = base_reg
+            return
+        self.tools_registry = self._build_stage_tool_registry("task_execution") or base_reg
+        stage_agents = (
+            ("planning", getattr(self, "todo_agent", None)),
+            ("review", getattr(self, "review_agent", None)),
+            ("report", getattr(self, "report_agent", None)),
+        )
+        for stage_name, stage_agent in stage_agents:
+            if stage_agent is not None and hasattr(stage_agent, "tool_registry"):
+                stage_reg = self._build_stage_tool_registry(stage_name)
+                if stage_reg is not None:
+                    stage_agent.tool_registry = stage_reg
 
     def _apply_request_config_overrides(
         self,
@@ -1111,6 +1211,16 @@ class DeepResearchAgent(
         if base_config is not None:
             self._swap_runtime_config(base_config)
             self._base_config = None
+        base_reg = getattr(self, "_base_tools_registry", None)
+        if base_reg is not None:
+            self.tools_registry = base_reg
+            for stage_agent in (
+                getattr(self, "todo_agent", None),
+                getattr(self, "review_agent", None),
+                getattr(self, "report_agent", None),
+            ):
+                if stage_agent is not None and hasattr(stage_agent, "tool_registry"):
+                    stage_agent.tool_registry = base_reg
 
     def _swap_runtime_config(self, target_config: Configuration) -> None:
         self.config = target_config
@@ -1570,6 +1680,10 @@ class DeepResearchAgent(
     ) -> Iterator[dict[str, Any]]:
         """Run the unified 6-stage workflow for both sync and streaming callers."""
         self._cancel_event = cancel_event
+        self._active_state = state
+        pending_approval = getattr(state, "pending_tool_approval", None)
+        if resumed and isinstance(pending_approval, dict) and pending_approval.get("status") == "approved_once":
+            state.pending_tool_approval = None
         report = state.structured_report or ""
         request_completed = False
         self._select_skill_pack(state.research_topic or topic, observer, state=state)
@@ -1815,6 +1929,8 @@ class DeepResearchAgent(
                                 else:
                                     self._execute_task_batch_sync(state, additional_tasks)
                                 self._refresh_context_checkpoints(state)
+                        except MCPHitlApprovalRequired:
+                            raise
                         except Exception as exc:
                             completed_event = reflection_span.complete(status="failed", error=exc)
                             observer.record_reflection_call(
@@ -2135,6 +2251,26 @@ class DeepResearchAgent(
                     "note_path": state.report_note_path,
                 }
                 yield {"type": "done"}
+        except MCPHitlApprovalRequired as hitl_exc:
+            pending_payload = hitl_exc.to_dict()
+            state.pending_tool_approval = pending_payload
+            if not request_completed:
+                observer.complete_request(status="awaiting_approval")
+                request_completed = True
+            self._persist_request_state(
+                state,
+                phase="awaiting_tool_approval",
+                status="awaiting_approval",
+                report_markdown=report,
+            )
+            if emit_stream:
+                yield {
+                    "type": "tool_approval_required",
+                    "request_id": self.request_id,
+                    **pending_payload,
+                }
+                yield observer.metrics_event()
+            return
         except Exception as exc:
             if not request_completed:
                 failed_snapshot = observer.complete_request(status="failed", error=exc)
@@ -2151,6 +2287,7 @@ class DeepResearchAgent(
             )
             raise
         finally:
+            self._active_state = None
             self._cancel_event = None
             self._restore_request_config()
 

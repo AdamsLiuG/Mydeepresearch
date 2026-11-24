@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
 from threading import Event, Thread
-from typing import Any, Callable, Dict, Iterator
+from typing import Any, Callable, Dict, Iterator, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -23,6 +23,7 @@ from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
 from services.event_bus import build_stream_event_bus
 from services.hitl import HitlService
+from services.mcp_bridge import MCPBridgeManager
 from services.skill_pack import SkillPackService
 from services.storage_backends import build_request_state_store
 from services.tenant import (
@@ -136,6 +137,13 @@ class DrilldownRequest(BaseModel):
         default=None,
         description="Optional search backend override",
     )
+
+
+class ToolApprovalDecisionRequest(BaseModel):
+    """Payload for approving or rejecting a paused non-readonly MCP tool call."""
+
+    decision: Literal["approve", "reject"] = Field(..., description="Approval decision")
+    reason: str = Field(default="", description="Optional operator reason")
 
 
 def _mask_secret(value: str | None, visible: int = 4) -> str:
@@ -338,13 +346,21 @@ def create_app(
             extra={"request_id": "startup"},
         )
         _warmup_semantic_cache_model(config)
-        yield
+        if getattr(app.state, "mcp_bridge", None) is None and getattr(config, "mcp_enabled", False):
+            app.state.mcp_bridge = MCPBridgeManager(config)
+        try:
+            yield
+        finally:
+            bridge = getattr(app.state, "mcp_bridge", None)
+            if bridge is not None and hasattr(bridge, "close"):
+                bridge.close()
 
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
     app.state.base_config = base_config
     app.state.agent_factory = resolved_agent_factory
     app.state.request_state_store = build_request_state_store(base_config)
     app.state.event_bus = build_stream_event_bus(base_config)
+    app.state.mcp_bridge = MCPBridgeManager(base_config) if getattr(base_config, "mcp_enabled", False) else None
     app.state.rate_limiter = TenantRateLimiter(
         rpm_limit=base_config.tenant_rate_limit_rpm,
         max_concurrent=base_config.tenant_max_concurrent_requests,
@@ -463,6 +479,8 @@ def create_app(
         kwargs: dict[str, Any] = {"config": config, "request_id": request_id}
         if _accepts_kwarg(factory, "tenant_id"):
             kwargs["tenant_id"] = tenant_id
+        if _accepts_kwarg(factory, "mcp_bridge") and getattr(app.state, "mcp_bridge", None) is not None:
+            kwargs["mcp_bridge"] = app.state.mcp_bridge
         agent = factory(**kwargs)
         if not hasattr(agent, "tenant_id"):
             try:
@@ -1087,6 +1105,57 @@ def create_app(
             error_log_label=f"Streaming resume failed request_id={request_id}",
             on_complete=lambda: _release_rate_limit(tenant),
         )
+
+    @app.post("/requests/{request_id}/tool-approvals/{approval_id}")
+    async def resolve_mcp_tool_approval(
+        request_id: str,
+        approval_id: str,
+        payload: ToolApprovalDecisionRequest,
+        request: Request,
+    ) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
+        _ensure_request_ownership(request_id, tenant)
+        store = app.state.request_state_store
+        if store is None:
+            raise HTTPException(status_code=400, detail="request_state store is disabled")
+        snapshot = _store_load(store, request_id, tenant_id=tenant.tenant_id)
+        if not isinstance(snapshot, dict):
+            raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
+        pending = snapshot.get("pending_tool_approval")
+        if not isinstance(pending, dict) or str(pending.get("approval_id") or "") != approval_id:
+            raise HTTPException(status_code=404, detail=f"pending tool approval not found: {approval_id}")
+        digest = str(pending.get("arguments_digest") or "").strip()
+        server_id = str(pending.get("server_id") or "").strip()
+        tool_name = str(pending.get("tool_name") or "").strip()
+        if not digest or not server_id or not tool_name:
+            raise HTTPException(status_code=409, detail="pending tool approval metadata is incomplete")
+
+        approved_map = dict(snapshot.get("approved_tool_calls") or {})
+        if payload.decision == "approve":
+            approval_key = f"{server_id}:{tool_name}:{digest}"
+            approved_map[approval_key] = {
+                "approval_id": approval_id,
+                "server_id": server_id,
+                "tool_name": tool_name,
+                "arguments_digest": digest,
+                "status": "approved_once",
+                "reason": payload.reason,
+            }
+            pending["status"] = "approved_once"
+            snapshot["status"] = "approved_ready"
+        else:
+            pending["status"] = "rejected"
+            pending["reason"] = payload.reason
+            snapshot["status"] = "rejected"
+        snapshot["pending_tool_approval"] = pending
+        snapshot["approved_tool_calls"] = approved_map
+        _store_save(store, request_id, snapshot, tenant_id=tenant.tenant_id)
+        return {
+            "request_id": request_id,
+            "approval_id": approval_id,
+            "decision": payload.decision,
+            "status": pending["status"],
+        }
 
     return app
 
