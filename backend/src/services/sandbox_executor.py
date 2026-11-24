@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
-import html
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -20,7 +18,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from services.memory_sanitizer import sanitize_injection_text
 from services.sandbox_runner import (
@@ -28,6 +33,9 @@ from services.sandbox_runner import (
     BANNED_NAMES,
     MAX_AST_NODES,
     MAX_CODE_CHARS,
+    MAX_INPUT_BYTES,
+    MAX_OUTPUT_BYTES,
+    _validate_ast_safety,
 )
 
 try:
@@ -60,8 +68,9 @@ _DANGEROUS_CHART_TEXT_RE = re.compile(
     r"(?:<\s*script|javascript:|vbscript:|data:text/html|\bon(?:error|load|click|mouseover)\s*=|function\s*\(|=>|\beval\s*\(|new\s+Function\s*\(|document\.|window\.)",
     flags=re.IGNORECASE,
 )
-_MAX_CHART_SPEC_BYTES = 256 * 1024
+_MAX_CHART_SPEC_BYTES = 64 * 1024
 _MAX_CHART_DEPTH = 12
+_MAX_CHART_POINTS = 2000
 
 
 class SandboxInputTable(BaseModel):
@@ -69,11 +78,12 @@ class SandboxInputTable(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
-    source_id: str
-    columns: list[str] = Field(default_factory=list)
-    rows: list[list[Any]] = Field(default_factory=list)
-    records: list[dict[str, Any]] = Field(default_factory=list)
+    name: str = Field(max_length=64, validation_alias=AliasChoices("name", "table_name"))
+    source_id: str | None = None
+    source_ids: list[str] = Field(default_factory=list, max_length=64)
+    columns: list[str] = Field(default_factory=list, max_length=128)
+    rows: list[list[Any] | dict[str, Any]] = Field(default_factory=list, max_length=2000)
+    records: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
     description: str = ""
 
     @field_validator("name")
@@ -88,11 +98,26 @@ class SandboxInputTable(BaseModel):
 
     @field_validator("source_id")
     @classmethod
-    def _validate_source_id(cls, value: str) -> str:
+    def _validate_source_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         cleaned = (value or "").strip().strip("[]")
         if not _SOURCE_ID_REGEX.fullmatch(cleaned):
             raise ValueError(f"sandbox table must bind a valid source_id [Tn-(S|M|C)m], got: {value!r}")
         return cleaned
+
+    @model_validator(mode="after")
+    def _validate_table(self) -> SandboxInputTable:
+        self.source_ids = list(dict.fromkeys(
+            self._validate_source_id(sid) for sid in ([self.source_id] if self.source_id else []) + self.source_ids
+        ))
+        if not self.source_ids:
+            raise ValueError("sandbox input table requires at least one source ID")
+        if self.records and self.rows:
+            raise ValueError("sandbox input table must provide one row representation")
+        if len(self.columns) != len(set(self.columns)):
+            raise ValueError("sandbox input table columns must be unique")
+        return self
 
 
 class ReportChartArtifact(BaseModel):
@@ -114,14 +139,27 @@ class SandboxExecutionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    task_id: int
-    code: str
-    title: str = ""
-    tables: list[SandboxInputTable] = Field(default_factory=list)
-    derived_from_source_ids: list[str] = Field(default_factory=list)
-    timeout_seconds: float | None = None
+    task_id: int = Field(gt=0)
+    code: str = Field(validation_alias=AliasChoices("code", "script"))
+    title: str = Field(default="", max_length=120)
+    tables: list[SandboxInputTable] = Field(
+        default_factory=list, max_length=8, validation_alias=AliasChoices("tables", "input_tables"),
+    )
+    derived_from_source_ids: list[str] = Field(
+        default_factory=list, max_length=64,
+        validation_alias=AliasChoices("derived_from_source_ids", "input_source_ids"),
+    )
+    timeout_seconds: float | None = Field(default=None, gt=0.5, le=30, allow_inf_nan=False)
     purpose: str = ""
     emit_chart: bool = False
+    chart_library: str | None = None
+
+    @field_validator("chart_library")
+    @classmethod
+    def _validate_library(cls, value: str | None) -> str | None:
+        if value not in {None, "none", "vega-lite", "echarts"}:
+            raise ValueError("unsupported sandbox chart library")
+        return value
 
 
 class SandboxExecutionResult(BaseModel):
@@ -140,6 +178,7 @@ class SandboxExecutionResult(BaseModel):
     execution_hash: str = ""
     duration_ms: float = 0.0
     error: str | None = None
+    error_code: str | None = None
     timed_out: bool = False
 
 
@@ -171,81 +210,48 @@ class SandboxASTValidator:
         self.max_ast_nodes = max_ast_nodes
 
     def validate(self, code: str) -> ASTValidationOutcome:
-        errors: list[str] = []
-        if not isinstance(code, str) or not code.strip():
-            return ASTValidationOutcome(ok=False, errors=["code must be a non-empty string"])
-        if len(code) > self.max_code_chars:
-            return ASTValidationOutcome(
-                ok=False,
-                errors=[f"code exceeds max length ({len(code)} > {self.max_code_chars})"],
-            )
-
-        try:
-            tree = ast.parse(code, mode="exec")
-        except SyntaxError as exc:
-            return ASTValidationOutcome(
-                ok=False,
-                errors=[f"syntax error at line {exc.lineno}: {exc.msg}"],
-            )
-
-        node_count = 0
-        for node in ast.walk(tree):
-            node_count += 1
-            if node_count > self.max_ast_nodes:
-                errors.append(f"AST node budget exceeded ({node_count} > {self.max_ast_nodes})")
-                break
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".", 1)[0]
-                    if root not in self.allowed_modules:
-                        errors.append(f"disallowed import '{alias.name}'")
-            elif isinstance(node, ast.ImportFrom):
-                root = (node.module or "").split(".", 1)[0]
-                if node.level != 0 or root not in self.allowed_modules:
-                    errors.append(f"disallowed import-from '{node.module}'")
-            elif isinstance(node, ast.Attribute):
-                if node.attr.startswith("__") or node.attr in {"_subclasses__"}:
-                    errors.append(f"disallowed dunder attribute access '.{node.attr}'")
-            elif isinstance(node, ast.Name):
-                if node.id in self.banned_names:
-                    errors.append(f"disallowed name '{node.id}'")
-            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in self.banned_names:
-                    errors.append(f"disallowed builtin call '{node.func.id}()'")
-
+        errors = _validate_ast_safety(
+            code, allowed_modules=self.allowed_modules, banned_names=self.banned_names,
+            max_code_chars=self.max_code_chars, max_ast_nodes=self.max_ast_nodes,
+        )
         return ASTValidationOutcome(ok=not errors, errors=errors)
 
 
-def _sanitize_spec_value(value: Any, *, depth: int = 0) -> Any:
+def _sanitize_spec_value(value: Any, *, depth: int = 0, points: list[int]) -> Any:
     if depth > _MAX_CHART_DEPTH:
         raise ValueError("chart spec exceeds max nesting depth")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("chart spec contains a non-finite number")
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
-        if _DANGEROUS_CHART_TEXT_RE.search(value):
-            raise ValueError(f"chart spec contains unsafe script/URI content: {value[:80]!r}")
-        return html.escape(sanitize_injection_text(value), quote=False)
+        if _DANGEROUS_CHART_TEXT_RE.search(value) or re.search(
+            r"[<>]|(?:https?|file|ftp|image|data):|^\s*//", value, re.IGNORECASE,
+        ):
+            raise ValueError("chart spec contains unsafe markup or a resource URL")
+        return sanitize_injection_text(value)
     if isinstance(value, list):
-        return [_sanitize_spec_value(item, depth=depth + 1) for item in value[:500]]
+        points[0] += len(value)
+        if points[0] > _MAX_CHART_POINTS:
+            raise ValueError("chart spec exceeds point limit")
+        return [_sanitize_spec_value(item, depth=depth + 1, points=points) for item in value]
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
-        for raw_key, raw_val in list(value.items())[:200]:
-            key = str(raw_key)
+        for key, raw_val in value.items():
+            if not isinstance(key, str):
+                raise ValueError("chart spec keys must be strings")
             key_lower = key.lower()
             if key_lower in {"href", "usermeta"}:
                 continue
-            if key_lower == "url":
-                raise ValueError("external url references are forbidden in chart specs")
-            if key_lower == "data" and isinstance(raw_val, dict) and "url" in {
-                str(k).lower() for k in raw_val
-            }:
-                raise ValueError("external data.url is forbidden in Vega-Lite specs; use inline values")
-            if key_lower in {"formatter", "symbolsize"} and isinstance(raw_val, str):
-                if _DANGEROUS_CHART_TEXT_RE.search(raw_val):
-                    raise ValueError(f"unsafe JS callback in '{key}'")
-            cleaned[key] = _sanitize_spec_value(raw_val, depth=depth + 1)
+            if key_lower == "$schema":
+                continue
+            if key_lower in {"url", "__proto__", "constructor", "prototype", "expr", "calculate"}:
+                raise ValueError("chart spec contains an unsafe key")
+            if key_lower == "type" and raw_val in ("image", "html"):
+                raise ValueError("chart spec contains an unsafe renderer type")
+            cleaned[key] = _sanitize_spec_value(raw_val, depth=depth + 1, points=points)
         return cleaned
-    return html.escape(sanitize_injection_text(str(value)), quote=False)
+    raise ValueError("chart spec contains a non-JSON value")
 
 
 def sanitize_chart_spec(
@@ -274,23 +280,26 @@ def sanitize_chart_spec(
         return None
 
     try:
-        cleaned_spec = _sanitize_spec_value(spec)
+        cleaned_spec = _sanitize_spec_value(spec, points=[0])
     except ValueError as exc:
         logger.warning("dropped unsafe chart spec: %s", exc)
         return None
 
-    raw_sources = [str(s).strip().strip("[]") for s in (payload.get("source_ids") or []) if s]
+    sources = payload.get("source_ids")
+    if sources is not None and not isinstance(sources, list):
+        return None
+    raw_sources = list(dict.fromkeys(str(s).strip().strip("[]") for s in sources or [] if s))
     if valid_source_ids is not None:
         filtered_sources = [sid for sid in raw_sources if sid in valid_source_ids]
-        if not filtered_sources:
+        if not filtered_sources or len(filtered_sources) != len(raw_sources):
             return None
     else:
         filtered_sources = [sid for sid in raw_sources if _SOURCE_ID_REGEX.fullmatch(sid)]
 
-    title = html.escape(sanitize_injection_text(payload.get("title") or "数据图表"), quote=False)
-    caption = html.escape(sanitize_injection_text(payload.get("caption") or ""), quote=False)
-    chart_id = re.sub(r"[^a-zA-Z0-9_-]", "-", str(payload.get("chart_id") or "chart-1")).strip("-") or "chart-1"
-    anchor_id = re.sub(r"[^a-zA-Z0-9_-]", "-", str(payload.get("anchor_id") or chart_id)).strip("-") or chart_id
+    title = sanitize_injection_text(payload.get("title") or "数据图表").replace("<", "").replace(">", "")[:120]
+    caption = sanitize_injection_text(payload.get("caption") or "").replace("<", "").replace(">", "")[:500]
+    chart_id = re.sub(r"[^a-zA-Z0-9_-]", "-", str(payload.get("chart_id") or "chart-1")[:100]).strip("-") or "chart-1"
+    anchor_id = re.sub(r"[^a-zA-Z0-9_-]", "-", str(payload.get("anchor_id") or chart_id)[:100]).strip("-") or chart_id
 
     return ReportChartArtifact(
         chart_id=chart_id,
@@ -337,11 +346,10 @@ class DockerSandboxBackend:
     ) -> None:
         self.image = (image or "helloagents-sandbox:latest").strip()
         self.cpus = str(cpus or "1.0").strip()
-        self.runner_path = runner_path or str(Path(__file__).with_name("sandbox_runner.py"))
         self.docker_bin = docker_bin or (shutil.which("docker") or "docker")
 
     def is_available(self) -> bool:
-        if not shutil.which(self.docker_bin) or not os.path.isfile(self.runner_path):
+        if not shutil.which(self.docker_bin):
             return False
         try:
             probe = subprocess.run(
@@ -360,13 +368,15 @@ class DockerSandboxBackend:
         self,
         *,
         container_name: str,
-        workdir: str,
+        workdir: str = "",
         memory_mb: int,
     ) -> list[str]:
         return [
             self.docker_bin,
             "run",
             "--rm",
+            "--interactive",
+            "--pull=never",
             "--name",
             container_name,
             "--network=none",
@@ -375,17 +385,12 @@ class DockerSandboxBackend:
             "--security-opt=no-new-privileges:true",
             "--pids-limit=64",
             f"--memory={max(64, int(memory_mb))}m",
+            f"--memory-swap={max(64, int(memory_mb))}m",
             f"--cpus={self.cpus}",
             "--user=65534:65534",
-            "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
-            "-v",
-            f"{self.runner_path}:/opt/sandbox/sandbox_runner.py:ro",
-            "-v",
-            f"{workdir}:/workspace:ro",
+            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
+            "--log-driver=none",
             self.image,
-            "python",
-            "/opt/sandbox/sandbox_runner.py",
-            "/workspace/input.json",
         ]
 
     def execute(
@@ -403,64 +408,47 @@ class DockerSandboxBackend:
             "timeout_seconds": timeout_seconds,
             "memory_mb": memory_mb,
         }
-        with tempfile.TemporaryDirectory(prefix="ha_sandbox_") as workdir:
-            input_path = Path(workdir) / "input.json"
-            input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            os.chmod(input_path, 0o444)
-            cmd = self.build_command(
-                container_name=container_name,
-                workdir=workdir,
-                memory_mb=memory_mb,
+        cmd = self.build_command(container_name=container_name, memory_mb=memory_mb)
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=json.dumps(payload, ensure_ascii=True, allow_nan=False),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
             )
+        except subprocess.TimeoutExpired:
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_seconds + 2.0,
+                subprocess.run(
+                    [self.docker_bin, "rm", "-f", container_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3.0,
                     check=False,
-                    shell=False,
                 )
-            except subprocess.TimeoutExpired:
-                try:
-                    subprocess.run(
-                        [self.docker_bin, "rm", "-f", container_name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=5.0,
-                        check=False,
-                        shell=False,
-                    )
-                except Exception:
-                    pass
-                return {
-                    "ok": False,
-                    "timed_out": True,
-                    "error": f"docker sandbox timed out after {timeout_seconds}s",
-                    "stdout": "",
-                    "stderr": "",
-                    "result": None,
-                    "tables_out": [],
-                    "charts": [],
-                }
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning("Docker sandbox cleanup failed for %s", container_name)
+            return _backend_failure("timeout", f"docker sandbox timed out after {timeout_seconds}s")
+        return _parse_backend_output(proc.stdout, proc.returncode, "docker")
 
-        raw_out = (proc.stdout or "").strip()
-        if raw_out:
-            try:
-                parsed = json.loads(raw_out.splitlines()[-1])
-                if isinstance(parsed, dict):
-                    return parsed
-            except Exception:
-                pass
-        return {
-            "ok": False,
-            "error": (proc.stderr or "").strip() or f"docker sandbox exited with code {proc.returncode}",
-            "stdout": raw_out[:4000],
-            "stderr": (proc.stderr or "")[:4000],
-            "result": None,
-            "tables_out": [],
-            "charts": [],
-        }
+
+def _backend_failure(error_code: str, error: str) -> dict[str, Any]:
+    return {"ok": False, "timed_out": error_code == "timeout", "error_code": error_code, "error": error}
+
+
+def _parse_backend_output(stdout: str, returncode: int, backend: str) -> dict[str, Any]:
+    if len(stdout) > MAX_OUTPUT_BYTES or len(stdout.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        return _backend_failure("output_limit", f"{backend} sandbox output exceeds limit")
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, dict) and type(parsed.get("ok")) is bool and (returncode == 0 or not parsed["ok"]):
+            return parsed
+    except (ValueError, RecursionError):
+        pass
+    if returncode in (-signal.SIGKILL, 137):
+        return _backend_failure("oom", f"{backend} sandbox was killed")
+    return _backend_failure("runtime_error", f"{backend} sandbox exited with code {returncode}")
 
 
 class PyodideSandboxBackend:
@@ -487,14 +475,21 @@ class PyodideSandboxBackend:
             and shutil.which(self.node_bin)
             and os.path.isfile(self.worker_path)
             and self.pyodide_cache_dir
-            and os.path.isdir(self.pyodide_cache_dir)
+            and Path(self.pyodide_cache_dir, "pyodide.mjs").is_file()
         )
 
-    def build_command(self) -> list[str]:
+    def build_command(self, memory_mb: int | None = None) -> list[str]:
+        worker = Path(self.worker_path).resolve()
+        heap_mb = self.max_old_space_mb if memory_mb is None else min(self.max_old_space_mb, max(16, memory_mb // 4))
         return [
             self.node_bin or "node",
-            f"--max-old-space-size={self.max_old_space_mb}",
-            self.worker_path,
+            f"--max-old-space-size={heap_mb}",
+            f"--wasm-max-mem-pages={max(16, (memory_mb or 512) - heap_mb) * 16}",
+            "--experimental-permission",
+            f"--allow-fs-read={Path(self.pyodide_cache_dir).resolve()}",
+            f"--allow-fs-read={worker}",
+            f"--allow-fs-read={worker.with_name('sandbox_runner.py')}",
+            str(worker),
         ]
 
     def execute(
@@ -505,16 +500,17 @@ class PyodideSandboxBackend:
         timeout_seconds: float,
         memory_mb: int,
     ) -> dict[str, Any]:
-        cmd = self.build_command()
+        cmd = self.build_command(memory_mb)
         payload = json.dumps(
             {
                 "code": code,
                 "tables": tables,
                 "timeout_seconds": timeout_seconds,
                 "memory_mb": memory_mb,
-                "pyodide_cache_dir": self.pyodide_cache_dir,
+                "pyodide_cache_dir": str(Path(self.pyodide_cache_dir).resolve()),
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
+            allow_nan=False,
         )
         proc = subprocess.Popen(
             cmd,
@@ -524,49 +520,21 @@ class PyodideSandboxBackend:
             text=True,
             start_new_session=True,
             shell=False,
+            env={"PATH": os.defpath, "LANG": "C.UTF-8"},
         )
         try:
-            stdout, stderr = proc.communicate(input=payload, timeout=timeout_seconds + 2.0)
+            stdout, _ = proc.communicate(input=payload, timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             try:
                 proc.communicate(timeout=2.0)
             except Exception:
                 pass
-            return {
-                "ok": False,
-                "timed_out": True,
-                "error": f"pyodide sandbox timed out after {timeout_seconds}s",
-                "stdout": "",
-                "stderr": "",
-                "result": None,
-                "tables_out": [],
-                "charts": [],
-            }
-
-        raw_out = (stdout or "").strip()
-        if raw_out:
-            try:
-                parsed = json.loads(raw_out.splitlines()[-1])
-                if isinstance(parsed, dict):
-                    return parsed
-            except Exception:
-                pass
-        return {
-            "ok": False,
-            "error": (stderr or "").strip() or f"pyodide worker exited with code {proc.returncode}",
-            "stdout": raw_out[:4000],
-            "stderr": (stderr or "")[:4000],
-            "result": None,
-            "tables_out": [],
-            "charts": [],
-        }
+            return _backend_failure("timeout", f"pyodide sandbox timed out after {timeout_seconds}s")
+        return _parse_backend_output(stdout, proc.returncode, "pyodide")
 
 
 class SandboxExecutorService:
@@ -596,6 +564,16 @@ class SandboxExecutorService:
         self._metrics = metrics
         self._lock = threading.Lock()
         self._task_execution_counts: dict[int, int] = {}
+        self._execution_slots = threading.BoundedSemaphore(2)
+
+    def restore_task_counts(self, tasks: list[Any]) -> None:
+        with self._lock:
+            for task in tasks:
+                count = sum(
+                    item.get("source_origin") == "sandbox"
+                    for item in task.evidence_items if isinstance(item, dict)
+                )
+                self._task_execution_counts[task.id] = max(self._task_execution_counts.get(task.id, 0), count)
 
     def _inc_metric(self, name: str, delta: int = 1) -> None:
         if self._metrics is not None:
@@ -606,6 +584,8 @@ class SandboxExecutorService:
 
     def _select_backend(self) -> SandboxBackend | None:
         pref = self.backend_preference
+        if pref not in {"auto", "docker", "pyodide"}:
+            return None
         if pref == "docker":
             return self.docker_backend if self.docker_backend.is_available() else None
         if pref == "pyodide":
@@ -621,19 +601,17 @@ class SandboxExecutorService:
         *,
         code: str,
         tables: list[dict[str, Any]],
-        result: Any,
-        tables_out: list[dict[str, Any]],
+        derived_ids: list[str],
     ) -> str:
         canonical = json.dumps(
             {
-                "code": code,
+                "code": code.replace("\r\n", "\n"),
                 "tables": tables,
-                "result": result,
-                "tables_out": tables_out,
+                "derived_from_source_ids": sorted(derived_ids),
             },
             ensure_ascii=False,
             sort_keys=True,
-            default=str,
+            allow_nan=False,
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -656,19 +634,20 @@ class SandboxExecutorService:
 
         derived_ids = list(
             dict.fromkeys(
-                [t.source_id for t in request.tables if t.source_id]
+                [sid for table in request.tables for sid in table.source_ids]
                 + [str(sid).strip().strip("[]") for sid in request.derived_from_source_ids if sid]
             )
         )
-        if valid_source_ids is not None:
-            ungrounded = [sid for sid in derived_ids if sid not in valid_source_ids]
-            if ungrounded:
-                return SandboxExecutionResult(
-                    ok=False,
-                    backend="provenance_rejected",
-                    error=f"derived_from_source_ids contain unknown sources: {', '.join(ungrounded)}",
-                    derived_from_source_ids=derived_ids,
-                )
+        if not derived_ids or any(
+            not _SOURCE_ID_REGEX.fullmatch(sid) or "-C" in sid
+            or (valid_source_ids is not None and sid not in valid_source_ids)
+            for sid in derived_ids
+        ):
+            return SandboxExecutionResult(
+                ok=False, backend="provenance_rejected", error_code="provenance_rejected",
+                error="computation requires known original evidence source IDs",
+                derived_from_source_ids=derived_ids,
+            )
 
         ast_check = self.ast_validator.validate(request.code)
         if not ast_check.ok:
@@ -676,6 +655,7 @@ class SandboxExecutorService:
             return SandboxExecutionResult(
                 ok=False,
                 backend="ast_rejected",
+                error_code="ast_rejected",
                 error="; ".join(ast_check.errors),
                 derived_from_source_ids=derived_ids,
                 duration_ms=round((time.perf_counter() - started) * 1000.0, 2),
@@ -686,9 +666,21 @@ class SandboxExecutorService:
             return SandboxExecutionResult(
                 ok=False,
                 backend="unavailable",
+                error_code="backend_unavailable",
                 error=f"no isolated sandbox runtime available for backend={self.backend_preference!r}",
                 derived_from_source_ids=derived_ids,
                 duration_ms=round((time.perf_counter() - started) * 1000.0, 2),
+            )
+
+        table_payloads = [tbl.model_dump() for tbl in request.tables]
+        try:
+            if len({tbl.name for tbl in request.tables}) != len(request.tables):
+                raise ValueError("duplicate sandbox table names")
+            if len(json.dumps({"code": request.code, "tables": table_payloads}, allow_nan=False)) > MAX_INPUT_BYTES - 4096:
+                raise ValueError("sandbox input exceeds byte limit")
+        except (ValueError, TypeError, RecursionError) as exc:
+            return SandboxExecutionResult(
+                ok=False, backend="input_rejected", error_code="input_rejected", error=str(exc)[:300],
             )
 
         with self._lock:
@@ -705,20 +697,37 @@ class SandboxExecutorService:
 
         self._inc_metric("sandbox_executions_total")
         timeout = min(self.timeout_seconds, float(request.timeout_seconds or self.timeout_seconds))
-        table_payloads = [tbl.model_dump() for tbl in request.tables]
-        raw_res = backend.execute(
-            code=request.code,
-            tables=table_payloads,
-            timeout_seconds=max(1.0, timeout),
-            memory_mb=self.memory_mb,
-        )
+        try:
+            if self._execution_slots.acquire(timeout=timeout):
+                try:
+                    raw_res = backend.execute(
+                        code=request.code,
+                        tables=table_payloads,
+                        timeout_seconds=timeout,
+                        memory_mb=self.memory_mb,
+                    )
+                finally:
+                    self._execution_slots.release()
+            else:
+                raw_res = _backend_failure("timeout", "sandbox execution queue timed out")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raw_res = _backend_failure("backend_unavailable", "sandbox runtime could not start")
         timed_out = bool(raw_res.get("timed_out"))
         if timed_out:
             self._inc_metric("sandbox_timeouts_total")
 
+        if not raw_res.get("ok"):
+            return SandboxExecutionResult(
+                ok=False, backend=backend.backend_name, timed_out=timed_out,
+                error_code=raw_res.get("error_code") or "runtime_error",
+                error=raw_res.get("error") or "sandbox execution failed",
+                derived_from_source_ids=derived_ids,
+                duration_ms=round((time.perf_counter() - started) * 1000.0, 2),
+            )
+
         sanitized_charts: list[ReportChartArtifact] = []
         valid_chart_sources = set(derived_ids) if derived_ids else valid_source_ids
-        for raw_chart in raw_res.get("charts") or []:
+        for raw_chart in (raw_res.get("charts") or [])[:8]:
             if not isinstance(raw_chart, dict):
                 continue
             enriched = dict(raw_chart)
@@ -729,15 +738,15 @@ class SandboxExecutorService:
                 valid_source_ids=valid_chart_sources,
             )
             if cleaned_chart is not None:
-                sanitized_charts.append(ReportChartArtifact.model_validate(cleaned_chart))
+                if request.chart_library in (None, cleaned_chart["library"]):
+                    sanitized_charts.append(ReportChartArtifact.model_validate(cleaned_chart))
 
         result_val = raw_res.get("result")
         tables_out = [t for t in (raw_res.get("tables_out") or []) if isinstance(t, dict)]
         exec_hash = self._compute_execution_hash(
             code=request.code,
             tables=table_payloads,
-            result=result_val,
-            tables_out=tables_out,
+            derived_ids=derived_ids,
         )
         backend_name = str(getattr(backend, "backend_name", "sandbox") or "sandbox")
         return SandboxExecutionResult(
@@ -756,6 +765,34 @@ class SandboxExecutorService:
         )
 
 
+def record_sandbox_result(
+    store: Any, request: SandboxExecutionRequest, result: SandboxExecutionResult, *, tenant_id: str = "default",
+) -> dict[str, Any]:
+    result_text = sanitize_injection_text(json.dumps(result.result, ensure_ascii=False))
+    stdout = sanitize_injection_text(result.stdout)[:400]
+    summary = f"计算结果: {result_text}" + (f"\n输出: {stdout}" if stdout else "")
+    charts = [chart.model_dump() for chart in result.charts]
+    return store.record_computation_evidence(
+        task_id=request.task_id,
+        title=request.title,
+        summary_text=summary,
+        derived_from_source_ids=result.derived_from_source_ids,
+        computation_artifact={
+            "execution_hash": result.execution_hash,
+            "backend": result.backend,
+            "result": result.result,
+            "tables_out": result.tables_out,
+            "code": request.code,
+            "input_tables": [table.model_dump() for table in request.tables],
+            "stdout": result.stdout,
+            "duration_ms": result.duration_ms,
+        },
+        structured_payload={"result": result.result, "tables_out": result.tables_out, "charts": charts},
+        tenant_id=tenant_id,
+        backend=result.backend,
+    )
+
+
 class RunPythonSandboxTool(Tool):
     """Execute bounded quantitative Python code in an isolated sandbox and register [Tn-Cm] evidence."""
 
@@ -765,6 +802,7 @@ class RunPythonSandboxTool(Tool):
         sandbox_service: SandboxExecutorService,
         evidence_store: Any,
         config: Any | None = None,
+        tenant_id: str = "default",
     ) -> None:
         super().__init__(
             name="run_python_sandbox",
@@ -776,6 +814,7 @@ class RunPythonSandboxTool(Tool):
         self._sandbox_service = sandbox_service
         self._evidence_store = evidence_store
         self._config = config
+        self._tenant_id = tenant_id
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
@@ -812,42 +851,28 @@ class RunPythonSandboxTool(Tool):
                     ensure_ascii=False,
                 )
 
-        task_id = int(parameters.get("task_id") or 0)
-        if task_id <= 0:
-            raise ValueError("task_id is required")
-        code = str(parameters.get("code") or "")
-        title = sanitize_injection_text(parameters.get("title") or "沙箱定量计算")
-        raw_sources = parameters.get("derived_from_source_ids") or []
-        if isinstance(raw_sources, str):
-            raw_sources = [s.strip() for s in raw_sources.split(",") if s.strip()]
-        derived_ids = [str(s).strip().strip("[]") for s in raw_sources if str(s).strip()]
-
-        raw_tables = parameters.get("tables") or []
-        if isinstance(raw_tables, str):
-            raw_tables = json.loads(raw_tables)
-        tables = [
-            SandboxInputTable.model_validate(tbl)
-            for tbl in (raw_tables or [])
-            if isinstance(tbl, dict)
-        ]
+        try:
+            raw = dict(parameters)
+            raw["title"] = sanitize_injection_text(raw.get("title") or "沙箱定量计算")[:120]
+            for key in ("derived_from_source_ids", "input_source_ids"):
+                if isinstance(raw.get(key), str):
+                    raw[key] = [value.strip() for value in raw[key].split(",") if value.strip()]
+            for key in ("tables", "input_tables"):
+                if isinstance(raw.get(key), str):
+                    raw[key] = json.loads(raw[key])
+            req = SandboxExecutionRequest.model_validate(raw)
+        except (ValueError, TypeError, RecursionError):
+            return json.dumps(_backend_failure("input_rejected", "invalid sandbox request"))
 
         valid_task_sources: set[str] | None = None
         if hasattr(self._evidence_store, "list_task_evidence"):
-            items = self._evidence_store.list_task_evidence(task_id)
+            items = self._evidence_store.list_task_evidence(req.task_id)
             valid_task_sources = {
                 str(item.get("source_id") or "").strip()
                 for item in items
                 if item.get("source_id")
             }
 
-        req = SandboxExecutionRequest(
-            task_id=task_id,
-            code=code,
-            title=title,
-            tables=tables,
-            derived_from_source_ids=derived_ids,
-            emit_chart=bool(parameters.get("emit_chart", False)),
-        )
         exec_result = self._sandbox_service.execute(req, valid_source_ids=valid_task_sources)
 
         payload: dict[str, Any] = {
@@ -859,35 +884,12 @@ class RunPythonSandboxTool(Tool):
             "derived_from_source_ids": exec_result.derived_from_source_ids,
             "execution_hash": exec_result.execution_hash,
             "error": exec_result.error,
+            "error_code": exec_result.error_code,
             "timed_out": exec_result.timed_out,
         }
 
         if exec_result.ok and hasattr(self._evidence_store, "record_computation_evidence"):
-            snippet_parts = [f"计算结论: {json.dumps(exec_result.result, ensure_ascii=False)}"]
-            if exec_result.stdout:
-                snippet_parts.append(f"输出: {exec_result.stdout.strip()[:400]}")
-            if exec_result.derived_from_source_ids:
-                snippet_parts.append(f"上游来源: {', '.join(exec_result.derived_from_source_ids)}")
-            record = self._evidence_store.record_computation_evidence(
-                task_id=task_id,
-                title=title,
-                summary_text="\n".join(snippet_parts),
-                derived_from_source_ids=exec_result.derived_from_source_ids,
-                computation_artifact={
-                    "execution_hash": exec_result.execution_hash,
-                    "backend": exec_result.backend,
-                    "result": exec_result.result,
-                    "tables_out": exec_result.tables_out,
-                    "code": code,
-                    "duration_ms": exec_result.duration_ms,
-                },
-                structured_payload={
-                    "result": exec_result.result,
-                    "tables_out": exec_result.tables_out,
-                    "charts": [c.model_dump() for c in exec_result.charts],
-                },
-                backend=exec_result.backend,
-            )
+            record = record_sandbox_result(self._evidence_store, req, exec_result, tenant_id=self._tenant_id)
             payload["source_id"] = record.get("source_id")
             payload["evidence"] = record
 

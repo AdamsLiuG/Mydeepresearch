@@ -1763,6 +1763,10 @@ class TaskExecutorMixin:
         if (
             summary_result is not None
             and bool(getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)())
+            and (
+                not self.config.use_tool_calling
+                or str(self.config.llm_provider or "").strip().lower() == "vllm"
+            )
             and getattr(self, "_sandbox_service", None) is not None
             and isinstance(getattr(summary_result, "payload", None), dict)
             and summary_result.payload.get("computation_requests")
@@ -1774,6 +1778,7 @@ class TaskExecutorMixin:
             )
 
         task.evidence_items = evidence_store.list_task_evidence(task.id)
+        task.sources_summary = format_evidence_sources(task.evidence_items)
         task.summary = (summary_result.markdown or "").strip() if summary_result else "暂无可用信息"
         task.summary_payload = dict(summary_result.payload or {}) if summary_result else None
         task.claims = list(summary_result.claims or []) if summary_result else []
@@ -1821,11 +1826,15 @@ class TaskExecutorMixin:
         sandbox_service = getattr(self, "_sandbox_service", None)
         if sandbox_service is None:
             return
-        requests_list = list((summary_result.payload or {}).get("computation_requests") or [])
+        requests_list = (summary_result.payload or {}).pop("computation_requests", [])
         if not requests_list:
             return
 
-        from services.sandbox_executor import SandboxExecutionRequest, SandboxInputTable
+        from services.memory_sanitizer import sanitize_injection_text
+        from services.sandbox_executor import (
+            SandboxExecutionRequest,
+            record_sandbox_result,
+        )
 
         valid_ids = {
             str(item.get("source_id") or "").strip()
@@ -1838,64 +1847,36 @@ class TaskExecutorMixin:
             if not isinstance(req_data, dict):
                 continue
             try:
-                tables = [
-                    SandboxInputTable.model_validate(tbl)
-                    for tbl in (req_data.get("tables") or [])
-                    if isinstance(tbl, dict)
-                ]
-                derived_ids = [
-                    str(sid).strip().strip("[]")
-                    for sid in (req_data.get("derived_from_source_ids") or [])
-                    if str(sid).strip()
-                ]
-                title = str(req_data.get("title") or "定量计算验证").strip() or "定量计算验证"
-                code = str(req_data.get("code") or "")
-                exec_res = sandbox_service.execute(
-                    SandboxExecutionRequest(
-                        task_id=task.id,
-                        code=code,
-                        title=title,
-                        tables=tables,
-                        derived_from_source_ids=derived_ids,
-                    ),
-                    valid_source_ids=valid_ids,
-                )
+                title = sanitize_injection_text(req_data.get("title") or "定量计算验证")[:120] or "定量计算验证"
+                request = SandboxExecutionRequest.model_validate({**req_data, "task_id": task.id, "title": title})
+                exec_res = sandbox_service.execute(request, valid_source_ids=valid_ids)
             except Exception as exc:
                 logger.debug("prompt-only sandbox computation skipped task=%s err=%s", task.id, exc)
                 continue
 
             if not exec_res.ok:
                 logger.debug("prompt-only sandbox computation rejected task=%s err=%s", task.id, exec_res.error)
+                observer = getattr(self, "_request_trace", None)
+                if observer is not None:
+                    observer.record_degraded(f"sandbox_computation:{exec_res.error_code or exec_res.backend}")
                 continue
 
-            summary_text = f"计算结果: {json.dumps(exec_res.result, ensure_ascii=False)}"
-            record = evidence_store.record_computation_evidence(
-                task_id=task.id,
-                title=title,
-                summary_text=summary_text,
-                derived_from_source_ids=exec_res.derived_from_source_ids,
-                computation_artifact={
-                    "execution_hash": exec_res.execution_hash,
-                    "backend": exec_res.backend,
-                    "result": exec_res.result,
-                    "tables_out": exec_res.tables_out,
-                    "code": code,
-                    "duration_ms": exec_res.duration_ms,
-                },
-                structured_payload={
-                    "result": exec_res.result,
-                    "tables_out": exec_res.tables_out,
-                    "charts": [c.model_dump() for c in exec_res.charts],
-                },
-                backend=exec_res.backend,
+            record = record_sandbox_result(
+                evidence_store, request, exec_res, tenant_id=getattr(self, "tenant_id", "default"),
             )
             comp_sid = str(record.get("source_id") or "").strip()
             if comp_sid:
-                valid_ids.add(comp_sid)
-                finding_text = f"{title}：{summary_text}"
+                finding_text = f"{title}：{record['snippet']}"
                 extra_findings.append({"text": finding_text, "source_ids": [comp_sid]})
 
         if extra_findings:
+            from services.fact_ledger import FactLedgerCompactor
+
+            compactor = FactLedgerCompactor()
+            task.fact_claims.extend(
+                compactor._structured_from_text(item["text"], item["source_ids"], task)
+                for item in extra_findings
+            )
             summary_result.claims = list(summary_result.claims or []) + extra_findings
             if isinstance(summary_result.payload, dict):
                 existing_kf = list(summary_result.payload.get("key_findings") or [])

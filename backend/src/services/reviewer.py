@@ -20,7 +20,7 @@ from services.evidence import extract_citation_ids, format_evidence_sources
 from services.evidence_index import EvidenceRetrievalService
 from services.fact_ledger import FactLedger, render_evidence_index_cards_block
 from services.mcp_bridge import MCPHitlApprovalRequired
-from services.skill_verifiers import run_skill_verifiers
+from services.skill_verifiers import run_skill_verifiers, verify_computation_lineage
 from services.text_processing import (
     looks_like_meta_reasoning,
     normalize_agent_markdown,
@@ -580,11 +580,13 @@ class ReviewService:
                 }
             )
 
-        evidence_by_id = {
+        evidence_by_id = dict(request_evidence_by_id or {})
+        evidence_by_id.update({
             str(item.get("source_id") or "").strip(): item
             for item in evidence_items
             if str(item.get("source_id") or "").strip()
-        }
+            and str(item.get("source_id") or "").strip() not in evidence_by_id
+        })
         for item in evidence_items:
             sid = str(item.get("source_id") or "").strip()
             is_sandbox = str(item.get("source_origin") or "").strip().lower() == "sandbox" or "-C" in sid
@@ -830,84 +832,12 @@ class ReviewService:
             )
         return None
 
-    @staticmethod
-    def _extract_salient_numbers(text: str) -> list[float]:
-        ignored_ints = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 24.0, 52.0, 60.0, 100.0, 365.0, 1000.0}
-        values: list[float] = []
-        for token in re.findall(r"(?<![A-Za-z0-9_])(\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)", str(text or "")):
-            normalized = token.replace(",", "")
-            try:
-                num = float(normalized)
-            except ValueError:
-                continue
-            if num in ignored_ints:
-                continue
-            if num.is_integer() and 0 <= num < 10:
-                continue
-            values.append(num)
-        return values
-
     def _verify_computation_lineage(
         self,
         compute_record: dict[str, Any],
         evidence_by_id: dict[str, dict[str, Any]],
     ) -> str | None:
-        derived_ids = [
-            str(sid).strip().strip("[]")
-            for sid in (compute_record.get("derived_from_source_ids") or [])
-            if str(sid).strip()
-        ]
-        if not derived_ids:
-            return "未声明上游支撑来源 derived_from_source_ids"
-
-        upstream_records = [evidence_by_id[sid] for sid in derived_ids if sid in evidence_by_id]
-        if not upstream_records:
-            return f"引用的上游来源 {', '.join(derived_ids)} 不在当前任务证据目录中"
-
-        artifact = compute_record.get("computation_artifact")
-        if not isinstance(artifact, dict):
-            return "缺少 computation_artifact 计算产物记录"
-
-        input_corpus_parts = [str(artifact.get("code") or "")]
-        if isinstance(artifact.get("tables"), list):
-            input_corpus_parts.append(str(artifact.get("tables")))
-        salient_inputs = self._extract_salient_numbers("\n".join(input_corpus_parts))
-        if len(salient_inputs) < 2:
-            return None
-
-        upstream_parts: list[str] = []
-        for rec in upstream_records:
-            upstream_parts.append(str(rec.get("title") or ""))
-            upstream_parts.append(str(rec.get("snippet") or ""))
-            upstream_parts.append(str(rec.get("raw_content") or ""))
-            upstream_parts.append(str(rec.get("full_content") or ""))
-            for block in rec.get("multimodal_blocks") or []:
-                if isinstance(block, dict):
-                    upstream_parts.append(str(block.get("markdown") or ""))
-                    upstream_parts.append(str(block.get("text") or ""))
-                    upstream_parts.append(str(block.get("summary") or ""))
-                    if isinstance(block.get("structured_payload"), dict):
-                        upstream_parts.append(str(block.get("structured_payload")))
-        upstream_nums = [
-            float(tok.replace(",", ""))
-            for tok in re.findall(r"(\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)", "\n".join(upstream_parts))
-            if tok not in {".", ""}
-        ]
-        if not upstream_nums:
-            return "上游来源缺乏可核对的数值输入"
-
-        missing: list[float] = []
-        for val in salient_inputs:
-            matched = any(
-                abs(val - u) <= max(1e-6, 0.01 * max(abs(val), abs(u)))
-                for u in upstream_nums
-            )
-            if not matched:
-                missing.append(val)
-        if len(missing) / len(salient_inputs) > 0.30:
-            sample = ", ".join(f"{v:g}" for v in missing[:4])
-            return f"超过 30% 的计算关键输入数字未出现在上游来源中: {sample}"
-        return None
+        return verify_computation_lineage(compute_record, evidence_by_id)
 
     @staticmethod
     def _normalize_repair_check(check: str) -> str | None:

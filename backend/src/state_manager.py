@@ -47,6 +47,12 @@ class StateManagerMixin:
             "cache_misses": observer_snapshot.get("cache_misses", 0),
             "last_search_cache_details": dict(observer_snapshot.get("last_search_cache_details") or {}),
         }
+        serialized_tasks = [self._serialize_task(task) for task in state.todo_items]
+        if getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)():
+            for task, serialized in zip(state.todo_items, serialized_tasks):
+                evidence = self._evidence_store.list_task_evidence(task.id, include_full_content=True)
+                if evidence:
+                    serialized["evidence_items"] = evidence
         payload = {
             "snapshot_version": 2,
             "request_id": self.request_id,
@@ -58,9 +64,10 @@ class StateManagerMixin:
             "elapsed_ms": observer_snapshot.get("elapsed_ms"),
             "report_markdown": report_markdown or state.structured_report or state.running_summary or "",
             "report_charts": list(getattr(state, "report_charts", None) or []),
+            **({"charts_spec": list(state.report_charts)} if state.report_charts else {}),
             "report_note_id": state.report_note_id,
             "report_note_path": state.report_note_path,
-            "todo_items": [self._serialize_task(task) for task in state.todo_items],
+            "todo_items": serialized_tasks,
             "review_summary": dict(state.review_summary or {}),
             "reflection_completed": bool(state.reflection_completed),
             "review_completed": bool(state.review_completed),
@@ -268,7 +275,7 @@ class StateManagerMixin:
             report_charts=(
                 list(payload.get("report_charts") or [])
                 if isinstance(payload.get("report_charts"), list)
-                else []
+                else list(payload["charts_spec"]) if isinstance(payload.get("charts_spec"), list) else []
             ),
             evidence_conflicts=(
                 list(payload.get("evidence_conflicts") or [])
@@ -285,6 +292,9 @@ class StateManagerMixin:
             workflow_run_id=str(payload.get("workflow_run_id") or "").strip() or None,
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
+        sandbox = getattr(self, "_sandbox_service", None)
+        if sandbox is not None:
+            sandbox.restore_task_counts(state.todo_items)
         for task in state.todo_items:
             if not task.sources_summary and task.id > 0:
                 evidence_items = self._evidence_store.list_task_evidence(task.id)

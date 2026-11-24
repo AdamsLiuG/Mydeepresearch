@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import logging
+import math
 import re
 import struct
 import threading
@@ -16,7 +17,6 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-import requests
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.memory_sanitizer import sanitize_injection_text
@@ -29,12 +29,13 @@ ALLOWED_IMAGE_MIME_TYPES = frozenset(
         "image/jpeg",
         "image/jpg",
         "image/webp",
-        "image/gif",
     }
 )
 DEFAULT_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 16_000_000
+DEFAULT_MAX_PDF_BYTES = 15 * 1024 * 1024
 DEFAULT_MAX_VLM_CONCURRENCY = 4
+_VLM_SLOTS = threading.BoundedSemaphore(DEFAULT_MAX_VLM_CONCURRENCY)
 _MAX_IMAGE_REDIRECTS = 3
 
 _CHART_HINT_KEYWORDS = (
@@ -270,6 +271,35 @@ def _looks_like_svg_payload(raw_bytes: bytes, content_type: str = "") -> bool:
         return True
     head = raw_bytes[:512].lstrip().lower()
     return head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head)
+
+
+def _image_matches_mime(data: bytes, mime_type: str) -> bool:
+    if _looks_like_svg_payload(data, mime_type):
+        return False
+    if mime_type == "image/png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if mime_type in {"image/jpeg", "image/jpg"}:
+        return data.startswith(b"\xff\xd8")
+    if mime_type == "image/webp":
+        return data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    return False
+
+
+def _table_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return sanitize_injection_text(" ".join(text.split()))[:500]
+
+
+def _page_bbox(value: Any) -> list[float] | None:
+    try:
+        coords = [float(coord) for coord in value]
+    except (TypeError, ValueError):
+        return None
+    if len(coords) != 4 or not all(math.isfinite(coord) for coord in coords):
+        return None
+    if coords[0] >= coords[2] or coords[1] >= coords[3]:
+        return None
+    return coords
 
 
 def _rows_to_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -553,11 +583,13 @@ class MultimodalEvidenceParser:
         vlm_model: str | None = None,
         vlm_base_url: str | None = None,
         vlm_api_key: str | None = None,
-        vlm_timeout_seconds: float = 20.0,
+        vlm_timeout_seconds: float = 12.0,
         max_vlm_concurrency: int = DEFAULT_MAX_VLM_CONCURRENCY,
         max_pdf_pages: int = 20,
-        max_vlm_pages_per_doc: int = 4,
-        max_images_per_page: int = 3,
+        max_pdf_bytes: int = DEFAULT_MAX_PDF_BYTES,
+        pdf_render_dpi: int = 144,
+        max_vlm_pages_per_doc: int = 6,
+        max_images_per_page: int = 2,
         max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
         max_image_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
         metrics: Any | None = None,
@@ -571,6 +603,8 @@ class MultimodalEvidenceParser:
         self.vlm_api_key = (vlm_api_key or "").strip() or None
         self.vlm_timeout_seconds = max(1.0, float(vlm_timeout_seconds or 20.0))
         self.max_pdf_pages = max(1, int(max_pdf_pages or 20))
+        self.max_pdf_bytes = max(1, int(max_pdf_bytes))
+        self.pdf_render_dpi = max(72, min(200, int(pdf_render_dpi)))
         self.max_vlm_pages_per_doc = max(0, int(max_vlm_pages_per_doc or 0))
         self.max_images_per_page = max(0, int(max_images_per_page or 0))
         self.max_image_bytes = max(1024, int(max_image_bytes or DEFAULT_MAX_IMAGE_BYTES))
@@ -587,12 +621,20 @@ class MultimodalEvidenceParser:
             except Exception:
                 pass
 
+    @property
+    def _visual_parsing_available(self) -> bool:
+        return self.vlm_enabled and bool(self._vlm_caller or (self.vlm_base_url and self.vlm_model))
+
     def _is_chart_candidate(self, meta: dict[str, str]) -> bool:
         src = (meta.get("src") or "").strip()
         if not src:
             return False
         lower_src = src.lower()
-        if lower_src.startswith("data:") or ".svg" in urlsplit(lower_src).path:
+        try:
+            parsed = urlsplit(lower_src)
+        except ValueError:
+            return False
+        if parsed.scheme not in {"", "http", "https"} or ".svg" in parsed.path:
             return False
         combined = " ".join(
             [
@@ -608,14 +650,14 @@ class MultimodalEvidenceParser:
         return any(hint in combined for hint in _CHART_HINT_KEYWORDS)
 
     def _download_validated_image(self, img_url: str, *, timeout_seconds: float = 10.0) -> tuple[bytes, str] | None:
+        from services.evidence import _open_public_fetch
+
         current_url = self._url_validator(img_url)
         for redirect_count in range(_MAX_IMAGE_REDIRECTS + 1):
-            with requests.get(
+            with _open_public_fetch(
                 current_url,
                 timeout=timeout_seconds,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; HelloAgentsDeepResearch/1.0)"},
-                allow_redirects=False,
-                stream=True,
             ) as resp:
                 if 300 <= resp.status_code < 400:
                     location = (resp.headers.get("Location") or "").strip()
@@ -632,7 +674,9 @@ class MultimodalEvidenceParser:
                     return None
 
                 declared_len = resp.headers.get("Content-Length")
-                if declared_len and declared_len.isdigit() and int(declared_len) > self.max_image_bytes:
+                if declared_len and declared_len.isascii() and declared_len.isdecimal() and (
+                    len(declared_len) > 20 or int(declared_len) > self.max_image_bytes
+                ):
                     return None
 
                 chunks: list[bytes] = []
@@ -649,6 +693,8 @@ class MultimodalEvidenceParser:
                     return None
                 dims = inspect_image_dimensions(raw_bytes)
                 if dims is None or dims[0] * dims[1] > self.max_image_pixels:
+                    return None
+                if not _image_matches_mime(raw_bytes, content_type):
                     return None
                 return raw_bytes, content_type
         return None
@@ -711,10 +757,16 @@ class MultimodalEvidenceParser:
         elif response_format_mode == "json_object":
             payload["response_format"] = {"type": "json_object"}
 
-        with httpx.Client(timeout=self.vlm_timeout_seconds) as client:
-            response = client.post(endpoint, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        payload["max_tokens"] = 2048
+        with httpx.Client(timeout=self.vlm_timeout_seconds, trust_env=False) as client:
+            with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                body = bytearray()
+                for chunk in response.iter_bytes(chunk_size=8192):
+                    body.extend(chunk)
+                    if len(body) > 128 * 1024:
+                        raise ValueError("VLM response exceeds byte limit")
+        data = json.loads(body)
         choices = data.get("choices") or []
         if not choices:
             return None
@@ -730,17 +782,24 @@ class MultimodalEvidenceParser:
     ) -> MultimodalChartExtraction | None:
         """Invoke configured VLM with Semaphore(4) and json_schema -> json_object -> plain JSON fallback."""
 
-        if not self.vlm_enabled:
+        if not self.enabled or not self.vlm_enabled:
             return None
-        if len(image_bytes) > self.max_image_bytes or _looks_like_svg_payload(image_bytes, mime_type):
+        if len(image_bytes) > self.max_image_bytes or not _image_matches_mime(image_bytes, mime_type):
             return None
         dims = inspect_image_dimensions(image_bytes)
-        if dims is not None and dims[0] * dims[1] > self.max_image_pixels:
+        if dims is None or dims[0] * dims[1] > self.max_image_pixels:
             return None
-        if self._vlm_caller is None and not (self.vlm_base_url and self.vlm_model):
+        if not self._visual_parsing_available:
             return None
 
-        with self._vlm_semaphore:
+        if not _VLM_SLOTS.acquire(timeout=self.vlm_timeout_seconds):
+            self._inc_metric("multimodal_vlm_fallback_total")
+            return None
+        if not self._vlm_semaphore.acquire(blocking=False):
+            _VLM_SLOTS.release()
+            self._inc_metric("multimodal_vlm_fallback_total")
+            return None
+        try:
             self._inc_metric("multimodal_vlm_calls_total")
             modes: tuple[str | None, ...] = ("json_schema", "json_object", None)
             for idx, mode in enumerate(modes):
@@ -761,12 +820,20 @@ class MultimodalEvidenceParser:
                     if not isinstance(parsed_dict, dict):
                         raise ValueError("unparseable VLM JSON output")
                     validated = MultimodalChartExtraction.model_validate(parsed_dict)
-                    return _sanitize_chart_extraction(validated)
+                    cleaned = _sanitize_chart_extraction(validated)
+                    if not _chart_extraction_to_markdown(cleaned):
+                        raise ValueError("VLM output contains no usable evidence")
+                    return cleaned
+                except (TimeoutError, httpx.TimeoutException):
+                    break
                 except Exception as exc:
                     logger.debug("VLM extraction failed under mode=%s: %s", mode, exc)
                     if idx < len(modes) - 1:
                         self._inc_metric("multimodal_vlm_fallback_total")
                     continue
+        finally:
+            self._vlm_semaphore.release()
+            _VLM_SLOTS.release()
         self._inc_metric("multimodal_vlm_fallback_total")
         return None
 
@@ -792,9 +859,9 @@ class MultimodalEvidenceParser:
 
         if self.enabled and html:
             raw_tables, raw_images = _extract_html_tables_and_images(html)
-            for idx, table in enumerate(raw_tables, start=1):
-                headers = [str(h or "").strip() for h in table.get("headers") or []]
-                rows = [[str(c or "").strip() for c in r] for r in table.get("rows") or []]
+            for idx, table in enumerate(raw_tables[:32], start=1):
+                headers = [_table_cell(h) for h in (table.get("headers") or [])[:128]]
+                rows = [[_table_cell(c) for c in r[:128]] for r in (table.get("rows") or [])[:2000]]
                 if len(headers) < 2 and len(rows) < 2:
                     continue
                 md = _rows_to_markdown_table(headers, rows)
@@ -814,15 +881,16 @@ class MultimodalEvidenceParser:
                 )
                 table_markdowns.append(f"[多模态表格 {anchor_id}: {caption}]\n{md}")
 
-            if fetch_chart_images and self.vlm_enabled and self.max_images_per_page > 0:
+            if fetch_chart_images and self._visual_parsing_available:
                 processed_charts = 0
                 for meta in raw_images:
                     if processed_charts >= self.max_images_per_page:
                         break
                     if not self._is_chart_candidate(meta):
                         continue
-                    candidate_url = urljoin(base_url, meta["src"]) if base_url else meta["src"]
+                    processed_charts += 1
                     try:
+                        candidate_url = urljoin(base_url, meta["src"]) if base_url else meta["src"]
                         downloaded = self._download_validated_image(
                             candidate_url,
                             timeout_seconds=image_timeout_seconds,
@@ -843,7 +911,6 @@ class MultimodalEvidenceParser:
                     )
                     if extraction is None:
                         continue
-                    processed_charts += 1
                     anchor_id = f"html-c{processed_charts}"
                     chart_md = _chart_extraction_to_markdown(extraction)
                     blocks.append(
@@ -886,6 +953,8 @@ class MultimodalEvidenceParser:
 
         triage = {"l0_text_pages": 0, "l1_table_pages": 0, "l2_vlm_pages": 0}
         blocks: list[MultimodalEvidenceBlock] = []
+        if len(raw_bytes) > self.max_pdf_bytes:
+            raise ValueError("PDF exceeds byte limit")
         if not self.enabled or not raw_bytes:
             fallback_text = (text_fallback or _default_pdf_text_fallback)(raw_bytes)
             return FetchedPageArtifact(
@@ -926,10 +995,18 @@ class MultimodalEvidenceParser:
         try:
             for page_idx in range(min(page_count, self.max_pdf_pages)):
                 page_no = page_idx + 1
-                page = doc[page_idx]
-                page_text = " ".join((page.get_text("text") or "").split())
-                images = page.get_images() or []
-                drawings = page.get_drawings() or []
+                try:
+                    page = doc[page_idx]
+                    page_text = sanitize_injection_text(page.get_text("text") or "")[:100_000]
+                except Exception:
+                    continue
+                images = drawings = []
+                if self._visual_parsing_available:
+                    try:
+                        images = page.get_images() or []
+                        drawings = page.get_drawings() or []
+                    except Exception:
+                        pass
                 extracted_tables: list[Any] = []
                 if hasattr(page, "find_tables"):
                     try:
@@ -959,26 +1036,26 @@ class MultimodalEvidenceParser:
                 if page_text:
                     page_sections.append(f"[p{page_no}] {page_text}")
 
-                for t_idx, tbl in enumerate(extracted_tables, start=1):
+                for t_idx, tbl in enumerate(extracted_tables[:32], start=1):
                     try:
                         matrix = tbl.extract() or []
                     except Exception:
                         matrix = []
                     if len(matrix) < 2:
                         continue
-                    headers = [str(c or "").strip() for c in matrix[0]]
-                    rows = [[str(c or "").strip() for c in r] for r in matrix[1:]]
+                    headers = [_table_cell(c) for c in matrix[0][:128]]
+                    rows = [[_table_cell(c) for c in r[:128]] for r in matrix[1:2001]]
                     md = _rows_to_markdown_table(headers, rows)
                     if not md:
                         continue
                     anchor_id = f"p{page_no}-t{t_idx}"
-                    bbox = list(tbl.bbox) if getattr(tbl, "bbox", None) else None
+                    bbox = _page_bbox(getattr(tbl, "bbox", None))
                     blocks.append(
                         MultimodalEvidenceBlock(
                             anchor_id=anchor_id,
                             modality="table",
                             page_no=page_no,
-                            bbox=[round(float(x), 2) for x in bbox] if bbox else None,
+                            bbox=bbox,
                             title=f"PDF 第 {page_no} 页表格 {t_idx}",
                             markdown=md,
                             summary=f"第 {page_no} 页结构化表格 ({len(rows)} 行)",
@@ -987,14 +1064,24 @@ class MultimodalEvidenceParser:
                     )
                     page_sections.append(f"[PDF 表格 {anchor_id}]\n{md}")
 
-                if tier == "l2" and self.vlm_enabled and vlm_pages_used < self.max_vlm_pages_per_doc:
-                    rect = page.rect
-                    zoom = 1.5
-                    projected_px = rect.width * zoom * rect.height * zoom
-                    if projected_px > self.max_image_pixels and projected_px > 0:
-                        zoom = zoom * ((self.max_image_pixels / projected_px) ** 0.5) * 0.95
-                    pix = page.get_pixmap(matrix=fitz.Matrix(max(0.5, zoom), max(0.5, zoom)))
-                    png_bytes = pix.tobytes("png")
+                if tier == "l2" and self._visual_parsing_available and vlm_pages_used < self.max_vlm_pages_per_doc:
+                    vlm_pages_used += 1
+                    try:
+                        rect = page.rect
+                        bbox = _page_bbox(rect)
+                        if bbox is None or min(rect.width, rect.height) <= 0:
+                            continue
+                        zoom = min(
+                            self.pdf_render_dpi / 72,
+                            math.sqrt(self.max_image_pixels / (rect.width * rect.height)) * 0.95,
+                        )
+                        if (math.ceil(rect.width * zoom) + 1) * (math.ceil(rect.height * zoom) + 1) > self.max_image_pixels:
+                            continue
+                        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                        png_bytes = pix.tobytes("png")
+                    except Exception:
+                        self._inc_metric("multimodal_vlm_fallback_total")
+                        continue
                     if len(png_bytes) <= self.max_image_bytes:
                         extraction = self.extract_chart_with_vlm(
                             image_bytes=png_bytes,
@@ -1002,7 +1089,6 @@ class MultimodalEvidenceParser:
                             context_hint=f"{title} page {page_no}",
                         )
                         if extraction is not None:
-                            vlm_pages_used += 1
                             anchor_id = f"p{page_no}-c1"
                             chart_md = _chart_extraction_to_markdown(extraction)
                             blocks.append(
@@ -1010,6 +1096,7 @@ class MultimodalEvidenceParser:
                                     anchor_id=anchor_id,
                                     modality="chart" if (extraction.series or extraction.title) else "ocr_page",
                                     page_no=page_no,
+                                    bbox=bbox,
                                     title=extraction.title or f"PDF 第 {page_no} 页视觉解析",
                                     markdown=chart_md,
                                     summary=extraction.summary or extraction.title,
@@ -1025,8 +1112,6 @@ class MultimodalEvidenceParser:
                 pass
 
         content = "\n\n".join(sec for sec in page_sections if sec).strip()
-        if not content:
-            content = (text_fallback or _default_pdf_text_fallback)(raw_bytes)
         return FetchedPageArtifact(
             url=url,
             title=title,

@@ -664,7 +664,7 @@ class EvidenceStoreTests(unittest.TestCase):
         # Redirect to loopback must be blocked
         with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
             with patch(
-                "services.evidence.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=FakeResponse(
                     status_code=302,
                     headers={"Location": "http://127.0.0.1/secret"},
@@ -676,7 +676,7 @@ class EvidenceStoreTests(unittest.TestCase):
         # Oversized body must be rejected
         with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
             with patch(
-                "services.evidence.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=FakeResponse(
                     status_code=200,
                     headers={"Content-Type": "text/html"},
@@ -689,7 +689,7 @@ class EvidenceStoreTests(unittest.TestCase):
         # Disallowed binary content type must be rejected
         with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
             with patch(
-                "services.evidence.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=FakeResponse(
                     status_code=200,
                     headers={"Content-Type": "application/octet-stream"},
@@ -702,7 +702,7 @@ class EvidenceStoreTests(unittest.TestCase):
         # Safe HTML strips <script> before extraction
         with patch("services.evidence.socket.getaddrinfo", return_value=public_addr):
             with patch(
-                "services.evidence.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=FakeResponse(
                     status_code=200,
                     headers={"Content-Type": "text/html; charset=utf-8"},

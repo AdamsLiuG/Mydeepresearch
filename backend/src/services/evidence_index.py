@@ -523,6 +523,65 @@ def _record_has_full_content(record: Any) -> bool:
     return bool(_clean_structured_text(getattr(record, "full_content", "")))
 
 
+def _layout_fields(block: dict[str, Any]) -> dict[str, Any]:
+    page_no = block.get("page_no")
+    bbox = block.get("bbox")
+    if not (
+        isinstance(bbox, (list, tuple)) and len(bbox) == 4
+        and all(type(coord) in (int, float) and math.isfinite(coord) for coord in bbox)
+        and bbox[0] < bbox[2] and bbox[1] < bbox[3]
+    ):
+        bbox = None
+    structured = block.get("structured_payload", block.get("extraction"))
+    return {
+        "modality": _normalize_text(block.get("modality")) or "text",
+        "page_no": page_no if type(page_no) is int and page_no > 0 else None,
+        "bbox": list(bbox) if bbox else None,
+        "anchor_id": _normalize_text(block.get("anchor_id")) or None,
+        "structured_payload": dict(structured) if isinstance(structured, dict) else None,
+    }
+
+
+def _multimodal_chunks(record: Any, *, task_id: int, source_id: str, origin: str) -> list[EvidenceChunk]:
+    chunks: list[EvidenceChunk] = []
+    seen: set[str] = set()
+    for index, block in enumerate(getattr(record, "multimodal_blocks", None) or (), start=1):
+        if not isinstance(block, dict):
+            continue
+        text = _clean_structured_text(
+            block.get("markdown") or block.get("text") or block.get("summary") or block.get("title"),
+        )
+        if not text:
+            continue
+        layout = _layout_fields(block)
+        anchor = layout["anchor_id"] or f"mm-{index}"
+        if anchor in seen:
+            continue
+        seen.add(anchor)
+        layout["anchor_id"] = anchor
+        chunks.append(EvidenceChunk(
+            chunk_id=f"{source_id}::mm::{anchor}",
+            task_id=task_id,
+            source_id=source_id,
+            text=text,
+            start_char=0,
+            end_char=len(text),
+            has_full_content=True,
+            origin=origin,
+            title=_normalize_text(block.get("title") or getattr(record, "title", "")),
+            url=_normalize_text(getattr(record, "url", "")),
+            domain=_normalize_text(getattr(record, "domain", "")),
+            snippet=_clean_text(block.get("summary") or text),
+            quality_label=_normalize_text(getattr(record, "quality_label", "")) or "medium",
+            freshness_label=_normalize_text(getattr(record, "freshness_label", "")) or "unknown",
+            published_at=_normalize_text(getattr(record, "published_at", "")) or None,
+            archive_doc_key=_record_archive_doc_key(record),
+            archive_version_id=_record_archive_version_id(record),
+            **layout,
+        ))
+    return chunks
+
+
 def _record_archive_doc_key(record: Any) -> str | None:
     value = _normalize_text(getattr(record, "archive_doc_key", ""))
     return value or None
@@ -627,7 +686,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                 task_id=task_id,
                 source_id=str(getattr(record, "source_id", "") or ""),
             )
-            if restored:
+            if restored and (not getattr(record, "multimodal_blocks", None) or any(chunk.anchor_id for chunk in restored)):
                 return restored
 
         source_id = str(getattr(record, "source_id", "") or "").strip()
@@ -691,47 +750,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
             )
 
         offset_base = max((c.end_char for c in chunks), default=len(text))
-        for mm_idx, block in enumerate(getattr(record, "multimodal_blocks", None) or (), start=1):
-            if not isinstance(block, dict):
-                continue
-            block_text = _clean_text(
-                block.get("markdown") or block.get("text") or block.get("summary") or block.get("title") or ""
-            )
-            if not block_text:
-                continue
-            anchor_id = _normalize_text(block.get("anchor_id")) or f"mm-{mm_idx}"
-            raw_page = block.get("page_no")
-            page_no = int(raw_page) if isinstance(raw_page, int) and not isinstance(raw_page, bool) else None
-            raw_bbox = block.get("bbox")
-            bbox = [float(x) for x in raw_bbox] if isinstance(raw_bbox, list) else None
-            modality = _normalize_text(block.get("modality")) or "table"
-            structured = block.get("structured_payload")
-            chunks.append(
-                EvidenceChunk(
-                    chunk_id=f"{source_id}::mm::{anchor_id}",
-                    task_id=task_id,
-                    source_id=source_id,
-                    text=block_text,
-                    start_char=offset_base + mm_idx,
-                    end_char=offset_base + mm_idx + len(block_text),
-                    has_full_content=True,
-                    origin="current",
-                    title=_normalize_text(block.get("title") or getattr(record, "title", "")),
-                    url=_normalize_text(getattr(record, "url", "")),
-                    domain=_normalize_text(getattr(record, "domain", "")),
-                    snippet=_clean_text(block.get("summary") or block_text),
-                    quality_label=_normalize_text(getattr(record, "quality_label", "")) or "medium",
-                    freshness_label=_normalize_text(getattr(record, "freshness_label", "")) or "unknown",
-                    published_at=_normalize_text(getattr(record, "published_at", "")) or None,
-                    archive_doc_key=_record_archive_doc_key(record),
-                    archive_version_id=archive_version_id,
-                    page_no=page_no,
-                    bbox=bbox,
-                    anchor_id=anchor_id,
-                    modality=modality,
-                    structured_payload=dict(structured) if isinstance(structured, dict) else None,
-                )
-            )
+        chunks.extend(_multimodal_chunks(record, task_id=task_id, source_id=source_id, origin="current"))
 
         artifact = getattr(record, "computation_artifact", None)
         if isinstance(artifact, dict) and artifact:
@@ -1150,7 +1169,10 @@ class EvidenceMemoryService(EvidenceStoreListener):
             return False
 
         canonical_doc_key = _sha256_text(normalized_url)
-        content_hash = _sha256_text(text)
+        blocks = getattr(record, "multimodal_blocks", None) or []
+        content_hash = _sha256_text(
+            f"{text}\n{json.dumps(blocks, sort_keys=True, ensure_ascii=False)}" if blocks else text,
+        )
         doc_version_id = _sha256_text(f"{normalized_url}\n{content_hash}")
         has_full_content = _record_has_full_content(record)
         observed_at = time()
@@ -1223,6 +1245,9 @@ class EvidenceMemoryService(EvidenceStoreListener):
             )
             for index, (start, end, window) in enumerate(windows, start=1)
         ]
+        archive_chunks.extend(_multimodal_chunks(
+            record, task_id=int(getattr(record, "task_id", 0) or 0), source_id=doc_version_id, origin="history",
+        ))
         if collection is not None and archive_chunks:
             try:
                 embeddings = encode_texts(
@@ -1250,6 +1275,9 @@ class EvidenceMemoryService(EvidenceStoreListener):
                                 "freshness_label": chunk.freshness_label,
                                 "has_full_content": has_full_content,
                                 "request_id": _normalize_text(request_id),
+                                "modality": chunk.modality,
+                                **({"page_no": chunk.page_no} if chunk.page_no is not None else {}),
+                                **({"bbox_json": json.dumps(chunk.bbox)} if chunk.bbox is not None else {}),
                             }
                             for chunk, _ in valid
                         ],
@@ -1282,6 +1310,11 @@ class EvidenceMemoryService(EvidenceStoreListener):
                     "start_char": chunk.start_char,
                     "end_char": chunk.end_char,
                     "has_full_content": chunk.has_full_content,
+                    "modality": chunk.modality,
+                    "page_no": chunk.page_no,
+                    "bbox": chunk.bbox,
+                    "anchor_id": chunk.anchor_id,
+                    "structured_payload": chunk.structured_payload,
                 }
                 for chunk in archive_chunks
             ],
@@ -1371,6 +1404,8 @@ class EvidenceMemoryService(EvidenceStoreListener):
         )
 
     def _load_doc_payload(self, doc_version_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{64}", doc_version_id):
+            return {}
         path = self._docs_dir / f"{doc_version_id}.json"
         if not path.exists():
             return {}
@@ -1423,7 +1458,9 @@ class EvidenceMemoryService(EvidenceStoreListener):
                 continue
             restored.append(
                 EvidenceChunk(
-                    chunk_id=f"{source_id}::{str(item.get('chunk_id') or '').split('::')[-1]}",
+                    chunk_id=f"{source_id}::mm::{item['anchor_id']}" if item.get("anchor_id") else (
+                        f"{source_id}::{str(item.get('chunk_id') or '').split('::')[-1]}"
+                    ),
                     task_id=task_id,
                     source_id=source_id,
                     text=_clean_structured_text(item.get("text")),
@@ -1439,6 +1476,7 @@ class EvidenceMemoryService(EvidenceStoreListener):
                     published_at=_normalize_text(doc.get("published_at")) or None,
                     archive_doc_key=_normalize_text(doc.get("canonical_doc_key")) or None,
                     archive_version_id=_normalize_text(doc.get("doc_version_id")) or archive_version_id,
+                    **_layout_fields(item),
                 )
             )
         if not restored:
@@ -1686,6 +1724,7 @@ class EvidenceMemoryService(EvidenceStoreListener):
             published_at=_normalize_text(doc.get("published_at")) or None,
             archive_doc_key=_normalize_text(doc.get("canonical_doc_key")) or None,
             archive_version_id=_normalize_text(doc.get("doc_version_id")) or None,
+            **_layout_fields(chosen),
         )
 
 class EvidenceRetrievalService:

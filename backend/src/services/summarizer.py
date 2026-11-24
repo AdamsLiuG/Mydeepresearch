@@ -537,9 +537,14 @@ class SummarizationService:
             cleaned = strip_thinking_tokens(cleaned)
         cleaned = strip_tool_calls(cleaned).strip()
 
+        evidence_items = list(task.evidence_items or [])
+        if self._evidence_store is not None:
+            latest = self._evidence_store.list_task_evidence(task.id, include_full_content=True)
+            if latest:
+                task.evidence_items = evidence_items = latest
         valid_source_ids = {
             str(item.get("source_id") or "").strip()
-            for item in task.evidence_items or []
+            for item in evidence_items
             if str(item.get("source_id") or "").strip()
         }
 
@@ -563,7 +568,7 @@ class SummarizationService:
             )
         normalized["executive_summary"] = executive_summary
 
-        if not normalized["key_findings"]:
+        if not normalized["key_findings"] and not normalized.get("computation_requests"):
             raise ValueError("summary contained no grounded findings")
 
         markdown = self._render_markdown(normalized)
@@ -657,7 +662,10 @@ class SummarizationService:
             "evidence_gaps": evidence_gaps,
         }
         raw_comp_reqs = payload.get("computation_requests")
-        if isinstance(raw_comp_reqs, list) and raw_comp_reqs:
+        if (
+            self._config.resolved_sandbox_effective_enabled()
+            and isinstance(raw_comp_reqs, list) and raw_comp_reqs
+        ):
             max_reqs = max(1, int(getattr(self._config, "sandbox_max_executions_per_task", 4) or 4))
             comp_requests: list[dict[str, Any]] = []
             for req in raw_comp_reqs:
@@ -666,16 +674,19 @@ class SummarizationService:
                 code = str(req.get("code") or "").strip()
                 if not code:
                     continue
-                derived = self._normalize_source_ids(req.get("derived_from_source_ids"), valid_source_ids)
-                if not derived:
+                raw_sources = req.get("derived_from_source_ids")
+                if not isinstance(raw_sources, list):
+                    continue
+                derived = list(dict.fromkeys(str(sid).strip().strip("[]") for sid in raw_sources))
+                if not derived or any(sid not in valid_source_ids or "-C" in sid for sid in derived):
                     continue
                 entry: dict[str, Any] = {
                     "title": normalize_agent_markdown(str(req.get("title") or "定量计算验证").strip()) or "定量计算验证",
                     "code": code,
                     "derived_from_source_ids": derived,
                 }
-                if isinstance(req.get("tables"), list):
-                    entry["tables"] = [t for t in req["tables"] if isinstance(t, dict)]
+                if "tables" in req:
+                    entry["tables"] = req["tables"]
                 comp_requests.append(entry)
                 if len(comp_requests) >= max_reqs:
                     break

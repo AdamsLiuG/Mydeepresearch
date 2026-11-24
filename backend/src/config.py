@@ -450,7 +450,7 @@ class Configuration(BaseModel):
         description="Optional API key override for the VLM endpoint",
     )
     multimodal_vlm_timeout_seconds: float = Field(
-        default=20.0,
+        default=12.0,
         ge=1.0,
         title="Multimodal VLM Timeout Seconds",
         description="HTTP timeout in seconds per VLM chart extraction request",
@@ -467,14 +467,16 @@ class Configuration(BaseModel):
         title="Multimodal Max PDF Pages",
         description="Maximum number of pages triaged per PDF document",
     )
+    multimodal_max_pdf_bytes: int = Field(default=15 * 1024 * 1024, ge=1)
+    multimodal_pdf_render_dpi: int = Field(default=144, ge=72, le=200)
     multimodal_max_vlm_pages_per_doc: int = Field(
-        default=4,
+        default=6,
         ge=0,
         title="Multimodal Max VLM Pages Per Doc",
         description="Maximum number of L2 PDF pages routed to VLM per document",
     )
     multimodal_max_images_per_page: int = Field(
-        default=3,
+        default=2,
         ge=0,
         title="Multimodal Max Images Per Page",
         description="Maximum chart image candidates fetched per HTML page",
@@ -524,7 +526,7 @@ class Configuration(BaseModel):
         description="CPU quota flag passed to Docker sandbox runtime",
     )
     sandbox_max_executions_per_task: int = Field(
-        default=4,
+        default=2,
         ge=1,
         title="Code Sandbox Max Executions Per Task",
         description="Maximum sandbox executions permitted per research task",
@@ -534,6 +536,7 @@ class Configuration(BaseModel):
         title="Code Sandbox Pyodide Cache Dir",
         description="Local Pyodide distribution directory for offline WASM fallback execution",
     )
+    sandbox_pyodide_node_bin: str = "node"
     active_code_sandbox_enabled: bool | None = Field(
         default=None,
         title="Active Code Sandbox Override",
@@ -1734,14 +1737,16 @@ class Configuration(BaseModel):
             "mcp_tenant_token_secret": os.getenv("MCP_TENANT_TOKEN_SECRET"),
             "multimodal_evidence_enabled": os.getenv("MULTIMODAL_EVIDENCE_ENABLED"),
             "multimodal_vlm_enabled": os.getenv("MULTIMODAL_VLM_ENABLED"),
-            "multimodal_vlm_model": os.getenv("MULTIMODAL_VLM_MODEL"),
+            "multimodal_vlm_model": os.getenv("MULTIMODAL_VLM_MODEL_ID") or os.getenv("MULTIMODAL_VLM_MODEL"),
             "multimodal_vlm_base_url": os.getenv("MULTIMODAL_VLM_BASE_URL"),
             "multimodal_vlm_api_key": os.getenv("MULTIMODAL_VLM_API_KEY"),
             "multimodal_vlm_timeout_seconds": os.getenv("MULTIMODAL_VLM_TIMEOUT_SECONDS"),
             "multimodal_vlm_max_concurrency": os.getenv("MULTIMODAL_VLM_MAX_CONCURRENCY"),
             "multimodal_max_pdf_pages": os.getenv("MULTIMODAL_MAX_PDF_PAGES"),
+            "multimodal_max_pdf_bytes": os.getenv("MULTIMODAL_MAX_PDF_BYTES"),
+            "multimodal_pdf_render_dpi": os.getenv("MULTIMODAL_PDF_RENDER_DPI"),
             "multimodal_max_vlm_pages_per_doc": os.getenv("MULTIMODAL_MAX_VLM_PAGES_PER_DOC"),
-            "multimodal_max_images_per_page": os.getenv("MULTIMODAL_MAX_IMAGES_PER_PAGE"),
+            "multimodal_max_images_per_page": os.getenv("MULTIMODAL_MAX_WEB_IMAGES") or os.getenv("MULTIMODAL_MAX_IMAGES_PER_PAGE"),
             "multimodal_image_max_bytes": os.getenv("MULTIMODAL_IMAGE_MAX_BYTES"),
             "multimodal_image_max_pixels": os.getenv("MULTIMODAL_IMAGE_MAX_PIXELS"),
             "sandbox_enabled": os.getenv("SANDBOX_ENABLED"),
@@ -1750,8 +1755,9 @@ class Configuration(BaseModel):
             "sandbox_timeout_seconds": os.getenv("SANDBOX_TIMEOUT_SECONDS"),
             "sandbox_memory_mb": os.getenv("SANDBOX_MEMORY_MB"),
             "sandbox_cpus": os.getenv("SANDBOX_CPUS"),
-            "sandbox_max_executions_per_task": os.getenv("SANDBOX_MAX_EXECUTIONS_PER_TASK"),
+            "sandbox_max_executions_per_task": os.getenv("SANDBOX_MAX_RUNS_PER_TASK") or os.getenv("SANDBOX_MAX_EXECUTIONS_PER_TASK"),
             "sandbox_pyodide_cache_dir": os.getenv("SANDBOX_PYODIDE_CACHE_DIR"),
+            "sandbox_pyodide_node_bin": os.getenv("SANDBOX_PYODIDE_NODE_BIN"),
             "nli_verifier_enabled": os.getenv("NLI_VERIFIER_ENABLED"),
             "nli_model_backend": os.getenv("NLI_MODEL_BACKEND"),
             "nli_model_name": os.getenv("NLI_MODEL_NAME"),
@@ -2142,12 +2148,12 @@ class Configuration(BaseModel):
         return (self.llm_model_id or self.local_llm or "").strip()
 
     def resolved_sandbox_effective_enabled(self) -> bool:
-        """Return True only when sandbox provisioning is enabled and not disabled by the active SkillPack."""
-        if not self.sandbox_enabled:
-            return False
-        if self.active_code_sandbox_enabled is not None:
-            return bool(self.active_code_sandbox_enabled)
-        return True
+        """Require provisioning and explicit activation from the request's SkillPack."""
+        return (
+            self.sandbox_enabled
+            and self.active_code_sandbox_enabled is True
+            and self.sandbox_backend.strip().lower() in {"auto", "docker", "pyodide"}
+        )
 
     def resolved_multimodal_vlm_base_url(self) -> str | None:
         """Return configured VLM base URL, falling back to primary LLM base URL if set."""
@@ -2162,6 +2168,9 @@ class Configuration(BaseModel):
         explicit = (self.multimodal_vlm_api_key or "").strip()
         if explicit:
             return explicit
+        if (self.multimodal_vlm_base_url or "").strip().rstrip("/") != (self.llm_base_url or "").strip().rstrip("/"):
+            if self.multimodal_vlm_base_url:
+                return None
         fallback = (self.llm_api_key or "").strip()
         return fallback or None
 

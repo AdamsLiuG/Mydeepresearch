@@ -216,28 +216,20 @@ class ReportingService:
                 }
 
     def _collect_valid_source_ids(self, state: SummaryState) -> set[str]:
-        valid: set[str] = set()
-        for task in state.todo_items:
-            for item in task.evidence_items or []:
-                sid = str(item.get("source_id") or "").strip()
-                if sid:
-                    valid.add(sid)
+        valid = self._known_source_ids(state)
         if self._evidence_store is not None:
             for task in state.todo_items:
                 for item in self._evidence_store.list_task_evidence(task.id):
                     sid = str(item.get("source_id") or "").strip()
                     if sid:
                         valid.add(sid)
-        return valid
+        return valid - self._rejected_computation_ids(state)
 
     @staticmethod
     def _sanitize_chunk_citations(text: str, valid_source_ids: set[str]) -> str:
-        """Strip any unknown [T{task}-S{seq}] citation tokens not present in the request whitelist."""
+        """Strip citation tokens absent from the request whitelist."""
         if not text:
             return ""
-        if not valid_source_ids:
-            return text
-
         def _replace(match: re.Match[str]) -> str:
             token = match.group(1)
             return match.group(0) if token in valid_source_ids else ""
@@ -1097,6 +1089,15 @@ class ReportingService:
         return "".join(kept).strip()
 
     @staticmethod
+    def _rejected_computation_ids(state: SummaryState) -> set[str]:
+        return {
+            sid for task in state.todo_items for issue in (task.review_issues or [])
+            if isinstance(issue, dict) and issue.get("check") == "sandbox_input_ungrounded"
+            for sid in (issue.get("source_ids") or [])
+            if isinstance(sid, str) and re.fullmatch(r"T[0-9]+-C[0-9]+", sid)
+        }
+
+    @staticmethod
     def _known_source_ids(state: SummaryState) -> set[str]:
         source_ids: set[str] = set()
         for task in state.todo_items:
@@ -1265,7 +1266,7 @@ class ReportingService:
         observer: RequestTrace | None = None,
     ) -> dict[str, Any]:
         background = self._strip_internal_process_sentences(payload.get("background_overview")) or "暂无相关信息"
-        valid_source_ids = self._known_source_ids(state)
+        valid_source_ids = self._collect_valid_source_ids(state)
         key_findings, dropped_findings = self._normalize_structured_items(
             payload.get("key_findings"),
             text_keys=("claim", "point", "text"),
@@ -1372,40 +1373,37 @@ class ReportingService:
         if len(references) < len(cited_source_ids) and observer:
             observer.record_degraded("report_reference_resolution_incomplete")
 
-        raw_charts: list[dict[str, Any]] = []
-        for candidate in payload.get("charts") or []:
-            if isinstance(candidate, dict):
-                raw_charts.append(candidate)
+        computed_records: dict[str, dict[str, Any]] = {}
         for task in getattr(state, "todo_items", []) or []:
-            for item in getattr(task, "evidence_items", None) or []:
-                if not isinstance(item, dict):
-                    continue
-                structured = item.get("structured_payload") or {}
-                if isinstance(structured, dict):
-                    for candidate in structured.get("charts") or []:
-                        if isinstance(candidate, dict):
-                            raw_charts.append(candidate)
-        if self._evidence_store is not None:
-            for task in getattr(state, "todo_items", []) or []:
-                for item in self._evidence_store.list_task_evidence(task.id):
-                    structured = item.get("structured_payload") or {}
-                    if isinstance(structured, dict):
-                        for candidate in structured.get("charts") or []:
-                            if isinstance(candidate, dict):
-                                raw_charts.append(candidate)
+            items = list(task.evidence_items or [])
+            if self._evidence_store is not None:
+                items.extend(self._evidence_store.list_task_evidence(task.id))
+            for item in items:
+                sid = str(item.get("source_id") or "") if isinstance(item, dict) else ""
+                if sid in valid_source_ids and re.fullmatch(r"T[0-9]+-C[0-9]+", sid):
+                    computed_records[sid] = item
 
         sanitized_charts: list[dict[str, Any]] = []
         seen_chart_ids: set[str] = set()
-        for raw_chart in raw_charts:
-            cleaned_chart = sanitize_chart_spec(raw_chart, valid_source_ids=valid_source_ids)
-            if cleaned_chart is None:
-                continue
-            cid = str(cleaned_chart.get("chart_id") or "")
-            if cid and cid in seen_chart_ids:
-                continue
-            if cid:
+        for sid, item in computed_records.items():
+            structured = item.get("structured_payload")
+            charts = structured.get("charts") if isinstance(structured, dict) else None
+            for raw_chart in charts if isinstance(charts, list) else []:
+                if not isinstance(raw_chart, dict) or not isinstance(raw_chart.get("source_ids", []), list):
+                    continue
+                candidate = {**raw_chart, "source_ids": [sid, *raw_chart.get("source_ids", [])]}
+                chart = sanitize_chart_spec(candidate, valid_source_ids=valid_source_ids)
+                if chart is None:
+                    continue
+                cid = chart["chart_id"]
+                if cid in seen_chart_ids:
+                    cid = f"{sid}-{cid}"
+                    if cid in seen_chart_ids:
+                        continue
+                    chart["chart_id"] = cid
+                    chart["anchor_id"] = cid
                 seen_chart_ids.add(cid)
-            sanitized_charts.append(cleaned_chart)
+                sanitized_charts.append(chart)
         state.report_charts = list(sanitized_charts)
 
         return {
@@ -1602,10 +1600,11 @@ def build_report_workbench_payload(
     """Build structured workbench metadata for citation drawer, conflict card, and governance bar."""
 
     citation_index: dict[str, dict[str, Any]] = {}
+    rejected_ids = ReportingService._rejected_computation_ids(state)
 
     def _ingest_record(rec: dict[str, Any], default_task_id: int | None = None) -> None:
         sid = str(rec.get("source_id") or "").strip()
-        if not sid:
+        if not sid or sid in rejected_ids:
             return
         anchors: list[str] = []
         modality = "text"
@@ -1641,6 +1640,11 @@ def build_report_workbench_payload(
             "published_at": rec.get("published_at") or existing.get("published_at"),
             "modality": modality,
             "anchors": anchors,
+            "source_origin": str(rec.get("source_origin") or existing.get("source_origin") or "web"),
+            **({"page_no": rec["page_no"]} if rec.get("page_no") is not None else {}),
+            **({"bbox": rec["bbox"]} if rec.get("bbox") is not None else {}),
+            **({"derived_from_source_ids": list(rec["derived_from_source_ids"])}
+               if isinstance(rec.get("derived_from_source_ids"), list) else {}),
         }
 
     for task in getattr(state, "todo_items", []) or []:
@@ -1681,7 +1685,7 @@ def build_report_workbench_payload(
         ordered_sids: list[str] = []
         seen_sids: set[str] = set()
         for sid in raw_sids:
-            if sid not in seen_sids:
+            if sid in citation_index and sid not in seen_sids:
                 ordered_sids.append(sid)
                 seen_sids.add(sid)
         matched_conflicts: list[str] = []

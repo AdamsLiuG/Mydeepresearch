@@ -8,10 +8,11 @@ import math
 import re
 import socket
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -617,12 +618,24 @@ _MAX_FETCH_REDIRECTS = 5
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 
+class _ValidatedFetchURL(str):
+    def __new__(cls, url: str, ips: tuple[str, ...]) -> _ValidatedFetchURL:
+        instance = super().__new__(cls, url)
+        instance.ips = ips
+        return instance
+
+
 def _is_public_ip(ip_str: str) -> bool:
     """Return True only when ip_str is a globally routable public IP address."""
     try:
         address = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped:
+            return _is_public_ip(str(address.ipv4_mapped))
+        if address.scope_id or address.sixtofour or address.teredo or address in ipaddress.ip_network("64:ff9b::/96"):
+            return False
     if (
         address.is_private
         or address.is_loopback
@@ -632,16 +645,20 @@ def _is_public_ip(ip_str: str) -> bool:
         or address.is_unspecified
     ):
         return False
-    return True
+    return address.is_global
 
 
-def _validate_fetch_url(url: str) -> str:
+def _validate_fetch_url(url: str) -> _ValidatedFetchURL:
     """Validate URL scheme and resolved IPs to block SSRF against local/private networks."""
     cleaned = (url or "").strip()
+    if any(ord(char) < 33 or ord(char) == 127 or char == "\\" for char in cleaned):
+        raise ValueError("URL contains invalid characters")
     parsed = urlsplit(cleaned)
     scheme = (parsed.scheme or "").lower()
     if scheme not in _ALLOWED_FETCH_SCHEMES:
         raise ValueError(f"unsupported URL scheme: {scheme or '<empty>'}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL credentials are forbidden")
 
     hostname = (parsed.hostname or "").strip().lower().rstrip(".")
     if not hostname:
@@ -649,6 +666,7 @@ def _validate_fetch_url(url: str) -> str:
     if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
         raise ValueError(f"blocked private/local hostname: {hostname}")
 
+    port = parsed.port or (443 if scheme == "https" else 80)
     try:
         ipaddress.ip_address(hostname)
     except ValueError:
@@ -656,9 +674,9 @@ def _validate_fetch_url(url: str) -> str:
     else:
         if not _is_public_ip(hostname):
             raise ValueError(f"blocked non-public IP address: {hostname}")
-        return cleaned
+        return _ValidatedFetchURL(cleaned, (hostname,))
 
-    port = parsed.port or (443 if scheme == "https" else 80)
+    hostname = hostname.encode("idna").decode("ascii")
     try:
         addr_infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -675,14 +693,61 @@ def _validate_fetch_url(url: str) -> str:
         if not _is_public_ip(ip_str):
             raise ValueError(f"blocked non-public resolved IP {ip_str} for {hostname}")
 
-    return cleaned
+    return _ValidatedFetchURL(cleaned, tuple(sorted(resolved_ips, key=lambda ip: (":" in ip, ip))))
+
+
+class _PinnedFetchAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, ip: str, hostname: str, port: int, scheme: str) -> None:
+        super().__init__()
+        self.ip = ip
+        self.hostname = hostname
+        self.port = port
+        self.scheme = scheme
+
+    def get_connection(self, url: str, proxies: Any = None) -> Any:
+        tls = {"server_hostname": self.hostname, "assert_hostname": self.hostname}
+        return self.poolmanager.connection_from_host(
+            self.ip, port=self.port, scheme=self.scheme, pool_kwargs=tls if self.scheme == "https" else None,
+        )
+
+    def get_connection_with_tls_context(
+        self, request: Any, verify: Any, proxies: Any = None, cert: Any = None,
+    ) -> Any:
+        return self.get_connection(request.url)
+
+
+@contextmanager
+def _open_public_fetch(
+    url: str, *, timeout: float, headers: dict[str, str] | None = None,
+) -> Iterator[requests.Response]:
+    validated = url if isinstance(url, _ValidatedFetchURL) else _validate_fetch_url(url)
+    prepared = requests.Request(
+        "GET", validated, headers={"Accept-Encoding": "identity", **(headers or {})},
+    ).prepare()
+    parsed = urlsplit(prepared.url)
+    prepared.headers["Host"] = parsed.netloc
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    for idx, ip in enumerate(validated.ips):
+        adapter = _PinnedFetchAdapter(ip, parsed.hostname, port, parsed.scheme)
+        try:
+            try:
+                response = adapter.send(prepared, stream=True, timeout=timeout)
+            except requests.exceptions.ConnectionError:
+                if idx == len(validated.ips) - 1:
+                    raise
+                continue
+            with response:
+                yield response
+            return
+        finally:
+            adapter.close()
 
 
 def _fetch_page_artifact(
     url: str,
     timeout_seconds: float,
     *,
-    max_bytes: int = _MAX_FETCH_BYTES,
+    max_bytes: int | None = None,
     parser: Any | None = None,
     multimodal_enabled: bool = False,
 ) -> Any:
@@ -691,17 +756,15 @@ def _fetch_page_artifact(
     from services.multimodal_parser import FetchedPageArtifact, MultimodalEvidenceParser
 
     current_url = _validate_fetch_url(url)
-    max_allowed = max(1, int(max_bytes))
+    max_allowed = _MAX_FETCH_BYTES if max_bytes is None else max(1, int(max_bytes))
     active_parser = parser
     if active_parser is None and multimodal_enabled:
         active_parser = MultimodalEvidenceParser(enabled=True)
 
     for redirect_count in range(_MAX_FETCH_REDIRECTS + 1):
-        with requests.get(
+        with _open_public_fetch(
             current_url,
             timeout=timeout_seconds,
-            allow_redirects=False,
-            stream=True,
         ) as response:
             if response.status_code in _REDIRECT_STATUS_CODES:
                 location = str(response.headers.get("Location") or "").strip()
@@ -721,14 +784,15 @@ def _fetch_page_artifact(
             if media_type and media_type not in allowed_types:
                 raise ValueError(f"unsupported content type: {media_type}")
 
+            limit = max_allowed
+            if media_type == "application/pdf" and active_parser is not None and active_parser.enabled:
+                pdf_limit = getattr(active_parser, "max_pdf_bytes", max_allowed)
+                limit = pdf_limit if max_bytes is None else min(limit, pdf_limit)
             content_length_raw = str(response.headers.get("Content-Length") or "").strip()
-            if content_length_raw:
-                try:
-                    if int(content_length_raw) > max_allowed:
-                        raise ValueError(f"fetched page exceeds max byte limit ({max_allowed} bytes)")
-                except ValueError as exc:
-                    if "exceeds max byte limit" in str(exc):
-                        raise
+            if content_length_raw.isascii() and content_length_raw.isdecimal() and (
+                len(content_length_raw) > 20 or int(content_length_raw) > limit
+            ):
+                raise ValueError(f"fetched page exceeds max byte limit ({limit} bytes)")
 
             chunks: list[bytes] = []
             total_bytes = 0
@@ -736,8 +800,8 @@ def _fetch_page_artifact(
                 if not chunk:
                     continue
                 total_bytes += len(chunk)
-                if total_bytes > max_allowed:
-                    raise ValueError(f"fetched page exceeds max byte limit ({max_allowed} bytes)")
+                if total_bytes > limit:
+                    raise ValueError(f"fetched page exceeds max byte limit ({limit} bytes)")
                 chunks.append(chunk)
 
             raw_payload = b"".join(chunks)
@@ -1631,6 +1695,14 @@ def _apply_quality_metadata(record: EvidenceRecord) -> None:
     record.quality_flags = list(scored["quality_flags"])
 
 
+def _next_source_sequence(source_ids: list[str], prefix: str) -> int:
+    return 1 + max(
+        (int(suffix) for sid in source_ids if sid.startswith(prefix)
+         and (suffix := sid[len(prefix):]).isascii() and suffix.isdecimal() and len(suffix) <= 12),
+        default=0,
+    )
+
+
 class EvidenceStore:
     """Thread-safe in-memory evidence store scoped to a single request."""
 
@@ -1688,7 +1760,7 @@ class EvidenceStore:
         with self._lock:
             task_ids = self._task_source_ids.setdefault(task_id, [])
             url_index = self._task_url_index.setdefault(task_id, {})
-            next_index = len(task_ids) + 1
+            next_index = _next_source_sequence(task_ids, f"T{task_id}-S")
 
             for result in results:
                 if not isinstance(result, dict):
@@ -1770,13 +1842,19 @@ class EvidenceStore:
             record: EvidenceRecord | None = None
             if source_id:
                 record = self._records_by_id.get(source_id)
+                if (
+                    record is None or record.task_id != task_id or record.source_origin != "web"
+                    or _normalize_url(record.url) != normalized_url
+                ):
+                    raise ValueError("source_id does not match the task's web evidence URL")
             if record is None and normalized_url:
                 existing_id = url_index.get(normalized_url)
                 if existing_id:
                     record = self._records_by_id.get(existing_id)
 
             if record is None:
-                source_id = source_id or f"T{task_id}-S{len(task_ids) + 1}"
+                prefix = f"T{task_id}-S"
+                source_id = f"{prefix}{_next_source_sequence(task_ids, prefix)}"
                 record = EvidenceRecord(
                     source_id=source_id,
                     task_id=task_id,
@@ -1801,7 +1879,7 @@ class EvidenceStore:
                 record.full_content = full_content
                 if not record.snippet:
                     record.snippet = truncate_text(full_content, 600)
-            if multimodal_blocks:
+            if multimodal_blocks is not None:
                 record.multimodal_blocks = [
                     dict(block) for block in multimodal_blocks if isinstance(block, dict)
                 ]
@@ -1936,16 +2014,24 @@ class EvidenceStore:
             raise ValueError("task_id must be positive")
         prefix = f"T{task_id}-C"
         normalized_tenant = str(tenant_id or "default").strip() or "default"
-        clean_derived = [str(sid).strip() for sid in (derived_from_source_ids or []) if str(sid).strip()]
+        clean_derived = list(dict.fromkeys(str(sid).strip() for sid in derived_from_source_ids if str(sid).strip()))
         raw_backend = str(backend or "sandbox").strip() or "sandbox"
         backend_label = raw_backend if raw_backend.startswith("sandbox") else f"sandbox:{raw_backend}"
 
         with self._lock:
             task_ids = self._task_source_ids.setdefault(task_id, [])
-            existing_c = [sid for sid in task_ids if sid.startswith(prefix)]
-            next_c = len(existing_c) + 1
+            next_c = _next_source_sequence(task_ids, prefix)
             source_id = f"{prefix}{next_c}"
-            url = f"sandbox://compute/{task_id}/{next_c}"
+            request_id = self._request_id_getter() if self._request_id_getter else None
+            url = f"sandbox://{request_id or 'local'}/{source_id}"
+            structured_payload = dict(structured_payload) if isinstance(structured_payload, dict) else None
+            if structured_payload is not None:
+                charts = structured_payload.get("charts")
+                if isinstance(charts, list):
+                    structured_payload["charts"] = [
+                        {**chart, "source_ids": list(dict.fromkeys([source_id, *(chart.get("source_ids") or [])]))}
+                        for chart in charts if isinstance(chart, dict) and isinstance(chart.get("source_ids", []), list)
+                    ]
             rec = EvidenceRecord(
                 source_id=source_id,
                 task_id=task_id,
@@ -1965,7 +2051,7 @@ class EvidenceStore:
                 modality="computation",
                 derived_from_source_ids=clean_derived,
                 computation_artifact=dict(computation_artifact or {}),
-                structured_payload=dict(structured_payload) if isinstance(structured_payload, dict) else None,
+                structured_payload=structured_payload,
                 created_at=time.time(),
                 updated_at=time.time(),
             )
@@ -2183,8 +2269,8 @@ class EvidenceStore:
                         title=title,
                         url=url,
                         snippet=snippet,
-                        raw_content="",
-                        full_content="",
+                        raw_content=str(item.get("raw_content") or ""),
+                        full_content=str(item.get("full_content") or ""),
                         backend=backend,
                         backend_sources=backend_sources,
                         provider_count=provider_count,
@@ -2716,6 +2802,13 @@ class FetchPageTool(Tool):
             raise ValueError("task_id is required")
         if not url:
             raise ValueError("url is required")
+        if source_id:
+            record = self._evidence_store.get_evidence(source_id)
+            if (
+                not record or record["task_id"] != task_id or record["source_origin"] != "web"
+                or _normalize_url(record["url"]) != _normalize_url(url)
+            ):
+                raise ValueError("source_id does not match the task's web evidence URL")
 
         parser = getattr(self, "_multimodal_parser", None)
         if parser is not None and getattr(parser, "enabled", False):

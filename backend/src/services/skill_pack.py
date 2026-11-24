@@ -307,6 +307,9 @@ def load_pack(path: Path) -> SkillPack:
 
     frontmatter, body = _split_frontmatter(raw_text)
     body_sections = _split_body_sections(body)
+    code_sandbox = frontmatter.get("code_sandbox", False)
+    if not isinstance(code_sandbox, bool):
+        raise SkillPackError(f"code_sandbox must be a boolean in {path}")
 
     try:
         schema_version = int(frontmatter.get("schema_version") or 0)
@@ -348,7 +351,7 @@ def load_pack(path: Path) -> SkillPack:
         composable_with=_as_list(frontmatter.get("composable_with")),
         outline_sections=_as_list(frontmatter.get("outline_sections")),
         mcp_tool_scopes=_as_dict(frontmatter.get("mcp_tool_scopes")),
-        code_sandbox=bool(frontmatter.get("code_sandbox", False)),
+        code_sandbox=code_sandbox,
     )
     pack.content_hash = compute_content_hash(pack)
     return pack

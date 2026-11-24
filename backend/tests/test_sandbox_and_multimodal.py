@@ -6,6 +6,7 @@ import json
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -82,6 +83,60 @@ class _FakeHttpResponse:
 
 
 class TestMultimodalEvidenceParser(unittest.TestCase):
+    def test_public_fetch_pins_transport_address_and_original_tls_name(self) -> None:
+        from services.evidence import _open_public_fetch
+
+        with (
+            patch("services.evidence.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]) as dns,
+            patch("services.evidence._PinnedFetchAdapter.send", autospec=True, return_value=_FakeHttpResponse()) as send,
+        ):
+            with _open_public_fetch("https://example.com/report", timeout=1):
+                pass
+        dns.assert_called_once()
+        adapter, request = send.call_args.args
+        self.assertEqual(adapter.ip, "93.184.216.34")
+        self.assertEqual(request.headers["Host"], "example.com")
+        self.assertEqual(adapter.get_connection(request.url).conn_kw["server_hostname"], "example.com")
+
+    def test_failed_visual_attempts_count_against_html_budget(self) -> None:
+        parser = MultimodalEvidenceParser(vlm_enabled=True, vlm_caller=MagicMock(), max_images_per_page=1)
+        html = '<img src="/chart-a.png"><img src="/chart-b.png">'
+        with patch.object(parser, "_download_validated_image", return_value=None) as download:
+            artifact = parser.parse_html(html, base_url="https://example.com/report", base_text="plain evidence")
+        download.assert_called_once()
+        self.assertEqual(artifact.content, "plain evidence")
+
+    def test_pdf_byte_limit_is_checked_before_fallback(self) -> None:
+        fallback = MagicMock()
+        parser = MultimodalEvidenceParser(enabled=False, max_pdf_bytes=4)
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            parser.parse_pdf_bytes(b"oversize", text_fallback=fallback)
+        fallback.assert_not_called()
+
+    def test_pdf_failed_render_retains_text_and_honors_visual_attempt_limit(self) -> None:
+        page = MagicMock()
+        page.get_text.return_value = "Visible text"
+        page.get_images.return_value = ["image"]
+        page.get_drawings.return_value = []
+        page.find_tables.return_value.tables = []
+        page.get_pixmap.side_effect = RuntimeError("render failed")
+        page.rect = MagicMock(width=400, height=800)
+        page.rect.__iter__.return_value = iter([0, 0, 400, 800])
+        doc = MagicMock()
+        doc.__len__.return_value = 5
+        doc.__getitem__.return_value = page
+        caller = MagicMock()
+        parser = MultimodalEvidenceParser(
+            vlm_enabled=True, vlm_caller=caller, max_pdf_pages=2, max_vlm_pages_per_doc=1,
+        )
+        with patch.dict(sys.modules, {"fitz": SimpleNamespace(open=MagicMock(return_value=doc), Matrix=MagicMock())}):
+            artifact = parser.parse_pdf_bytes(b"test document")
+        self.assertEqual(artifact.content.count("Visible text"), 2)
+        self.assertEqual(artifact.page_count, 5)
+        page.get_pixmap.assert_called_once()
+        caller.assert_not_called()
+        doc.close.assert_called_once()
+
     def test_html_table_extraction_and_chart_candidate_filtering(self) -> None:
         metrics = MetricsRegistry()
         parser = MultimodalEvidenceParser(
@@ -144,7 +199,7 @@ class TestMultimodalEvidenceParser(unittest.TestCase):
                 url_validator=lambda u: u,
             )
             with patch(
-                "services.multimodal_parser.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=_FakeHttpResponse(
                     headers={"Content-Type": "image/svg+xml"},
                     body=svg_bytes,
@@ -153,7 +208,7 @@ class TestMultimodalEvidenceParser(unittest.TestCase):
                 self.assertIsNone(parser_safe._download_validated_image("https://cdn.example.com/chart.png"))
 
             with patch(
-                "services.multimodal_parser.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=_FakeHttpResponse(
                     headers={"Content-Type": "image/png"},
                     body=svg_bytes,
@@ -164,7 +219,7 @@ class TestMultimodalEvidenceParser(unittest.TestCase):
             oversized_px_png = _make_png_bytes(5000, 4000)  # 20M pixels > 16M
             self.assertEqual(inspect_image_dimensions(oversized_px_png), (5000, 4000))
             with patch(
-                "services.multimodal_parser.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=_FakeHttpResponse(
                     headers={"Content-Type": "image/png"},
                     body=oversized_px_png,
@@ -174,7 +229,7 @@ class TestMultimodalEvidenceParser(unittest.TestCase):
 
             oversized_bytes = b"\x89PNG\r\n\x1a\n" + b"0" * 3000
             with patch(
-                "services.multimodal_parser.requests.get",
+                "services.evidence._open_public_fetch",
                 return_value=_FakeHttpResponse(
                     headers={"Content-Type": "image/png"},
                     body=oversized_bytes,
@@ -235,7 +290,7 @@ class TestMultimodalEvidenceParser(unittest.TestCase):
         with (
             patch("services.evidence._validate_fetch_url", side_effect=lambda u: u),
             patch(
-                "services.evidence.requests.get",
+                "services.evidence._open_public_fetch",
                 side_effect=lambda *a, **kw: _FakeHttpResponse(
                     headers={"Content-Type": "text/html; charset=utf-8"},
                     body=html.encode("utf-8"),
@@ -256,6 +311,23 @@ class TestMultimodalEvidenceParser(unittest.TestCase):
 
 
 class TestCodeSandboxAndCharts(unittest.TestCase):
+    def test_sandbox_policy_preserves_numeric_operations_and_limits_artifacts(self) -> None:
+        validator = SandboxASTValidator()
+        self.assertTrue(validator.validate("from math import sqrt\nresult = sqrt(25)").ok)
+        self.assertFalse(validator.validate("result = 2 ** 10001").ok)
+        output = execute_sandbox_payload({"code": "print('x' * 20000)\nresult = 5"})
+        self.assertFalse(output["ok"])
+        self.assertEqual(output["error_code"], "output_limit")
+
+    def test_docker_command_uses_image_entrypoint_and_stdin(self) -> None:
+        backend = DockerSandboxBackend()
+        cmd = backend.build_command(container_name="c1", workdir="/tmp/w1", memory_mb=256)
+        self.assertIn("--interactive", cmd)
+        self.assertIn("--pull=never", cmd)
+        self.assertIn("--memory-swap=256m", cmd)
+        self.assertNotIn("-v", cmd)
+        self.assertEqual(cmd[-1], backend.image)
+
     def test_ast_validator_and_runner_enforce_allowlist(self) -> None:
         validator = SandboxASTValidator()
         self.assertTrue(validator.validate("import math\nresult = round(math.sqrt(144), 2)").ok)
@@ -441,6 +513,7 @@ class TestCodeSandboxAndCharts(unittest.TestCase):
         assert comp_rec is not None
         scored = score_evidence_quality(comp_rec)
         self.assertEqual(comp_rec["source_type"], "computed_sandbox")
+        self.assertEqual(comp_rec["computation_artifact"]["input_tables"][0]["rows"][1][1], 125)
         self.assertEqual(scored["quality_label"], "high")
 
         refs = store.build_reference_map(["T1-C1"])
@@ -464,6 +537,86 @@ class TestCodeSandboxAndCharts(unittest.TestCase):
 
 
 class TestDirection02PipelineIntegration(unittest.TestCase):
+    def test_evidence_sequences_survive_sparse_hydration(self) -> None:
+        store = EvidenceStore()
+        store.hydrate_from_tasks([{
+            "id": 1,
+            "evidence_items": [
+                {"source_id": "T1-S2", "url": "https://example.com/old"},
+                {"source_id": "T1-C4", "source_origin": "sandbox", "url": "sandbox://old/T1-C4"},
+                {"source_id": "T1-M5", "source_origin": "mcp", "url": "mcp://old/5"},
+            ],
+        }])
+        web = store.update_full_content(
+            task_id=1, source_id=None, url="https://example.com/new", title="Report", full_content="revenue 12",
+        )
+        calc = store.record_computation_evidence(
+            task_id=1, title="Calculation", summary_text="12", derived_from_source_ids=["T1-S3"],
+            computation_artifact={"result": 12},
+        )
+        self.assertEqual(web["source_id"], "T1-S3")
+        self.assertEqual(calc["source_id"], "T1-C5")
+        with self.assertRaises(ValueError):
+            store.update_full_content(
+                task_id=1, source_id="T1-C4", url="https://example.com/new", title="Other", full_content="99",
+            )
+
+    def test_archive_round_trip_preserves_layout_anchors(self) -> None:
+        from services.evidence_index import EvidenceMemoryService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Configuration(evidence_memory_enabled=True, evidence_memory_dir=tmp)
+            memory = EvidenceMemoryService(cfg)
+            store = EvidenceStore(listeners=[memory])
+            with patch.object(memory, "_get_collection", return_value=None):
+                item = store.update_full_content(
+                    task_id=1, source_id=None, url="https://example.com/report.pdf", title="Report",
+                    full_content="Quarterly results",
+                    multimodal_blocks=[{
+                        "anchor_id": "p2-t1", "page_no": 2, "bbox": [10, 20, 50, 80], "modality": "table",
+                        "markdown": "| sales | 25 |", "structured_payload": {"rows": [["sales", 25]]},
+                    }],
+                )
+            restored = memory.load_runtime_chunks(item["archive_version_id"], task_id=1, source_id="T1-S1")
+            anchored = next(chunk for chunk in restored if chunk.anchor_id)
+            self.assertEqual(anchored.chunk_id, "T1-S1::mm::p2-t1")
+            self.assertEqual(anchored.page_no, 2)
+            self.assertEqual(anchored.bbox, [10, 20, 50, 80])
+            self.assertEqual(anchored.structured_payload["rows"][0][1], 25)
+
+    def test_lineage_requires_every_source_and_checks_each_table_binding(self) -> None:
+        from services.skill_verifiers import verify_computation_lineage
+
+        evidence = {"T1-S1": {"full_content": "Revenue was 125."}, "T2-M1": {"full_content": "Revenue was -500."}}
+        calc = {
+            "derived_from_source_ids": ["T1-S1", "T2-M1"],
+            "computation_artifact": {
+                "code": "result = rows[0]['revenue']",
+                "input_tables": [{"source_id": "T1-S1", "records": [{"revenue": -500}]}],
+            },
+        }
+        self.assertIsNotNone(verify_computation_lineage(calc, evidence))
+        calc["computation_artifact"]["input_tables"][0]["source_id"] = "T2-M1"
+        self.assertIsNone(verify_computation_lineage(calc, evidence))
+        calc["derived_from_source_ids"].append("T2-S7")
+        self.assertIsNotNone(verify_computation_lineage(calc, evidence))
+
+    def test_report_whitelist_excludes_rejected_calculation_and_unknown_citations(self) -> None:
+        state = SummaryState(todo_items=[TodoItem(
+            id=1, title="Research", query="query", intent="intent",
+            evidence_items=[{"source_id": sid} for sid in ("T1-S1", "T1-M1", "T1-C1", "T1-C2")],
+            review_issues=[{"check": "sandbox_input_ungrounded", "source_ids": ["T1-C1"]}],
+        )])
+        reporter = ReportingService(MagicMock(), Configuration(), evidence_store=EvidenceStore())
+        self.assertEqual(reporter._collect_valid_source_ids(state), {"T1-S1", "T1-M1", "T1-C2"})
+        self.assertEqual(reporter._sanitize_chunk_citations("unsupported [T1-C1]", set()), "unsupported ")
+
+    def test_sandbox_requires_explicit_skill_activation(self) -> None:
+        self.assertFalse(Configuration(sandbox_enabled=True).resolved_sandbox_effective_enabled())
+        self.assertFalse(Configuration(
+            sandbox_enabled=True, sandbox_backend="disabled", active_code_sandbox_enabled=True,
+        ).resolved_sandbox_effective_enabled())
+
     def test_skill_pack_code_sandbox_and_config_gates(self) -> None:
         cfg_off = Configuration(sandbox_enabled=False, active_code_sandbox_enabled=True)
         self.assertFalse(cfg_off.resolved_sandbox_effective_enabled())
@@ -658,6 +811,7 @@ class TestDirection02PipelineIntegration(unittest.TestCase):
         self.assertEqual(chart_events[0]["chart"]["chart_id"], "safe-1")
         self.assertEqual(len(state.report_charts), 1)
         self.assertTrue(set(state.report_charts[0]["source_ids"]).issubset(valid_sid_set))
+        self.assertIn("T1-C1", state.report_charts[0]["source_ids"])
 
         with tempfile.TemporaryDirectory() as tmp:
             class _Mgr(StateManagerMixin):
@@ -686,6 +840,7 @@ class TestDirection02PipelineIntegration(unittest.TestCase):
             mgr._persist_request_state(state, phase="completed", status="completed")
             loaded_payload = mgr._load_resume_snapshot("req-chart")
             assert loaded_payload is not None
+            self.assertEqual(loaded_payload["charts_spec"], state.report_charts)
             loaded, _ = mgr._state_from_snapshot(loaded_payload)
             self.assertEqual(len(loaded.report_charts), 1)
             self.assertEqual(loaded.report_charts[0]["chart_id"], "safe-1")

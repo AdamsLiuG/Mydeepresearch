@@ -810,11 +810,13 @@ class DeepResearchAgent(
             vlm_model=getattr(self.config, "multimodal_vlm_model", None),
             vlm_base_url=self.config.resolved_multimodal_vlm_base_url(),
             vlm_api_key=self.config.resolved_multimodal_vlm_api_key(),
-            vlm_timeout_seconds=float(getattr(self.config, "multimodal_vlm_timeout_seconds", 20.0) or 20.0),
+            vlm_timeout_seconds=self.config.multimodal_vlm_timeout_seconds,
             max_vlm_concurrency=int(getattr(self.config, "multimodal_vlm_max_concurrency", 4) or 4),
             max_pdf_pages=int(getattr(self.config, "multimodal_max_pdf_pages", 20) or 20),
-            max_vlm_pages_per_doc=int(getattr(self.config, "multimodal_max_vlm_pages_per_doc", 4) or 4),
-            max_images_per_page=int(getattr(self.config, "multimodal_max_images_per_page", 3) or 3),
+            max_pdf_bytes=self.config.multimodal_max_pdf_bytes,
+            pdf_render_dpi=self.config.multimodal_pdf_render_dpi,
+            max_vlm_pages_per_doc=self.config.multimodal_max_vlm_pages_per_doc,
+            max_images_per_page=self.config.multimodal_max_images_per_page,
             max_image_bytes=int(getattr(self.config, "multimodal_image_max_bytes", 2 * 1024 * 1024) or (2 * 1024 * 1024)),
             max_image_pixels=int(getattr(self.config, "multimodal_image_max_pixels", 16_000_000) or 16_000_000),
             metrics=metrics_registry,
@@ -824,13 +826,14 @@ class DeepResearchAgent(
             backend_preference=str(getattr(self.config, "sandbox_backend", "auto") or "auto"),
             timeout_seconds=float(getattr(self.config, "sandbox_timeout_seconds", 10.0) or 10.0),
             memory_mb=int(getattr(self.config, "sandbox_memory_mb", 512) or 512),
-            max_executions_per_task=int(getattr(self.config, "sandbox_max_executions_per_task", 4) or 4),
+            max_executions_per_task=self.config.sandbox_max_executions_per_task,
             docker_backend=DockerSandboxBackend(
                 image=str(getattr(self.config, "sandbox_docker_image", "helloagents-sandbox:latest") or "helloagents-sandbox:latest"),
                 cpus=str(getattr(self.config, "sandbox_cpus", "1.0") or "1.0"),
             ),
             pyodide_backend=PyodideSandboxBackend(
                 pyodide_cache_dir=str(getattr(self.config, "sandbox_pyodide_cache_dir", "") or ""),
+                node_bin=self.config.sandbox_pyodide_node_bin,
             ),
             metrics=metrics_registry,
         )
@@ -848,6 +851,7 @@ class DeepResearchAgent(
             sandbox_service=self._sandbox_service,
             evidence_store=self._evidence_store,
             config=self.config,
+            tenant_id=self.tenant_id,
         )
         self.tools_registry.register_tool(self.search_web_tool)
         self.tools_registry.register_tool(self.fetch_page_tool)
@@ -2384,6 +2388,7 @@ class DeepResearchAgent(
                     "report": report,
                     "note_id": state.report_note_id,
                     "note_path": state.report_note_path,
+                    **({"charts_spec": list(state.report_charts)} if state.report_charts else {}),
                     "evidence_conflicts": list(getattr(state, "evidence_conflicts", None) or []),
                     "claim_verification_summary": dict(
                         getattr(state, "claim_verification_summary", None) or {}

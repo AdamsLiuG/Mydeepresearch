@@ -109,6 +109,10 @@ class ResearchResponse(BaseModel):
         default_factory=list,
         description="Structured TODO items with summaries and sources",
     )
+    charts_spec: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Sanitized charts backed by calculation evidence",
+    )
     evidence_conflicts: list[dict[str, Any]] | None = Field(
         default=None,
         description="Detected cross-source conflicts and adjudication status",
@@ -777,6 +781,7 @@ def create_app(
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
+            charts_spec=list(getattr(result, "report_charts", []) or []) or None,
             evidence_conflicts=raw_conflicts or None,
             claim_verification_summary=raw_summary or None,
         )
@@ -1256,6 +1261,7 @@ def create_app(
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
+            charts_spec=list(getattr(result, "report_charts", []) or []) or None,
             evidence_conflicts=raw_conflicts or None,
             claim_verification_summary=raw_summary or None,
         )

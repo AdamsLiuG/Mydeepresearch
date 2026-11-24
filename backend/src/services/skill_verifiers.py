@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
+import json
 import logging
 import re
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from services.text_processing import strip_citation_markers
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +29,12 @@ _GROWTH_ARITHMETIC_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _SHARE_SENTENCE_HINT_PATTERN = re.compile(r"(?:占比|份额|比重|share)", re.IGNORECASE)
-_PERCENT_TOKEN_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_PERCENT_TOKEN_PATTERN = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
+_LINEAGE_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9_.])([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?|[+-]?\.\d+)"
+    r"(?!\d|\.\d|[eE][+-]?\d)",
+)
+_FORMULA_CONSTANTS = frozenset({0, 1, -1, 2, 4, 12, 100, 1000, 365})
 _YEAR_TOKEN_PATTERN = re.compile(r"\b(20\d{2})\b")
 _RECENCY_HINT_PATTERN = re.compile(
     r"(?:最新|近期|最近|今年|current|latest|recent)",
@@ -34,6 +44,82 @@ _COMPARISON_HINT_PATTERN = re.compile(
     r"(?:\bvs\.?\b|对比|比较|选型|竞品|compare|comparison|versus|trade-?off)",
     re.IGNORECASE,
 )
+
+
+def _lineage_numbers(text: str) -> set[Decimal]:
+    numbers: set[Decimal] = set()
+    for token in _LINEAGE_NUMBER.findall(strip_citation_markers(text)):
+        try:
+            numbers.add(Decimal(token.replace(",", "")))
+        except InvalidOperation:
+            continue
+    return numbers
+
+
+def verify_computation_lineage(
+    record: dict[str, Any], evidence_by_id: dict[str, dict[str, Any]],
+) -> str | None:
+    raw_ids = record.get("derived_from_source_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return "未声明上游支撑来源 derived_from_source_ids"
+    derived_ids = [str(sid).strip().strip("[]") for sid in raw_ids]
+    for sid in derived_ids:
+        upstream = evidence_by_id.get(sid)
+        if not re.fullmatch(r"T[0-9]+-[SM][0-9]+", sid) or not upstream or upstream.get("source_origin") == "sandbox":
+            return f"引用了无效的上游原始证据 {sid}"
+    artifact = record.get("computation_artifact")
+    if not isinstance(artifact, dict) or not artifact:
+        return "缺少 computation_artifact 计算产物记录"
+
+    corpus: dict[str, set[Decimal]] = {}
+    for sid in derived_ids:
+        upstream = evidence_by_id[sid]
+        parts = [str(upstream.get(key) or "") for key in ("title", "snippet", "raw_content", "full_content")]
+        for block in upstream.get("multimodal_blocks") or []:
+            if isinstance(block, dict):
+                parts.extend(str(block.get(key) or "") for key in ("markdown", "text", "structured_payload", "extraction"))
+        corpus[sid] = _lineage_numbers("\n".join(parts))
+
+    tables = artifact.get("input_tables", artifact.get("tables", []))
+    if not isinstance(tables, list):
+        return "计算输入表格式无效"
+    for table in tables:
+        if not isinstance(table, dict):
+            return "计算输入表格式无效"
+        table_ids = table.get("source_ids") or [table.get("source_id")]
+        if not isinstance(table_ids, list) or any(not isinstance(sid, str) or sid not in corpus for sid in table_ids):
+            return "计算输入表未绑定到有效上游来源"
+        table_numbers = _lineage_numbers(json.dumps(table.get("records") or table.get("rows") or []))
+        missing = table_numbers.difference(*(corpus[sid] for sid in table_ids))
+        if missing:
+            return f"计算输入表包含来源中不存在的数值 {min(missing)}"
+
+    code = artifact.get("code") or artifact.get("script")
+    if isinstance(code, str) and code:
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, ValueError, RecursionError):
+            return "计算脚本无法解析"
+        literals: set[Decimal] = set()
+        signed_constants: set[ast.AST] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                if isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float):
+                    signed_constants.add(node.operand)
+                    value = node.operand.value
+                    literals.add(Decimal(str(-value if isinstance(node.op, ast.USub) else value)))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or node in signed_constants:
+                continue
+            if type(node.value) in (int, float):
+                literals.add(Decimal(str(node.value)))
+            elif isinstance(node.value, str):
+                literals.update(_lineage_numbers(node.value))
+        missing = literals.difference(_FORMULA_CONSTANTS, *corpus.values())
+        if missing:
+            sample = ", ".join(map(str, sorted(missing, key=str)[:4]))
+            return f"计算脚本包含来源中不存在的数值 {sample}"
+    return None
 
 
 def _source_ids_for_task(task: Any) -> list[str]:
@@ -51,7 +137,13 @@ def _numeric_audit(state: Any, config: Any) -> list[dict[str, Any]]:
 
     del config
     issues: list[dict[str, Any]] = []
-    for task in getattr(state, "todo_items", []) or []:
+    all_tasks = getattr(state, "todo_items", []) or []
+    evidence_by_id = {
+        str(item["source_id"]): item
+        for task in all_tasks for item in (getattr(task, "evidence_items", None) or [])
+        if isinstance(item, dict) and item.get("source_id")
+    }
+    for task in all_tasks:
         if getattr(task, "status", "") != "completed":
             continue
         texts: list[str] = []
@@ -109,11 +201,6 @@ def _numeric_audit(state: Any, config: Any) -> list[dict[str, Any]]:
                 )
                 break
 
-        evidence_by_id = {
-            str(item.get("source_id") or "").strip(): item
-            for item in getattr(task, "evidence_items", None) or []
-            if isinstance(item, dict) and str(item.get("source_id") or "").strip()
-        }
         for claim in getattr(task, "claims", None) or []:
             if not isinstance(claim, dict):
                 continue
@@ -135,7 +222,7 @@ def _numeric_audit(state: Any, config: Any) -> list[dict[str, Any]]:
             claimed_pcts = [float(val) for val in _PERCENT_TOKEN_PATTERN.findall(str(claim.get("text") or ""))]
             if not claimed_pcts:
                 continue
-            if all(
+            if any(
                 all(abs(cp - sp) > max(1.0, 0.1 * abs(sp)) for sp in scalar_nums)
                 for cp in claimed_pcts
             ):
