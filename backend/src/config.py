@@ -280,6 +280,10 @@ class Configuration(BaseModel):
         title="Skill Distillation Max Adversarial Regression",
         description="Maximum allowed hybrid_score drop on adv_* regression cases",
     )
+    skill_distill_min_top_traces: int = Field(default=10, ge=1)
+    skill_distill_min_fail_traces: int = Field(default=5, ge=1)
+    skill_distill_max_latency_regression_ratio: float = Field(default=0.25, ge=0.0, allow_inf_nan=False)
+    skill_distill_max_cost_regression_ratio: float = Field(default=0.25, ge=0.0, allow_inf_nan=False)
     default_output_format: str | None = Field(
         default=None,
         title="Default Output Format Skill",
@@ -990,10 +994,11 @@ class Configuration(BaseModel):
         description="Optional API key for the policy controller endpoint",
     )
     policy_model_timeout_seconds: float = Field(
-        default=15.0,
-        ge=1.0,
+        default=0.8,
+        ge=0.01,
+        allow_inf_nan=False,
         title="Policy Model Timeout Seconds",
-        description="Request timeout in seconds for external policy model calls",
+        description="Request timeout in seconds for external policy model calls, capped at five seconds",
     )
     policy_model_mode: str = Field(
         default="off",
@@ -1018,24 +1023,27 @@ class Configuration(BaseModel):
         description="Prompt format template version used by both GRPO exporter and online policy controller",
     )
     policy_model_circuit_breaker_window: int = Field(
-        default=20,
+        default=50,
         ge=1,
+        le=10000,
         title="Policy Model Circuit Breaker Window",
         description="Sliding window size for policy fallback-rate circuit breaker",
     )
     policy_model_circuit_breaker_fallback_rate: float = Field(
-        default=0.25,
+        default=0.15,
         ge=0.0,
         le=1.0,
         title="Policy Model Circuit Breaker Fallback Rate",
         description="Fallback ratio threshold that opens the policy circuit breaker",
     )
     policy_model_max_p95_ms: float = Field(
-        default=250.0,
+        default=800.0,
         ge=1.0,
+        allow_inf_nan=False,
         title="Policy Model Max P95 Ms",
         description="Latency SLO budget in milliseconds for online policy calls",
     )
+    policy_model_consecutive_timeout_limit: int = Field(default=5, ge=1)
     search_cache_enabled: bool = Field(
         default=True,
         title="Search Cache Enabled",
@@ -2196,7 +2204,7 @@ class Configuration(BaseModel):
     def resolved_policy_model_mode(self) -> str:
         """Resolve effective policy model mode honoring explicit mode and legacy flag."""
         mode = str(getattr(self, "policy_model_mode", "off") or "off").strip().lower()
-        if mode in {"shadow", "canary", "active"}:
+        if mode != "off" or "policy_model_mode" in self.model_fields_set:
             return mode
         if bool(getattr(self, "policy_model_enabled", False)):
             return "active"

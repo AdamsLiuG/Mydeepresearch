@@ -294,6 +294,11 @@ class MetricsRegistry:
             "policy_shadow_agreement_total": 0,
             "policy_canary_decisions_total": 0,
             "policy_circuit_breaker_open_total": 0,
+            "policy_model_call_total": 0,
+            "policy_model_fallback_total": 0,
+            "policy_model_shadow_agree_total": 0,
+            "policy_model_canary_total": 0,
+            "policy_circuit_breaker_trip_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
         self._kv_cache_by_stage: dict[str, dict[str, Any]] = {}
@@ -341,6 +346,28 @@ class MetricsRegistry:
     def increment(self, metric: str, amount: int = 1) -> None:
         with self._lock:
             self._counters[metric] = self._counters.get(metric, 0) + amount
+
+    def record_policy_observation(self, telemetry: dict[str, Any]) -> None:
+        called = telemetry.get("model_called") is True
+        shadow = telemetry.get("mode") == "shadow"
+        canary = telemetry.get("mode") == "canary" and telemetry.get("canary_selected") is True
+        with self._lock:
+            if called:
+                self._counters["policy_model_call_total"] += 1
+                self._latencies.setdefault("policy_model_latency_ms", LatencyStats()).add(telemetry["latency_ms"])
+            if telemetry.get("fallback_reason"):
+                self._counters["policy_model_fallback_total"] += 1
+            if shadow and called:
+                self._counters["policy_shadow_decisions_total"] += 1
+            if shadow and telemetry.get("shadow_agreement") is True:
+                self._counters["policy_shadow_agreement_total"] += 1
+                self._counters["policy_model_shadow_agree_total"] += 1
+            if canary and called:
+                self._counters["policy_canary_decisions_total"] += 1
+                self._counters["policy_model_canary_total"] += 1
+            if telemetry.get("circuit_tripped") is True:
+                self._counters["policy_circuit_breaker_open_total"] += 1
+                self._counters["policy_circuit_breaker_trip_total"] += 1
 
     def add_tokens(
         self,
@@ -712,6 +739,8 @@ class RequestTrace:
         self.skill_pack_fallback_reason = ""
         self.skill_pack_shadow = False
         self.policy_decisions: list[dict[str, Any]] = []
+        self.policy_shadow_decisions: list[dict[str, Any]] = []
+        self.policy_model_latency = LatencyStats()
         self.cached_prompt_tokens = 0
         self.cache_creation_tokens = 0
         self.uncached_prompt_tokens = 0
@@ -722,6 +751,25 @@ class RequestTrace:
     def record_policy_decision(self, decision: dict[str, Any]) -> None:
         with self._lock:
             self.policy_decisions.append(_clone_dict(decision))
+            telemetry = decision.get("telemetry") or {}
+            if telemetry.get("model_called") is True:
+                self.policy_model_latency.add(telemetry["latency_ms"])
+
+    def record_policy_shadow_decision(self, task_id: int, round_index: int, telemetry: dict[str, Any]) -> None:
+        with self._lock:
+            self.policy_shadow_decisions.append(_clone_dict({
+                "task_id": task_id, "round": round_index, **telemetry,
+            }))
+            if telemetry.get("model_called") is True:
+                self.policy_model_latency.add(telemetry["latency_ms"])
+
+    def record_policy_execution(self, task_id: int, round_index: int, decision: dict[str, Any]) -> None:
+        with self._lock:
+            for entry in reversed(self.policy_decisions):
+                if entry.get("task_id") == task_id and entry.get("round") == round_index:
+                    entry["decision"] = _clone_dict(decision)
+                    entry["applied"] = True
+                    break
 
     def start_stage(
         self,
@@ -1234,6 +1282,8 @@ class RequestTrace:
                 "skill_pack_fallback_reason": self.skill_pack_fallback_reason,
                 "skill_pack_shadow": self.skill_pack_shadow,
                 "policy_decisions": _clone_dict({"items": self.policy_decisions}).get("items", []),
+                "policy_shadow_decisions": _clone_dict({"items": self.policy_shadow_decisions}).get("items", []),
+                "policy_model_latency_ms": self.policy_model_latency.to_dict(),
                 "report_markdown": self.report_markdown,
                 "todo_items": _clone_dict({"items": self.todo_items}).get("items", []),
                 "report_note_id": self.report_note_id,

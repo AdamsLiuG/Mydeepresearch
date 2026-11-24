@@ -24,7 +24,11 @@ from services.evidence_index import EvidenceRetrievalHit
 from services.fact_ledger import render_context_checkpoint, render_context_delta
 from services.mcp_bridge import MCPHitlApprovalRequired, _scope_allows_tool
 from services.policy_controller import (
+    ModelPolicyController,
+    PolicyDecision,
     PolicyStateFeatures,
+    RuleBasedPolicyController,
+    ShadowCanaryPolicyController,
     build_policy_controller,
     is_budget_legal_action,
 )
@@ -792,158 +796,166 @@ class TaskExecutorMixin:
         fallback: TaskReactDecision,
         *,
         observer: RequestTrace | None,
+        repair_hits: list[EvidenceRetrievalHit] | None = None,
     ) -> TaskReactDecision | None:
+        mode = self.config.resolved_policy_model_mode()
         controller = getattr(self, "_policy_controller", None)
-        if controller is None:
+        if mode == "off":
+            controller = RuleBasedPolicyController()
+        elif controller is None:
             controller = build_policy_controller(self.config)
 
         max_rounds = max(int(self.config.task_react_max_rounds or 1), 1)
-        round_index = (
-            int(getattr(task, "react_additional_search_count", 0) or 0)
-            + int(getattr(task, "react_fetch_count", 0) or 0)
-            + 1
-        )
-        searches_left = max(
-            max(int(self.config.task_react_max_additional_searches_per_task or 0), 0)
-            - int(getattr(task, "react_additional_search_count", 0) or 0),
-            0,
-        )
-        fetches_left = max(
-            max(int(self.config.task_react_max_fetches_per_task or 0), 0)
-            - int(getattr(task, "react_fetch_count", 0) or 0),
-            0,
-        )
+        round_index = max(1, task.react_rounds)
+        searches_left = max(self.config.task_react_max_additional_searches_per_task - task.react_additional_search_count, 0)
+        fetches_left = max(self.config.task_react_max_fetches_per_task - task.react_fetch_count, 0)
         high_quality_sources = sum(
-            1
-            for item in evidence_items
+            1 for item in evidence_items
             if str(item.get("quality_label") or "").lower() in {"high", "authoritative", "official"}
         )
-        top_item = self._top_evidence_item(evidence_items)
-        can_fetch = bool(
-            top_item
-            and str(top_item.get("url") or "").strip()
-            and not str(top_item.get("full_content") or "").strip()
-        )
-        gap_signals = tuple(str(sig) for sig in (getattr(observation, "gap_signals", []) or ()))
-        pack_meta = getattr(state, "skill_pack_metadata", None) or {}
-        skill_pack_id = str(pack_meta.get("pack_id") or "_neutral")
-        topic_domain = str(pack_meta.get("domain") or pack_meta.get("pack_id") or "general")
-        freshness_ok = "stale_evidence" not in gap_signals and "freshness_gap" not in gap_signals
-        evidence_sufficiency = not bool(gap_signals) and len(evidence_items) > 0
-        archive_repair_hits = len(getattr(observation, "archive_hits", ()) or ())
-        history_actions = list(getattr(task, "_policy_action_history", ()) or ())
-        if not history_actions and getattr(task, "react_last_action", None):
-            history_actions = [str(task.react_last_action)]
-        recent_actions = tuple(str(a) for a in history_actions[-3:])
-
+        fetchable_evidence = [
+            item for item in evidence_items
+            if item.get("url") and item.get("source_id") and not item.get("full_content")
+        ]
+        current_targets = {item["url"]: item["source_id"] for item in fetchable_evidence}
+        top_item = self._top_evidence_item(fetchable_evidence)
+        current_urls = {item.get("url") for item in evidence_items}
+        archive_targets = {
+            hit.url for hit in repair_hits or ()
+            if hit.origin == "history" and not hit.citation_eligible and hit.url and hit.url not in current_urls
+        }
+        pack_meta = state.skill_pack_metadata or {}
+        history_actions = getattr(task, "_policy_action_history", ())
         features = PolicyStateFeatures(
             task_id=task.id,
             round_index=round_index,
             max_rounds=max_rounds,
             evidence_count=len(evidence_items),
-            distinct_domains=int(getattr(observation, "source_diversity", 0) or 0),
+            distinct_domains=observation.source_diversity,
             high_quality_sources=high_quality_sources,
-            has_gap_signals=bool(gap_signals),
+            has_gap_signals=bool(observation.gap_signals),
             searches_left=searches_left,
             fetches_left=fetches_left,
-            remaining_budget_ratio=round(max(0.0, (max_rounds - round_index + 1) / max_rounds), 4),
+            remaining_budget_ratio=round(max(0.0, (max_rounds - round_index) / max_rounds), 4),
             task_title=task.title,
             task_intent=task.intent,
-            gap_signals=gap_signals,
-            can_fetch=can_fetch,
-            skill_pack_id=skill_pack_id,
-            topic_domain=topic_domain,
-            freshness_ok=freshness_ok,
-            evidence_sufficiency=evidence_sufficiency,
-            archive_repair_hits=archive_repair_hits,
-            recent_actions=recent_actions,
+            gap_signals=tuple(observation.gap_signals),
+            can_fetch=bool(current_targets or archive_targets),
+            skill_pack_id=str(pack_meta.get("pack_id") or "_neutral"),
+            topic_domain=str(pack_meta.get("topic_domain") or pack_meta.get("domain") or "general"),
+            freshness_ok=observation.freshness_ok,
+            evidence_sufficiency=observation.evidence_sufficiency,
+            archive_repair_hits=len(archive_targets),
+            recent_actions=tuple(history_actions[-3:]),
         )
-        req_id = str(getattr(self, "request_id", "") or "")
-        tenant_id = str(getattr(self, "tenant_id", "default") or "default")
-        telemetry: dict[str, Any] | None = None
-        if hasattr(controller, "decide_with_context"):
-            decision, telemetry = controller.decide_with_context(
-                features,
-                request_id=req_id,
-                tenant_id=tenant_id,
-            )
-        else:
-            decision = controller.decide(features)
-
-        if telemetry:
-            t_mode = telemetry.get("mode")
-            if t_mode == "shadow":
-                metrics_registry.increment("policy_shadow_decisions_total")
-                if telemetry.get("shadow_agreement") is True:
-                    metrics_registry.increment("policy_shadow_agreement_total")
-            elif t_mode == "canary" and telemetry.get("canary_selected"):
-                metrics_registry.increment("policy_canary_decisions_total")
-            if telemetry.get("circuit_open"):
-                metrics_registry.increment("policy_circuit_breaker_open_total")
-
-        trace_entry = {
-            "task_id": task.id,
-            "round": round_index,
-            "features": features.to_dict(),
-            "decision": decision.to_dict(),
+        context = {
+            "request_id": str(getattr(self, "request_id", "") or ""),
+            "tenant_id": str(getattr(self, "tenant_id", "default") or "default"),
         }
-        if telemetry:
-            trace_entry["telemetry"] = telemetry
+        allowed_fetch_urls = frozenset(current_targets.keys() | archive_targets)
+
+        def record_shadow(outcome: dict[str, Any]) -> None:
+            metrics_registry.record_policy_observation(outcome)
+            if observer is not None:
+                observer.record_policy_shadow_decision(features.task_id, round_index, outcome)
+
+        if isinstance(controller, ShadowCanaryPolicyController):
+            decision, telemetry = controller.decide_with_context(
+                features, **context, allowed_fetch_urls=allowed_fetch_urls, on_shadow_result=record_shadow,
+            )
+        elif isinstance(controller, ModelPolicyController):
+            decision, telemetry = controller.decide_with_context(
+                features, **context, allowed_fetch_urls=allowed_fetch_urls,
+            )
+        elif hasattr(controller, "decide_with_context"):
+            decision, telemetry = controller.decide_with_context(features, **context)
+        else:
+            decision, telemetry = controller.decide(features), None
+        if telemetry and not telemetry.get("shadow_pending"):
+            metrics_registry.record_policy_observation(telemetry)
+
+        routed = None
+        if mode in {"canary", "active"} and decision.source == "model" and is_budget_legal_action(features, decision):
+            if decision.action == "stop":
+                routed = TaskReactDecision(action="stop", reason=decision.reason)
+            elif decision.action in {"search", "reflect"}:
+                query = self._normalize_query_candidate(decision.query_override or "") or fallback.query or task.query
+                action = fallback.action if fallback.action in {
+                    "rewrite_query", "broaden_query", "diversify_source_query",
+                } else "broaden_query"
+                routed = TaskReactDecision(action=action, query=query, reason=decision.reason)
+            elif decision.target_url in current_targets:
+                routed = TaskReactDecision(
+                    action="fetch_page_for_top_source", source_id=current_targets[decision.target_url],
+                    reason=decision.reason,
+                )
+            elif decision.target_url in archive_targets:
+                routed = TaskReactDecision(
+                    action="fetch_page_for_archive_hit", url=decision.target_url, reason=decision.reason,
+                )
+            elif decision.target_url is None:
+                if fallback.action in {"fetch_page_for_top_source", "fetch_page_for_archive_hit"}:
+                    routed = TaskReactDecision(
+                        action=fallback.action, source_id=fallback.source_id, url=fallback.url, reason=decision.reason,
+                    )
+                elif top_item is not None:
+                    routed = TaskReactDecision(
+                        action="fetch_page_for_top_source", source_id=top_item["source_id"], reason=decision.reason,
+                    )
+                elif archive_targets:
+                    routed = TaskReactDecision(
+                        action="fetch_page_for_archive_hit", url=min(archive_targets), reason=decision.reason,
+                    )
+
+        trace_decision = decision
+        if routed is not None and decision.action in {"search", "reflect"} and decision.query_override:
+            trace_decision = PolicyDecision(
+                decision.action, decision.confidence, decision.reason, "model", query_override=routed.query,
+            )
+        if routed is None and mode in {"canary", "active"} and (
+            decision.source == "rule_fallback" or decision.source == "model"
+            or (telemetry or {}).get("circuit_open") and (mode == "active" or telemetry.get("canary_selected"))
+        ):
+            routed = fallback
+            trace_decision = self._policy_decision_for_task_action(fallback, source=decision.source)
+        elif routed is not None and decision.action == "fetch":
+            trace_decision = PolicyDecision("fetch", decision.confidence, decision.reason, "model")
         if observer is not None:
-            observer.record_policy_decision(trace_entry)
+            observer.record_policy_decision({
+                "task_id": task.id,
+                "round": round_index,
+                "features": features.to_dict(),
+                "decision": trace_decision.to_dict(),
+                "applied": routed is not None,
+                "policy_mode": mode,
+                "telemetry": telemetry or {},
+            })
+        return routed
 
-        updated_history = (*history_actions, decision.action)[-3:]
-        task._policy_action_history = list(updated_history)  # type: ignore[attr-defined]
+    @staticmethod
+    def _policy_decision_for_task_action(decision: TaskReactDecision, *, source: str) -> PolicyDecision:
+        action = decision.action
+        if action.startswith("fetch_page_"):
+            action = "fetch"
+        elif action != "stop":
+            action = "search"
+        reason = " ".join(decision.reason.split())[:240] or "Task routing decision"
+        return PolicyDecision(action, 0.0, reason, source)
 
-        resolved_mode = (
-            self.config.resolved_policy_model_mode()
-            if hasattr(self.config, "resolved_policy_model_mode")
-            else ("active" if bool(getattr(self.config, "policy_model_enabled", False)) else "off")
-        )
-        if resolved_mode not in {"canary", "active"} or decision.source != "model":
-            return None
-        if not is_budget_legal_action(features, decision):
-            return None
-
-        if decision.action == "stop":
-            return TaskReactDecision(action="stop", reason=decision.reason)
-        if decision.action == "fetch" and fetches_left > 0:
-            if decision.target_url:
-                return TaskReactDecision(
-                    action="fetch_page_for_archive_hit",
-                    url=decision.target_url,
-                    reason=decision.reason,
-                )
-            if fallback.action in {"fetch_page_for_top_source", "fetch_page_for_archive_hit"}:
-                return TaskReactDecision(
-                    action=fallback.action,
-                    source_id=fallback.source_id,
-                    url=fallback.url,
-                    reason=decision.reason,
-                )
-            if top_item and str(top_item.get("source_id") or "").strip():
-                return TaskReactDecision(
-                    action="fetch_page_for_top_source",
-                    source_id=str(top_item.get("source_id")).strip(),
-                    reason=decision.reason,
-                )
-        if decision.action in {"search", "reflect"} and searches_left > 0:
-            candidate_query = (
-                self._normalize_query_candidate(decision.query_override or "")
-                or fallback.query
-                or task.query
+    def _record_baseline_task_action(
+        self,
+        observer: RequestTrace | None,
+        task: TodoItem,
+        decision: TaskReactDecision,
+        *,
+        source: str,
+    ) -> TaskReactDecision:
+        if observer is not None:
+            observer.record_policy_execution(
+                task.id, max(1, task.react_rounds),
+                self._policy_decision_for_task_action(decision, source=source).to_dict(),
             )
-            mapped_action = (
-                fallback.action
-                if fallback.action in {"rewrite_query", "broaden_query", "diversify_source_query"}
-                else "broaden_query"
-            )
-            return TaskReactDecision(
-                action=mapped_action,
-                query=candidate_query,
-                reason=decision.reason,
-            )
-        return None
+        return decision
 
     def _plan_task_react_decision(
         self,
@@ -963,11 +975,16 @@ class TaskExecutorMixin:
             evidence_items,
             fallback,
             observer=observer,
+            repair_hits=repair_hits,
         )
         if routed is not None:
             return routed
+
+        def baseline(decision: TaskReactDecision, *, source: str = "rule") -> TaskReactDecision:
+            return self._record_baseline_task_action(observer, task, decision, source=source)
+
         if fallback.action == "stop":
-            return fallback
+            return baseline(fallback)
 
         top_item = self._top_evidence_item(evidence_items) or {}
         repair_candidates = [
@@ -1039,7 +1056,7 @@ class TaskExecutorMixin:
                     error=exc,
                     stage="task_react",
                 )
-            return fallback
+            return baseline(fallback)
         finally:
             self.task_react_agent.clear_history()
 
@@ -1057,7 +1074,7 @@ class TaskExecutorMixin:
             cleaned = strip_thinking_tokens(cleaned)
         payload = self._extract_json_payload(cleaned)
         if not isinstance(payload, dict):
-            return fallback
+            return baseline(fallback)
 
         action = str(payload.get("action") or "").strip()
         if action not in {
@@ -1068,7 +1085,7 @@ class TaskExecutorMixin:
             "fetch_page_for_archive_hit",
             "stop",
         }:
-            return fallback
+            return baseline(fallback)
 
         decision = TaskReactDecision(
             action=action,
@@ -1088,15 +1105,30 @@ class TaskExecutorMixin:
             decision.query = fallback.query
 
         if decision.action == "stop":
-            return decision
-        if decision.action == "fetch_page_for_top_source" and not decision.source_id:
-            return fallback
-        if decision.action == "fetch_page_for_archive_hit" and not decision.url:
-            return fallback
-        if decision.action != "fetch_page_for_top_source" and not decision.query:
-            if decision.action != "fetch_page_for_archive_hit":
-                return fallback
-        return decision
+            return baseline(decision, source="task_react_llm")
+        if decision.action.startswith("fetch_page_") and (
+            task.react_fetch_count >= self.config.task_react_max_fetches_per_task
+        ):
+            return baseline(fallback)
+        if not decision.action.startswith("fetch_page_") and (
+            task.react_additional_search_count >= self.config.task_react_max_additional_searches_per_task
+        ):
+            return baseline(fallback)
+        if decision.action == "fetch_page_for_top_source":
+            if not any(
+                item.get("source_id") == decision.source_id and item.get("url") and not item.get("full_content")
+                for item in evidence_items
+            ):
+                return baseline(fallback)
+        elif decision.action == "fetch_page_for_archive_hit":
+            if not any(
+                hit.origin == "history" and not hit.citation_eligible and hit.url == decision.url
+                for hit in repair_hits
+            ):
+                return baseline(fallback)
+        elif not decision.query:
+            return baseline(fallback)
+        return baseline(decision, source="task_react_llm")
 
     def _apply_task_budget(
         self,
@@ -1267,6 +1299,7 @@ class TaskExecutorMixin:
                     else str((target_item or {}).get("source_id") or "").strip() or None
                 )
                 if target_url:
+                    task.react_fetch_count += 1
                     try:
                         response = self.fetch_page_tool.run(
                             {
@@ -1277,7 +1310,6 @@ class TaskExecutorMixin:
                         )
                         payload = self._extract_json_payload(str(response or "").strip()) or {}
                         if payload:
-                            task.react_fetch_count += 1
                             fetch_notice = (
                                 f"已抓取来源全文：{payload.get('source_id') or target_source_id or target_url}"
                             )
@@ -1492,6 +1524,8 @@ class TaskExecutorMixin:
                     repair_hits,
                     observer=observer,
                 )
+                executed_action = self._policy_decision_for_task_action(decision, source="rule").action
+                task._policy_action_history = (*getattr(task, "_policy_action_history", ()), executed_action)[-3:]
                 if decision.action != "stop":
                     task.react_last_action = decision.action
                     if observer:

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
+from statistics import mean
 from typing import Any, Iterable, Mapping, Sequence
 
 # Bounded [0, 1] quality ratios (weight 1.0 in normalized quality gain).
@@ -37,6 +39,7 @@ OPTIONAL_VERIFIER_QUALITY_METRICS = (
     "verifier_clean_rate",
     "citation_validity_rate",
 )
+BOUNDED_QUALITY_METRICS = RATIO_QUALITY_METRICS + LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS
 
 DEFAULT_MAX_ADVERSARIAL_REGRESSION = 0.02
 
@@ -80,33 +83,73 @@ def _load_payload(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def _index_results(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    indexed: dict[str, dict[str, Any]] = {}
-    for result in payload.get("results") or []:
-        if not isinstance(result, dict):
+def _index_results(payload: Mapping[str, Any]) -> tuple[dict[str, Mapping[str, Any]], list[str]]:
+    if not isinstance(payload, Mapping):
+        return {}, ["invalid_payload"]
+    rows = payload.get("results", [])
+    if not isinstance(rows, (list, tuple)):
+        return {}, ["invalid_results"]
+    indexed: dict[str, Mapping[str, Any]] = {}
+    errors: list[str] = []
+    for offset, result in enumerate(rows):
+        case_id = result.get("id") if isinstance(result, Mapping) else None
+        if not isinstance(case_id, str) or not case_id.strip():
+            errors.append(f"invalid_case_id:{offset}")
             continue
-        case_id = str(result.get("id") or "").strip()
-        if case_id:
-            indexed[case_id] = result
-    return indexed
+        case_id = case_id.strip()
+        if case_id in indexed:
+            errors.append(f"duplicate_case_id:{case_id}")
+            continue
+        indexed[case_id] = result
+    return indexed, errors
+
+
+def _metrics(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    metrics = result.get("metrics")
+    return metrics if isinstance(metrics, Mapping) else {}
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _read_metric(metrics: Mapping[str, Any], name: str) -> float | None:
+    value = _finite_number(metrics.get(name))
+    if value is None or value < 0:
+        return None
+    if name in BOUNDED_QUALITY_METRICS and value > 1:
+        return None
+    return value
 
 
 def _metric_value(result: Mapping[str, Any], name: str) -> float:
-    metrics = result.get("metrics") or {}
-    try:
-        return float(metrics.get(name) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return _read_metric(_metrics(result), name) or 0.0
+
+
+def _metric_delta(baseline: Mapping[str, Any], candidate: Mapping[str, Any], name: str) -> float:
+    return _metric_value(candidate, name) - _metric_value(baseline, name)
 
 
 def _task_titles(result: Mapping[str, Any]) -> set[str]:
     titles: set[str] = set()
-    for item in result.get("todo_items") or []:
+    items = result.get("todo_items")
+    for item in items if isinstance(items, (list, tuple)) else ():
         if isinstance(item, Mapping):
             title = str(item.get("title") or "").strip().casefold()
             if title:
                 titles.add(title)
     return titles
+
+
+def _case_error(result: Mapping[str, Any]) -> str | None:
+    error = result.get("error")
+    return str(error) if error is not None else None
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
@@ -127,16 +170,7 @@ def _case_normalized_quality_delta(
     cand_result: Mapping[str, Any],
 ) -> float:
     """Compute a scale-safe weighted quality delta for a single case."""
-    base_metrics = base_result.get("metrics") or {}
-    cand_metrics = cand_result.get("metrics") or {}
-
-    weighted_sum = 0.0
-    for name in RATIO_QUALITY_METRICS:
-        weighted_sum += _metric_value(cand_result, name) - _metric_value(base_result, name)
-
-    for name in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
-        if name in base_metrics or name in cand_metrics:
-            weighted_sum += _metric_value(cand_result, name) - _metric_value(base_result, name)
+    weighted_sum = sum(_metric_delta(base_result, cand_result, name) for name in BOUNDED_QUALITY_METRICS)
 
     for name in COUNT_QUALITY_METRICS:
         base_val = _metric_value(base_result, name)
@@ -156,14 +190,23 @@ def compare_cases(
     metric_names: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Diff every case present in both runs."""
-    baseline_index = _index_results(baseline)
-    candidate_index = _index_results(candidate)
+    baseline_index, _ = _index_results(baseline)
+    candidate_index, _ = _index_results(candidate)
+    return _compare_indexed_cases(baseline_index, candidate_index, metric_names=metric_names)
+
+
+def _compare_indexed_cases(
+    baseline_index: Mapping[str, Mapping[str, Any]],
+    candidate_index: Mapping[str, Mapping[str, Any]],
+    *,
+    metric_names: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
     shared_ids = sorted(set(baseline_index) & set(candidate_index))
     default_names = list(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
     for extra_metric in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
         if any(
-            extra_metric in (baseline_index[cid].get("metrics") or {})
-            or extra_metric in (candidate_index[cid].get("metrics") or {})
+            extra_metric in _metrics(baseline_index[cid])
+            or extra_metric in _metrics(candidate_index[cid])
             for cid in shared_ids
         ):
             default_names.append(extra_metric)
@@ -174,7 +217,7 @@ def compare_cases(
         base_result = baseline_index[case_id]
         cand_result = candidate_index[case_id]
         deltas = {
-            name: round(_metric_value(cand_result, name) - _metric_value(base_result, name), 6)
+            name: round(_metric_delta(base_result, cand_result, name), 6)
             for name in names
         }
         base_titles = _task_titles(base_result)
@@ -186,8 +229,8 @@ def compare_cases(
                 "topic": str(cand_result.get("topic") or base_result.get("topic") or ""),
                 "task_title_jaccard": _jaccard(base_titles, cand_titles),
                 "plan_changed": base_titles != cand_titles,
-                "baseline_error": base_result.get("error"),
-                "candidate_error": cand_result.get("error"),
+                "baseline_error": _case_error(base_result),
+                "candidate_error": _case_error(cand_result),
                 "net_quality_delta": net_quality_delta,
                 "deltas": deltas,
             }
@@ -196,9 +239,63 @@ def compare_cases(
 
 
 def _mean(values: Sequence[float]) -> float:
-    if not values:
-        return 0.0
-    return round(sum(values) / len(values), 6)
+    return mean(values) if values else 0.0
+
+
+def _regression_ratio(
+    baseline_values: Sequence[float],
+    candidate_values: Sequence[float],
+    limit: float,
+) -> tuple[float | None, bool]:
+    baseline_mean = _mean(baseline_values)
+    candidate_mean = _mean(candidate_values)
+    if baseline_mean == 0:
+        return (None, True) if candidate_mean > 0 else (0.0, False)
+    ratio = (candidate_mean - baseline_mean) / baseline_mean
+    if not math.isfinite(ratio):
+        return None, True
+    return ratio, ratio > limit and not math.isclose(ratio, limit, rel_tol=1e-12)
+
+
+def _adversarial_regressed(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any], limit: float
+) -> bool:
+    drop = _metric_value(baseline, "hybrid_score") - _metric_value(candidate, "hybrid_score")
+    return drop > 0 and (drop > limit or math.isclose(drop, limit, rel_tol=1e-12))
+
+
+def _comparison_data_errors(
+    baseline_index: Mapping[str, Mapping[str, Any]],
+    candidate_index: Mapping[str, Mapping[str, Any]],
+    required_metrics: set[str],
+) -> list[str]:
+    errors: list[str] = []
+    names = sorted(set(BOUNDED_QUALITY_METRICS + COUNT_QUALITY_METRICS + LOWER_IS_BETTER) | required_metrics)
+    for case_id in sorted(baseline_index.keys() & candidate_index.keys()):
+        baseline = baseline_index[case_id]
+        candidate = candidate_index[case_id]
+        if baseline.get("topic") and candidate.get("topic") and baseline["topic"] != candidate["topic"]:
+            errors.append(f"case_topic_mismatch:{case_id}")
+        baseline_metrics = _metrics(baseline)
+        candidate_metrics = _metrics(candidate)
+        for label, row, metrics, peer in (
+            ("baseline", baseline, baseline_metrics, candidate_metrics),
+            ("candidate", candidate, candidate_metrics, baseline_metrics),
+        ):
+            if row.get("error") is not None:
+                errors.append(f"{label}:{case_id}:case_error")
+            if "metrics" in row and not isinstance(row["metrics"], Mapping):
+                errors.append(f"{label}:{case_id}:invalid_metrics")
+            for name in names:
+                if name in required_metrics or name in metrics or name in peer:
+                    if _read_metric(metrics, name) is None:
+                        errors.append(f"{label}:{case_id}:missing_or_invalid_metric:{name}")
+    return errors
+
+
+def _variant_label(payload: Mapping[str, Any], label: str | None, default: str) -> str:
+    variant = payload.get("variant") if isinstance(payload, Mapping) else None
+    return label or (variant if isinstance(variant, str) else None) or default
 
 
 def build_comparison(
@@ -210,81 +307,110 @@ def build_comparison(
     max_latency_regression_ratio: float = DEFAULT_MAX_LATENCY_REGRESSION_RATIO,
     max_cost_regression_ratio: float = DEFAULT_MAX_COST_REGRESSION_RATIO,
     max_adversarial_regression: float = DEFAULT_MAX_ADVERSARIAL_REGRESSION,
+    required_metrics: Iterable[str] = (),
+    expected_case_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build the full comparison payload, including normalized quality & cost guardrails."""
-    comparisons = compare_cases(baseline, candidate)
-    baseline_index = _index_results(baseline)
-    candidate_index = _index_results(candidate)
+    baseline_index, baseline_errors = _index_results(baseline)
+    candidate_index, candidate_errors = _index_results(candidate)
+    comparisons = _compare_indexed_cases(baseline_index, candidate_index)
     shared_ids = [case["id"] for case in comparisons]
+    baseline_only = sorted(set(baseline_index) - set(candidate_index))
+    candidate_only = sorted(set(candidate_index) - set(baseline_index))
+    required = set(required_metrics)
+    expected = set(expected_case_ids) if expected_case_ids is not None else None
+    strict = expected is not None or bool(required)
+    comparison_errors = [f"baseline:{error}" for error in baseline_errors]
+    comparison_errors.extend(f"candidate:{error}" for error in candidate_errors)
 
     metric_names = list(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
     for extra_metric in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
         if any(extra_metric in case["deltas"] for case in comparisons):
             metric_names.append(extra_metric)
+    tracked_outcomes = set(OPTIONAL_VERIFIER_QUALITY_METRICS).intersection(metric_names)
+    comparison_errors.extend(_comparison_data_errors(baseline_index, candidate_index, required | tracked_outcomes))
 
     aggregate = {
-        name: _mean([case["deltas"].get(name, 0.0) for case in comparisons])
+        name: _mean([_metric_delta(baseline_index[cid], candidate_index[cid], name) for cid in shared_ids])
         for name in metric_names
     }
 
     improved = sum(1 for case in comparisons if case["net_quality_delta"] > 1e-6)
     regressed = sum(1 for case in comparisons if case["net_quality_delta"] < -1e-6)
-    normalized_quality_gain = _mean([case["net_quality_delta"] for case in comparisons])
+    normalized_quality_gain = round(_mean([case["net_quality_delta"] for case in comparisons]), 6)
 
     regression_guardrails_tripped: list[str] = []
-    if shared_ids:
-        base_latency_mean = _mean([_metric_value(baseline_index[cid], "total_latency_ms") for cid in shared_ids])
-        cand_latency_mean = _mean([_metric_value(candidate_index[cid], "total_latency_ms") for cid in shared_ids])
-        if (
-            base_latency_mean > 0
-            and max_latency_regression_ratio >= 0
-            and (cand_latency_mean - base_latency_mean) / base_latency_mean > max_latency_regression_ratio
-        ):
-            regression_guardrails_tripped.append("latency_regression_exceeded")
+    if comparison_errors:
+        regression_guardrails_tripped.append("invalid_comparison_data")
+    if shared_ids and (baseline_only or candidate_only):
+        regression_guardrails_tripped.append("unmatched_cases")
+    if expected is not None and (set(baseline_index) != expected or set(candidate_index) != expected):
+        regression_guardrails_tripped.append("unexpected_case_coverage")
 
-        base_cost_mean = _mean([_metric_value(baseline_index[cid], "estimated_cost") for cid in shared_ids])
-        cand_cost_mean = _mean([_metric_value(candidate_index[cid], "estimated_cost") for cid in shared_ids])
-        if (
-            base_cost_mean > 0
-            and max_cost_regression_ratio >= 0
-            and (cand_cost_mean - base_cost_mean) / base_cost_mean > max_cost_regression_ratio
-        ):
-            regression_guardrails_tripped.append("cost_regression_exceeded")
+    regression_ratios: dict[str, float | None] = {}
+    for label, name, raw_limit in (
+        ("latency", "total_latency_ms", max_latency_regression_ratio),
+        ("cost", "estimated_cost", max_cost_regression_ratio),
+    ):
+        regression_ratios[f"{label}_delta_ratio"] = None
+        limit = _finite_number(raw_limit)
+        if limit is None or limit < 0:
+            regression_guardrails_tripped.append(f"invalid_{label}_regression_limit")
+            continue
+        base_values = [_read_metric(_metrics(baseline_index[cid]), name) for cid in shared_ids]
+        cand_values = [_read_metric(_metrics(candidate_index[cid]), name) for cid in shared_ids]
+        if not any(value is not None for value in base_values + cand_values):
+            continue
+        if None in base_values or None in cand_values:
+            regression_guardrails_tripped.append(f"incomplete_{label}_metrics")
+            continue
+        ratio, exceeded = _regression_ratio(
+            [value for value in base_values if value is not None],
+            [value for value in cand_values if value is not None],
+            limit,
+        )
+        regression_ratios[f"{label}_delta_ratio"] = ratio
+        if exceeded:
+            regression_guardrails_tripped.append(f"{label}_regression_exceeded")
 
-        for cid in shared_ids:
-            if not cid.lower().startswith("adv_"):
-                continue
-            b_metrics = baseline_index[cid].get("metrics") or {}
-            c_metrics = candidate_index[cid].get("metrics") or {}
-            if "hybrid_score" in b_metrics or "hybrid_score" in c_metrics:
-                drop = float(b_metrics.get("hybrid_score") or 0.0) - float(c_metrics.get("hybrid_score") or 0.0)
-                if drop > float(max_adversarial_regression):
-                    regression_guardrails_tripped.append("adversarial_regression_exceeded")
-                    break
+    adversarial_limit = _finite_number(max_adversarial_regression)
+    if adversarial_limit is None or not 0 <= adversarial_limit <= 1:
+        regression_guardrails_tripped.append("invalid_adversarial_regression_limit")
+    elif any(
+        cid.lower().startswith("adv_")
+        and _adversarial_regressed(baseline_index[cid], candidate_index[cid], adversarial_limit)
+        for cid in shared_ids
+    ):
+        regression_guardrails_tripped.append("adversarial_regression_exceeded")
 
-    if not comparisons:
-        verdict = "inconclusive"
-    elif normalized_quality_gain < -1e-6 or regression_guardrails_tripped:
+    for name in OPTIONAL_VERIFIER_QUALITY_METRICS:
+        if aggregate.get(name, 0.0) < -1e-12:
+            regression_guardrails_tripped.append(f"{name}_regression")
+
+    case_balance_passed = improved > regressed if strict else improved >= regressed
+    if normalized_quality_gain < -1e-6 or regression_guardrails_tripped:
         verdict = "fail"
-    elif normalized_quality_gain > 1e-6 and improved >= regressed:
+    elif normalized_quality_gain > 1e-6 and case_balance_passed:
         verdict = "pass"
     else:
         verdict = "inconclusive"
 
     return {
-        "baseline_label": baseline_label or baseline.get("variant") or "baseline",
-        "candidate_label": candidate_label or candidate.get("variant") or "candidate",
+        "baseline_label": _variant_label(baseline, baseline_label, "baseline"),
+        "candidate_label": _variant_label(candidate, candidate_label, "candidate"),
         "compared_cases": len(comparisons),
-        "baseline_only_cases": sorted(set(baseline_index) - set(candidate_index)),
-        "candidate_only_cases": sorted(set(candidate_index) - set(baseline_index)),
+        "baseline_only_cases": baseline_only,
+        "candidate_only_cases": candidate_only,
         "plan_changed_cases": sum(1 for case in comparisons if case["plan_changed"]),
         "improved_cases": improved,
         "regressed_cases": regressed,
         "normalized_quality_gain": normalized_quality_gain,
         "regression_guardrails_tripped": regression_guardrails_tripped,
+        "comparison_data_errors": comparison_errors,
         "verdict": verdict,
         "aggregate_deltas": aggregate,
         "cases": comparisons,
+        **regression_ratios,
     }
 
 
@@ -314,6 +440,9 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
     aggregate = comparison.get("aggregate_deltas") or {}
     for name in HIGHER_IS_BETTER:
         lines.append(f"| {name} | {_format_delta(aggregate.get(name, 0.0))} | higher is better |")
+    for name in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
+        if name in aggregate:
+            lines.append(f"| {name} | {_format_delta(aggregate[name])} | higher is better |")
     for name in LOWER_IS_BETTER:
         lines.append(f"| {name} | {_format_delta(aggregate.get(name, 0.0))} | lower is better |")
     for name in INFORMATIONAL:
@@ -345,6 +474,11 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
     )
     if unmatched:
         lines.extend(["", f"> Unmatched cases skipped: {', '.join(unmatched)}"])
+    guardrails = comparison.get("regression_guardrails_tripped") or []
+    if guardrails:
+        lines.extend(["", "## Regression guardrails", ""])
+        lines.extend(f"- `{reason}`" for reason in guardrails)
+        lines.extend(f"- `{error}`" for error in comparison.get("comparison_data_errors") or [])
     return "\n".join(lines) + "\n"
 
 
@@ -364,7 +498,7 @@ def compare_result_files(
         destination = Path(output_json).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
-            json.dumps(comparison, ensure_ascii=False, indent=2),
+            json.dumps(comparison, ensure_ascii=False, indent=2, allow_nan=False),
             encoding="utf-8",
         )
         comparison["output_json"] = str(destination)

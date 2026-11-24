@@ -11,10 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
+import unicodedata
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +78,8 @@ SKILL_STAGES = (
 STATUS_ACTIVE = "active"
 STATUS_SHADOW = "shadow"
 STATUS_DISABLED = "disabled"
+DISTILLATION_SOURCE = "offline_distillation"
+SKILL_PROMOTION_BENCHMARK = "backend/evals/benchmarks/golden_multidomain_24cases.jsonl"
 _STATUS_VALUES = {STATUS_ACTIVE, STATUS_SHADOW, STATUS_DISABLED}
 
 MATURITY_DRAFT = "draft"
@@ -113,15 +118,49 @@ BUDGET_KNOBS = {
 LAYOUT_KNOBS = {"report_layout_mode", "search_api"}
 
 _FRONTMATTER_DELIMITER = "---"
-_TOOL_CALL_MARKER = "[TOOL_CALL:"
+_TOOL_CALL_PATTERN = re.compile(r"\[\s*TOOL[_ -]?CALL\s*:", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 # A run of >=4 digits (optionally with %/.,) reads as a concrete finding rather than method text.
 _HARD_NUMBER_PATTERN = re.compile(r"\d[\d.,]{3,}%?")
 _SECTION_HEADER_PATTERN = re.compile(r"^##\s+(?P<name>[A-Za-z_]+)\s*$")
+_PROMPT_CONTROL_PATTERN = re.compile(
+    r"<\|[^>\n]{1,64}\|>|</?\s*(?:system|assistant|user|tool|"
+    r"(?:SECONDARY_)?RESEARCH_SKILL|OUTPUT_FORMAT_SKILL)\b|"
+    r"\b(?:ignore|disregard|override)\s+(?:all\s+)?(?:previous|prior|system)\s+instructions\b|"
+    r"(?:忽略|无视|覆盖)(?:之前|前面|系统)的?(?:指令|提示词)|"
+    r"\b(?:expected_keywords|expected_sections|golden_answer)\b",
+    re.IGNORECASE,
+)
+
+_TEXT_FRONTMATTER_KEYS = {
+    "pack_id", "skill_kind", "maturity", "status", "title", "topic_domain", "applicable_when",
+    "supersedes", "derived_from", "owner", "content_hash",
+}
+_LIST_FRONTMATTER_KEYS = {
+    "match_signals", "negative_signals", "stage_scope", "verifiers", "composable_with", "outline_sections",
+}
+_MAPPING_FRONTMATTER_KEYS = {"quality_gates", "budget_knobs", "layout", "eval", "retrieval_profile", "mcp_tool_scopes"}
+_OTHER_FRONTMATTER_KEYS = {"schema_version", "version", "min_match_score", "code_sandbox", "created_at", "updated_at"}
 
 
 class SkillPackError(Exception):
     """Raised when a skill pack file cannot be parsed into a well-formed pack."""
+
+
+class _SkillFrontmatterLoader(yaml.SafeLoader):
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise SkillPackError("frontmatter must not contain YAML aliases")
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[str, Any]:
+        keys: set[str] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, str) or key in keys:
+                raise SkillPackError("frontmatter mapping keys must be unique strings")
+            keys.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 @dataclass
@@ -217,7 +256,7 @@ def _split_frontmatter(raw_text: str) -> tuple[dict[str, Any], str]:
     lines = raw_text.splitlines()
     end_index = None
     for index in range(1, len(lines)):
-        if lines[index].strip() == _FRONTMATTER_DELIMITER:
+        if lines[index] == _FRONTMATTER_DELIMITER:
             end_index = index
             break
     if end_index is None:
@@ -225,8 +264,8 @@ def _split_frontmatter(raw_text: str) -> tuple[dict[str, Any], str]:
 
     frontmatter_text = "\n".join(lines[1:end_index])
     try:
-        parsed = yaml.safe_load(frontmatter_text) or {}
-    except yaml.YAMLError as exc:
+        parsed = yaml.load(frontmatter_text, Loader=_SkillFrontmatterLoader)
+    except (yaml.YAMLError, RecursionError) as exc:
         raise SkillPackError(f"frontmatter is not valid YAML: {exc}") from exc
     if not isinstance(parsed, dict):
         raise SkillPackError("frontmatter must be a mapping")
@@ -251,9 +290,13 @@ def _split_body_sections(body: str) -> dict[str, str]:
         if header:
             _flush()
             current = header.group("name").strip()
+            if current in sections:
+                raise SkillPackError(f"duplicate skill stage heading '{current}'")
             buffer = []
         elif current is not None:
             buffer.append(line)
+        elif line.strip():
+            raise SkillPackError("skill body content must be in a stage section")
     _flush()
     return sections
 
@@ -302,25 +345,37 @@ def load_pack(path: Path) -> SkillPack:
 
     try:
         raw_text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise SkillPackError(f"cannot read {path}: {exc}") from exc
 
     frontmatter, body = _split_frontmatter(raw_text)
+    unknown = frontmatter.keys() - (
+        _TEXT_FRONTMATTER_KEYS | _LIST_FRONTMATTER_KEYS | _MAPPING_FRONTMATTER_KEYS | _OTHER_FRONTMATTER_KEYS
+    )
+    if unknown:
+        raise SkillPackError(f"unknown frontmatter keys: {sorted(unknown)}")
+    for key, value in frontmatter.items():
+        if key in _TEXT_FRONTMATTER_KEYS and not isinstance(value, str):
+            raise SkillPackError(f"{key} must be a string")
+        if key in _LIST_FRONTMATTER_KEYS and (
+            not isinstance(value, list) or any(not isinstance(item, str) for item in value)
+        ):
+            raise SkillPackError(f"{key} must be a list of strings")
+        if key in _MAPPING_FRONTMATTER_KEYS and not isinstance(value, dict):
+            raise SkillPackError(f"{key} must be a mapping")
     body_sections = _split_body_sections(body)
     code_sandbox = frontmatter.get("code_sandbox", False)
     if not isinstance(code_sandbox, bool):
         raise SkillPackError(f"code_sandbox must be a boolean in {path}")
 
-    try:
-        schema_version = int(frontmatter.get("schema_version") or 0)
-        version = int(frontmatter.get("version") or 0)
-    except (TypeError, ValueError) as exc:
-        raise SkillPackError(f"schema_version/version must be integers in {path}") from exc
+    schema_version = frontmatter.get("schema_version", 0)
+    version = frontmatter.get("version", 0)
+    if type(schema_version) is not int or type(version) is not int:
+        raise SkillPackError(f"schema_version/version must be integers in {path}")
 
-    try:
-        min_match_score = float(frontmatter.get("min_match_score", 0.0) or 0.0)
-    except (TypeError, ValueError) as exc:
-        raise SkillPackError(f"min_match_score must be a number in {path}") from exc
+    min_match_score = frontmatter.get("min_match_score", 0.0)
+    if type(min_match_score) not in {int, float} or not 0 <= min_match_score <= 1:
+        raise SkillPackError(f"min_match_score must be a number between zero and one in {path}")
 
     pack = SkillPack(
         pack_id=str(frontmatter.get("pack_id") or "").strip(),
@@ -353,7 +408,10 @@ def load_pack(path: Path) -> SkillPack:
         mcp_tool_scopes=_as_dict(frontmatter.get("mcp_tool_scopes")),
         code_sandbox=code_sandbox,
     )
-    pack.content_hash = compute_content_hash(pack)
+    try:
+        pack.content_hash = compute_content_hash(pack)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise SkillPackError(f"frontmatter must contain JSON-compatible data in {path}") from exc
     return pack
 
 
@@ -375,15 +433,14 @@ def validate_pack(
     # --- identity ---
     if directory_name is not None and pack.pack_id != directory_name:
         errors.append(f"pack_id '{pack.pack_id}' does not match directory '{directory_name}'")
-    if is_neutral:
-        if pack.pack_id != NEUTRAL_PACK_ID:
-            errors.append("neutral pack must use the reserved id '_neutral'")
-    elif not _PACK_ID_PATTERN.match(pack.pack_id):
+    if not is_neutral and not _PACK_ID_PATTERN.fullmatch(pack.pack_id):
         errors.append(f"pack_id '{pack.pack_id}' must be kebab-case")
     if pack.schema_version != CURRENT_SCHEMA_VERSION:
         errors.append(f"schema_version must be {CURRENT_SCHEMA_VERSION}")
     if pack.version < 1:
         errors.append("version must be a positive integer")
+    if type(pack.min_match_score) not in {int, float} or not 0 <= pack.min_match_score <= 1:
+        errors.append("min_match_score must be a number between zero and one")
     if pack.pinned_content_hash and pack.pinned_content_hash != pack.content_hash:
         errors.append("content_hash does not match the computed hash of the pack content")
     if pack.status not in _STATUS_VALUES:
@@ -402,6 +459,8 @@ def validate_pack(
             "body sections "
             f"{sorted(pack.body_sections)} must equal stage_scope {sorted(pack.stage_scope)}"
         )
+    if len(pack.stage_scope) != len(set(pack.stage_scope)):
+        errors.append("stage_scope must not contain duplicate stages")
     if pack.is_format and (not pack.stage_scope or set(pack.stage_scope) != {STAGE_REPORT}):
         errors.append("format skill pack stage_scope must equal ['report']")
     for stage, fragment in pack.body_sections.items():
@@ -448,6 +507,14 @@ def validate_pack(
         errors.append("format skill pack must not declare domain quality/budget/retrieval/verifier knobs")
     if pack.maturity in {MATURITY_PROMOTED, MATURITY_PRODUCTION} and _as_dict(pack.eval_meta).get("verdict") != "pass":
         errors.append("promoted pack requires an eval with verdict=pass")
+    if _is_distilled(pack):
+        if not pack.pinned_content_hash:
+            errors.append("distilled pack requires a pinned content_hash")
+        if pack.status == STATUS_ACTIVE and (
+            pack.maturity not in {MATURITY_PROMOTED, MATURITY_PRODUCTION}
+            or not _has_promotion_audit(pack)
+        ):
+            errors.append("active distilled pack requires a promoted maturity and matching Golden gate audit")
 
     return errors
 
@@ -462,8 +529,24 @@ def validate_candidate_against_parent(
     """Validate an auto-evolved/distilled SkillPack candidate against safety and parent invariants."""
 
     errors = list(validate_pack(candidate, char_limit=char_limit))
+    if candidate.status != STATUS_SHADOW or candidate.maturity not in {MATURITY_DRAFT, MATURITY_VERIFIED}:
+        errors.append("distilled candidate must be draft or verified and remain shadow")
 
-    bad_tokens = [str(cid or "").strip().lower() for cid in (forbidden_case_ids or ()) if str(cid or "").strip()]
+    for key, value in (
+        ("title", candidate.title),
+        ("applicable_when", candidate.applicable_when),
+        ("topic_domain", candidate.topic_domain),
+        ("match_signals", "\n".join(candidate.match_signals)),
+        ("negative_signals", "\n".join(candidate.negative_signals)),
+        ("outline_sections", "\n".join(candidate.outline_sections)),
+    ):
+        errors.extend(_validate_fragment_safety(key, value))
+
+    bad_tokens = [
+        unicodedata.normalize("NFKC", cid.strip()).casefold()
+        for cid in forbidden_case_ids
+        if isinstance(cid, str) and cid.strip()
+    ]
     if bad_tokens:
         haystack = "\n".join(
             [
@@ -472,9 +555,11 @@ def validate_candidate_against_parent(
                 candidate.applicable_when,
                 *candidate.match_signals,
                 *candidate.negative_signals,
+                *candidate.outline_sections,
                 *candidate.body_sections.values(),
             ]
-        ).lower()
+        )
+        haystack = unicodedata.normalize("NFKC", haystack).casefold()
         for token in bad_tokens:
             if token in haystack:
                 errors.append(f"overfitting_forbidden_case_id:{token}")
@@ -487,14 +572,23 @@ def validate_candidate_against_parent(
             errors.append(f"candidate dropped required parent verifiers: {missing_verifiers}")
 
         for gate_key, parent_val in (parent.quality_gates or {}).items():
-            if gate_key in candidate.quality_gates:
-                if not enforce_quality_gate_direction(
-                    gate_key, parent_val, candidate.quality_gates[gate_key]
-                ):
-                    errors.append(
-                        f"candidate loosened quality_gate '{gate_key}': "
-                        f"{candidate.quality_gates[gate_key]} vs parent {parent_val}"
-                    )
+            if gate_key not in candidate.quality_gates:
+                errors.append(f"candidate dropped required parent quality_gate '{gate_key}'")
+            elif not enforce_quality_gate_direction(gate_key, parent_val, candidate.quality_gates[gate_key]):
+                errors.append(
+                    f"candidate loosened quality_gate '{gate_key}': "
+                    f"{candidate.quality_gates[gate_key]} vs parent {parent_val}"
+                )
+
+        for key in (
+            "mcp_tool_scopes", "code_sandbox", "skill_kind", "topic_domain", "budget_knobs",
+            "layout", "retrieval_profile", "composable_with", "stage_scope", "match_signals",
+            "negative_signals", "min_match_score", "title", "applicable_when", "outline_sections",
+        ):
+            if getattr(candidate, key) != getattr(parent, key):
+                errors.append(f"candidate changed parent {key}")
+        if candidate.version <= parent.version:
+            errors.append("candidate version must exceed parent version")
 
         parent_chars = sum(len(v) for v in (parent.body_sections or {}).values())
         cand_chars = sum(len(v) for v in (candidate.body_sections or {}).values())
@@ -506,11 +600,63 @@ def validate_candidate_against_parent(
     return errors
 
 
+def _is_distilled(pack: SkillPack) -> bool:
+    return bool(pack.supersedes and pack.derived_from) or pack.eval_meta.get("source") == DISTILLATION_SOURCE
+
+
+def _has_promotion_audit(pack: SkillPack) -> bool:
+    audit = pack.eval_meta
+    baseline_version = audit.get("baseline_version")
+    baseline_hash = audit.get("baseline_content_hash")
+    improved, regressed = audit.get("improved_cases"), audit.get("regressed_cases")
+    artifact = audit.get("comparison_artifact")
+    if (
+        audit.get("benchmark") != SKILL_PROMOTION_BENCHMARK
+        or audit.get("judge") != "hybrid"
+        or audit.get("candidate_content_hash") != pack.content_hash
+        or type(audit.get("compared_cases")) is not int or audit["compared_cases"] != 24
+        or type(baseline_version) is not int or not 1 <= baseline_version < pack.version
+        or not pack.supersedes.endswith(f"@v{baseline_version}")
+        or not isinstance(baseline_hash, str) or not re.fullmatch(r"[0-9a-f]{16}", baseline_hash)
+        or type(improved) is not int or type(regressed) is not int
+        or not 0 <= regressed < improved or improved + regressed > 24
+        or not isinstance(artifact, str) or not artifact.strip()
+    ):
+        return False
+
+    limits = {
+        "hybrid_score_delta": (0.015, 1.0),
+        "target_domain_hybrid_delta": (0.03 - 1e-12, 1.0),
+        "citation_validity_rate_delta": (0.0, 1.0),
+        "verifier_clean_rate_baseline": (0.0, 1.0),
+        "verifier_clean_rate_candidate": (0.0, 1.0),
+        "latency_delta_ratio": (-1.0, 0.25),
+        "cost_delta_ratio": (-1.0, 0.25),
+    }
+    if any(
+        type(audit.get(key)) not in {int, float} or not low <= audit[key] <= high
+        for key, (low, high) in limits.items()
+    ):
+        return False
+    adversarial_delta = audit.get("adversarial_min_delta")
+    if (
+        type(adversarial_delta) not in {int, float} or not -0.02 < adversarial_delta <= 1
+        or audit["verifier_clean_rate_candidate"] < audit["verifier_clean_rate_baseline"]
+    ):
+        return False
+    try:
+        return datetime.fromisoformat(audit["evaluated_at"].replace("Z", "+00:00")).utcoffset() is not None
+    except (AttributeError, KeyError, ValueError):
+        return False
+
+
 def _validate_quality_gates(pack: SkillPack) -> list[str]:
     errors: list[str] = []
-    for key in pack.quality_gates:
+    for key, value in pack.quality_gates.items():
         if key not in QUALITY_GATE_DIRECTIONS:
             errors.append(f"quality_gates key '{key}' is not in the override whitelist")
+        elif type(value) is not int or value < 1:
+            errors.append(f"quality_gates value for '{key}' must be a positive integer")
     return errors
 
 
@@ -706,7 +852,9 @@ def _validate_fragment_safety(stage: str, fragment: str) -> list[str]:
     """A skill fragment is method text; it must not smuggle facts, tools, ids or citations."""
 
     errors: list[str] = []
-    if _TOOL_CALL_MARKER in fragment:
+    fragment = unicodedata.normalize("NFKC", fragment)
+    fragment = "".join(char for char in fragment if unicodedata.category(char) != "Cf")
+    if _TOOL_CALL_PATTERN.search(fragment):
         errors.append(f"stage '{stage}' fragment must not contain a tool directive")
     if _SOURCE_ID_PATTERN.search(fragment):
         errors.append(f"stage '{stage}' fragment must not contain a source id")
@@ -714,6 +862,10 @@ def _validate_fragment_safety(stage: str, fragment: str) -> list[str]:
         errors.append(f"stage '{stage}' fragment must not contain a URL")
     if _HARD_NUMBER_PATTERN.search(fragment):
         errors.append(f"stage '{stage}' fragment must not contain a concrete numeric finding")
+    if _PROMPT_CONTROL_PATTERN.search(fragment):
+        errors.append(f"stage '{stage}' fragment must not contain a prompt control or benchmark marker")
+    if any(_SECTION_HEADER_PATTERN.fullmatch(line.strip()) for line in fragment.splitlines()):
+        errors.append(f"stage '{stage}' fragment must not contain a skill stage heading")
     return errors
 
 
@@ -726,7 +878,9 @@ def enforce_quality_gate_direction(field_name: str, baseline: Any, override: Any
     try:
         baseline_value = float(baseline)
         override_value = float(override)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if isinstance(override, bool) or not math.isfinite(baseline_value) or not math.isfinite(override_value):
         return False
     if direction == "increase":
         return override_value >= baseline_value
@@ -760,7 +914,7 @@ def apply_skill_pack_overrides(
     so a pack (or secondary constraint pack) can never weaken review/freshness bars.
     """
 
-    if base_config is None:
+    if base_config is None or pack.status != STATUS_ACTIVE:
         return base_config, {}
 
     updates: dict[str, Any] = {}
@@ -773,7 +927,7 @@ def apply_skill_pack_overrides(
         if (
             secondary_pack is not None
             and not secondary_pack.is_neutral
-            and secondary_pack.status != STATUS_SHADOW
+            and secondary_pack.status == STATUS_ACTIVE
         ):
             source_packs.append(secondary_pack)
 
@@ -854,7 +1008,7 @@ def apply_skill_pack_overrides(
 
     if (
         format_pack is not None
-        and format_pack.status != STATUS_SHADOW
+        and format_pack.status == STATUS_ACTIVE
         and hasattr(base_config, "active_output_format_id")
     ):
         updates["active_output_format_id"] = format_pack.pack_id
@@ -940,10 +1094,10 @@ class SkillPackService:
         packs: dict[str, SkillPack] = {}
         if directory.is_dir():
             for entry in sorted(directory.iterdir()):
-                if not entry.is_dir():
+                if not entry.is_dir() or entry.is_symlink():
                     continue
                 skill_file = entry / "SKILL.md"
-                if not skill_file.is_file():
+                if not skill_file.is_file() or skill_file.is_symlink():
                     continue
                 try:
                     pack = load_pack(skill_file)
@@ -966,7 +1120,7 @@ class SkillPackService:
                 if errors:
                     logger.warning("skill pack invalid dir=%s errors=%s", entry.name, errors)
                     continue
-                if pack.status == STATUS_DISABLED:
+                if pack.status == STATUS_DISABLED or (_is_distilled(pack) and pack.status != STATUS_ACTIVE):
                     continue
                 required_gate = str(
                     getattr(self._config, "skill_pack_maturity_gate", MATURITY_DRAFT) or MATURITY_DRAFT
@@ -1013,7 +1167,8 @@ class SkillPackService:
             or ""
         ).strip().lower()
         if requested:
-            return formats.get(requested)
+            pack = formats.get(requested)
+            return pack if pack is not None and pack.status == STATUS_ACTIVE else None
 
         haystack = " ".join(
             part.lower()
@@ -1023,6 +1178,8 @@ class SkillPackService:
         best: SkillPack | None = None
         best_score = 0.0
         for pack in formats.values():
+            if pack.status != STATUS_ACTIVE:
+                continue
             score, disqualified = self._score(pack, haystack)
             if disqualified:
                 continue
@@ -1263,7 +1420,7 @@ class SkillPackService:
         """Render the ``<RESEARCH_SKILL>`` block for one stage, or empty when there is nothing."""
 
         fragment = pack.fragment_for(stage)
-        if not fragment:
+        if pack.status != STATUS_ACTIVE or not fragment:
             return ""
         return (
             f'\n\n<RESEARCH_SKILL pack="{pack.pack_id}" version="{pack.version}">\n'
@@ -1276,7 +1433,7 @@ class SkillPackService:
     def render_secondary_block(self, pack: SkillPack | None, stage: str) -> str:
         """Render a compact secondary constraint fragment for review/report stages only."""
 
-        if pack is None or pack.is_neutral or stage not in {STAGE_REVIEW, STAGE_REPORT}:
+        if pack is None or pack.is_neutral or pack.status != STATUS_ACTIVE or stage not in {STAGE_REVIEW, STAGE_REPORT}:
             return ""
         fragment = pack.fragment_for(stage)
         if not fragment:
@@ -1295,7 +1452,7 @@ class SkillPackService:
     def render_format_block(self, format_pack: SkillPack | None, stage: str) -> str:
         """Render the orthogonal ``<OUTPUT_FORMAT_SKILL>`` block for the report stage only."""
 
-        if format_pack is None or stage != STAGE_REPORT:
+        if format_pack is None or format_pack.status != STATUS_ACTIVE or stage != STAGE_REPORT:
             return ""
         fragment = format_pack.fragment_for(STAGE_REPORT)
         if not fragment:

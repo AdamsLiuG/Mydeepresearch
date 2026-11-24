@@ -214,7 +214,10 @@ def _build_config(payload: ResearchRequest, *, base_config: Configuration) -> Co
     if getattr(payload, "output_format", None) is not None and str(payload.output_format).strip():
         overrides["default_output_format"] = str(payload.output_format).strip().lower()
 
-    return Configuration.model_validate({**base_config.model_dump(), **overrides})
+    values = base_config.model_dump()
+    if "policy_model_mode" not in base_config.model_fields_set:
+        values.pop("policy_model_mode", None)
+    return Configuration.model_validate({**values, **overrides})
 
 
 def _warmup_semantic_cache_model(config: Configuration) -> None:
