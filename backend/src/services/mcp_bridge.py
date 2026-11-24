@@ -1279,9 +1279,13 @@ class ScopedToolRegistry(ToolRegistry):
         enforce_readonly: bool = True,
     ) -> None:
         super().__init__()
+        if not hasattr(self, "_tools") or not isinstance(self._tools, dict):
+            self._tools = {}
         self._mcp_tool_names: list[str] = []
         for tool in core_tools or ():
-            self._tools[tool.name] = tool
+            tool_name = str(getattr(tool, "name", "") or "").strip()
+            if tool_name:
+                self._tools[tool_name] = tool
 
         scopes = active_scopes if isinstance(active_scopes, dict) else {}
         if not scopes:
@@ -1319,6 +1323,9 @@ class ScopedToolRegistry(ToolRegistry):
     @property
     def injected_mcp_tools(self) -> list[str]:
         return list(self._mcp_tool_names)
+
+    def get_tool(self, name: str) -> Any | None:
+        return getattr(self, "_tools", {}).get(name)
 
     def execute_tool(self, name: str, input_text: str) -> str:
         """Preserve MCPHitlApprovalRequired propagation instead of flattening to string."""

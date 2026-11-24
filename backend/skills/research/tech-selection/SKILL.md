@@ -2,7 +2,7 @@
 pack_id: tech-selection
 schema_version: 1
 version: 1
-content_hash: "84cd11f7d879ead0"
+content_hash: "21237800e7b89153"
 maturity: draft
 status: active
 supersedes: ""
@@ -60,6 +60,7 @@ retrieval_profile:
 verifiers:
   - numeric-audit
   - comparison-matrix
+code_sandbox: true
 composable_with:
   - policy-analysis
   - financial-research

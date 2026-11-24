@@ -20,6 +20,7 @@ from services.evidence import (
     render_references,
 )
 from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.sandbox_executor import sanitize_chart_spec
 from services.text_processing import CITATION_PATTERN, normalize_agent_markdown
 from utils import strip_thinking_tokens, truncate_text
 
@@ -206,6 +207,12 @@ class ReportingService:
                 "index": index,
                 "total_chunks": total_chunks,
             }
+        for chart in getattr(state, "report_charts", None) or []:
+            if isinstance(chart, dict):
+                yield {
+                    "type": "report_chart",
+                    "chart": dict(chart),
+                }
 
     def _collect_valid_source_ids(self, state: SummaryState) -> set[str]:
         valid: set[str] = set()
@@ -1317,6 +1324,43 @@ class ReportingService:
         )
         if len(references) < len(cited_source_ids) and observer:
             observer.record_degraded("report_reference_resolution_incomplete")
+
+        raw_charts: list[dict[str, Any]] = []
+        for candidate in payload.get("charts") or []:
+            if isinstance(candidate, dict):
+                raw_charts.append(candidate)
+        for task in getattr(state, "todo_items", []) or []:
+            for item in getattr(task, "evidence_items", None) or []:
+                if not isinstance(item, dict):
+                    continue
+                structured = item.get("structured_payload") or {}
+                if isinstance(structured, dict):
+                    for candidate in structured.get("charts") or []:
+                        if isinstance(candidate, dict):
+                            raw_charts.append(candidate)
+        if self._evidence_store is not None:
+            for task in getattr(state, "todo_items", []) or []:
+                for item in self._evidence_store.list_task_evidence(task.id):
+                    structured = item.get("structured_payload") or {}
+                    if isinstance(structured, dict):
+                        for candidate in structured.get("charts") or []:
+                            if isinstance(candidate, dict):
+                                raw_charts.append(candidate)
+
+        sanitized_charts: list[dict[str, Any]] = []
+        seen_chart_ids: set[str] = set()
+        for raw_chart in raw_charts:
+            cleaned_chart = sanitize_chart_spec(raw_chart, valid_source_ids=valid_source_ids)
+            if cleaned_chart is None:
+                continue
+            cid = str(cleaned_chart.get("chart_id") or "")
+            if cid and cid in seen_chart_ids:
+                continue
+            if cid:
+                seen_chart_ids.add(cid)
+            sanitized_charts.append(cleaned_chart)
+        state.report_charts = list(sanitized_charts)
+
         return {
             "background": background,
             "key_findings": key_findings,
@@ -1326,6 +1370,7 @@ class ReportingService:
             "custom_sections": custom_sections,
             "process_notes": process_notes,
             "references": references,
+            "charts": sanitized_charts,
             "section_order": payload.get("section_order"),
         }
 

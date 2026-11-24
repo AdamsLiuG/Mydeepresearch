@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN groupadd -g 65534 -o sandbox \
+    && useradd -M -u 65534 -g 65534 -s /usr/sbin/nologin sandbox || true
+
+WORKDIR /workspace
+RUN mkdir -p /opt/sandbox
+
+COPY src/services/sandbox_runner.py /opt/sandbox/sandbox_runner.py
+RUN chmod 0444 /opt/sandbox/sandbox_runner.py
+
+USER 65534:65534
+
+ENTRYPOINT ["python", "/opt/sandbox/sandbox_runner.py"]

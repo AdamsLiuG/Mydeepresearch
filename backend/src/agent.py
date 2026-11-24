@@ -17,7 +17,7 @@ from hello_agents.tools.builtin.note_tool import NoteTool
 from openai import OpenAI
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import RequestTrace, metrics_registry
 from models import SummaryState, SummaryStateOutput, TodoItem
 from prompts import (
     report_writer_instructions,
@@ -57,6 +57,7 @@ from services.mcp_bridge import (
     MCPHitlApprovalRequired,
     ScopedToolRegistry,
 )
+from services.multimodal_parser import MultimodalEvidenceParser
 from services.note_memory import NoteMemoryService
 from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
@@ -64,6 +65,12 @@ from services.policy_controller import build_policy_controller
 from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService
 from services.reviewer import ReviewService
+from services.sandbox_executor import (
+    DockerSandboxBackend,
+    PyodideSandboxBackend,
+    RunPythonSandboxTool,
+    SandboxExecutorService,
+)
 from services.search import classify_search_query_bucket
 from services.skill_pack import (
     SkillPackService,
@@ -794,14 +801,50 @@ class DeepResearchAgent(
             evidence_store=self._evidence_store,
             observer_getter=lambda: self._request_trace,
         )
+        self._multimodal_parser = MultimodalEvidenceParser(
+            enabled=bool(getattr(self.config, "multimodal_evidence_enabled", False)),
+            vlm_enabled=bool(getattr(self.config, "multimodal_vlm_enabled", False)),
+            vlm_model=getattr(self.config, "multimodal_vlm_model", None),
+            vlm_base_url=self.config.resolved_multimodal_vlm_base_url(),
+            vlm_api_key=self.config.resolved_multimodal_vlm_api_key(),
+            vlm_timeout_seconds=float(getattr(self.config, "multimodal_vlm_timeout_seconds", 20.0) or 20.0),
+            max_vlm_concurrency=int(getattr(self.config, "multimodal_vlm_max_concurrency", 4) or 4),
+            max_pdf_pages=int(getattr(self.config, "multimodal_max_pdf_pages", 20) or 20),
+            max_vlm_pages_per_doc=int(getattr(self.config, "multimodal_max_vlm_pages_per_doc", 4) or 4),
+            max_images_per_page=int(getattr(self.config, "multimodal_max_images_per_page", 3) or 3),
+            max_image_bytes=int(getattr(self.config, "multimodal_image_max_bytes", 2 * 1024 * 1024) or (2 * 1024 * 1024)),
+            max_image_pixels=int(getattr(self.config, "multimodal_image_max_pixels", 16_000_000) or 16_000_000),
+            metrics=metrics_registry,
+        )
+        self._sandbox_service = SandboxExecutorService(
+            enabled=self.config.resolved_sandbox_effective_enabled(),
+            backend_preference=str(getattr(self.config, "sandbox_backend", "auto") or "auto"),
+            timeout_seconds=float(getattr(self.config, "sandbox_timeout_seconds", 10.0) or 10.0),
+            memory_mb=int(getattr(self.config, "sandbox_memory_mb", 512) or 512),
+            max_executions_per_task=int(getattr(self.config, "sandbox_max_executions_per_task", 4) or 4),
+            docker_backend=DockerSandboxBackend(
+                image=str(getattr(self.config, "sandbox_docker_image", "helloagents-sandbox:latest") or "helloagents-sandbox:latest"),
+                cpus=str(getattr(self.config, "sandbox_cpus", "1.0") or "1.0"),
+            ),
+            pyodide_backend=PyodideSandboxBackend(
+                pyodide_cache_dir=str(getattr(self.config, "sandbox_pyodide_cache_dir", "") or ""),
+            ),
+            metrics=metrics_registry,
+        )
         self.fetch_page_tool = FetchPageTool(
             evidence_store=self._evidence_store,
             timeout_seconds=float(self.config.search_tool_timeout_seconds or 10.0),
+            multimodal_parser=self._multimodal_parser,
         )
         self.evidence_lookup_tool = EvidenceLookupTool(
             evidence_store=self._evidence_store,
             retrieval_service=self._evidence_retrieval,
             request_id_getter=lambda: self.request_id,
+        )
+        self.run_python_sandbox_tool = RunPythonSandboxTool(
+            sandbox_service=self._sandbox_service,
+            evidence_store=self._evidence_store,
+            config=self.config,
         )
         self.tools_registry.register_tool(self.search_web_tool)
         self.tools_registry.register_tool(self.fetch_page_tool)
@@ -874,6 +917,8 @@ class DeepResearchAgent(
             self.config,
             evidence_store=self._evidence_store,
         )
+        if self.config.resolved_sandbox_effective_enabled() or bool(getattr(self.config, "mcp_enabled", False)):
+            self._refresh_scoped_tools_for_request()
         self._last_search_notices: list[str] = []
         self._request_trace: RequestTrace | None = None
 
@@ -1137,25 +1182,37 @@ class DeepResearchAgent(
         return self._mcp_bridge
 
     def _build_stage_tool_registry(self, stage: str) -> ToolRegistry | None:
-        bridge = self._ensure_mcp_bridge()
+        mcp_enabled = bool(getattr(self.config, "mcp_enabled", False))
+        sandbox_enabled = bool(
+            getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)()
+        )
         base_reg = getattr(self, "_base_tools_registry", None)
         if base_reg is None:
             base_reg = getattr(self, "tools_registry", None)
-        if bridge is None:
+        mcp_adapters: list[Any] = []
+        if mcp_enabled:
+            bridge = self._ensure_mcp_bridge()
+            if bridge is not None:
+                try:
+                    mcp_adapters = bridge.build_tool_adapters(
+                        evidence_store=self._evidence_store,
+                        tenant_id_getter=lambda: self.tenant_id,
+                        request_id_getter=lambda: self.request_id,
+                        approved_registry_getter=lambda: getattr(self._active_state, "approved_tool_calls", None),
+                        observer_getter=lambda: self._request_trace,
+                    )
+                except Exception as exc:
+                    logger.warning("MCP adapter discovery failed stage=%s error=%s", stage, exc)
+                    mcp_adapters = []
+        stage_core_tools = list(getattr(self, "_core_tools", ()))
+        if sandbox_enabled and stage in {"task_execution", "review"}:
+            sandbox_tool = getattr(self, "run_python_sandbox_tool", None)
+            if sandbox_tool is not None and sandbox_tool not in stage_core_tools:
+                stage_core_tools.append(sandbox_tool)
+        if not mcp_enabled and len(stage_core_tools) == len(getattr(self, "_core_tools", ())):
             return base_reg
-        try:
-            mcp_adapters = bridge.build_tool_adapters(
-                evidence_store=self._evidence_store,
-                tenant_id_getter=lambda: self.tenant_id,
-                request_id_getter=lambda: self.request_id,
-                approved_registry_getter=lambda: getattr(self._active_state, "approved_tool_calls", None),
-                observer_getter=lambda: self._request_trace,
-            )
-        except Exception as exc:
-            logger.warning("MCP adapter discovery failed stage=%s error=%s", stage, exc)
-            mcp_adapters = []
         return ScopedToolRegistry(
-            core_tools=getattr(self, "_core_tools", ()),
+            core_tools=stage_core_tools,
             mcp_adapters=mcp_adapters,
             active_scopes=getattr(self.config, "active_mcp_tool_scopes", None),
             stage=stage,
@@ -1167,9 +1224,20 @@ class DeepResearchAgent(
         base_reg = getattr(self, "_base_tools_registry", None)
         if base_reg is None:
             base_reg = getattr(self, "tools_registry", None)
-        if not bool(getattr(self.config, "mcp_enabled", False)):
+        mcp_enabled = bool(getattr(self.config, "mcp_enabled", False))
+        sandbox_enabled = bool(
+            getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)()
+        )
+        if not mcp_enabled and not sandbox_enabled:
             if base_reg is not None:
                 self.tools_registry = base_reg
+                for stage_agent in (
+                    getattr(self, "todo_agent", None),
+                    getattr(self, "review_agent", None),
+                    getattr(self, "report_agent", None),
+                ):
+                    if stage_agent is not None and hasattr(stage_agent, "tool_registry"):
+                        stage_agent.tool_registry = base_reg
             return
         self.tools_registry = self._build_stage_tool_registry("task_execution") or base_reg
         stage_agents = (
@@ -1228,6 +1296,34 @@ class DeepResearchAgent(
             service = getattr(self, attr, None)
             if service is not None and hasattr(service, "_config"):
                 service._config = target_config
+        sandbox_service = getattr(self, "_sandbox_service", None)
+        if sandbox_service is not None:
+            sandbox_service.enabled = bool(
+                getattr(target_config, "resolved_sandbox_effective_enabled", lambda: False)()
+            )
+            sandbox_service.timeout_seconds = float(
+                getattr(target_config, "sandbox_timeout_seconds", sandbox_service.timeout_seconds)
+                or sandbox_service.timeout_seconds
+            )
+            sandbox_service.memory_mb = int(
+                getattr(target_config, "sandbox_memory_mb", sandbox_service.memory_mb)
+                or sandbox_service.memory_mb
+            )
+            sandbox_service.max_executions_per_task = int(
+                getattr(
+                    target_config,
+                    "sandbox_max_executions_per_task",
+                    sandbox_service.max_executions_per_task,
+                )
+                or sandbox_service.max_executions_per_task
+            )
+        sandbox_tool = getattr(self, "run_python_sandbox_tool", None)
+        if sandbox_tool is not None and hasattr(sandbox_tool, "_config"):
+            sandbox_tool._config = target_config
+        parser = getattr(self, "_multimodal_parser", None)
+        if parser is not None:
+            parser.enabled = bool(getattr(target_config, "multimodal_evidence_enabled", parser.enabled))
+            parser.vlm_enabled = bool(getattr(target_config, "multimodal_vlm_enabled", parser.vlm_enabled))
 
     def _refresh_context_checkpoints(self, state: SummaryState) -> None:
         """Advance frozen FactLedger and EvidenceIndexCard checkpoints between waves/stages."""

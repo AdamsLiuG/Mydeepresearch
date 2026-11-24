@@ -54,6 +54,7 @@ class StateManagerMixin:
             "search_api": observer_snapshot.get("search_api"),
             "elapsed_ms": observer_snapshot.get("elapsed_ms"),
             "report_markdown": report_markdown or state.structured_report or state.running_summary or "",
+            "report_charts": list(getattr(state, "report_charts", None) or []),
             "report_note_id": state.report_note_id,
             "report_note_path": state.report_note_path,
             "todo_items": [self._serialize_task(task) for task in state.todo_items],
@@ -208,6 +209,11 @@ class StateManagerMixin:
                 dict(payload.get("approved_tool_calls") or {})
                 if isinstance(payload.get("approved_tool_calls"), dict)
                 else {}
+            ),
+            report_charts=(
+                list(payload.get("report_charts") or [])
+                if isinstance(payload.get("report_charts"), list)
+                else []
             ),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)

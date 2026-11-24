@@ -108,6 +108,49 @@ def _numeric_audit(state: Any, config: Any) -> list[dict[str, Any]]:
                     }
                 )
                 break
+
+        evidence_by_id = {
+            str(item.get("source_id") or "").strip(): item
+            for item in getattr(task, "evidence_items", None) or []
+            if isinstance(item, dict) and str(item.get("source_id") or "").strip()
+        }
+        for claim in getattr(task, "claims", None) or []:
+            if not isinstance(claim, dict):
+                continue
+            cited_ids = [str(s).strip() for s in claim.get("source_ids") or [] if str(s).strip()]
+            if len(cited_ids) != 1 or "-C" not in cited_ids[0]:
+                continue
+            comp_item = evidence_by_id.get(cited_ids[0]) or {}
+            artifact = comp_item.get("computation_artifact") or {}
+            result_obj = artifact.get("result")
+            scalar_nums: list[float] = []
+            if isinstance(result_obj, (int, float)) and not isinstance(result_obj, bool):
+                scalar_nums.append(float(result_obj))
+            elif isinstance(result_obj, dict):
+                for val in result_obj.values():
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        scalar_nums.append(float(val))
+            if not scalar_nums:
+                continue
+            claimed_pcts = [float(val) for val in _PERCENT_TOKEN_PATTERN.findall(str(claim.get("text") or ""))]
+            if not claimed_pcts:
+                continue
+            if all(
+                all(abs(cp - sp) > max(1.0, 0.1 * abs(sp)) for sp in scalar_nums)
+                for cp in claimed_pcts
+            ):
+                issues.append(
+                    {
+                        "task_id": task.id,
+                        "severity": "high",
+                        "check": "numeric_audit_mismatch",
+                        "message": (
+                            f"任务 {task.id} 引用沙箱计算 [{cited_ids[0]}] 的结论数值与计算产物 result 不一致。"
+                        ),
+                        "source_ids": cited_ids,
+                        "origin": "skill_verifier:numeric-audit",
+                    }
+                )
     return issues
 
 

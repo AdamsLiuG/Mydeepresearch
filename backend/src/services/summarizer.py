@@ -415,16 +415,34 @@ class SummarizationService:
         effective_tools_enabled = (
             self._tools_enabled() if tools_enabled is None else bool(tools_enabled)
         )
+        sandbox_active = bool(
+            getattr(self._config, "resolved_sandbox_effective_enabled", lambda: False)()
+        )
+        sandbox_schema_snippet = ""
+        sandbox_rule_snippet = ""
         if effective_tools_enabled:
             tool_guidance = (
                 "请先调用 `evidence_lookup` 读取当前任务的来源目录；当摘要不足以支撑结论时，可调用 "
                 "`fetch_page` 读取某个 source_id 对应网页正文，必要时再调用 `search_web` 补充搜索。\n"
             )
+            if sandbox_active:
+                tool_guidance = (
+                    "请先调用 `evidence_lookup` 读取当前任务的来源目录；当摘要不足以支撑结论时，可调用 "
+                    "`fetch_page` 读取某个 source_id 对应网页正文，必要时再调用 `search_web` 补充搜索；"
+                    "涉及同比/CAGR/指标汇总/表格对比验证时，可调用 `run_python_sandbox` 执行定量计算并引用 [Tn-Cm] 证据。\n"
+                )
         else:
             tool_guidance = (
                 "当前运行模式已提供完整来源目录与任务上下文，请直接基于上方材料提炼结论，"
                 "不要尝试调用任何工具或输出工具调用指令。\n"
             )
+            if sandbox_active:
+                sandbox_schema_snippet = (
+                    ',\n  "computation_requests": [{"title": "计算标题", "code": "result = ...", "derived_from_source_ids": ["T1-S1"]}]'
+                )
+                sandbox_rule_snippet = (
+                    "\n8. 如需执行可复核的定量计算，可在可选字段 `computation_requests` 中提交受限 Python 脚本（必须包含 result 赋值与已引用的 derived_from_source_ids）。"
+                )
 
         static_rules = (
             f"{tool_guidance}"
@@ -434,7 +452,8 @@ class SummarizationService:
             '  "key_findings": [\n'
             '    {"text": "2-3 句完整、面向用户的结论，包含事实、判断和意义", "source_ids": ["T1-S1", "T1-S2"]}\n'
             "  ],\n"
-            '  "evidence_gaps": ["证据不足或待补充说明"]\n'
+            '  "evidence_gaps": ["证据不足或待补充说明"]'
+            f"{sandbox_schema_snippet}\n"
             "}\n"
             "要求：\n"
             "1. `executive_summary` 用 1 段中文完整概括本任务的主要发现、现实含义和证据边界，避免只写一句空泛结论；\n"
@@ -444,6 +463,7 @@ class SummarizationService:
             "5. `evidence_gaps` 仅写证据缺口，不要写工具调用叙述；\n"
             "6. 不允许编造 source_id；\n"
             "7. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
+            f"{sandbox_rule_snippet}"
         )
 
         frozen_parts: list[str] = []
@@ -631,11 +651,37 @@ class SummarizationService:
         evidence_gaps = self._normalize_evidence_gaps(payload.get("evidence_gaps"))
         if not executive_summary:
             executive_summary = self._derive_executive_summary(findings, evidence_gaps)
-        return {
+        result: dict[str, Any] = {
             "executive_summary": executive_summary,
             "key_findings": findings,
             "evidence_gaps": evidence_gaps,
         }
+        raw_comp_reqs = payload.get("computation_requests")
+        if isinstance(raw_comp_reqs, list) and raw_comp_reqs:
+            max_reqs = max(1, int(getattr(self._config, "sandbox_max_executions_per_task", 4) or 4))
+            comp_requests: list[dict[str, Any]] = []
+            for req in raw_comp_reqs:
+                if not isinstance(req, dict):
+                    continue
+                code = str(req.get("code") or "").strip()
+                if not code:
+                    continue
+                derived = self._normalize_source_ids(req.get("derived_from_source_ids"), valid_source_ids)
+                if not derived:
+                    continue
+                entry: dict[str, Any] = {
+                    "title": normalize_agent_markdown(str(req.get("title") or "定量计算验证").strip()) or "定量计算验证",
+                    "code": code,
+                    "derived_from_source_ids": derived,
+                }
+                if isinstance(req.get("tables"), list):
+                    entry["tables"] = [t for t in req["tables"] if isinstance(t, dict)]
+                comp_requests.append(entry)
+                if len(comp_requests) >= max_reqs:
+                    break
+            if comp_requests:
+                result["computation_requests"] = comp_requests
+        return result
 
     def _fallback_summary_payload(
         self,

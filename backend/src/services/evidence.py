@@ -181,6 +181,7 @@ SOURCE_TYPE_BONUS = {
     "mcp_filing": 3.5,
     "mcp_tool": 2.5,
     "sandbox_computation": 3.5,
+    "computed_sandbox": 3.5,
 }
 
 PROVIDER_BONUS = {
@@ -673,15 +674,23 @@ def _validate_fetch_url(url: str) -> str:
     return cleaned
 
 
-def _fetch_page_text(
+def _fetch_page_artifact(
     url: str,
     timeout_seconds: float,
     *,
     max_bytes: int = _MAX_FETCH_BYTES,
-) -> tuple[str, str]:
-    """Safely fetch a web page with SSRF validation, redirect checks, and size caps."""
+    parser: Any | None = None,
+    multimodal_enabled: bool = False,
+) -> Any:
+    """Safely fetch a web page or PDF into a normalized FetchedPageArtifact."""
+
+    from services.multimodal_parser import FetchedPageArtifact, MultimodalEvidenceParser
+
     current_url = _validate_fetch_url(url)
     max_allowed = max(1, int(max_bytes))
+    active_parser = parser
+    if active_parser is None and multimodal_enabled:
+        active_parser = MultimodalEvidenceParser(enabled=True)
 
     for redirect_count in range(_MAX_FETCH_REDIRECTS + 1):
         with requests.get(
@@ -703,7 +712,7 @@ def _fetch_page_text(
             content_type_header = str(response.headers.get("Content-Type") or "").strip()
             media_type = content_type_header.split(";", 1)[0].strip().lower()
             allowed_types = set(_ALLOWED_FETCH_CONTENT_TYPES)
-            if pymupdf is not None:
+            if pymupdf is not None or multimodal_enabled or (active_parser is not None and getattr(active_parser, "enabled", False)):
                 allowed_types.add("application/pdf")
             if media_type and media_type not in allowed_types:
                 raise ValueError(f"unsupported content type: {media_type}")
@@ -729,17 +738,60 @@ def _fetch_page_text(
 
             raw_payload = b"".join(chunks)
             if media_type == "application/pdf":
-                return "", _extract_pdf_text(raw_payload)
+                if active_parser is not None and getattr(active_parser, "enabled", False):
+                    return active_parser.parse_pdf_bytes(
+                        raw_payload,
+                        url=current_url,
+                        title="",
+                        text_fallback=_extract_pdf_text,
+                    )
+                return FetchedPageArtifact(
+                    url=current_url,
+                    title="",
+                    content=_extract_pdf_text(raw_payload),
+                    content_type="application/pdf",
+                )
 
             encoding = response.encoding or "utf-8"
             html = raw_payload.decode(encoding, errors="replace")
             if media_type in {"text/plain", "text/markdown", "application/json"}:
-                return "", _clean_structured_text(html)
+                return FetchedPageArtifact(
+                    url=current_url,
+                    title="",
+                    content=_clean_structured_text(html),
+                    content_type=media_type or "text/plain",
+                )
 
             title = _extract_title(html)
-            return title, _extract_structured_html_text(html)
+            base_text = _extract_structured_html_text(html)
+            if active_parser is not None and getattr(active_parser, "enabled", False):
+                return active_parser.parse_html(
+                    html,
+                    base_url=current_url,
+                    title=title,
+                    base_text=base_text,
+                    fetch_chart_images=bool(getattr(active_parser, "vlm_enabled", False)),
+                    image_timeout_seconds=timeout_seconds,
+                )
+            return FetchedPageArtifact(
+                url=current_url,
+                title=title,
+                content=base_text,
+                content_type=media_type or "text/html",
+            )
 
     raise ValueError("too many redirects")
+
+
+def _fetch_page_text(
+    url: str,
+    timeout_seconds: float,
+    *,
+    max_bytes: int = _MAX_FETCH_BYTES,
+) -> tuple[str, str]:
+    """Safely fetch a web page with SSRF validation, redirect checks, and size caps."""
+    artifact = _fetch_page_artifact(url, timeout_seconds=timeout_seconds, max_bytes=max_bytes)
+    return artifact.title, artifact.content
 
 
 def _safe_now() -> datetime:
@@ -1104,9 +1156,9 @@ def detect_source_type(ev: Any) -> str:
             return coarse_type
         return "mcp_tool"
     if source_origin == "sandbox":
-        if coarse_type.startswith("sandbox_"):
+        if coarse_type.startswith("sandbox_") or coarse_type == "computed_sandbox":
             return coarse_type
-        return "sandbox_computation"
+        return "computed_sandbox"
 
     domain = extract_domain(_ev_str(ev, "url"))
     url = _ev_str(ev, "url").lower()
@@ -1214,6 +1266,8 @@ def _analyze_evidence_quality(ev: Any, now: datetime | None = None) -> dict[str,
         "is_social_official": social_official,
         "freshness_days": age_days,
         "freshness_label": freshness_label,
+        "source_origin": _ev_str(ev, "source_origin") or "web",
+        "has_computation_artifact": bool(_ev_get(ev, "computation_artifact", None)),
     }
 
 
@@ -1235,6 +1289,8 @@ def compute_source_reliability_score(ev: Any) -> float:
 
 def compute_content_quality_score(ev: Any) -> float:
     components = _quality_components(ev)
+    if components.get("source_origin") == "sandbox" and bool(components.get("has_computation_artifact")):
+        return 9.0
     score = 3.0
     if components["published_at"]:
         score += 0.8
@@ -1313,7 +1369,11 @@ def compute_quality_score_and_label(
         label = "medium"
     else:
         label = "low"
-    if label == "high" and (
+    is_valid_sandbox = (
+        components.get("source_origin") == "sandbox"
+        and bool(components.get("has_computation_artifact"))
+    )
+    if label == "high" and not is_valid_sandbox and (
         components["extraction_quality"] == "poor"
         or components["navigation_page"]
         or components["word_count"] < 120
@@ -1693,6 +1753,7 @@ class EvidenceStore:
         url: str,
         title: str,
         full_content: str,
+        multimodal_blocks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Attach fetched page content to an existing or new evidence record."""
 
@@ -1736,6 +1797,10 @@ class EvidenceStore:
                 record.full_content = full_content
                 if not record.snippet:
                     record.snippet = truncate_text(full_content, 600)
+            if multimodal_blocks:
+                record.multimodal_blocks = [
+                    dict(block) for block in multimodal_blocks if isinstance(block, dict)
+                ]
             if not record.source_type or record.source_type == "web":
                 record.source_type = _classify_source_type(url, record.title)
             _apply_quality_metadata(record)
@@ -1859,6 +1924,7 @@ class EvidenceStore:
         computation_artifact: dict[str, Any],
         structured_payload: dict[str, Any] | None = None,
         tenant_id: str = "default",
+        backend: str = "sandbox",
     ) -> dict[str, Any]:
         """Record a deterministic sandbox computation result as a [Tn-Cm] citation."""
 
@@ -1867,6 +1933,8 @@ class EvidenceStore:
         prefix = f"T{task_id}-C"
         normalized_tenant = str(tenant_id or "default").strip() or "default"
         clean_derived = [str(sid).strip() for sid in (derived_from_source_ids or []) if str(sid).strip()]
+        raw_backend = str(backend or "sandbox").strip() or "sandbox"
+        backend_label = raw_backend if raw_backend.startswith("sandbox") else f"sandbox:{raw_backend}"
 
         with self._lock:
             task_ids = self._task_source_ids.setdefault(task_id, [])
@@ -1883,11 +1951,11 @@ class EvidenceStore:
                 snippet=truncate_text(summary_text.strip(), 1000),
                 raw_content=summary_text.strip(),
                 full_content=summary_text.strip(),
-                backend="sandbox",
-                backend_sources=["sandbox"],
+                backend=backend_label,
+                backend_sources=[backend_label],
                 provider_count=1,
                 domain="sandbox.local",
-                source_type="sandbox_computation",
+                source_type="computed_sandbox",
                 source_origin="sandbox",
                 tenant_id=normalized_tenant,
                 modality="computation",
@@ -2029,15 +2097,22 @@ class EvidenceStore:
                 or source_id
             )
             url = str(item.get("url") or "").strip()
-            references.append(
-                {
-                    "source_id": source_id,
-                    "title": title,
-                    "url": url,
-                    "domain": str(item.get("domain") or ""),
-                    "published_at": str(item.get("published_at") or ""),
-                }
-            )
+            ref_entry: dict[str, Any] = {
+                "source_id": source_id,
+                "title": title,
+                "url": url,
+                "domain": str(item.get("domain") or ""),
+                "published_at": str(item.get("published_at") or ""),
+            }
+            if str(item.get("source_origin") or "") == "sandbox" or url.startswith("sandbox://"):
+                ref_entry["source_origin"] = str(item.get("source_origin") or "sandbox")
+                if item.get("backend"):
+                    ref_entry["backend"] = str(item.get("backend"))
+                if isinstance(item.get("computation_artifact"), dict):
+                    ref_entry["computation_artifact"] = dict(item.get("computation_artifact"))
+                if isinstance(item.get("derived_from_source_ids"), list):
+                    ref_entry["derived_from_source_ids"] = list(item.get("derived_from_source_ids"))
+            references.append(ref_entry)
         return references
 
     def hydrate_from_tasks(self, tasks: list[Any]) -> None:
@@ -2304,7 +2379,7 @@ def build_task_context_from_hits(
     return truncate_text(context, config.resolved_task_context_char_limit())
 
 
-def render_references(reference_items: list[dict[str, str]]) -> str:
+def render_references(reference_items: list[dict[str, Any]]) -> str:
     """Render a standard reference section."""
 
     if not reference_items:
@@ -2314,6 +2389,21 @@ def render_references(reference_items: list[dict[str, str]]) -> str:
         source_id = str(item.get("source_id") or "").strip()
         title = str(item.get("title") or "").strip() or source_id or "来源"
         url = str(item.get("url") or "").strip()
+        if str(item.get("source_origin") or "").strip() == "sandbox" or url.startswith("sandbox://"):
+            artifact = item.get("computation_artifact") or {}
+            exec_hash = str(artifact.get("execution_hash") or "")[:8]
+            derived = ", ".join(str(s) for s in (item.get("derived_from_source_ids") or ()) if s)
+            backend = str(item.get("backend") or "sandbox").strip()
+            meta = (
+                f"({backend}"
+                + (f" | sha256:{exec_hash}" if exec_hash else "")
+                + (f" | 基于 {derived}" if derived else "")
+                + ")"
+            )
+            rendered_lines.append(
+                f"- [{source_id}] 计算验证：{title} {meta}" if source_id else f"- 计算验证：{title} {meta}"
+            )
+            continue
         line = f"- [{source_id}] {title}" if source_id else f"- {title}"
         if url:
             line = f"{line} - {url}"
@@ -2587,7 +2677,13 @@ class SearchWebTool(Tool):
 class FetchPageTool(Tool):
     """Fetch and normalize a specific page to enrich existing evidence."""
 
-    def __init__(self, *, evidence_store: EvidenceStore, timeout_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        evidence_store: EvidenceStore,
+        timeout_seconds: float = 10.0,
+        multimodal_parser: Any | None = None,
+    ) -> None:
         super().__init__(
             name="fetch_page",
             description=(
@@ -2596,6 +2692,7 @@ class FetchPageTool(Tool):
         )
         self._evidence_store = evidence_store
         self._timeout_seconds = timeout_seconds
+        self._multimodal_parser = multimodal_parser
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
@@ -2613,13 +2710,28 @@ class FetchPageTool(Tool):
         if not url:
             raise ValueError("url is required")
 
-        title, content = _fetch_page_text(url, timeout_seconds=self._timeout_seconds)
+        parser = getattr(self, "_multimodal_parser", None)
+        if parser is not None and getattr(parser, "enabled", False):
+            artifact = _fetch_page_artifact(
+                url,
+                timeout_seconds=self._timeout_seconds,
+                parser=parser,
+                multimodal_enabled=True,
+            )
+            title = artifact.title
+            content = artifact.content
+            multimodal_blocks = artifact.multimodal_blocks
+        else:
+            title, content = _fetch_page_text(url, timeout_seconds=self._timeout_seconds)
+            multimodal_blocks = None
+
         item = self._evidence_store.update_full_content(
             task_id=task_id,
             source_id=source_id,
             url=url,
             title=title,
             full_content=content,
+            multimodal_blocks=multimodal_blocks,
         )
         return json.dumps(item, ensure_ascii=False)
 

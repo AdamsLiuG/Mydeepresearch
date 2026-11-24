@@ -84,6 +84,8 @@ class EvidenceChunk:
     page_no: int | None = None
     bbox: list[float] | None = None
     anchor_id: str | None = None
+    modality: str = "text"
+    structured_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -153,9 +155,14 @@ class EvidenceRetrievalHit:
     freshness_label: str
     score: float
     score_breakdown: dict[str, float] = field(default_factory=dict)
+    modality: str = "text"
+    page_no: int | None = None
+    bbox: list[float] | None = None
+    anchor_id: str | None = None
+    structured_payload: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "origin": self.origin,
             "citation_eligible": self.citation_eligible,
             "task_id": self.task_id,
@@ -175,6 +182,17 @@ class EvidenceRetrievalHit:
                 for key, value in (self.score_breakdown or {}).items()
             },
         }
+        if self.modality and self.modality != "text":
+            payload["modality"] = self.modality
+        if self.page_no is not None:
+            payload["page_no"] = self.page_no
+        if self.bbox is not None:
+            payload["bbox"] = list(self.bbox)
+        if self.anchor_id:
+            payload["anchor_id"] = self.anchor_id
+        if self.structured_payload is not None:
+            payload["structured_payload"] = dict(self.structured_payload)
+        return payload
 
 
 @dataclass
@@ -614,15 +632,21 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
 
         source_id = str(getattr(record, "source_id", "") or "").strip()
         text = _record_text(record)
-        if not source_id or not text:
+        mm_blocks = getattr(record, "multimodal_blocks", None)
+        comp_artifact = getattr(record, "computation_artifact", None)
+        if not source_id or (not text and not mm_blocks and not comp_artifact):
             return []
 
         has_full_content = _record_has_full_content(record)
-        windows = _chunk_text(
-            text,
-            max_chars=self._config.evidence_chunk_chars,
-            overlap=self._config.evidence_chunk_overlap,
-            max_chunks=self._config.evidence_runtime_max_chunks,
+        windows = (
+            _chunk_text(
+                text,
+                max_chars=self._config.evidence_chunk_chars,
+                overlap=self._config.evidence_chunk_overlap,
+                max_chunks=self._config.evidence_runtime_max_chunks,
+            )
+            if text
+            else []
         )
         chunks: list[EvidenceChunk] = []
         for index, (start, end, window) in enumerate(windows, start=1):
@@ -657,8 +681,88 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                         else None
                     ),
                     anchor_id=_normalize_text(getattr(record, "anchor_id", "")) or None,
+                    modality=_normalize_text(getattr(record, "modality", "")) or "text",
+                    structured_payload=(
+                        dict(getattr(record, "structured_payload"))
+                        if isinstance(getattr(record, "structured_payload", None), dict)
+                        else None
+                    ),
                 )
             )
+
+        offset_base = max((c.end_char for c in chunks), default=len(text))
+        for mm_idx, block in enumerate(getattr(record, "multimodal_blocks", None) or (), start=1):
+            if not isinstance(block, dict):
+                continue
+            block_text = _clean_text(
+                block.get("markdown") or block.get("text") or block.get("summary") or block.get("title") or ""
+            )
+            if not block_text:
+                continue
+            anchor_id = _normalize_text(block.get("anchor_id")) or f"mm-{mm_idx}"
+            raw_page = block.get("page_no")
+            page_no = int(raw_page) if isinstance(raw_page, int) and not isinstance(raw_page, bool) else None
+            raw_bbox = block.get("bbox")
+            bbox = [float(x) for x in raw_bbox] if isinstance(raw_bbox, list) else None
+            modality = _normalize_text(block.get("modality")) or "table"
+            structured = block.get("structured_payload")
+            chunks.append(
+                EvidenceChunk(
+                    chunk_id=f"{source_id}::mm::{anchor_id}",
+                    task_id=task_id,
+                    source_id=source_id,
+                    text=block_text,
+                    start_char=offset_base + mm_idx,
+                    end_char=offset_base + mm_idx + len(block_text),
+                    has_full_content=True,
+                    origin="current",
+                    title=_normalize_text(block.get("title") or getattr(record, "title", "")),
+                    url=_normalize_text(getattr(record, "url", "")),
+                    domain=_normalize_text(getattr(record, "domain", "")),
+                    snippet=_clean_text(block.get("summary") or block_text),
+                    quality_label=_normalize_text(getattr(record, "quality_label", "")) or "medium",
+                    freshness_label=_normalize_text(getattr(record, "freshness_label", "")) or "unknown",
+                    published_at=_normalize_text(getattr(record, "published_at", "")) or None,
+                    archive_doc_key=_record_archive_doc_key(record),
+                    archive_version_id=archive_version_id,
+                    page_no=page_no,
+                    bbox=bbox,
+                    anchor_id=anchor_id,
+                    modality=modality,
+                    structured_payload=dict(structured) if isinstance(structured, dict) else None,
+                )
+            )
+
+        artifact = getattr(record, "computation_artifact", None)
+        if isinstance(artifact, dict) and artifact:
+            artifact_text = _clean_text(
+                f"计算结果 {artifact.get('result')} backend={artifact.get('backend', '')} hash={artifact.get('execution_hash', '')}"
+            )
+            if artifact_text:
+                chunks.append(
+                    EvidenceChunk(
+                        chunk_id=f"{source_id}::compute::1",
+                        task_id=task_id,
+                        source_id=source_id,
+                        text=artifact_text,
+                        start_char=offset_base + 1000,
+                        end_char=offset_base + 1000 + len(artifact_text),
+                        has_full_content=True,
+                        origin="current",
+                        title=_normalize_text(getattr(record, "title", "")),
+                        url=_normalize_text(getattr(record, "url", "")),
+                        domain=_normalize_text(getattr(record, "domain", "")),
+                        snippet=_clean_text(getattr(record, "snippet", "")),
+                        quality_label=_normalize_text(getattr(record, "quality_label", "")) or "high",
+                        freshness_label=_normalize_text(getattr(record, "freshness_label", "")) or "unknown",
+                        published_at=_normalize_text(getattr(record, "published_at", "")) or None,
+                        archive_doc_key=None,
+                        archive_version_id=None,
+                        anchor_id="compute-1",
+                        modality="computed",
+                        structured_payload=dict(artifact),
+                    )
+                )
         return chunks
 
     def chunk_counts_by_source(self) -> dict[str, int]:
@@ -717,6 +821,8 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                         }
                         if ch.page_no is not None:
                             entry["page_no"] = ch.page_no
+                        if ch.modality and ch.modality != "text":
+                            entry["modality"] = ch.modality
                         packed.append(entry)
                     remaining_chars = 0
                     truncated = True
@@ -732,6 +838,10 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                     entry["page_no"] = ch.page_no
                 if ch.anchor_id:
                     entry["anchor_id"] = ch.anchor_id
+                if ch.modality and ch.modality != "text":
+                    entry["modality"] = ch.modality
+                if ch.structured_payload is not None:
+                    entry["structured_payload"] = dict(ch.structured_payload)
                 packed.append(entry)
                 remaining_chars -= len(ch.text)
             results.append(
@@ -954,6 +1064,11 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                     freshness_label=chunk.freshness_label,
                     score=score,
                     score_breakdown=breakdown,
+                    modality=chunk.modality,
+                    page_no=chunk.page_no,
+                    bbox=list(chunk.bbox) if chunk.bbox is not None else None,
+                    anchor_id=chunk.anchor_id,
+                    structured_payload=dict(chunk.structured_payload) if chunk.structured_payload is not None else None,
                 )
             )
             source_counts[chunk.source_id] = source_counts.get(chunk.source_id, 0) + 1

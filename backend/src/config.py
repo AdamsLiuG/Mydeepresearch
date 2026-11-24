@@ -400,6 +400,121 @@ class Configuration(BaseModel):
         title="Active MCP Tool Scopes",
         description="Request-scoped MCP tool whitelist bound from active SkillPack",
     )
+    multimodal_evidence_enabled: bool = Field(
+        default=False,
+        title="Multimodal Evidence Enabled",
+        description="Whether to parse HTML tables/chart candidates and L0/L1/L2 PDF pages into structured multimodal blocks",
+    )
+    multimodal_vlm_enabled: bool = Field(
+        default=False,
+        title="Multimodal VLM Enabled",
+        description="Whether to invoke a Vision-Language Model on L2 visual PDF pages and chart images",
+    )
+    multimodal_vlm_model: str | None = Field(
+        default=None,
+        title="Multimodal VLM Model",
+        description="Vision-Language model identifier for chart/table OCR extraction",
+    )
+    multimodal_vlm_base_url: str | None = Field(
+        default=None,
+        title="Multimodal VLM Base URL",
+        description="Optional OpenAI-compatible base URL override for the VLM endpoint",
+    )
+    multimodal_vlm_api_key: str | None = Field(
+        default=None,
+        title="Multimodal VLM API Key",
+        description="Optional API key override for the VLM endpoint",
+    )
+    multimodal_vlm_timeout_seconds: float = Field(
+        default=20.0,
+        ge=1.0,
+        title="Multimodal VLM Timeout Seconds",
+        description="HTTP timeout in seconds per VLM chart extraction request",
+    )
+    multimodal_vlm_max_concurrency: int = Field(
+        default=4,
+        ge=1,
+        title="Multimodal VLM Max Concurrency",
+        description="Semaphore bound on concurrent VLM calls",
+    )
+    multimodal_max_pdf_pages: int = Field(
+        default=20,
+        ge=1,
+        title="Multimodal Max PDF Pages",
+        description="Maximum number of pages triaged per PDF document",
+    )
+    multimodal_max_vlm_pages_per_doc: int = Field(
+        default=4,
+        ge=0,
+        title="Multimodal Max VLM Pages Per Doc",
+        description="Maximum number of L2 PDF pages routed to VLM per document",
+    )
+    multimodal_max_images_per_page: int = Field(
+        default=3,
+        ge=0,
+        title="Multimodal Max Images Per Page",
+        description="Maximum chart image candidates fetched per HTML page",
+    )
+    multimodal_image_max_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        ge=1024,
+        title="Multimodal Image Max Bytes",
+        description="Hard byte cap per downloaded or rendered chart image",
+    )
+    multimodal_image_max_pixels: int = Field(
+        default=16_000_000,
+        ge=1024,
+        title="Multimodal Image Max Pixels",
+        description="Hard width*height pixel ceiling against decompression bombs",
+    )
+    sandbox_enabled: bool = Field(
+        default=False,
+        title="Code Sandbox Enabled",
+        description="Whether isolated Python quantitative sandbox execution is provisioned",
+    )
+    sandbox_backend: str = Field(
+        default="auto",
+        title="Code Sandbox Backend",
+        description="Sandbox backend selection: auto, docker, or pyodide",
+    )
+    sandbox_docker_image: str = Field(
+        default="helloagents-sandbox:latest",
+        title="Code Sandbox Docker Image",
+        description="Hardened non-root container image for Python quantitative sandbox execution",
+    )
+    sandbox_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        title="Code Sandbox Timeout Seconds",
+        description="Wall-clock timeout for a single sandbox execution",
+    )
+    sandbox_memory_mb: int = Field(
+        default=512,
+        ge=64,
+        title="Code Sandbox Memory MB",
+        description="Memory cap in MB enforced on the sandbox container or Pyodide worker",
+    )
+    sandbox_cpus: str = Field(
+        default="1.0",
+        title="Code Sandbox CPUs",
+        description="CPU quota flag passed to Docker sandbox runtime",
+    )
+    sandbox_max_executions_per_task: int = Field(
+        default=4,
+        ge=1,
+        title="Code Sandbox Max Executions Per Task",
+        description="Maximum sandbox executions permitted per research task",
+    )
+    sandbox_pyodide_cache_dir: str = Field(
+        default="./.cache/pyodide",
+        title="Code Sandbox Pyodide Cache Dir",
+        description="Local Pyodide distribution directory for offline WASM fallback execution",
+    )
+    active_code_sandbox_enabled: bool | None = Field(
+        default=None,
+        title="Active Code Sandbox Override",
+        description="Request-scoped sandbox activation state bound from active SkillPack",
+    )
     note_memory_enabled: bool = Field(
         default=False,
         title="Note Memory Enabled",
@@ -1229,6 +1344,13 @@ class Configuration(BaseModel):
             if not mcp_path.is_absolute():
                 mcp_path = backend_root() / mcp_path
             self.mcp_config_path = str(mcp_path.resolve(strict=False))
+
+        pyodide_dir = (self.sandbox_pyodide_cache_dir or "").strip()
+        if pyodide_dir:
+            pyodide_path = Path(pyodide_dir).expanduser()
+            if not pyodide_path.is_absolute():
+                pyodide_path = backend_root() / pyodide_path
+            self.sandbox_pyodide_cache_dir = str(pyodide_path.resolve(strict=False))
         return self
 
     def resolved_max_total_tasks(self) -> int:
@@ -1353,6 +1475,26 @@ class Configuration(BaseModel):
             "mcp_tool_cache_ttl_seconds": os.getenv("MCP_TOOL_CACHE_TTL_SECONDS"),
             "mcp_max_tools_per_stage": os.getenv("MCP_MAX_TOOLS_PER_STAGE"),
             "mcp_tenant_token_secret": os.getenv("MCP_TENANT_TOKEN_SECRET"),
+            "multimodal_evidence_enabled": os.getenv("MULTIMODAL_EVIDENCE_ENABLED"),
+            "multimodal_vlm_enabled": os.getenv("MULTIMODAL_VLM_ENABLED"),
+            "multimodal_vlm_model": os.getenv("MULTIMODAL_VLM_MODEL"),
+            "multimodal_vlm_base_url": os.getenv("MULTIMODAL_VLM_BASE_URL"),
+            "multimodal_vlm_api_key": os.getenv("MULTIMODAL_VLM_API_KEY"),
+            "multimodal_vlm_timeout_seconds": os.getenv("MULTIMODAL_VLM_TIMEOUT_SECONDS"),
+            "multimodal_vlm_max_concurrency": os.getenv("MULTIMODAL_VLM_MAX_CONCURRENCY"),
+            "multimodal_max_pdf_pages": os.getenv("MULTIMODAL_MAX_PDF_PAGES"),
+            "multimodal_max_vlm_pages_per_doc": os.getenv("MULTIMODAL_MAX_VLM_PAGES_PER_DOC"),
+            "multimodal_max_images_per_page": os.getenv("MULTIMODAL_MAX_IMAGES_PER_PAGE"),
+            "multimodal_image_max_bytes": os.getenv("MULTIMODAL_IMAGE_MAX_BYTES"),
+            "multimodal_image_max_pixels": os.getenv("MULTIMODAL_IMAGE_MAX_PIXELS"),
+            "sandbox_enabled": os.getenv("SANDBOX_ENABLED"),
+            "sandbox_backend": os.getenv("SANDBOX_BACKEND"),
+            "sandbox_docker_image": os.getenv("SANDBOX_DOCKER_IMAGE"),
+            "sandbox_timeout_seconds": os.getenv("SANDBOX_TIMEOUT_SECONDS"),
+            "sandbox_memory_mb": os.getenv("SANDBOX_MEMORY_MB"),
+            "sandbox_cpus": os.getenv("SANDBOX_CPUS"),
+            "sandbox_max_executions_per_task": os.getenv("SANDBOX_MAX_EXECUTIONS_PER_TASK"),
+            "sandbox_pyodide_cache_dir": os.getenv("SANDBOX_PYODIDE_CACHE_DIR"),
             "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
             "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
             "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),
@@ -1708,3 +1850,27 @@ class Configuration(BaseModel):
         if explicit:
             return explicit
         return (self.llm_model_id or self.local_llm or "").strip()
+
+    def resolved_sandbox_effective_enabled(self) -> bool:
+        """Return True only when sandbox provisioning is enabled and not disabled by the active SkillPack."""
+        if not self.sandbox_enabled:
+            return False
+        if self.active_code_sandbox_enabled is not None:
+            return bool(self.active_code_sandbox_enabled)
+        return True
+
+    def resolved_multimodal_vlm_base_url(self) -> str | None:
+        """Return configured VLM base URL, falling back to primary LLM base URL if set."""
+        explicit = (self.multimodal_vlm_base_url or "").strip()
+        if explicit:
+            return explicit
+        fallback = (self.llm_base_url or "").strip()
+        return fallback or None
+
+    def resolved_multimodal_vlm_api_key(self) -> str | None:
+        """Return configured VLM API key, falling back to primary LLM API key if set."""
+        explicit = (self.multimodal_vlm_api_key or "").strip()
+        if explicit:
+            return explicit
+        fallback = (self.llm_api_key or "").strip()
+        return fallback or None

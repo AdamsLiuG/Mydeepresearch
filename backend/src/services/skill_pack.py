@@ -150,6 +150,7 @@ class SkillPack:
     composable_with: list[str] = field(default_factory=list)
     outline_sections: list[str] = field(default_factory=list)
     mcp_tool_scopes: dict[str, Any] = field(default_factory=dict)
+    code_sandbox: bool = False
 
     @property
     def is_neutral(self) -> bool:
@@ -283,6 +284,8 @@ def compute_content_hash(pack: SkillPack) -> str:
         canonical["outline_sections"] = list(pack.outline_sections)
     if pack.mcp_tool_scopes:
         canonical["mcp_tool_scopes"] = pack.mcp_tool_scopes
+    if pack.code_sandbox:
+        canonical["code_sandbox"] = True
     serialised = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(serialised.encode("utf-8")).hexdigest()[:16]
 
@@ -338,6 +341,7 @@ def load_pack(path: Path) -> SkillPack:
         composable_with=_as_list(frontmatter.get("composable_with")),
         outline_sections=_as_list(frontmatter.get("outline_sections")),
         mcp_tool_scopes=_as_dict(frontmatter.get("mcp_tool_scopes")),
+        code_sandbox=bool(frontmatter.get("code_sandbox", False)),
     )
     pack.content_hash = compute_content_hash(pack)
     return pack
@@ -417,6 +421,7 @@ def validate_pack(
             or pack.verifiers
             or pack.composable_with
             or pack.mcp_tool_scopes
+            or pack.code_sandbox
         ):
             errors.append("neutral pack must not override any knobs")
         if pack.match_signals:
@@ -428,6 +433,7 @@ def validate_pack(
         or pack.verifiers
         or pack.composable_with
         or pack.mcp_tool_scopes
+        or pack.code_sandbox
     ):
         errors.append("format skill pack must not declare domain quality/budget/retrieval/verifier knobs")
     if pack.maturity == MATURITY_PROMOTED and _as_dict(pack.eval_meta).get("verdict") != "pass":
@@ -746,6 +752,10 @@ def apply_skill_pack_overrides(
                         merged_scopes[list_key] = existing_vals
         if merged_scopes and hasattr(base_config, "active_mcp_tool_scopes"):
             updates["active_mcp_tool_scopes"] = merged_scopes
+
+        sandbox_enabled = any(bool(getattr(p, "code_sandbox", False)) for p in source_packs)
+        if hasattr(base_config, "active_code_sandbox_enabled"):
+            updates["active_code_sandbox_enabled"] = sandbox_enabled
 
     if (
         format_pack is not None
@@ -1206,6 +1216,7 @@ class SkillPackService:
                 "applicable_when": pack.applicable_when,
                 "verifiers": list(pack.verifiers),
                 "composable_with": list(pack.composable_with),
+                "code_sandbox": bool(pack.code_sandbox),
                 "version": pack.version,
                 "status": pack.status,
             }

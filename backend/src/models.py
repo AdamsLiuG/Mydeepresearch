@@ -65,6 +65,7 @@ class SummaryState:
     frozen_prefix_version: int = field(default=0)
     pending_tool_approval: dict[str, Any] | None = field(default=None)
     approved_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
+    report_charts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -76,4 +77,5 @@ class SummaryStateInput:
 class SummaryStateOutput:
     running_summary: str = field(default=None)  # Backward-compatible文本
     report_markdown: str | None = field(default=None)
+    report_charts: list[dict[str, Any]] = field(default_factory=list)
     todo_items: List[TodoItem] = field(default_factory=list)

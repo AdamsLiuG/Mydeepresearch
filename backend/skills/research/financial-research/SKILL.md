@@ -2,7 +2,7 @@
 pack_id: financial-research
 schema_version: 1
 version: 1
-content_hash: "af0f77b64780bd41"
+content_hash: "97b46ca94000f6a3"
 maturity: draft
 status: active
 supersedes: ""
@@ -79,6 +79,7 @@ mcp_tool_scopes:
     - review
   readonly_only: true
   max_tools_injected: 4
+code_sandbox: true
 composable_with:
   - competitor-scan
   - policy-analysis

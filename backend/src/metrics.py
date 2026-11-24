@@ -193,6 +193,12 @@ class MetricsRegistry:
             "mcp_timeout_total": 0,
             "mcp_circuit_open_total": 0,
             "mcp_hitl_intercept_total": 0,
+            "multimodal_pages_triaged_total": 0,
+            "multimodal_vlm_calls_total": 0,
+            "multimodal_vlm_fallback_total": 0,
+            "sandbox_executions_total": 0,
+            "sandbox_timeouts_total": 0,
+            "sandbox_ast_rejections_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
         self._estimated_cost = 0.0

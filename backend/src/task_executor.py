@@ -1704,6 +1704,19 @@ class TaskExecutorMixin:
         finally:
             release_summary_slot()
 
+        if (
+            summary_result is not None
+            and bool(getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)())
+            and getattr(self, "_sandbox_service", None) is not None
+            and isinstance(getattr(summary_result, "payload", None), dict)
+            and summary_result.payload.get("computation_requests")
+        ):
+            self._execute_prompt_only_computations(
+                task=task,
+                summary_result=summary_result,
+                evidence_store=evidence_store,
+            )
+
         task.evidence_items = evidence_store.list_task_evidence(task.id)
         task.summary = (summary_result.markdown or "").strip() if summary_result else "暂无可用信息"
         task.summary_payload = dict(summary_result.payload or {}) if summary_result else None
@@ -1739,6 +1752,103 @@ class TaskExecutorMixin:
         else:
             self._drain_tool_events(state)
         self._persist_request_state(state, phase="task_execution", status="in_progress")
+
+    def _execute_prompt_only_computations(
+        self,
+        *,
+        task: TodoItem,
+        summary_result: TaskSummaryResult,
+        evidence_store: Any,
+    ) -> None:
+        """Execute post-summary computation_requests in Prompt-Only mode and attach [Tn-Cm] citations."""
+
+        sandbox_service = getattr(self, "_sandbox_service", None)
+        if sandbox_service is None:
+            return
+        requests_list = list((summary_result.payload or {}).get("computation_requests") or [])
+        if not requests_list:
+            return
+
+        from services.sandbox_executor import SandboxExecutionRequest, SandboxInputTable
+
+        valid_ids = {
+            str(item.get("source_id") or "").strip()
+            for item in evidence_store.list_task_evidence(task.id)
+            if item.get("source_id")
+        }
+        max_reqs = max(1, int(getattr(self.config, "sandbox_max_executions_per_task", 4) or 4))
+        extra_findings: list[dict[str, Any]] = []
+        for req_data in requests_list[:max_reqs]:
+            if not isinstance(req_data, dict):
+                continue
+            try:
+                tables = [
+                    SandboxInputTable.model_validate(tbl)
+                    for tbl in (req_data.get("tables") or [])
+                    if isinstance(tbl, dict)
+                ]
+                derived_ids = [
+                    str(sid).strip().strip("[]")
+                    for sid in (req_data.get("derived_from_source_ids") or [])
+                    if str(sid).strip()
+                ]
+                title = str(req_data.get("title") or "定量计算验证").strip() or "定量计算验证"
+                code = str(req_data.get("code") or "")
+                exec_res = sandbox_service.execute(
+                    SandboxExecutionRequest(
+                        task_id=task.id,
+                        code=code,
+                        title=title,
+                        tables=tables,
+                        derived_from_source_ids=derived_ids,
+                    ),
+                    valid_source_ids=valid_ids,
+                )
+            except Exception as exc:
+                logger.debug("prompt-only sandbox computation skipped task=%s err=%s", task.id, exc)
+                continue
+
+            if not exec_res.ok:
+                logger.debug("prompt-only sandbox computation rejected task=%s err=%s", task.id, exec_res.error)
+                continue
+
+            summary_text = f"计算结果: {json.dumps(exec_res.result, ensure_ascii=False)}"
+            record = evidence_store.record_computation_evidence(
+                task_id=task.id,
+                title=title,
+                summary_text=summary_text,
+                derived_from_source_ids=exec_res.derived_from_source_ids,
+                computation_artifact={
+                    "execution_hash": exec_res.execution_hash,
+                    "backend": exec_res.backend,
+                    "result": exec_res.result,
+                    "tables_out": exec_res.tables_out,
+                    "code": code,
+                    "duration_ms": exec_res.duration_ms,
+                },
+                structured_payload={
+                    "result": exec_res.result,
+                    "tables_out": exec_res.tables_out,
+                    "charts": [c.model_dump() for c in exec_res.charts],
+                },
+                backend=exec_res.backend,
+            )
+            comp_sid = str(record.get("source_id") or "").strip()
+            if comp_sid:
+                valid_ids.add(comp_sid)
+                finding_text = f"{title}：{summary_text}"
+                extra_findings.append({"text": finding_text, "source_ids": [comp_sid]})
+
+        if extra_findings:
+            summary_result.claims = list(summary_result.claims or []) + extra_findings
+            if isinstance(summary_result.payload, dict):
+                existing_kf = list(summary_result.payload.get("key_findings") or [])
+                summary_result.payload["key_findings"] = existing_kf + extra_findings
+            added_md = "\n".join(
+                f"- {item['text']} [{item['source_ids'][0]}]"
+                for item in extra_findings
+            )
+            summary_result.markdown = f"{(summary_result.markdown or '').rstrip()}\n\n{added_md}".strip()
 
     def _dispatch_mcp_scope_prefetch(
         self,
