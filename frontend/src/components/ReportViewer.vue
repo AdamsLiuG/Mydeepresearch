@@ -16,7 +16,19 @@
       </button>
     </div>
 
-    <div class="markdown-block" v-html="reportHtml"></div>
+    <SkillGovernanceBar
+      v-if="workbench"
+      :governance="workbench.skill_governance"
+      :claim-summary="workbench.claim_verification_summary"
+      :conflict-count="workbench.evidence_conflicts.length"
+      @inspect-conflicts="$emit('inspect-conflicts')"
+    />
+
+    <div
+      class="markdown-block"
+      v-html="decoratedReportHtml"
+      @click="handleMarkdownClick"
+    ></div>
 
     <div v-if="showDrilldown && requestId" class="drilldown-panel">
       <div class="drilldown-controls">
@@ -64,6 +76,9 @@
 
 <script lang="ts" setup>
 import { computed, ref, watch } from "vue";
+import type { ReportWorkbenchPayload } from "../types/research";
+import { decorateReportHtmlWithCitations } from "../utils/workbench";
+import SkillGovernanceBar from "./SkillGovernanceBar.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -74,17 +89,34 @@ const props = withDefaults(
     drilldownLoading?: boolean;
     drilldownAnswerHtml?: string;
     drilldownError?: string;
+    workbench?: ReportWorkbenchPayload | null;
   }>(),
   {
     drilldownLoading: false,
     drilldownAnswerHtml: "",
-    drilldownError: ""
+    drilldownError: "",
+    workbench: null
   }
 );
 
 const emit = defineEmits<{
   drilldown: [payload: { sectionTitle: string; question: string }];
+  "select-citation": [sourceId: string];
+  "inspect-conflicts": [];
 }>();
+
+const decoratedReportHtml = computed(() =>
+  decorateReportHtmlWithCitations(props.reportHtml || "")
+);
+
+function handleMarkdownClick(event: MouseEvent) {
+  const target = event.target as HTMLElement | null;
+  const chip = target?.closest<HTMLElement>("[data-citation-id]");
+  const citationId = chip?.dataset?.citationId?.trim();
+  if (citationId) {
+    emit("select-citation", citationId);
+  }
+}
 
 const showDrilldown = ref(false);
 const questionText = ref("");
@@ -241,5 +273,23 @@ function submitDrilldown() {
   margin: 0 0 12px;
   color: #0f172a;
   line-height: 1.35;
+}
+
+.markdown-block :deep(.citation-chip) {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(37, 99, 235, 0.32);
+  background: rgba(239, 246, 255, 0.92);
+  color: #1d4ed8;
+  border-radius: 6px;
+  padding: 0 5px;
+  margin: 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.markdown-block :deep(.citation-chip:hover) {
+  background: rgba(219, 234, 254, 1);
 }
 </style>

@@ -174,6 +174,112 @@ export interface TodoTaskView {
   toolCalls: ToolCallLog[];
   origin: string;
   round: number;
+  atomic_claims?: Array<Record<string, unknown>>;
+}
+
+export interface WorkbenchCitationEntry {
+  source_id: string;
+  task_id?: number | null;
+  title: string;
+  url: string;
+  domain: string;
+  snippet: string;
+  quality_label: string;
+  source_type?: string;
+  published_at?: string | null;
+  modality?: string;
+  anchors?: string[];
+}
+
+export interface WorkbenchParagraphBinding {
+  paragraph_index: number;
+  excerpt: string;
+  citation_ids: string[];
+  conflict_ids: string[];
+}
+
+export interface ConflictSide {
+  source_id: string;
+  task_id: number;
+  title: string;
+  url: string;
+  domain: string;
+  source_type: string;
+  quality_label: string;
+  published_at?: string | null;
+  claim_text: string;
+  normalized_value?: number | null;
+  unit?: string;
+  evidence_excerpt?: string;
+  authority_rank?: number;
+  nli_support_score?: number;
+}
+
+export interface EvidenceConflictCluster {
+  conflict_id: string;
+  entity: string;
+  metric: string;
+  period: string;
+  conflict_type: string;
+  severity: string;
+  contradiction_score: number;
+  sides: ConflictSide[];
+  adjudication_status: string;
+  recommended_source_id?: string | null;
+  adjudication_rationale: string;
+  affected_task_ids?: number[];
+}
+
+export interface ClaimVerificationSummary {
+  total_parent_claims?: number;
+  total_atomic_claims?: number;
+  entailed_count?: number;
+  contradicted_count?: number;
+  neutral_count?: number;
+  skipped_count?: number;
+  atomic_faithfulness_rate?: number;
+  conflict_count?: number;
+  unresolved_conflict_count?: number;
+  backend_used?: string;
+  elapsed_ms?: number;
+  degraded?: boolean;
+}
+
+export interface SkillGovernanceInfo {
+  pack_id: string;
+  version?: number | string | null;
+  maturity?: string | null;
+  active_verifiers?: string[];
+  code_sandbox_enabled?: boolean;
+  nli_verifier_enabled?: boolean;
+  mcp_tool_scopes?: Record<string, unknown>;
+}
+
+export interface ReportWorkbenchPayload {
+  citation_index: Record<string, WorkbenchCitationEntry>;
+  paragraph_bindings: WorkbenchParagraphBinding[];
+  evidence_conflicts: EvidenceConflictCluster[];
+  claim_verification_summary: ClaimVerificationSummary;
+  skill_governance: SkillGovernanceInfo;
+}
+
+export interface AsyncResearchSubmitResponse {
+  request_id: string;
+  workflow_run_id: string;
+  runner_backend: string;
+  status: string;
+  tenant_id: string;
+  events_url: string;
+}
+
+export interface WorkflowSignalResponse {
+  request_id: string;
+  tenant_id: string;
+  runner_backend: string;
+  signal_name: string;
+  accepted: boolean;
+  status?: string;
+  detail?: string;
 }
 
 export interface RecentResearchView {

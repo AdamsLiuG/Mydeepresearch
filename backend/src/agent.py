@@ -64,7 +64,7 @@ from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
 from services.policy_controller import build_policy_controller
 from services.reflection import ReflectionAssessment, ReflectionService
-from services.reporter import ReportingService
+from services.reporter import ReportingService, build_report_workbench_payload
 from services.reviewer import ReviewService
 from services.sandbox_executor import (
     DockerSandboxBackend,
@@ -2356,6 +2356,18 @@ class DeepResearchAgent(
 
             if emit_stream:
                 yield observer.metrics_event()
+                workbench = build_report_workbench_payload(
+                    state,
+                    report,
+                    evidence_store=self._evidence_store,
+                    config=self.config,
+                )
+                has_workbench = bool(
+                    workbench.get("citation_index")
+                    or workbench.get("evidence_conflicts")
+                    or workbench.get("claim_verification_summary")
+                    or (workbench.get("skill_governance") or {}).get("pack_id", "_neutral") != "_neutral"
+                )
                 yield {
                     "type": "final_report",
                     "report": report,
@@ -2365,6 +2377,7 @@ class DeepResearchAgent(
                     "claim_verification_summary": dict(
                         getattr(state, "claim_verification_summary", None) or {}
                     ),
+                    **({"workbench": workbench} if has_workbench else {}),
                 }
                 yield {"type": "done"}
         except MCPHitlApprovalRequired as hitl_exc:
@@ -2444,6 +2457,16 @@ class DeepResearchAgent(
         state, phase = self._state_from_snapshot(snapshot)
         topic = state.research_topic or str(snapshot.get("topic") or "").strip()
         return self.run(topic, initial_state=state, resume_phase=phase)
+
+    def execute_single_task(self, state: SummaryState, task_id: int) -> TodoItem:
+        """Execute one planned TodoItem in-place for durable step/activity orchestration."""
+
+        target = next((task for task in state.todo_items if task.id == task_id), None)
+        if target is None:
+            raise ValueError(f"task_id not found: {task_id}")
+        for _ in self._execute_task(state, target, emit_stream=False):
+            pass
+        return target
 
     def plan_only(self, topic: str) -> dict[str, Any]:
         """Generate an editable research plan and persist it with awaiting_approval status."""

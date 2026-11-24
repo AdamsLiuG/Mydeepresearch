@@ -263,6 +263,24 @@
         class="panel panel-result"
         v-if="shouldRenderResultPanel"
       >
+        <div
+          v-if="pendingRecoverySession && !loading"
+          class="recovery-banner"
+          role="status"
+        >
+          <span>
+            检测到未完成的后台研究任务 <strong>{{ pendingRecoverySession.topic || pendingRecoverySession.requestId }}</strong>
+          </span>
+          <div class="recovery-actions">
+            <button type="button" class="secondary-btn" @click="resumeRecoveredSession">
+              断点续传订阅
+            </button>
+            <button type="button" class="secondary-btn" @click="dismissRecoveredSession">
+              忽略
+            </button>
+          </div>
+        </div>
+
         <template v-if="hasResearchContent">
         <header class="status-bar">
           <div class="status-main">
@@ -599,7 +617,17 @@
           :drilldown-loading="drilldownLoading"
           :drilldown-answer-html="drilldownAnswerHtml"
           :drilldown-error="drilldownError"
+          :workbench="effectiveWorkbench"
           @drilldown="handleSectionDrilldown"
+          @select-citation="handleSelectCitation"
+          @inspect-conflicts="handleInspectConflicts"
+        />
+
+        <EvidenceDrawer
+          :visible="drawerVisible"
+          :selected-citation-id="selectedCitationId"
+          :workbench="effectiveWorkbench"
+          @close="closeEvidenceDrawer"
         />
         </template>
 
@@ -657,9 +685,17 @@
 <script lang="ts" setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 
+import EvidenceDrawer from "./components/EvidenceDrawer.vue";
 import HistorySidebar from "./components/HistorySidebar.vue";
 import PlanReviewPanel from "./components/PlanReviewPanel.vue";
 import ReportViewer from "./components/ReportViewer.vue";
+import {
+  clearActiveStreamSession,
+  loadActiveStreamSession,
+  saveActiveStreamSession,
+  useResilientStream,
+  type PersistedStreamSession
+} from "./composables/useResilientStream";
 import {
   clarifyResearch,
   createResearchPlan,
@@ -677,13 +713,17 @@ import {
 } from "./services/api";
 import type {
   ClaimItem,
+  ClaimVerificationSummary,
+  EvidenceConflictCluster,
   RecentResearchView,
+  ReportWorkbenchPayload,
   ReviewIssue,
   SourceItem,
   TodoTaskView,
   ToolCallLog
 } from "./types/research";
 import { renderMarkdownBlock } from "./utils/markdown";
+import { buildFallbackWorkbenchPayload } from "./utils/workbench";
 
 interface DemoScenario {
   id: string;
@@ -730,6 +770,13 @@ const hitlError = ref("");
 const drilldownLoading = ref(false);
 const drilldownAnswerMarkdown = ref("");
 const drilldownError = ref("");
+const reportWorkbench = ref<ReportWorkbenchPayload | null>(null);
+const evidenceConflicts = ref<EvidenceConflictCluster[]>([]);
+const claimVerificationSummary = ref<ClaimVerificationSummary>({});
+const selectedCitationId = ref<string | null>(null);
+const drawerVisible = ref(false);
+const pendingRecoverySession = ref<PersistedStreamSession | null>(null);
+const { followWithResume } = useResilientStream();
 
 const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
@@ -835,6 +882,84 @@ const currentTaskSummaryHtml = computed(() =>
 const reportMarkdownHtml = computed(() =>
   renderMarkdownBlock(reportMarkdown.value || "暂无生成的报告")
 );
+const effectiveWorkbench = computed<ReportWorkbenchPayload | null>(() => {
+  if (reportWorkbench.value) {
+    return reportWorkbench.value;
+  }
+  if (!reportMarkdown.value && !todoTasks.value.length && !evidenceConflicts.value.length) {
+    return null;
+  }
+  return buildFallbackWorkbenchPayload(
+    todoTasks.value,
+    reportMarkdown.value,
+    evidenceConflicts.value,
+    claimVerificationSummary.value
+  );
+});
+
+function handleSelectCitation(sourceId: string) {
+  selectedCitationId.value = sourceId;
+  drawerVisible.value = true;
+}
+
+function handleInspectConflicts() {
+  selectedCitationId.value = null;
+  drawerVisible.value = true;
+}
+
+function closeEvidenceDrawer() {
+  drawerVisible.value = false;
+  selectedCitationId.value = null;
+}
+
+async function resumeRecoveredSession() {
+  const session = pendingRecoverySession.value;
+  if (!session || loading.value) {
+    return;
+  }
+  pendingRecoverySession.value = null;
+  loading.value = true;
+  error.value = "";
+  isExpanded.value = true;
+  resetWorkflowState();
+  activeRequestId.value = session.requestId;
+  lastEventId.value = session.lastEventId || null;
+  if (session.topic) {
+    form.topic = session.topic;
+  }
+  const controller = new AbortController();
+  currentController = controller;
+  try {
+    await followWithResume(
+      session.requestId,
+      session.topic,
+      handleResearchEvent,
+      {
+        signal: controller.signal,
+        lastEventId: session.lastEventId || undefined,
+        onEventId: (eventId) => {
+          lastEventId.value = eventId;
+        }
+      }
+    );
+  } catch (err) {
+    if (!(err instanceof DOMException && err.name === "AbortError")) {
+      error.value = err instanceof Error ? err.message : "断点续传失败";
+    }
+  } finally {
+    loading.value = false;
+    void refreshGlobalMetrics();
+    void refreshPersistedHistory();
+    if (currentController === controller) {
+      currentController = null;
+    }
+  }
+}
+
+function dismissRecoveredSession() {
+  pendingRecoverySession.value = null;
+  clearActiveStreamSession();
+}
 const currentDrilldownRequestId = computed(
   () =>
     activeRequestId.value ||
@@ -1457,6 +1582,11 @@ function resetWorkflowState() {
   selectedHistoryRequestId.value = null;
   drilldownAnswerMarkdown.value = "";
   drilldownError.value = "";
+  reportWorkbench.value = null;
+  evidenceConflicts.value = [];
+  claimVerificationSummary.value = {};
+  selectedCitationId.value = null;
+  drawerVisible.value = false;
   summaryHighlight.value = false;
   sourcesHighlight.value = false;
   reportHighlight.value = false;
@@ -2262,6 +2392,16 @@ function handleResearchEvent(event: ResearchStreamEvent) {
         ? event.report.trim()
         : "";
     reportMarkdown.value = report || "报告生成失败，未获得有效内容";
+    const rawPayload = event as Record<string, unknown>;
+    if (Array.isArray(rawPayload.evidence_conflicts)) {
+      evidenceConflicts.value = rawPayload.evidence_conflicts as EvidenceConflictCluster[];
+    }
+    if (rawPayload.claim_verification_summary && typeof rawPayload.claim_verification_summary === "object") {
+      claimVerificationSummary.value = rawPayload.claim_verification_summary as ClaimVerificationSummary;
+    }
+    if (rawPayload.workbench && typeof rawPayload.workbench === "object") {
+      reportWorkbench.value = rawPayload.workbench as ReportWorkbenchPayload;
+    }
     pulse(reportHighlight);
     progressLogs.value.push("最终报告已生成");
     return;
@@ -2271,6 +2411,12 @@ function handleResearchEvent(event: ResearchStreamEvent) {
     activeRequestId.value = event.request_id.trim();
   }
 
+  if (event.type === "done" || event.type === "cancelled") {
+    clearActiveStreamSession();
+    pendingRecoverySession.value = null;
+    return;
+  }
+
   if (event.type === "error") {
     const detail =
       typeof event.detail === "string" && event.detail.trim()
@@ -2278,6 +2424,7 @@ function handleResearchEvent(event: ResearchStreamEvent) {
         : "研究过程中发生错误";
     error.value = detail;
     progressLogs.value.push("研究失败，已停止流程");
+    clearActiveStreamSession();
   }
 }
 
@@ -2458,6 +2605,13 @@ const handleSubmit = async () => {
         signal: controller.signal,
         onEventId: (eventId) => {
           lastEventId.value = eventId;
+          if (activeRequestId.value) {
+            saveActiveStreamSession({
+              requestId: activeRequestId.value,
+              lastEventId: eventId,
+              topic: payload.topic
+            });
+          }
         }
       }
     );
@@ -2508,6 +2662,7 @@ const startNewResearch = () => {
 };
 
 onMounted(() => {
+  pendingRecoverySession.value = loadActiveStreamSession();
   void refreshGlobalMetrics();
   void refreshPersistedHistory();
   globalMetricsTimer = window.setInterval(() => {
@@ -4580,6 +4735,26 @@ select:focus {
   margin: 0;
   font-size: 13px;
   color: #64748b;
+}
+
+.recovery-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: 12px;
+  background: rgba(239, 246, 255, 0.95);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  color: #1e3a8a;
+  font-size: 13px;
+}
+
+.recovery-actions {
+  display: flex;
+  gap: 8px;
 }
 
 /* 全屏状态下的结果面板 */

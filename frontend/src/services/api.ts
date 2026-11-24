@@ -1,5 +1,6 @@
 import { createSseFrameParser, parseSseJson } from "./sseParser";
 import type {
+  AsyncResearchSubmitResponse,
   ClarifyResponse,
   EditablePlanResponse,
   MetricsSnapshot,
@@ -11,10 +12,12 @@ import type {
   ResumeRequest,
   SectionDrilldownResponse,
   SkillsCatalogResponse,
-  StreamOptions
+  StreamOptions,
+  WorkflowSignalResponse
 } from "../types/research";
 
 export type {
+  AsyncResearchSubmitResponse,
   ClarifyResponse,
   EditablePlanResponse,
   MetricsSnapshot,
@@ -26,7 +29,8 @@ export type {
   ResumeRequest,
   SectionDrilldownResponse,
   SkillsCatalogResponse,
-  StreamOptions
+  StreamOptions,
+  WorkflowSignalResponse
 } from "../types/research";
 
 function resolveBaseURL(): string {
@@ -82,6 +86,44 @@ export async function resumeResearchStream(
   );
 }
 
+async function consumeSseBody(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: ResearchStreamEvent) => void,
+  options: StreamOptions = {}
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  const parser = createSseFrameParser(options.lastEventId);
+
+  const dispatchFrames = (frames: ReturnType<typeof parser.feed>): boolean => {
+    for (const frame of frames) {
+      if (frame.id) {
+        options.onEventId?.(frame.id);
+      }
+      const event = parseSseJson<ResearchStreamEvent>(frame);
+      if (event) {
+        onEvent(event);
+        if (event.type === "error" || event.type === "done" || event.type === "cancelled") {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    const chunk = decoder.decode(value || new Uint8Array(), { stream: !done });
+    if (dispatchFrames(parser.feed(chunk))) {
+      return;
+    }
+    if (done) {
+      dispatchFrames(parser.flush());
+      break;
+    }
+  }
+}
+
 async function streamFromEndpoint(
   endpoint: string,
   payload: unknown,
@@ -123,37 +165,84 @@ async function streamFromEndpoint(
     throw new Error("浏览器不支持流式响应，无法获取研究进度");
   }
 
-  const reader = body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  const parser = createSseFrameParser(options.lastEventId);
+  await consumeSseBody(body, onEvent, options);
+}
 
-  const dispatchFrames = (frames: ReturnType<typeof parser.feed>): boolean => {
-    for (const frame of frames) {
-      if (frame.id) {
-        options.onEventId?.(frame.id);
-      }
-      const event = parseSseJson<ResearchStreamEvent>(frame);
-      if (event) {
-        onEvent(event);
-        if (event.type === "error" || event.type === "done") {
-          return true;
-        }
-      }
-    }
-    return false;
-  };
-
-  while (true) {
-    const { value, done } = await reader.read();
-    const chunk = decoder.decode(value || new Uint8Array(), { stream: !done });
-    if (dispatchFrames(parser.feed(chunk))) {
-      return;
-    }
-    if (done) {
-      dispatchFrames(parser.flush());
-      break;
-    }
+export async function submitAsyncResearch(
+  payload: ResearchRequest,
+  options: StreamOptions = {}
+): Promise<AsyncResearchSubmitResponse> {
+  const response = await fetch(`${baseURL}/research/async`, {
+    method: "POST",
+    headers: buildHeaders(
+      {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      options
+    ),
+    body: JSON.stringify(payload),
+    signal: options.signal
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `提交异步研究失败，状态码：${response.status}`);
   }
+  return (await response.json()) as AsyncResearchSubmitResponse;
+}
+
+export async function sendWorkflowSignal(
+  requestId: string,
+  signalName: string,
+  payload: Record<string, unknown> = {},
+  options: StreamOptions = {}
+): Promise<WorkflowSignalResponse> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/signals/${encodeURIComponent(signalName)}`,
+    {
+      method: "POST",
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        options
+      ),
+      body: JSON.stringify({ payload }),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `发送工作流信号失败，状态码：${response.status}`);
+  }
+  return (await response.json()) as WorkflowSignalResponse;
+}
+
+export async function streamRequestEvents(
+  requestId: string,
+  onEvent: (event: ResearchStreamEvent) => void,
+  options: StreamOptions = {}
+): Promise<void> {
+  const query = options.lastEventId
+    ? `?follow=1&last_event_id=${encodeURIComponent(options.lastEventId)}`
+    : "?follow=1";
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/events${query}`,
+    {
+      method: "GET",
+      headers: buildHeaders({ Accept: "text/event-stream" }, options),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(errorText || `续传事件流失败，状态码：${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error("浏览器不支持事件流读取");
+  }
+  await consumeSseBody(response.body, onEvent, options);
 }
 
 export async function fetchMetricsSnapshot(

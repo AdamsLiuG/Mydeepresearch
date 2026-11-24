@@ -32,6 +32,12 @@ from services.tenant import (
     authenticate_tenant,
     extract_api_key,
 )
+from services.workflow_runner import build_workflow_runner
+
+try:  # pragma: no cover - optional runtime dependency
+    import redis as _redis_mod
+except Exception:  # pragma: no cover - optional runtime dependency
+    _redis_mod = None  # type: ignore[assignment]
 
 DeepResearchAgent: Any | None = None
 
@@ -152,6 +158,26 @@ class ToolApprovalDecisionRequest(BaseModel):
 
     decision: Literal["approve", "reject"] = Field(..., description="Approval decision")
     reason: str = Field(default="", description="Optional operator reason")
+
+
+class AsyncResearchRequest(BaseModel):
+    """Payload for submitting an asynchronous durable research run."""
+
+    topic: str = Field(..., min_length=1, description="Research topic supplied by the user")
+    search_api: SearchAPI | None = Field(
+        default=None,
+        description="Override the default search backend configured via env",
+    )
+    output_format: str | None = Field(
+        default=None,
+        description="Optional output format skill id",
+    )
+
+
+class WorkflowSignalRequest(BaseModel):
+    """Payload delivered via POST /requests/{request_id}/signals/{signal_name}."""
+
+    payload: dict[str, Any] = Field(default_factory=dict, description="Optional signal metadata")
 
 
 def _mask_secret(value: str | None, visible: int = 4) -> str:
@@ -414,6 +440,9 @@ def create_app(
             bridge = getattr(app.state, "mcp_bridge", None)
             if bridge is not None and hasattr(bridge, "close"):
                 bridge.close()
+            state_store = getattr(app.state, "request_state_store", None)
+            if state_store is not None and hasattr(state_store, "close"):
+                state_store.close()
 
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
     app.state.base_config = base_config
@@ -421,9 +450,26 @@ def create_app(
     app.state.request_state_store = build_request_state_store(base_config)
     app.state.event_bus = build_stream_event_bus(base_config)
     app.state.mcp_bridge = MCPBridgeManager(base_config) if getattr(base_config, "mcp_enabled", False) else None
+    rate_limit_redis = None
+    if getattr(base_config, "redis_url", None) and _redis_mod is not None:
+        try:
+            rate_limit_redis = _redis_mod.Redis.from_url(
+                str(base_config.redis_url),
+                decode_responses=True,
+            )
+        except Exception:
+            rate_limit_redis = None
     app.state.rate_limiter = TenantRateLimiter(
         rpm_limit=base_config.tenant_rate_limit_rpm,
         max_concurrent=base_config.tenant_max_concurrent_requests,
+        redis_client=rate_limit_redis,
+    )
+    app.state.workflow_runner = build_workflow_runner(
+        base_config,
+        agent_factory=resolved_agent_factory,
+        event_bus=app.state.event_bus,
+        state_store=app.state.request_state_store,
+        on_release=app.state.rate_limiter.release,
     )
 
     allow_wildcard_cors = "*" in base_config.cors_origins
@@ -876,6 +922,7 @@ def create_app(
         request_id: str,
         request: Request,
         last_event_id: str | None = None,
+        follow: bool = False,
     ) -> Any:
         tenant = _resolve_tenant(request)
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
@@ -884,6 +931,111 @@ def create_app(
             if last_event_id is not None
             else request.headers.get("last-event-id")
         )
+        if follow:
+            runner = getattr(app.state, "workflow_runner", None)
+            store = getattr(app.state, "request_state_store", None)
+
+            def _is_terminal() -> bool:
+                if runner is not None:
+                    rstat = runner.status(request_id, tenant_id=tenant.tenant_id)
+                    if isinstance(rstat, dict) and rstat.get("status") in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                    }:
+                        return True
+                if store is not None:
+                    snap = _store_load(store, request_id, tenant_id=tenant.tenant_id)
+                    if isinstance(snap, dict) and snap.get("status") in {
+                        "success",
+                        "partial_success",
+                        "failed",
+                        "cancelled",
+                    }:
+                        return True
+                return False
+
+            async def _follow_iter() -> AsyncIterator[str]:
+                tail_q: Queue[tuple[str, Any]] = Queue()
+
+                def _pump() -> None:
+                    try:
+                        tail_fn = getattr(app.state.event_bus, "tail_since", None)
+                        if callable(tail_fn):
+                            for env in tail_fn(
+                                tenant.tenant_id,
+                                request_id,
+                                last_event_id=resolved_last_id,
+                                is_terminal_fn=_is_terminal,
+                                block_ms=int(
+                                    max(
+                                        200,
+                                        float(
+                                            getattr(
+                                                app.state.base_config,
+                                                "sse_heartbeat_interval_seconds",
+                                                15.0,
+                                            )
+                                            or 15.0
+                                        )
+                                        * 1000,
+                                    )
+                                ),
+                            ):
+                                tail_q.put(("env", env))
+                        else:
+                            for env in app.state.event_bus.replay_since(
+                                tenant.tenant_id,
+                                request_id,
+                                last_event_id=resolved_last_id,
+                            ):
+                                tail_q.put(("env", env))
+                    except Exception as exc:
+                        tail_q.put(("error", exc))
+                    finally:
+                        tail_q.put(("end", None))
+
+                pump_thread = Thread(
+                    target=_pump,
+                    name=f"sse-tail-{request_id[:8]}",
+                    daemon=True,
+                )
+                pump_thread.start()
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        kind, item = await asyncio.to_thread(tail_q.get, True, 0.25)
+                    except Empty:
+                        continue
+                    if kind == "env":
+                        payload = item.payload
+                        if payload.get("type") == "__keepalive__":
+                            yield ": keepalive\n\n"
+                        else:
+                            yield (
+                                f"id: {item.event_id}\n"
+                                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                            )
+                    elif kind == "error":
+                        yield (
+                            f"data: {json.dumps({'type': 'error', 'detail': str(item)}, ensure_ascii=False)}\n\n"
+                        )
+                        break
+                    else:
+                        break
+
+            return StreamingResponse(
+                _follow_iter(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Request-ID": request_id,
+                },
+            )
+
         envelopes = app.state.event_bus.replay_since(
             tenant.tenant_id,
             request_id,
@@ -915,6 +1067,67 @@ def create_app(
                 for envelope in envelopes
             ],
         }
+
+    @app.post("/research/async", status_code=202)
+    async def submit_async_research(
+        payload: AsyncResearchRequest,
+        request: Request,
+    ) -> Dict[str, Any]:
+        request_id = _request_id(request)
+        tenant = _resolve_tenant(request)
+        _acquire_rate_limit(tenant)
+        try:
+            config = _build_config(
+                ResearchRequest(
+                    topic=payload.topic,
+                    search_api=payload.search_api,
+                    output_format=payload.output_format,
+                )
+            )
+            runner = app.state.workflow_runner
+            handle = await asyncio.to_thread(
+                runner.submit,
+                payload.topic,
+                request_id=request_id,
+                tenant_id=tenant.tenant_id,
+                config=config,
+                output_format=payload.output_format,
+            )
+            if runner.backend_name == "inline":
+                _release_rate_limit(tenant)
+            return {
+                **handle.to_dict(),
+                "events_url": f"/requests/{request_id}/events?follow=1",
+            }
+        except HTTPException:
+            _release_rate_limit(tenant)
+            raise
+        except ValueError as exc:
+            _release_rate_limit(tenant)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            _release_rate_limit(tenant)
+            logger.exception("Async submit failed request_id=%s", request_id)
+            raise HTTPException(status_code=500, detail=f"Async submit failed: {exc}") from exc
+
+    @app.post("/requests/{request_id}/signals/{signal_name}")
+    async def send_workflow_signal(
+        request_id: str,
+        signal_name: str,
+        request: Request,
+        payload: WorkflowSignalRequest | None = None,
+    ) -> Dict[str, Any]:
+        tenant = _resolve_tenant(request)
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
+        runner = app.state.workflow_runner
+        signal_body = payload.payload if payload is not None else {}
+        return await asyncio.to_thread(
+            runner.signal,
+            request_id,
+            signal_name,
+            signal_body,
+            tenant_id=tenant.tenant_id,
+        )
 
     @app.post(
         "/requests/{request_id}/resume",
@@ -1007,11 +1220,13 @@ def create_app(
         tenant_id: str = "default",
         heartbeat_seconds: float,
         error_log_label: str,
+        cancel_on_disconnect: bool = True,
         on_complete: Callable[[], None] | None = None,
     ) -> StreamingResponse:
         cancel_event = Event()
         event_queue: Queue[tuple[str, Any]] = Queue()
         heartbeat_interval = max(0.05, float(heartbeat_seconds or 15.0))
+        client_detached = Event()
 
         def _publish_and_format(event_payload: dict[str, Any]) -> str:
             event_id = app.state.event_bus.publish(tenant_id, request_id, event_payload)
@@ -1023,8 +1238,12 @@ def create_app(
         def producer() -> None:
             try:
                 for event in stream_starter(cancel_event):
-                    if cancel_event.is_set():
+                    if cancel_on_disconnect and cancel_event.is_set():
                         break
+                    if not cancel_on_disconnect and client_detached.is_set():
+                        if isinstance(event, dict):
+                            app.state.event_bus.publish(tenant_id, request_id, event)
+                        continue
                     event_queue.put(("event", event))
             except Exception as exc:  # pragma: no cover - defensive guardrail
                 logger.exception(
@@ -1032,8 +1251,18 @@ def create_app(
                     error_log_label,
                     extra={"request_id": request_id},
                 )
-                event_queue.put(("error", exc))
+                if not cancel_on_disconnect and client_detached.is_set():
+                    app.state.event_bus.publish(
+                        tenant_id,
+                        request_id,
+                        {"type": "error", "detail": f"{exc} (request_id={request_id})"},
+                    )
+                else:
+                    event_queue.put(("error", exc))
             finally:
+                if not cancel_on_disconnect and client_detached.is_set():
+                    if on_complete is not None:
+                        on_complete()
                 event_queue.put(("done", None))
 
         worker = Thread(
@@ -1046,10 +1275,14 @@ def create_app(
         async def event_iterator() -> AsyncIterator[str]:
             last_emitted = time.monotonic()
             poll_slice = min(0.1, heartbeat_interval)
+            detached = False
             try:
                 while True:
                     if request is not None and await request.is_disconnected():
-                        cancel_event.set()
+                        detached = True
+                        client_detached.set()
+                        if cancel_on_disconnect:
+                            cancel_event.set()
                         break
 
                     try:
@@ -1074,10 +1307,11 @@ def create_app(
                     else:
                         break
             finally:
-                cancel_event.set()
-                await asyncio.to_thread(worker.join, 1.0)
-                if on_complete is not None:
-                    on_complete()
+                if cancel_on_disconnect or not detached:
+                    cancel_event.set()
+                    await asyncio.to_thread(worker.join, 1.0)
+                    if on_complete is not None:
+                        on_complete()
 
         return StreamingResponse(
             event_iterator(),
@@ -1135,6 +1369,7 @@ def create_app(
             tenant_id=tenant.tenant_id,
             heartbeat_seconds=config.sse_heartbeat_interval_seconds,
             error_log_label=f"Streaming research failed topic={payload.topic}",
+            cancel_on_disconnect=(getattr(config, "workflow_runner", "inline") == "inline"),
             on_complete=lambda: _release_rate_limit(tenant),
         )
 
@@ -1189,6 +1424,7 @@ def create_app(
             tenant_id=tenant.tenant_id,
             heartbeat_seconds=config.sse_heartbeat_interval_seconds,
             error_log_label=f"Streaming resume failed request_id={request_id}",
+            cancel_on_disconnect=(getattr(config, "workflow_runner", "inline") == "inline"),
             on_complete=lambda: _release_rate_limit(tenant),
         )
 

@@ -79,6 +79,62 @@ services:
       - backend
     restart: unless-stopped
 
+  temporal-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: helloagents-deepresearch-temporal-worker
+    profiles:
+      - temporal
+    env_file:
+      - ./backend/.env
+    command: ["python", "-m", "worker.main", "--backend", "temporal"]
+    environment:
+      WORKFLOW_RUNNER: temporal
+      TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-temporal:7233}
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-deepresearch-tasks}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://deepresearch:deepresearch_change_me@postgres:5432/deepresearch}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/notes:/app/notes
+      - ./backend/.cache:/app/.cache
+      - ./backend/.memory:/app/.memory
+      - ./backend/.state:/app/.state
+    restart: unless-stopped
+
+  arq-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: helloagents-deepresearch-arq-worker
+    profiles:
+      - arq
+    env_file:
+      - ./backend/.env
+    command: ["python", "-m", "worker.main", "--backend", "arq"]
+    environment:
+      WORKFLOW_RUNNER: arq
+      ARQ_REDIS_DSN: ${ARQ_REDIS_DSN:-redis://redis:6379/0}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://deepresearch:deepresearch_change_me@postgres:5432/deepresearch}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/notes:/app/notes
+      - ./backend/.cache:/app/.cache
+      - ./backend/.memory:/app/.memory
+      - ./backend/.state:/app/.state
+    restart: unless-stopped
+
 volumes:
   deepresearch_pg_data:
   deepresearch_redis_data:

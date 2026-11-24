@@ -921,6 +921,49 @@ class Configuration(BaseModel):
         title="Event Bus Max Events Per Request",
         description="Maximum buffered SSE events retained per request for Last-Event-ID replay",
     )
+    event_bus_stream_ttl_seconds: int = Field(
+        default=86400,
+        ge=60,
+        title="Event Bus Stream TTL Seconds",
+        description="Retention TTL in seconds applied to finished Redis Streams",
+    )
+    workflow_runner: str = Field(
+        default="inline",
+        title="Workflow Runner Backend",
+        description="Execution backend: inline, local_durable, arq, or temporal",
+    )
+    temporal_address: str = Field(
+        default="127.0.0.1:7233",
+        title="Temporal Server Address",
+        description="Host:port of the Temporal gRPC frontend",
+    )
+    temporal_namespace: str = Field(
+        default="default",
+        title="Temporal Namespace",
+        description="Temporal namespace for workflow executions",
+    )
+    temporal_task_queue: str = Field(
+        default="deepresearch-tasks",
+        title="Temporal Task Queue",
+        description="Temporal task queue subscribed by DeepResearch workers",
+    )
+    arq_redis_dsn: str | None = Field(
+        default=None,
+        title="ARQ Redis DSN",
+        description="Optional Redis DSN override used by ARQ durable queue runner",
+    )
+    postgres_pool_min_size: int = Field(
+        default=2,
+        ge=1,
+        title="Postgres Pool Min Size",
+        description="Minimum connections kept in optional psycopg_pool connection pool",
+    )
+    postgres_pool_max_size: int = Field(
+        default=10,
+        ge=1,
+        title="Postgres Pool Max Size",
+        description="Maximum connections allowed in optional psycopg_pool connection pool",
+    )
     policy_model_enabled: bool = Field(
         default=False,
         title="Policy Model Enabled",
@@ -1408,6 +1451,20 @@ class Configuration(BaseModel):
             return normalized
         return value
 
+    @field_validator("workflow_runner", mode="before")
+    @classmethod
+    def _normalize_workflow_runner(cls, value: Any) -> Any:
+        if value is None:
+            return "inline"
+        if isinstance(value, str):
+            normalized = value.strip().lower() or "inline"
+            if normalized not in {"inline", "local_durable", "arq", "temporal"}:
+                raise ValueError(
+                    "workflow_runner must be one of 'inline', 'local_durable', 'arq', 'temporal'"
+                )
+            return normalized
+        return value
+
     @field_validator("policy_model_canary_tenants", mode="before")
     @classmethod
     def _normalize_policy_canary_tenants(cls, value: Any) -> Any:
@@ -1742,6 +1799,14 @@ class Configuration(BaseModel):
             "redis_url": os.getenv("REDIS_URL"),
             "database_url": os.getenv("DATABASE_URL"),
             "event_bus_max_events_per_request": os.getenv("EVENT_BUS_MAX_EVENTS_PER_REQUEST"),
+            "event_bus_stream_ttl_seconds": os.getenv("EVENT_BUS_STREAM_TTL_SECONDS"),
+            "workflow_runner": os.getenv("WORKFLOW_RUNNER"),
+            "temporal_address": os.getenv("TEMPORAL_ADDRESS"),
+            "temporal_namespace": os.getenv("TEMPORAL_NAMESPACE"),
+            "temporal_task_queue": os.getenv("TEMPORAL_TASK_QUEUE"),
+            "arq_redis_dsn": os.getenv("ARQ_REDIS_DSN"),
+            "postgres_pool_min_size": os.getenv("POSTGRES_POOL_MIN_SIZE"),
+            "postgres_pool_max_size": os.getenv("POSTGRES_POOL_MAX_SIZE"),
             "policy_model_enabled": os.getenv("POLICY_MODEL_ENABLED"),
             "policy_model_id": os.getenv("POLICY_MODEL_ID"),
             "policy_model_base_url": os.getenv("POLICY_MODEL_BASE_URL"),

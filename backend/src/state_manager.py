@@ -78,6 +78,9 @@ class StateManagerMixin:
             "claim_verification_summary": dict(
                 getattr(state, "claim_verification_summary", None) or {}
             ),
+            "state_version": int(getattr(state, "state_version", 0) or 0),
+            "runner_backend": str(getattr(state, "runner_backend", "inline") or "inline"),
+            "workflow_run_id": getattr(state, "workflow_run_id", None),
             "tenant_id": str(getattr(self, "tenant_id", "default") or "default").strip()
             or "default",
             "cache_diagnostics": cache_diagnostics,
@@ -85,9 +88,11 @@ class StateManagerMixin:
         }
         tenant_id = str(getattr(self, "tenant_id", "default") or "default").strip() or "default"
         if self._store_supports_tenant_id("save"):
-            self._request_state_store.save(self.request_id, payload, tenant_id=tenant_id)
+            saved = self._request_state_store.save(self.request_id, payload, tenant_id=tenant_id)
         else:
-            self._request_state_store.save(self.request_id, payload)
+            saved = self._request_state_store.save(self.request_id, payload)
+        if isinstance(saved, dict) and "state_version" in saved:
+            state.state_version = int(saved.get("state_version") or state.state_version or 0)
         self._refresh_note_memory_for_state(state, observer=self._request_trace)
 
     def _store_supports_tenant_id(self, method_name: str) -> bool:
@@ -230,6 +235,9 @@ class StateManagerMixin:
                 if isinstance(payload.get("claim_verification_summary"), dict)
                 else {}
             ),
+            state_version=max(0, int(payload.get("state_version") or 0)),
+            runner_backend=str(payload.get("runner_backend") or "inline").strip() or "inline",
+            workflow_run_id=str(payload.get("workflow_run_id") or "").strip() or None,
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
         for task in state.todo_items:

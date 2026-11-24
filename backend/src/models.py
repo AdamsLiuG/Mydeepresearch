@@ -69,6 +69,9 @@ class SummaryState:
     report_charts: list[dict[str, Any]] = field(default_factory=list)
     evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
     claim_verification_summary: dict[str, Any] = field(default_factory=dict)
+    state_version: int = field(default=0)
+    runner_backend: str = field(default="inline")
+    workflow_run_id: str | None = field(default=None)
 
 
 @dataclass(kw_only=True)
@@ -83,4 +86,7 @@ class SummaryStateOutput:
     report_charts: list[dict[str, Any]] = field(default_factory=list)
     evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
     claim_verification_summary: dict[str, Any] = field(default_factory=dict)
+    state_version: int = field(default=0)
+    runner_backend: str = field(default="inline")
+    workflow_run_id: str | None = field(default=None)
     todo_items: List[TodoItem] = field(default_factory=list)

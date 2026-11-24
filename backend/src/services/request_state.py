@@ -5,8 +5,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import uuid4
+
+
+class SnapshotConflictError(RuntimeError):
+    """Raised on optimistic CAS mismatch when persisting request snapshots."""
 
 
 def _utc_now() -> str:
@@ -19,6 +24,7 @@ class RequestStateStore:
     def __init__(self, directory: str, *, recent_limit: int = 50) -> None:
         self._directory = Path(directory)
         self._recent_limit = max(1, int(recent_limit or 1))
+        self._save_lock = Lock()
 
     @property
     def directory(self) -> Path:
@@ -36,27 +42,46 @@ class RequestStateStore:
         payload: dict[str, Any],
         *,
         tenant_id: str | None = None,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         self._directory.mkdir(parents=True, exist_ok=True)
         path = self.path_for(request_id)
-        stored_payload = dict(payload)
-        stored_payload.setdefault("request_id", request_id)
-        resolved_tenant = str(tenant_id or stored_payload.get("tenant_id") or "default").strip() or "default"
-        stored_payload["tenant_id"] = resolved_tenant
-        stored_payload["updated_at"] = _utc_now()
-        # Use a unique temp file per save so concurrent task snapshots for the
-        # same request_id cannot clobber each other's atomic replace step.
-        temp_path = path.with_name(f"{path.stem}.{uuid4().hex}.json.tmp")
-        try:
-            temp_path.write_text(
-                json.dumps(stored_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temp_path.replace(path)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
-        return stored_payload
+        with self._save_lock:
+            current_version = 0
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict):
+                        current_version = max(0, int(existing.get("state_version") or 0))
+                except (OSError, json.JSONDecodeError, ValueError):
+                    current_version = 0
+
+            if expected_version is not None and current_version != int(expected_version):
+                raise SnapshotConflictError(
+                    f"snapshot version conflict for request_id={request_id}: "
+                    f"expected={expected_version} current={current_version}"
+                )
+
+            next_version = current_version + 1
+            stored_payload = dict(payload)
+            stored_payload.setdefault("request_id", request_id)
+            resolved_tenant = str(tenant_id or stored_payload.get("tenant_id") or "default").strip() or "default"
+            stored_payload["tenant_id"] = resolved_tenant
+            stored_payload["state_version"] = next_version
+            stored_payload["updated_at"] = _utc_now()
+            # Use a unique temp file per save so concurrent task snapshots for the
+            # same request_id cannot clobber each other's atomic replace step.
+            temp_path = path.with_name(f"{path.stem}.{uuid4().hex}.json.tmp")
+            try:
+                temp_path.write_text(
+                    json.dumps(stored_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temp_path.replace(path)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+            return stored_payload
 
     def load(self, request_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         path = self.path_for(request_id)

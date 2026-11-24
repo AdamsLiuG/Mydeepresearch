@@ -1577,3 +1577,154 @@ class ReportingService:
         if self._config.resolved_report_layout_mode() == self._FIXED_LAYOUT_MODE:
             return self._render_structured_report_fixed_layout(content)
         return self._render_structured_report_flexible_layout(content)
+
+    def build_workbench_payload(
+        self,
+        state: SummaryState,
+        report_markdown: str,
+    ) -> dict[str, Any]:
+        """Build interactive workbench metadata binding paragraphs, citations, conflicts, and skills."""
+        return build_report_workbench_payload(
+            state,
+            report_markdown,
+            evidence_store=self._evidence_store,
+            config=self._config,
+        )
+
+
+def build_report_workbench_payload(
+    state: Any,
+    report_markdown: str,
+    *,
+    evidence_store: Any | None = None,
+    config: Any | None = None,
+) -> dict[str, Any]:
+    """Build structured workbench metadata for citation drawer, conflict card, and governance bar."""
+
+    citation_index: dict[str, dict[str, Any]] = {}
+
+    def _ingest_record(rec: dict[str, Any], default_task_id: int | None = None) -> None:
+        sid = str(rec.get("source_id") or "").strip()
+        if not sid:
+            return
+        anchors: list[str] = []
+        modality = "text"
+        if rec.get("computation_artifact") or "-C" in sid:
+            modality = "computed"
+            anchors.append("compute-1")
+        for idx, block in enumerate(rec.get("multimodal_blocks") or [], start=1):
+            if isinstance(block, dict):
+                modality = str(block.get("modality") or "multimodal")
+                anchor = str(block.get("anchor_id") or f"mm-{idx}")
+                if anchor not in anchors:
+                    anchors.append(anchor)
+        existing = citation_index.get(sid) or {}
+        snippet_text = truncate_text(
+            str(
+                rec.get("snippet")
+                or rec.get("full_content")
+                or rec.get("raw_content")
+                or existing.get("snippet")
+                or ""
+            ),
+            400,
+        )
+        citation_index[sid] = {
+            "source_id": sid,
+            "task_id": rec.get("task_id") if rec.get("task_id") is not None else default_task_id,
+            "title": str(rec.get("title") or existing.get("title") or sid),
+            "url": str(rec.get("url") or existing.get("url") or ""),
+            "domain": str(rec.get("domain") or existing.get("domain") or ""),
+            "snippet": snippet_text,
+            "quality_label": str(rec.get("quality_label") or existing.get("quality_label") or "medium"),
+            "source_type": str(rec.get("source_type") or existing.get("source_type") or "web_general"),
+            "published_at": rec.get("published_at") or existing.get("published_at"),
+            "modality": modality,
+            "anchors": anchors,
+        }
+
+    for task in getattr(state, "todo_items", []) or []:
+        tid = getattr(task, "id", None)
+        for item in getattr(task, "evidence_items", None) or []:
+            if isinstance(item, dict):
+                _ingest_record(item, default_task_id=tid)
+
+    if evidence_store is not None and hasattr(evidence_store, "lookup"):
+        for item in evidence_store.lookup(include_full_content=False) or []:
+            if isinstance(item, dict):
+                _ingest_record(item)
+
+    conflicts = [
+        dict(c)
+        for c in (getattr(state, "evidence_conflicts", None) or [])
+        if isinstance(c, dict)
+    ]
+    conflicts_by_source: dict[str, list[str]] = {}
+    for cluster in conflicts:
+        cid = str(cluster.get("conflict_id") or "").strip()
+        if not cid:
+            continue
+        for side in cluster.get("sides") or []:
+            if isinstance(side, dict):
+                sid = str(side.get("source_id") or "").strip()
+                if sid:
+                    conflicts_by_source.setdefault(sid, [])
+                    if cid not in conflicts_by_source[sid]:
+                        conflicts_by_source[sid].append(cid)
+
+    paragraph_bindings: list[dict[str, Any]] = []
+    paragraphs = [block.strip() for block in str(report_markdown or "").split("\n\n") if block.strip()]
+    for idx, para in enumerate(paragraphs):
+        raw_sids = CITATION_PATTERN.findall(para)
+        if not raw_sids:
+            continue
+        ordered_sids: list[str] = []
+        seen_sids: set[str] = set()
+        for sid in raw_sids:
+            if sid not in seen_sids:
+                ordered_sids.append(sid)
+                seen_sids.add(sid)
+        matched_conflicts: list[str] = []
+        for sid in ordered_sids:
+            for cid in conflicts_by_source.get(sid, []):
+                if cid not in matched_conflicts:
+                    matched_conflicts.append(cid)
+        paragraph_bindings.append(
+            {
+                "paragraph_index": idx,
+                "excerpt": truncate_text(para, 180),
+                "citation_ids": ordered_sids,
+                "conflict_ids": matched_conflicts,
+            }
+        )
+
+    pack_meta = dict(getattr(state, "skill_pack_metadata", None) or {})
+    skill_governance = {
+        "pack_id": str(pack_meta.get("pack_id") or "_neutral"),
+        "version": pack_meta.get("version"),
+        "maturity": pack_meta.get("maturity"),
+        "active_verifiers": list(
+            getattr(config, "active_skill_verifiers", None)
+            or pack_meta.get("active_verifiers")
+            or []
+        ),
+        "code_sandbox_enabled": bool(
+            getattr(config, "resolved_sandbox_effective_enabled", lambda: False)()
+            if config is not None
+            else False
+        ),
+        "nli_verifier_enabled": bool(getattr(config, "nli_verifier_enabled", False) if config else False),
+        "mcp_tool_scopes": dict(
+            getattr(config, "active_mcp_tool_scopes", None) or {}
+            if config is not None
+            else {}
+        ),
+    }
+
+    return {
+        "citation_index": citation_index,
+        "paragraph_bindings": paragraph_bindings,
+        "evidence_conflicts": conflicts,
+        "claim_verification_summary": dict(getattr(state, "claim_verification_summary", None) or {}),
+        "skill_governance": skill_governance,
+    }
