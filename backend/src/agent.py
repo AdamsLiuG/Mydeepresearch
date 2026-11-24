@@ -28,6 +28,7 @@ from prompts import (
     todo_planner_system_prompt,
 )
 from repair_orchestrator import RepairOrchestratorMixin
+from services.claim_verifier import ClaimVerificationOrchestrator
 from services.context_builder import (
     ContextPrefixBuilder,
     PromptEnvelope,
@@ -901,11 +902,19 @@ class DeepResearchAgent(
 
         self.planner = PlanningService(self.todo_agent, self.config)
         self.reflection = ReflectionService(self.reflection_agent, self.config)
+        self._claim_verification_orchestrator = ClaimVerificationOrchestrator(
+            self.config,
+            retrieval_service=self._evidence_retrieval,
+            evidence_store=self._evidence_store,
+            fast_llm=self._fast_content_only_llm,
+        )
         self.reviewer = ReviewService(
             self.review_agent if self.config.review_agent_enabled else None,
             self.config,
             retrieval_service=self._evidence_retrieval,
             request_id_getter=lambda: self.request_id,
+            claim_verification_orchestrator=self._claim_verification_orchestrator,
+            evidence_store=self._evidence_store,
         )
         self.summarizer = SummarizationService(
             self._summarizer_factory,
@@ -1324,6 +1333,13 @@ class DeepResearchAgent(
         if parser is not None:
             parser.enabled = bool(getattr(target_config, "multimodal_evidence_enabled", parser.enabled))
             parser.vlm_enabled = bool(getattr(target_config, "multimodal_vlm_enabled", parser.vlm_enabled))
+        orchestrator = getattr(self, "_claim_verification_orchestrator", None)
+        if orchestrator is not None:
+            orchestrator._config = target_config
+            if getattr(orchestrator, "_scorer", None) is not None:
+                orchestrator._scorer._config = target_config
+            if getattr(orchestrator, "_conflict_builder", None) is not None:
+                orchestrator._conflict_builder._config = target_config
 
     def _refresh_context_checkpoints(self, state: SummaryState) -> None:
         """Advance frozen FactLedger and EvidenceIndexCard checkpoints between waves/stages."""
@@ -2345,6 +2361,10 @@ class DeepResearchAgent(
                     "report": report,
                     "note_id": state.report_note_id,
                     "note_path": state.report_note_path,
+                    "evidence_conflicts": list(getattr(state, "evidence_conflicts", None) or []),
+                    "claim_verification_summary": dict(
+                        getattr(state, "claim_verification_summary", None) or {}
+                    ),
                 }
                 yield {"type": "done"}
         except MCPHitlApprovalRequired as hitl_exc:
@@ -2409,6 +2429,11 @@ class DeepResearchAgent(
         return SummaryStateOutput(
             running_summary=state.running_summary,
             report_markdown=state.structured_report,
+            report_charts=list(getattr(state, "report_charts", None) or []),
+            evidence_conflicts=list(getattr(state, "evidence_conflicts", None) or []),
+            claim_verification_summary=dict(
+                getattr(state, "claim_verification_summary", None) or {}
+            ),
             todo_items=state.todo_items,
         )
 
@@ -2645,6 +2670,7 @@ class DeepResearchAgent(
             "react_observation": dict(task.react_observation or {}),
             "depends_on": list(getattr(task, "depends_on", []) or []),
             "fact_claims": list(getattr(task, "fact_claims", []) or []),
+            "atomic_claims": list(getattr(task, "atomic_claims", []) or []),
         }
 
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:

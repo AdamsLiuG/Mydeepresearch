@@ -98,6 +98,14 @@ class ResearchResponse(BaseModel):
         default_factory=list,
         description="Structured TODO items with summaries and sources",
     )
+    evidence_conflicts: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Detected cross-source conflicts and adjudication status",
+    )
+    claim_verification_summary: dict[str, Any] | None = Field(
+        default=None,
+        description="Atomic claim NLI verification aggregate metrics",
+    )
 
 
 class ClarifyRequest(BaseModel):
@@ -240,6 +248,57 @@ def _warmup_semantic_cache_model(config: Configuration) -> None:
     )
 
 
+def _warmup_nli_model(config: Configuration) -> None:
+    """Best-effort NLI verifier warmup during startup when explicitly enabled."""
+
+    if not getattr(config, "nli_verifier_enabled", False) or not getattr(
+        config, "nli_warmup_enabled", False
+    ):
+        return
+
+    model_name = str(getattr(config, "nli_model_name", "") or "").strip()
+    if not model_name:
+        return
+
+    started_at = time.perf_counter()
+    try:
+        from services.claim_verifier import load_nli_model
+
+        model = load_nli_model(
+            model_name,
+            backend=str(getattr(config, "nli_model_backend", "auto") or "auto"),
+            device=str(getattr(config, "nli_device", "auto") or "auto"),
+            max_length=int(getattr(config, "nli_max_length", 512) or 512),
+            allow_download=False,
+        )
+    except Exception as exc:  # pragma: no cover - depends on local runtime state
+        logger.warning(
+            "NLI verifier warmup failed model=%s error=%s",
+            model_name,
+            exc,
+            extra={"request_id": "startup"},
+        )
+        return
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    if model is None:
+        logger.info(
+            "NLI verifier warmup skipped: local model unavailable model=%s elapsed_ms=%.2f",
+            model_name,
+            elapsed_ms,
+            extra={"request_id": "startup"},
+        )
+        return
+
+    logger.info(
+        "NLI verifier warmup completed model=%s backend=%s elapsed_ms=%.2f",
+        model_name,
+        model.backend,
+        elapsed_ms,
+        extra={"request_id": "startup"},
+    )
+
+
 def _request_id(request: Request) -> str:
     """Fetch the request identifier assigned by middleware."""
     return getattr(request.state, "request_id", "-")
@@ -346,6 +405,7 @@ def create_app(
             extra={"request_id": "startup"},
         )
         _warmup_semantic_cache_model(config)
+        _warmup_nli_model(config)
         if getattr(app.state, "mcp_bridge", None) is None and getattr(config, "mcp_enabled", False):
             app.state.mcp_bridge = MCPBridgeManager(config)
         try:
@@ -556,7 +616,11 @@ def create_app(
         _resolve_tenant(request)
         return SkillPackService(app.state.base_config).list_catalog()
 
-    @app.post("/research", response_model=ResearchResponse)
+    @app.post(
+        "/research",
+        response_model=ResearchResponse,
+        response_model_exclude_none=True,
+    )
     def run_research(payload: ResearchRequest, request: Request) -> ResearchResponse:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
@@ -598,6 +662,11 @@ def create_app(
                 "notices": getattr(item, "notices", []),
                 "evidence_items": getattr(item, "evidence_items", []),
                 "claims": getattr(item, "claims", []),
+                **(
+                    {"atomic_claims": list(getattr(item, "atomic_claims", []) or [])}
+                    if getattr(item, "atomic_claims", None)
+                    else {}
+                ),
                 "review_issues": getattr(item, "review_issues", []),
                 "review_status": getattr(item, "review_status", "pending"),
                 "note_id": item.note_id,
@@ -613,9 +682,13 @@ def create_app(
             for item in result.todo_items
         ]
 
+        raw_conflicts = list(getattr(result, "evidence_conflicts", []) or [])
+        raw_summary = dict(getattr(result, "claim_verification_summary", {}) or {})
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
+            evidence_conflicts=raw_conflicts or None,
+            claim_verification_summary=raw_summary or None,
         )
 
     @app.post("/research/clarify")
@@ -843,7 +916,11 @@ def create_app(
             ],
         }
 
-    @app.post("/requests/{request_id}/resume", response_model=ResearchResponse)
+    @app.post(
+        "/requests/{request_id}/resume",
+        response_model=ResearchResponse,
+        response_model_exclude_none=True,
+    )
     def resume_research(
         request_id: str,
         request: Request,
@@ -894,6 +971,11 @@ def create_app(
                 "notices": getattr(item, "notices", []),
                 "evidence_items": getattr(item, "evidence_items", []),
                 "claims": getattr(item, "claims", []),
+                **(
+                    {"atomic_claims": list(getattr(item, "atomic_claims", []) or [])}
+                    if getattr(item, "atomic_claims", None)
+                    else {}
+                ),
                 "review_issues": getattr(item, "review_issues", []),
                 "review_status": getattr(item, "review_status", "pending"),
                 "note_id": item.note_id,
@@ -908,9 +990,13 @@ def create_app(
             }
             for item in result.todo_items
         ]
+        raw_conflicts = list(getattr(result, "evidence_conflicts", []) or [])
+        raw_summary = dict(getattr(result, "claim_verification_summary", {}) or {})
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
+            evidence_conflicts=raw_conflicts or None,
+            claim_verification_summary=raw_summary or None,
         )
 
     def _build_sse_stream(

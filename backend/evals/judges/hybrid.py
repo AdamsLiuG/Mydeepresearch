@@ -81,6 +81,17 @@ class HybridJudge(Judge):
                 trace_snapshot=trace_snapshot,
             )
         )
+        if isinstance(trace_snapshot, Mapping):
+            claim_summary = trace_snapshot.get("claim_verification_summary")
+            if not isinstance(claim_summary, Mapping) and isinstance(
+                trace_snapshot.get("review_summary"), Mapping
+            ):
+                claim_summary = trace_snapshot["review_summary"].get("claim_verification_summary")
+            if isinstance(claim_summary, Mapping) and int(claim_summary.get("total_atomic_claims") or 0) > 0:
+                if "atomic_faithfulness_rate" in claim_summary:
+                    merged["atomic_faithfulness_rate"] = float(
+                        claim_summary.get("atomic_faithfulness_rate") or 0.0
+                    )
         heuristic_score = self._heuristic_composite(merged)
         merged["heuristic_composite_score"] = heuristic_score
 

@@ -39,6 +39,7 @@ class TodoItem:
     depends_on: list[int] = field(default_factory=list)
     upstream_context: str = field(default="")
     fact_claims: list[dict[str, Any]] = field(default_factory=list)
+    atomic_claims: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -66,6 +67,8 @@ class SummaryState:
     pending_tool_approval: dict[str, Any] | None = field(default=None)
     approved_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
     report_charts: list[dict[str, Any]] = field(default_factory=list)
+    evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    claim_verification_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -78,4 +81,6 @@ class SummaryStateOutput:
     running_summary: str = field(default=None)  # Backward-compatible文本
     report_markdown: str | None = field(default=None)
     report_charts: list[dict[str, Any]] = field(default_factory=list)
+    evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    claim_verification_summary: dict[str, Any] = field(default_factory=dict)
     todo_items: List[TodoItem] = field(default_factory=list)

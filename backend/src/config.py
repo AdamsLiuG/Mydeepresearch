@@ -515,6 +515,102 @@ class Configuration(BaseModel):
         title="Active Code Sandbox Override",
         description="Request-scoped sandbox activation state bound from active SkillPack",
     )
+    nli_verifier_enabled: bool = Field(
+        default=False,
+        title="NLI Claim Verifier Enabled",
+        description="Whether to run atomic claim decomposition, local NLI verification, and conflict graph checks",
+    )
+    nli_model_backend: str = Field(
+        default="auto",
+        title="NLI Model Backend",
+        description="NLI inference backend: auto, cross_encoder, transformers_nli, minicheck, or disabled",
+    )
+    nli_model_name: str = Field(
+        default="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+        title="NLI Model Name",
+        description="HuggingFace/local model id used by LocalNLIScorer",
+    )
+    nli_device: str = Field(
+        default="auto",
+        title="NLI Device",
+        description="Execution device for NLI model inference: auto, cpu, cuda, or mps",
+    )
+    nli_warmup_enabled: bool = Field(
+        default=False,
+        title="NLI Warmup Enabled",
+        description="Whether FastAPI lifespan warms up local cached NLI model on startup",
+    )
+    nli_decompose_with_fast_llm: bool = Field(
+        default=True,
+        title="NLI Decompose With Fast LLM",
+        description="Whether compound claim decomposition may use fast_llm before deterministic splitter fallback",
+    )
+    nli_batch_size: int = Field(
+        default=16,
+        ge=1,
+        le=64,
+        title="NLI Batch Size",
+        description="Pairs per NLI inference batch",
+    )
+    nli_max_length: int = Field(
+        default=512,
+        ge=128,
+        le=2048,
+        title="NLI Max Sequence Length",
+        description="Maximum tokenized sequence length per premise-hypothesis pair",
+    )
+    nli_max_atomic_claims_per_task: int = Field(
+        default=12,
+        ge=1,
+        title="NLI Max Atomic Claims Per Task",
+        description="Maximum atomic claims verified per research task",
+    )
+    nli_top_k_chunks_per_source: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        title="NLI Top K Chunks Per Source",
+        description="Top-K chunks recalled per cited source_id for atomic verification",
+    )
+    nli_entailment_threshold: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        title="NLI Entailment Threshold",
+        description="Calibrated probability threshold to classify an atomic claim as ENTAILED",
+    )
+    nli_contradiction_threshold: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        title="NLI Contradiction Threshold",
+        description="Calibrated probability threshold to flag an atomic claim as CONTRADICTED",
+    )
+    nli_stage_budget_seconds: float = Field(
+        default=8.0,
+        gt=0.0,
+        title="NLI Stage Budget Seconds",
+        description="Wall-clock budget for NLI verification before degrading gracefully to numeric checks",
+    )
+    nli_conflict_graph_enabled: bool = Field(
+        default=True,
+        title="NLI Conflict Graph Enabled",
+        description="Whether to cluster cross-source conflicting statements into state.evidence_conflicts",
+    )
+    nli_conflict_numeric_rel_tol: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        title="NLI Conflict Numeric Relative Tolerance",
+        description="Relative numeric divergence threshold above which sources form a conflict edge",
+    )
+    nli_conflict_min_score: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        title="NLI Conflict Min Score",
+        description="Minimum cross-NLI contradiction probability to form a semantic conflict edge",
+    )
     note_memory_enabled: bool = Field(
         default=False,
         title="Note Memory Enabled",
@@ -1495,6 +1591,22 @@ class Configuration(BaseModel):
             "sandbox_cpus": os.getenv("SANDBOX_CPUS"),
             "sandbox_max_executions_per_task": os.getenv("SANDBOX_MAX_EXECUTIONS_PER_TASK"),
             "sandbox_pyodide_cache_dir": os.getenv("SANDBOX_PYODIDE_CACHE_DIR"),
+            "nli_verifier_enabled": os.getenv("NLI_VERIFIER_ENABLED"),
+            "nli_model_backend": os.getenv("NLI_MODEL_BACKEND"),
+            "nli_model_name": os.getenv("NLI_MODEL_NAME"),
+            "nli_device": os.getenv("NLI_DEVICE"),
+            "nli_warmup_enabled": os.getenv("NLI_WARMUP_ENABLED"),
+            "nli_decompose_with_fast_llm": os.getenv("NLI_DECOMPOSE_WITH_FAST_LLM"),
+            "nli_batch_size": os.getenv("NLI_BATCH_SIZE"),
+            "nli_max_length": os.getenv("NLI_MAX_LENGTH"),
+            "nli_max_atomic_claims_per_task": os.getenv("NLI_MAX_ATOMIC_CLAIMS_PER_TASK"),
+            "nli_top_k_chunks_per_source": os.getenv("NLI_TOP_K_CHUNKS_PER_SOURCE"),
+            "nli_entailment_threshold": os.getenv("NLI_ENTAILMENT_THRESHOLD"),
+            "nli_contradiction_threshold": os.getenv("NLI_CONTRADICTION_THRESHOLD"),
+            "nli_stage_budget_seconds": os.getenv("NLI_STAGE_BUDGET_SECONDS"),
+            "nli_conflict_graph_enabled": os.getenv("NLI_CONFLICT_GRAPH_ENABLED"),
+            "nli_conflict_numeric_rel_tol": os.getenv("NLI_CONFLICT_NUMERIC_REL_TOL"),
+            "nli_conflict_min_score": os.getenv("NLI_CONFLICT_MIN_SCORE"),
             "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
             "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
             "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),

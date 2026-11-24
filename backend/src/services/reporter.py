@@ -45,6 +45,7 @@ class ReportingService:
         "evidence_and_data": "证据与数据",
         "dimension_sections": "分维度展开",
         "risks_and_challenges": "风险与挑战",
+        "source_conflicts": "多源口径分歧与证据对照",
         "process_notes": "研究过程说明（系统生成）",
         "references": "参考来源",
     }
@@ -327,6 +328,30 @@ class ReportingService:
             if cards_md:
                 frozen_parts.append(cards_md)
 
+        volatile_blocks: list[tuple[str, str]] = [
+            ("report_tasks", f"任务概览：\n{''.join(task_blocks)}"),
+        ]
+        raw_conflicts = getattr(state, "evidence_conflicts", None) or []
+        if raw_conflicts:
+            conflict_hints: list[str] = []
+            for cluster in raw_conflicts[:5]:
+                if not isinstance(cluster, dict):
+                    continue
+                topic_label = " / ".join(
+                    part for part in (cluster.get("entity"), cluster.get("metric"), cluster.get("period")) if part
+                )
+                rationale = str(cluster.get("adjudication_rationale") or "").strip()
+                if topic_label:
+                    conflict_hints.append(f"- {topic_label}：{truncate_text(rationale, 140)}")
+            if conflict_hints:
+                volatile_blocks.append(
+                    (
+                        "source_conflicts_hint",
+                        "以下客观多源口径差异需在正文中如实保留并说明前提边界，不要压缩为单一绝对值：\n"
+                        + "\n".join(conflict_hints),
+                    )
+                )
+
         builder = ContextPrefixBuilder(self._config)
         return builder.build_envelope(
             stage="report",
@@ -335,7 +360,7 @@ class ReportingService:
             research_topic=state.research_topic or "",
             skill_pack_context=str(skill_pack_context or "").strip(),
             frozen_index_and_ledger="\n\n".join(frozen_parts),
-            volatile_blocks=[("report_tasks", f"任务概览：\n{''.join(task_blocks)}")],
+            volatile_blocks=volatile_blocks,
             cache_key_scope="request",
         )
 
@@ -1318,6 +1343,28 @@ class ReportingService:
             custom_sections,
         )
 
+        filtered_conflicts: list[dict[str, Any]] = []
+        seen_cited = set(cited_source_ids)
+        for cluster in getattr(state, "evidence_conflicts", None) or []:
+            if not isinstance(cluster, dict):
+                continue
+            valid_sides = [
+                dict(side)
+                for side in (cluster.get("sides") or [])
+                if isinstance(side, dict)
+                and str(side.get("source_id") or "").strip() in valid_source_ids
+            ]
+            if len(valid_sides) < 2:
+                continue
+            filtered_cluster = dict(cluster)
+            filtered_cluster["sides"] = valid_sides
+            filtered_conflicts.append(filtered_cluster)
+            for side in valid_sides:
+                sid = str(side.get("source_id") or "").strip()
+                if sid and sid not in seen_cited:
+                    cited_source_ids.append(sid)
+                    seen_cited.add(sid)
+
         references = self._merge_reference_items(
             payload.get("references"),
             cited_source_ids=cited_source_ids,
@@ -1371,11 +1418,56 @@ class ReportingService:
             "process_notes": process_notes,
             "references": references,
             "charts": sanitized_charts,
+            "source_conflicts": filtered_conflicts,
             "section_order": payload.get("section_order"),
         }
 
+    @staticmethod
+    def _escape_table_cell(value: Any) -> str:
+        return " ".join(str(value or "").replace("|", "\\|").split()).strip()
+
+    def _render_source_conflicts_body(self, source_conflicts: list[dict[str, Any]]) -> str:
+        if not source_conflicts:
+            return ""
+        lines = [
+            "| 分歧议题（主体 / 指标 / 周期） | 来源口径 A | 来源口径 B | 口径采信与差异说明 |",
+            "| :--- | :--- | :--- | :--- |",
+        ]
+        for cluster in source_conflicts:
+            sides = cluster.get("sides") or []
+            if len(sides) < 2:
+                continue
+            topic_parts = [
+                str(cluster.get(k) or "").strip()
+                for k in ("entity", "metric", "period")
+                if str(cluster.get(k) or "").strip()
+            ]
+            topic_cell = self._escape_table_cell(" / ".join(topic_parts) or "多源事实")
+
+            def _fmt_side(side: dict[str, Any]) -> str:
+                sid = str(side.get("source_id") or "").strip()
+                title = truncate_text(str(side.get("title") or sid), 48)
+                val = side.get("normalized_value")
+                unit = str(side.get("unit") or "").strip()
+                val_txt = f"{val:g}{unit}" if isinstance(val, (int, float)) else ""
+                excerpt = truncate_text(
+                    str(side.get("claim_text") or side.get("evidence_excerpt") or ""),
+                    80,
+                )
+                detail = f"（{val_txt}）" if val_txt else f"：{excerpt}"
+                return self._escape_table_cell(f"《{title}》[{sid}]{detail}")
+
+            rationale = self._escape_table_cell(
+                truncate_text(str(cluster.get("adjudication_rationale") or ""), 140)
+            )
+            lines.append(
+                f"| {topic_cell} | {_fmt_side(sides[0])} | {_fmt_side(sides[1])} | {rationale} |"
+            )
+        return "\n".join(lines) if len(lines) > 2 else ""
+
     def _render_structured_report_fixed_layout(self, content: dict[str, Any]) -> str:
         dimension_body = self._render_dimension_body(content["dimension_sections"])
+        conflicts_body = self._render_source_conflicts_body(content.get("source_conflicts") or [])
         process_notes_body = self._render_process_notes_body(content["process_notes"])
 
         markdown = (
@@ -1394,6 +1486,12 @@ class ReportingService:
             + (
                 "## 风险与挑战\n"
                 f"{self._render_bullets(content['risks_and_challenges'])}\n\n"
+            )
+            + (
+                f"## {self._CORE_SECTION_TITLES['source_conflicts']}\n"
+                f"{conflicts_body}\n\n"
+                if conflicts_body
+                else ""
             )
             + (
                 f"{process_notes_body}\n\n"
@@ -1451,6 +1549,12 @@ class ReportingService:
             for section_id in ordered_section_ids
             if section_id in section_registry
         ]
+
+        conflicts_body = self._render_source_conflicts_body(content.get("source_conflicts") or [])
+        if conflicts_body:
+            blocks.append(
+                f"## {self._CORE_SECTION_TITLES['source_conflicts']}\n{conflicts_body}"
+            )
 
         process_notes_body = self._render_process_notes_body(content["process_notes"])
         if process_notes_body:

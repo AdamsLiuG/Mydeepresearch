@@ -23,7 +23,13 @@ DEFAULT_OUTPUT_MD = BACKEND_ROOT / "evals" / "results" / "project_metrics_report
 TERMINAL_REQUEST_STATUSES = {"success", "partial_success", "failed"}
 TERMINAL_REQUEST_PHASES = {"completed", "failed"}
 TERMINAL_TASK_STATUSES = {"completed", "failed", "skipped"}
-REVIEWED_CLAIM_STATUSES = {"supported", "missing_citation", "invalid_citation"}
+REVIEWED_CLAIM_STATUSES = {
+    "supported",
+    "missing_citation",
+    "invalid_citation",
+    "contradicted",
+    "unverified_claim",
+}
 
 
 @dataclass(frozen=True)
@@ -245,7 +251,15 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
     supported_claims = claim_support_counts.get("supported", 0)
     missing_citation_claims = claim_support_counts.get("missing_citation", 0)
     invalid_citation_claims = claim_support_counts.get("invalid_citation", 0)
-    reviewed_claim_total = supported_claims + missing_citation_claims + invalid_citation_claims
+    contradicted_claims = claim_support_counts.get("contradicted", 0)
+    unverified_claims = claim_support_counts.get("unverified_claim", 0)
+    reviewed_claim_total = (
+        supported_claims
+        + missing_citation_claims
+        + invalid_citation_claims
+        + contradicted_claims
+        + unverified_claims
+    )
 
     cache_total = cache_hits + cache_misses
 

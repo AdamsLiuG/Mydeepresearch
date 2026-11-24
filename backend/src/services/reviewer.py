@@ -125,12 +125,16 @@ class ReviewService:
         retrieval_service: EvidenceRetrievalService | None = None,
         request_id_getter: Callable[[], str | None] | None = None,
         claim_verifier: Callable[[str, list[dict[str, Any]]], tuple[bool, str] | None] | None = None,
+        claim_verification_orchestrator: Any | None = None,
+        evidence_store: Any | None = None,
     ) -> None:
         self._agent = review_agent
         self._config = config
         self._retrieval_service = retrieval_service
         self._request_id_getter = request_id_getter
         self._claim_verifier = claim_verifier
+        self._claim_verification_orchestrator = claim_verification_orchestrator
+        self._evidence_store = evidence_store
 
     def review_request(
         self,
@@ -165,6 +169,40 @@ class ReviewService:
             for item in verifier_issue_dicts
         ]
         issues.extend(verifier_issues)
+        claim_verification_summary: dict[str, Any] = {}
+        evidence_conflict_count = 0
+        unresolved_conflict_count = 0
+
+        orchestrator = getattr(self, "_claim_verification_orchestrator", None)
+        if orchestrator is not None and bool(getattr(self._config, "nli_verifier_enabled", False)):
+            nli_out = orchestrator.verify_request(
+                state,
+                claims_by_task=claims_by_task,
+                observer=observer,
+                fallback_claim_verifier=self._numeric_fallback_only,
+            )
+            claim_verification_summary = dict(nli_out.get("summary") or {})
+            conflicts = nli_out.get("conflicts") or []
+            evidence_conflict_count = len(conflicts)
+            unresolved_conflict_count = sum(
+                1
+                for c in conflicts
+                if isinstance(c, dict) and c.get("adjudication_status") == "unresolved_divergence"
+            )
+            for item in nli_out.get("issues") or []:
+                if not isinstance(item, dict):
+                    continue
+                issues.append(
+                    ReviewIssue(
+                        task_id=item.get("task_id"),
+                        severity=str(item.get("severity") or "medium"),
+                        check=str(item.get("check") or "claim_evidence_mismatch"),
+                        message=str(item.get("message") or ""),
+                        source_ids=list(item.get("source_ids") or []),
+                        origin=str(item.get("origin") or "claim_verifier"),
+                    )
+                )
+
         llm_summary: dict[str, Any] = {}
 
         if self._config.review_agent_enabled and self._agent is not None:
@@ -206,6 +244,9 @@ class ReviewService:
             llm_summary=llm_summary,
             executed_verifiers=executed_verifiers,
             verifier_issue_count=len(verifier_issues),
+            claim_verification_summary=claim_verification_summary,
+            evidence_conflict_count=evidence_conflict_count,
+            unresolved_conflict_count=unresolved_conflict_count,
         )
         return summary
 
@@ -320,8 +361,25 @@ class ReviewService:
         issues: list[ReviewIssue] = []
         claims_by_task: dict[int, list[dict[str, Any]]] = {}
 
+        request_evidence_by_id: dict[str, dict[str, Any]] = {}
+        for t in state.todo_items:
+            for item in t.evidence_items or []:
+                if isinstance(item, dict) and item.get("source_id"):
+                    request_evidence_by_id[str(item["source_id"]).strip()] = item
+        evidence_store = getattr(self, "_evidence_store", None)
+        if evidence_store is not None and hasattr(evidence_store, "lookup"):
+            for item in evidence_store.lookup(include_full_content=True) or []:
+                if isinstance(item, dict) and item.get("source_id"):
+                    request_evidence_by_id[str(item["source_id"]).strip()] = item
+        request_valid_ids = set(request_evidence_by_id.keys())
+
         for task in state.todo_items:
-            task_issues, task_claims = self._review_task(state, task)
+            task_issues, task_claims = self._review_task(
+                state,
+                task,
+                request_valid_ids=request_valid_ids,
+                request_evidence_by_id=request_evidence_by_id,
+            )
             issues.extend(task_issues)
             claims_by_task[task.id] = task_claims
 
@@ -353,6 +411,9 @@ class ReviewService:
         self,
         state: SummaryState,
         task: TodoItem,
+        *,
+        request_valid_ids: set[str] | None = None,
+        request_evidence_by_id: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[list[ReviewIssue], list[dict[str, Any]]]:
         issues: list[ReviewIssue] = []
         claims: list[dict[str, Any]] = []
@@ -363,6 +424,7 @@ class ReviewService:
             for item in evidence_items
             if str(item.get("source_id") or "").strip()
         }
+        effective_valid_ids = valid_ids | (request_valid_ids or set())
         unique_domains = {
             str(item.get("domain") or "").strip().lower()
             for item in evidence_items
@@ -457,7 +519,9 @@ class ReviewService:
                 if source_id
             ]
             missing = not citation_ids
-            invalid_source_ids = [source_id for source_id in citation_ids if source_id not in valid_ids]
+            invalid_source_ids = [
+                source_id for source_id in citation_ids if source_id not in effective_valid_ids
+            ]
             if missing:
                 issues.append(
                     ReviewIssue(
@@ -484,11 +548,11 @@ class ReviewService:
                 support_status = "invalid_citation"
             else:
                 support_status = "supported"
-                evidence_by_id = {
-                    str(item.get("source_id") or "").strip(): item
-                    for item in evidence_items
-                    if str(item.get("source_id") or "").strip()
-                }
+                evidence_by_id = dict(request_evidence_by_id or {})
+                for item in evidence_items:
+                    sid_key = str(item.get("source_id") or "").strip()
+                    if sid_key:
+                        evidence_by_id[sid_key] = item
                 cited_records = [
                     evidence_by_id[sid] for sid in citation_ids if sid in evidence_by_id
                 ]
@@ -713,6 +777,13 @@ class ReviewService:
         if not cited_records:
             return None
 
+        if (
+            getattr(self, "_claim_verification_orchestrator", None) is not None
+            and bool(getattr(self._config, "nli_verifier_enabled", False))
+        ):
+            # Single-track guard: defer to batch ClaimVerificationOrchestrator when active.
+            return None
+
         if self._claim_verifier is not None:
             verdict = self._claim_verifier(claim_text, cited_records)
             if verdict is not None:
@@ -720,6 +791,15 @@ class ReviewService:
                 if not supported:
                     return reason or truncate_text(claim_text, 120)
 
+        return self._numeric_fallback_only(claim_text, cited_records)
+
+    @staticmethod
+    def _numeric_fallback_only(
+        claim_text: str,
+        cited_records: list[dict[str, Any]],
+    ) -> str | None:
+        if not cited_records:
+            return None
         corpus = " ".join(_evidence_body_text(rec) for rec in cited_records).strip()
         # Only run numeric grounding when cited records actually carry substantive excerpt text.
         body_without_titles = " ".join(
@@ -831,6 +911,8 @@ class ReviewService:
         normalized = str(check or "").strip().lower()
         if normalized in {"missing_angle", "weak_evidence", "stale_evidence", "invalid_citation"}:
             return normalized
+        if normalized == "claim_contradicted":
+            return "invalid_citation"
         if normalized == "timeline_inconsistency":
             return "stale_evidence"
         if normalized in {
@@ -841,6 +923,7 @@ class ReviewService:
             "numeric_audit_mismatch",
             "comparison_asymmetry",
             "sandbox_input_ungrounded",
+            "cross_source_conflict",
         }:
             return "weak_evidence"
         return None
@@ -881,6 +964,9 @@ class ReviewService:
         llm_summary: dict[str, Any],
         executed_verifiers: list[str] | None = None,
         verifier_issue_count: int = 0,
+        claim_verification_summary: dict[str, Any] | None = None,
+        evidence_conflict_count: int = 0,
+        unresolved_conflict_count: int = 0,
     ) -> dict[str, Any]:
         issues_by_task: dict[int, list[dict[str, Any]]] = {}
         severity_counts = {"high": 0, "medium": 0, "low": 0}
@@ -935,6 +1021,10 @@ class ReviewService:
             "verifiers_executed": list(executed_verifiers or []),
             "verifier_issue_count": int(verifier_issue_count or 0),
         }
+        if claim_verification_summary:
+            summary["claim_verification_summary"] = dict(claim_verification_summary)
+            summary["evidence_conflict_count"] = int(evidence_conflict_count or 0)
+            summary["unresolved_conflict_count"] = int(unresolved_conflict_count or 0)
         state.review_summary = summary
         state.review_completed = True
         return summary

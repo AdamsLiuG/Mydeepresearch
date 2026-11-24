@@ -858,7 +858,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         self,
         *,
         text: str,
-        task_id: int,
+        task_id: int | None = None,
         top_k: int,
         per_source_limit: int = 2,
         max_sources: int = 4,
@@ -873,16 +873,17 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
             if allowed_source_ids is not None
             else None
         )
-        if not normalized_query or (task_id <= 0 and not allowed_set):
+        tid = int(task_id or 0)
+        if not normalized_query or (tid <= 0 and not allowed_set):
             return []
         if allowed_set is not None and not allowed_set:
             return []
 
         with self._lock:
-            if allowed_set is not None and task_id <= 0:
+            if allowed_set is not None and tid <= 0:
                 raw_chunks = [c for chunk_list in self._chunks_by_task.values() for c in chunk_list]
             else:
-                raw_chunks = list(self._chunks_by_task.get(task_id, []))
+                raw_chunks = list(self._chunks_by_task.get(tid, []))
                 if allowed_set is not None and not any(c.source_id in allowed_set for c in raw_chunks):
                     raw_chunks = [c for chunk_list in self._chunks_by_task.values() for c in chunk_list]
             chunks = (
@@ -1738,7 +1739,10 @@ class EvidenceRetrievalService:
             normalized_mode = "grounding"
 
         notices: list[str] = []
-        if normalized_mode == "grounding" and normalized_scope != "current":
+        if allowed_source_ids is not None:
+            normalized_scope = "current"
+            normalized_mode = "grounding"
+        elif normalized_mode == "grounding" and normalized_scope != "current":
             normalized_scope = "current"
             notices.append("grounding mode only returns current-request citeable chunks")
 

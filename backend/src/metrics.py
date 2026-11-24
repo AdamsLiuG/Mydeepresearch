@@ -199,6 +199,10 @@ class MetricsRegistry:
             "sandbox_executions_total": 0,
             "sandbox_timeouts_total": 0,
             "sandbox_ast_rejections_total": 0,
+            "nli_claims_verified_total": 0,
+            "nli_contradictions_total": 0,
+            "nli_degraded_total": 0,
+            "evidence_conflicts_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
         self._estimated_cost = 0.0
@@ -208,6 +212,7 @@ class MetricsRegistry:
             "summarization_latency_ms": LatencyStats(),
             "reflection_latency_ms": LatencyStats(),
             "review_latency_ms": LatencyStats(),
+            "nli_latency_ms": LatencyStats(),
             "repair_latency_ms": LatencyStats(),
             "report_latency_ms": LatencyStats(),
             "total_latency_ms": LatencyStats(),
@@ -234,6 +239,7 @@ class MetricsRegistry:
                 "summarization_latency_ms": LatencyStats(),
                 "reflection_latency_ms": LatencyStats(),
                 "review_latency_ms": LatencyStats(),
+                "nli_latency_ms": LatencyStats(),
                 "repair_latency_ms": LatencyStats(),
                 "report_latency_ms": LatencyStats(),
                 "total_latency_ms": LatencyStats(),
@@ -591,6 +597,7 @@ class RequestTrace:
         self.cache_creation_tokens = 0
         self.uncached_prompt_tokens = 0
         self.kv_cache_by_stage: dict[str, dict[str, Any]] = {}
+        self.claim_verification_summary: dict[str, Any] = {}
         metrics_registry.increment("request_total")
 
     def record_policy_decision(self, decision: dict[str, Any]) -> None:
@@ -980,6 +987,17 @@ class RequestTrace:
             self.skill_pack_fallback_reason = str(fallback_reason or "").strip()
             self.skill_pack_shadow = bool(shadow)
 
+    def record_nli_verification(
+        self,
+        summary: dict[str, Any],
+        *,
+        elapsed_ms: float | None = None,
+    ) -> None:
+        if elapsed_ms is not None and elapsed_ms >= 0:
+            metrics_registry.add_latency("nli_latency_ms", float(elapsed_ms))
+        with self._lock:
+            self.claim_verification_summary = _clone_dict(summary)
+
     def attach_result(
         self,
         *,
@@ -1068,6 +1086,7 @@ class RequestTrace:
                 "reflection_gap_signals": list(self.reflection_gap_signals),
                 "reflection_added_tasks": self.reflection_added_tasks,
                 "review_summary": _clone_dict(self.review_summary),
+                "claim_verification_summary": _clone_dict(self.claim_verification_summary),
                 "task_react_rounds": self.task_react_rounds,
                 "task_react_continue_count": self.task_react_continue_count,
                 "task_react_stop_count": self.task_react_stop_count,

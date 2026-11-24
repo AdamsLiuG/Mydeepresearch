@@ -74,6 +74,10 @@ class StateManagerMixin:
                 else None
             ),
             "approved_tool_calls": dict(getattr(state, "approved_tool_calls", None) or {}),
+            "evidence_conflicts": list(getattr(state, "evidence_conflicts", None) or []),
+            "claim_verification_summary": dict(
+                getattr(state, "claim_verification_summary", None) or {}
+            ),
             "tenant_id": str(getattr(self, "tenant_id", "default") or "default").strip()
             or "default",
             "cache_diagnostics": cache_diagnostics,
@@ -164,6 +168,7 @@ class StateManagerMixin:
             depends_on=normalize_depends_on(payload.get("depends_on")),
             upstream_context=str(payload.get("upstream_context") or "").strip(),
             fact_claims=list(payload.get("fact_claims") or []),
+            atomic_claims=list(payload.get("atomic_claims") or []),
         )
 
     def _state_from_snapshot(self, payload: dict[str, Any]) -> tuple[SummaryState, str]:
@@ -214,6 +219,16 @@ class StateManagerMixin:
                 list(payload.get("report_charts") or [])
                 if isinstance(payload.get("report_charts"), list)
                 else []
+            ),
+            evidence_conflicts=(
+                list(payload.get("evidence_conflicts") or [])
+                if isinstance(payload.get("evidence_conflicts"), list)
+                else []
+            ),
+            claim_verification_summary=(
+                dict(payload.get("claim_verification_summary") or {})
+                if isinstance(payload.get("claim_verification_summary"), dict)
+                else {}
             ),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
