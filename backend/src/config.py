@@ -257,6 +257,29 @@ class Configuration(BaseModel):
         title="Skill Pack LLM Router Enabled",
         description="Enable lightweight LLM tie-breaker routing when candidate skill packs tie closely",
     )
+    skill_pack_maturity_gate: str = Field(
+        default="draft",
+        title="Skill Pack Maturity Gate",
+        description="Minimum maturity tier allowed when loading SkillPacks (draft, verified, promoted/production)",
+    )
+    skill_distill_min_support_cases: int = Field(
+        default=3,
+        ge=1,
+        title="Skill Distillation Minimum Support Cases",
+        description="Minimum benchmark failure/win cases supporting a distilled skill candidate",
+    )
+    skill_distill_min_hybrid_gain: float = Field(
+        default=0.03,
+        ge=0.0,
+        title="Skill Distillation Minimum Hybrid Gain",
+        description="Minimum normalized quality gain required to promote a distilled skill candidate",
+    )
+    skill_distill_max_adversarial_regression: float = Field(
+        default=0.02,
+        ge=0.0,
+        title="Skill Distillation Max Adversarial Regression",
+        description="Maximum allowed hybrid_score drop on adv_* regression cases",
+    )
     default_output_format: str | None = Field(
         default=None,
         title="Default Output Format Skill",
@@ -924,6 +947,47 @@ class Configuration(BaseModel):
         title="Policy Model Timeout Seconds",
         description="Request timeout in seconds for external policy model calls",
     )
+    policy_model_mode: str = Field(
+        default="off",
+        title="Policy Model Mode",
+        description="Policy rollout mode: off, shadow, canary, or active",
+    )
+    policy_model_canary_ratio: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        title="Policy Model Canary Ratio",
+        description="Deterministic traffic fraction routed to learned policy in canary mode",
+    )
+    policy_model_canary_tenants: tuple[str, ...] = Field(
+        default=(),
+        title="Policy Model Canary Tenants",
+        description="Explicit tenant IDs always enrolled in canary policy execution",
+    )
+    policy_model_prompt_version: str = Field(
+        default="policy_prompt_v2",
+        title="Policy Model Prompt Version",
+        description="Prompt format template version used by both GRPO exporter and online policy controller",
+    )
+    policy_model_circuit_breaker_window: int = Field(
+        default=20,
+        ge=1,
+        title="Policy Model Circuit Breaker Window",
+        description="Sliding window size for policy fallback-rate circuit breaker",
+    )
+    policy_model_circuit_breaker_fallback_rate: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        title="Policy Model Circuit Breaker Fallback Rate",
+        description="Fallback ratio threshold that opens the policy circuit breaker",
+    )
+    policy_model_max_p95_ms: float = Field(
+        default=250.0,
+        ge=1.0,
+        title="Policy Model Max P95 Ms",
+        description="Latency SLO budget in milliseconds for online policy calls",
+    )
     search_cache_enabled: bool = Field(
         default=True,
         title="Search Cache Enabled",
@@ -1314,7 +1378,7 @@ class Configuration(BaseModel):
 
         return value
 
-    @field_validator("memory_maturity_gate", mode="before")
+    @field_validator("memory_maturity_gate", "skill_pack_maturity_gate", mode="before")
     @classmethod
     def _normalize_memory_maturity_gate(cls, value: Any) -> Any:
         if value is None:
@@ -1322,13 +1386,38 @@ class Configuration(BaseModel):
 
         if isinstance(value, str):
             normalized = value.strip().lower() or "draft"
+            if normalized == "production":
+                return "promoted"
             if normalized not in {"draft", "verified", "promoted"}:
                 raise ValueError(
-                    "memory_maturity_gate must be one of 'draft', 'verified', 'promoted'"
+                    "maturity_gate must be one of 'draft', 'verified', 'promoted', 'production'"
                 )
             return normalized
 
         return value
+
+    @field_validator("policy_model_mode", mode="before")
+    @classmethod
+    def _normalize_policy_model_mode(cls, value: Any) -> Any:
+        if value is None:
+            return "off"
+        if isinstance(value, str):
+            normalized = value.strip().lower() or "off"
+            if normalized not in {"off", "shadow", "canary", "active"}:
+                raise ValueError("policy_model_mode must be one of 'off', 'shadow', 'canary', 'active'")
+            return normalized
+        return value
+
+    @field_validator("policy_model_canary_tenants", mode="before")
+    @classmethod
+    def _normalize_policy_canary_tenants(cls, value: Any) -> Any:
+        if value in (None, "", ()):
+            return ()
+        if isinstance(value, str):
+            return tuple(item.strip() for item in value.split(",") if item.strip())
+        if isinstance(value, (list, tuple, set)):
+            return tuple(str(item).strip() for item in value if str(item).strip())
+        return ()
 
     @field_validator("benchmark_profile", mode="before")
     @classmethod
@@ -1548,6 +1637,12 @@ class Configuration(BaseModel):
             "skill_pack_secondary_min_match_score": os.getenv("SKILL_PACK_SECONDARY_MIN_MATCH_SCORE"),
             "skill_pack_semantic_routing_enabled": os.getenv("SKILL_PACK_SEMANTIC_ROUTING_ENABLED"),
             "skill_pack_llm_router_enabled": os.getenv("SKILL_PACK_LLM_ROUTER_ENABLED"),
+            "skill_pack_maturity_gate": os.getenv("SKILL_PACK_MATURITY_GATE"),
+            "skill_distill_min_support_cases": os.getenv("SKILL_DISTILL_MIN_SUPPORT_CASES"),
+            "skill_distill_min_hybrid_gain": os.getenv("SKILL_DISTILL_MIN_HYBRID_GAIN"),
+            "skill_distill_max_adversarial_regression": os.getenv(
+                "SKILL_DISTILL_MAX_ADVERSARIAL_REGRESSION"
+            ),
             "default_output_format": os.getenv("DEFAULT_OUTPUT_FORMAT"),
             "kv_cache_prefix_optimization_enabled": os.getenv("KV_CACHE_PREFIX_OPTIMIZATION_ENABLED"),
             "kv_cache_provider_mode": os.getenv("KV_CACHE_PROVIDER_MODE"),
@@ -1652,6 +1747,15 @@ class Configuration(BaseModel):
             "policy_model_base_url": os.getenv("POLICY_MODEL_BASE_URL"),
             "policy_model_api_key": os.getenv("POLICY_MODEL_API_KEY"),
             "policy_model_timeout_seconds": os.getenv("POLICY_MODEL_TIMEOUT_SECONDS"),
+            "policy_model_mode": os.getenv("POLICY_MODEL_MODE"),
+            "policy_model_canary_ratio": os.getenv("POLICY_MODEL_CANARY_RATIO"),
+            "policy_model_canary_tenants": os.getenv("POLICY_MODEL_CANARY_TENANTS"),
+            "policy_model_prompt_version": os.getenv("POLICY_MODEL_PROMPT_VERSION"),
+            "policy_model_circuit_breaker_window": os.getenv("POLICY_MODEL_CIRCUIT_BREAKER_WINDOW"),
+            "policy_model_circuit_breaker_fallback_rate": os.getenv(
+                "POLICY_MODEL_CIRCUIT_BREAKER_FALLBACK_RATE"
+            ),
+            "policy_model_max_p95_ms": os.getenv("POLICY_MODEL_MAX_P95_MS"),
             "search_cache_enabled": os.getenv("SEARCH_CACHE_ENABLED"),
             "search_cache_ttl_seconds": os.getenv("SEARCH_CACHE_TTL_SECONDS"),
             "search_cache_dynamic_ttl_enabled": os.getenv("SEARCH_CACHE_DYNAMIC_TTL_ENABLED"),
@@ -1986,3 +2090,12 @@ class Configuration(BaseModel):
             return explicit
         fallback = (self.llm_api_key or "").strip()
         return fallback or None
+
+    def resolved_policy_model_mode(self) -> str:
+        """Resolve effective policy model mode honoring explicit mode and legacy flag."""
+        mode = str(getattr(self, "policy_model_mode", "off") or "off").strip().lower()
+        if mode in {"shadow", "canary", "active"}:
+            return mode
+        if bool(getattr(self, "policy_model_enabled", False)):
+            return "active"
+        return "off"

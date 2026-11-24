@@ -31,6 +31,15 @@ LLM_JUDGE_QUALITY_METRICS = (
     "conservativeness_score",
 )
 
+# Optional composite & verifier quality metrics (additive when present in either variant).
+OPTIONAL_VERIFIER_QUALITY_METRICS = (
+    "hybrid_score",
+    "verifier_clean_rate",
+    "citation_validity_rate",
+)
+
+DEFAULT_MAX_ADVERSARIAL_REGRESSION = 0.02
+
 # Unbounded count metrics (relative-normalized and down-weighted so raw counts never drown ratios).
 COUNT_QUALITY_METRICS = (
     "citation_count",
@@ -125,7 +134,7 @@ def _case_normalized_quality_delta(
     for name in RATIO_QUALITY_METRICS:
         weighted_sum += _metric_value(cand_result, name) - _metric_value(base_result, name)
 
-    for name in LLM_JUDGE_QUALITY_METRICS:
+    for name in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
         if name in base_metrics or name in cand_metrics:
             weighted_sum += _metric_value(cand_result, name) - _metric_value(base_result, name)
 
@@ -151,13 +160,13 @@ def compare_cases(
     candidate_index = _index_results(candidate)
     shared_ids = sorted(set(baseline_index) & set(candidate_index))
     default_names = list(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
-    for llm_metric in LLM_JUDGE_QUALITY_METRICS:
+    for extra_metric in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
         if any(
-            llm_metric in (baseline_index[cid].get("metrics") or {})
-            or llm_metric in (candidate_index[cid].get("metrics") or {})
+            extra_metric in (baseline_index[cid].get("metrics") or {})
+            or extra_metric in (candidate_index[cid].get("metrics") or {})
             for cid in shared_ids
         ):
-            default_names.append(llm_metric)
+            default_names.append(extra_metric)
     names = tuple(metric_names or default_names)
 
     comparisons: list[dict[str, Any]] = []
@@ -200,6 +209,7 @@ def build_comparison(
     candidate_label: str | None = None,
     max_latency_regression_ratio: float = DEFAULT_MAX_LATENCY_REGRESSION_RATIO,
     max_cost_regression_ratio: float = DEFAULT_MAX_COST_REGRESSION_RATIO,
+    max_adversarial_regression: float = DEFAULT_MAX_ADVERSARIAL_REGRESSION,
 ) -> dict[str, Any]:
     """Build the full comparison payload, including normalized quality & cost guardrails."""
     comparisons = compare_cases(baseline, candidate)
@@ -208,9 +218,9 @@ def build_comparison(
     shared_ids = [case["id"] for case in comparisons]
 
     metric_names = list(HIGHER_IS_BETTER + LOWER_IS_BETTER + INFORMATIONAL)
-    for llm_metric in LLM_JUDGE_QUALITY_METRICS:
-        if any(llm_metric in case["deltas"] for case in comparisons):
-            metric_names.append(llm_metric)
+    for extra_metric in LLM_JUDGE_QUALITY_METRICS + OPTIONAL_VERIFIER_QUALITY_METRICS:
+        if any(extra_metric in case["deltas"] for case in comparisons):
+            metric_names.append(extra_metric)
 
     aggregate = {
         name: _mean([case["deltas"].get(name, 0.0) for case in comparisons])
@@ -240,6 +250,17 @@ def build_comparison(
             and (cand_cost_mean - base_cost_mean) / base_cost_mean > max_cost_regression_ratio
         ):
             regression_guardrails_tripped.append("cost_regression_exceeded")
+
+        for cid in shared_ids:
+            if not cid.lower().startswith("adv_"):
+                continue
+            b_metrics = baseline_index[cid].get("metrics") or {}
+            c_metrics = candidate_index[cid].get("metrics") or {}
+            if "hybrid_score" in b_metrics or "hybrid_score" in c_metrics:
+                drop = float(b_metrics.get("hybrid_score") or 0.0) - float(c_metrics.get("hybrid_score") or 0.0)
+                if drop > float(max_adversarial_regression):
+                    regression_guardrails_tripped.append("adversarial_regression_exceeded")
+                    break
 
     if not comparisons:
         verdict = "inconclusive"

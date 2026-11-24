@@ -1,0 +1,45 @@
+# Reference verl GRPO configuration for DeepResearch policy routing RLVR.
+# Usage (GPU environment with verl + vLLM installed):
+#   python3 -m verl.trainer.main_ppo --config-path backend/evals/rl_training --config-name verl_grpo_config
+
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.02
+
+data:
+  train_files: backend/evals/rl_exports/grpo_groups.jsonl
+  prompt_key: messages
+  max_prompt_length: 1536
+  max_response_length: 256
+  train_batch_size: 32
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1.0e-6
+    ppo_mini_batch_size: 16
+    use_kl_loss: true
+    kl_loss_coef: 0.02
+    kl_loss_type: low_var_kl
+  rollout:
+    name: vllm
+    n: 4
+    temperature: 0.7
+    tensor_model_parallel_size: 1
+
+custom_reward_function:
+  path: backend/evals/rl_training/reward_functions.py
+  name: compute_score
+
+trainer:
+  total_epochs: 3
+  project_name: helloagents-deepresearch-policy
+  experiment_name: grpo-policy-v3
+  save_freq: 50
+  test_freq: 25
+  default_local_dir: backend/evals/rl_checkpoints/verl_grpo

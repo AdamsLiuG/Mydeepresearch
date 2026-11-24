@@ -203,6 +203,10 @@ class MetricsRegistry:
             "nli_contradictions_total": 0,
             "nli_degraded_total": 0,
             "evidence_conflicts_total": 0,
+            "policy_shadow_decisions_total": 0,
+            "policy_shadow_agreement_total": 0,
+            "policy_canary_decisions_total": 0,
+            "policy_circuit_breaker_open_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
         self._estimated_cost = 0.0

@@ -11,7 +11,7 @@ from threading import Semaphore, Thread
 from time import sleep
 from typing import Any, Callable, Iterator
 
-from metrics import RequestTrace, extract_llm_usage
+from metrics import RequestTrace, extract_llm_usage, metrics_registry
 from models import SummaryState, TodoItem
 from services.context_builder import ContextPrefixBuilder
 from services.evidence import (
@@ -23,7 +23,11 @@ from services.evidence import (
 from services.evidence_index import EvidenceRetrievalHit
 from services.fact_ledger import FactLedger, render_evidence_index_cards_block
 from services.mcp_bridge import MCPHitlApprovalRequired
-from services.policy_controller import PolicyStateFeatures, build_policy_controller
+from services.policy_controller import (
+    PolicyStateFeatures,
+    build_policy_controller,
+    is_budget_legal_action,
+)
 from services.reviewer import ReviewService
 from services.search import classify_search_query_bucket, dispatch_search
 from services.summarizer import TaskSummaryResult
@@ -820,6 +824,18 @@ class TaskExecutorMixin:
             and str(top_item.get("url") or "").strip()
             and not str(top_item.get("full_content") or "").strip()
         )
+        gap_signals = tuple(str(sig) for sig in (getattr(observation, "gap_signals", []) or ()))
+        pack_meta = getattr(state, "skill_pack_metadata", None) or {}
+        skill_pack_id = str(pack_meta.get("pack_id") or "_neutral")
+        topic_domain = str(pack_meta.get("domain") or pack_meta.get("pack_id") or "general")
+        freshness_ok = "stale_evidence" not in gap_signals and "freshness_gap" not in gap_signals
+        evidence_sufficiency = not bool(gap_signals) and len(evidence_items) > 0
+        archive_repair_hits = len(getattr(observation, "archive_hits", ()) or ())
+        history_actions = list(getattr(task, "_policy_action_history", ()) or ())
+        if not history_actions and getattr(task, "react_last_action", None):
+            history_actions = [str(task.react_last_action)]
+        recent_actions = tuple(str(a) for a in history_actions[-3:])
+
         features = PolicyStateFeatures(
             task_id=task.id,
             round_index=round_index,
@@ -827,27 +843,66 @@ class TaskExecutorMixin:
             evidence_count=len(evidence_items),
             distinct_domains=int(getattr(observation, "source_diversity", 0) or 0),
             high_quality_sources=high_quality_sources,
-            has_gap_signals=bool(getattr(observation, "gap_signals", [])),
+            has_gap_signals=bool(gap_signals),
             searches_left=searches_left,
             fetches_left=fetches_left,
             remaining_budget_ratio=round(max(0.0, (max_rounds - round_index + 1) / max_rounds), 4),
             task_title=task.title,
             task_intent=task.intent,
-            gap_signals=tuple(str(sig) for sig in (getattr(observation, "gap_signals", []) or ())),
+            gap_signals=gap_signals,
             can_fetch=can_fetch,
+            skill_pack_id=skill_pack_id,
+            topic_domain=topic_domain,
+            freshness_ok=freshness_ok,
+            evidence_sufficiency=evidence_sufficiency,
+            archive_repair_hits=archive_repair_hits,
+            recent_actions=recent_actions,
         )
-        decision = controller.decide(features)
-        if observer is not None:
-            observer.record_policy_decision(
-                {
-                    "task_id": task.id,
-                    "round": round_index,
-                    "features": features.to_dict(),
-                    "decision": decision.to_dict(),
-                }
+        req_id = str(getattr(self, "request_id", "") or "")
+        tenant_id = str(getattr(self, "tenant_id", "default") or "default")
+        telemetry: dict[str, Any] | None = None
+        if hasattr(controller, "decide_with_context"):
+            decision, telemetry = controller.decide_with_context(
+                features,
+                request_id=req_id,
+                tenant_id=tenant_id,
             )
+        else:
+            decision = controller.decide(features)
 
-        if not bool(getattr(self.config, "policy_model_enabled", False)) or decision.source != "model":
+        if telemetry:
+            t_mode = telemetry.get("mode")
+            if t_mode == "shadow":
+                metrics_registry.increment("policy_shadow_decisions_total")
+                if telemetry.get("shadow_agreement") is True:
+                    metrics_registry.increment("policy_shadow_agreement_total")
+            elif t_mode == "canary" and telemetry.get("canary_selected"):
+                metrics_registry.increment("policy_canary_decisions_total")
+            if telemetry.get("circuit_open"):
+                metrics_registry.increment("policy_circuit_breaker_open_total")
+
+        trace_entry = {
+            "task_id": task.id,
+            "round": round_index,
+            "features": features.to_dict(),
+            "decision": decision.to_dict(),
+        }
+        if telemetry:
+            trace_entry["telemetry"] = telemetry
+        if observer is not None:
+            observer.record_policy_decision(trace_entry)
+
+        updated_history = (*history_actions, decision.action)[-3:]
+        task._policy_action_history = list(updated_history)  # type: ignore[attr-defined]
+
+        resolved_mode = (
+            self.config.resolved_policy_model_mode()
+            if hasattr(self.config, "resolved_policy_model_mode")
+            else ("active" if bool(getattr(self.config, "policy_model_enabled", False)) else "off")
+        )
+        if resolved_mode not in {"canary", "active"} or decision.source != "model":
+            return None
+        if not is_budget_legal_action(features, decision):
             return None
 
         if decision.action == "stop":

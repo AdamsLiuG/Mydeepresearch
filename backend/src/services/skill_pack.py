@@ -80,7 +80,14 @@ _STATUS_VALUES = {STATUS_ACTIVE, STATUS_SHADOW, STATUS_DISABLED}
 MATURITY_DRAFT = "draft"
 MATURITY_VERIFIED = "verified"
 MATURITY_PROMOTED = "promoted"
-_MATURITY_VALUES = {MATURITY_DRAFT, MATURITY_VERIFIED, MATURITY_PROMOTED}
+MATURITY_PRODUCTION = "production"
+_MATURITY_VALUES = {MATURITY_DRAFT, MATURITY_VERIFIED, MATURITY_PROMOTED, MATURITY_PRODUCTION}
+_MATURITY_RANKS = {
+    MATURITY_DRAFT: 0,
+    MATURITY_VERIFIED: 1,
+    MATURITY_PROMOTED: 2,
+    MATURITY_PRODUCTION: 2,
+}
 
 # kebab-case identifiers; the neutral pack id is the one allowed underscore-prefixed exception.
 _PACK_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -436,8 +443,62 @@ def validate_pack(
         or pack.code_sandbox
     ):
         errors.append("format skill pack must not declare domain quality/budget/retrieval/verifier knobs")
-    if pack.maturity == MATURITY_PROMOTED and _as_dict(pack.eval_meta).get("verdict") != "pass":
+    if pack.maturity in {MATURITY_PROMOTED, MATURITY_PRODUCTION} and _as_dict(pack.eval_meta).get("verdict") != "pass":
         errors.append("promoted pack requires an eval with verdict=pass")
+
+    return errors
+
+
+def validate_candidate_against_parent(
+    candidate: SkillPack,
+    parent: SkillPack | None = None,
+    *,
+    forbidden_case_ids: list[str] | tuple[str, ...] = (),
+    char_limit: int = 1200,
+) -> list[str]:
+    """Validate an auto-evolved/distilled SkillPack candidate against safety and parent invariants."""
+
+    errors = list(validate_pack(candidate, char_limit=char_limit))
+
+    bad_tokens = [str(cid or "").strip().lower() for cid in (forbidden_case_ids or ()) if str(cid or "").strip()]
+    if bad_tokens:
+        haystack = "\n".join(
+            [
+                candidate.title,
+                candidate.topic_domain,
+                candidate.applicable_when,
+                *candidate.match_signals,
+                *candidate.negative_signals,
+                *candidate.body_sections.values(),
+            ]
+        ).lower()
+        for token in bad_tokens:
+            if token in haystack:
+                errors.append(f"overfitting_forbidden_case_id:{token}")
+
+    if parent is not None:
+        parent_verifiers = {str(v).strip().lower() for v in (parent.verifiers or ()) if str(v).strip()}
+        cand_verifiers = {str(v).strip().lower() for v in (candidate.verifiers or ()) if str(v).strip()}
+        missing_verifiers = sorted(parent_verifiers - cand_verifiers)
+        if missing_verifiers:
+            errors.append(f"candidate dropped required parent verifiers: {missing_verifiers}")
+
+        for gate_key, parent_val in (parent.quality_gates or {}).items():
+            if gate_key in candidate.quality_gates:
+                if not enforce_quality_gate_direction(
+                    gate_key, parent_val, candidate.quality_gates[gate_key]
+                ):
+                    errors.append(
+                        f"candidate loosened quality_gate '{gate_key}': "
+                        f"{candidate.quality_gates[gate_key]} vs parent {parent_val}"
+                    )
+
+        parent_chars = sum(len(v) for v in (parent.body_sections or {}).values())
+        cand_chars = sum(len(v) for v in (candidate.body_sections or {}).values())
+        if parent_chars > 0 and cand_chars > int(parent_chars * 1.35) + 120:
+            errors.append(
+                f"candidate exceeded section growth budget: {cand_chars} > {int(parent_chars * 1.35) + 120}"
+            )
 
     return errors
 
@@ -872,6 +933,13 @@ class SkillPackService:
                     logger.warning("skill pack invalid dir=%s errors=%s", entry.name, errors)
                     continue
                 if pack.status == STATUS_DISABLED:
+                    continue
+                required_gate = str(
+                    getattr(self._config, "skill_pack_maturity_gate", MATURITY_DRAFT) or MATURITY_DRAFT
+                ).strip().lower()
+                required_rank = _MATURITY_RANKS.get(required_gate, 0)
+                pack_rank = _MATURITY_RANKS.get(str(pack.maturity or MATURITY_DRAFT).lower(), 0)
+                if not pack.is_neutral and pack_rank < required_rank:
                     continue
                 packs[pack.pack_id] = pack
         return packs
