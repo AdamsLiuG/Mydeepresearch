@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 from evals.judges.base import Judge
 from evals.judges.heuristic import HeuristicJudge
 from evals.judges.llm import LLMJudge
+from evals.metrics.factscore import compute_atomic_factscore, compute_conflict_recall
 from evals.schema import BenchmarkCase
 
 
@@ -81,17 +82,25 @@ class HybridJudge(Judge):
                 trace_snapshot=trace_snapshot,
             )
         )
-        if isinstance(trace_snapshot, Mapping):
-            claim_summary = trace_snapshot.get("claim_verification_summary")
-            if not isinstance(claim_summary, Mapping) and isinstance(
-                trace_snapshot.get("review_summary"), Mapping
-            ):
-                claim_summary = trace_snapshot["review_summary"].get("claim_verification_summary")
-            if isinstance(claim_summary, Mapping) and int(claim_summary.get("total_atomic_claims") or 0) > 0:
-                if "atomic_faithfulness_rate" in claim_summary:
-                    merged["atomic_faithfulness_rate"] = float(
-                        claim_summary.get("atomic_faithfulness_rate") or 0.0
-                    )
+        trace = trace_snapshot or {}
+        claim_summary = trace.get("claim_verification_summary")
+        review = trace.get("review_summary")
+        if not claim_summary and isinstance(review, Mapping):
+            claim_summary = review.get("claim_verification_summary")
+        atomic_score = compute_atomic_factscore(todo_items, claim_summary)
+        if atomic_score["total_atomic_claims"]:
+            merged.update(atomic_score)
+            merged["atomic_faithfulness_rate"] = atomic_score["atomic_factscore"]
+        elif isinstance(claim_summary, Mapping) and claim_summary.get("total_atomic_claims"):
+            # Older snapshots can carry only the precomputed rate.
+            legacy_rate = claim_summary.get("atomic_faithfulness_rate")
+            if isinstance(legacy_rate, (int, float)) and 0 <= legacy_rate <= 1:
+                merged["atomic_faithfulness_rate"] = float(legacy_rate)
+
+        expected_conflicts = case.metadata.get("expected_conflicts")
+        if isinstance(expected_conflicts, list) and expected_conflicts:
+            merged.update(compute_conflict_recall(trace.get("evidence_conflicts") or [], expected_conflicts))
+
         heuristic_score = self._heuristic_composite(merged)
         merged["heuristic_composite_score"] = heuristic_score
 

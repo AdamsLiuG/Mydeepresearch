@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from html import escape
 from typing import Any
 
 from hello_agents import ToolAwareSimpleAgent
@@ -31,7 +32,9 @@ from services.fact_ledger import (
 from services.sandbox_executor import sanitize_chart_spec
 from services.text_processing import (
     CITATION_PATTERN,
+    iter_markdown_lines,
     normalize_agent_markdown,
+    strip_citation_markers,
     truncate_cited_text,
 )
 from utils import strip_thinking_tokens, truncate_text
@@ -159,7 +162,7 @@ class ReportingService:
         if isinstance(payload, dict):
             report = self._render_structured_report(payload, state=state, observer=observer)
         else:
-            report = normalize_agent_markdown(cleaned)
+            report = self._revise_markdown_report(cleaned, state)
         return self._sanitize_chunk_citations(report, self._collect_valid_source_ids(state)) or "报告生成失败，请检查输入。"
 
     def stream_generate_report(
@@ -191,6 +194,8 @@ class ReportingService:
                 self._CORE_SECTION_TITLES["risks_and_challenges"],
                 self._CORE_SECTION_TITLES["references"],
             ]
+        if self._filtered_conflicts(state, self._collect_valid_source_ids(state)):
+            raw_outline.insert(-1, self._CORE_SECTION_TITLES["source_conflicts"])
         resolved_outline: list[str] = []
         for title in raw_outline:
             if title and title not in resolved_outline:
@@ -242,7 +247,52 @@ class ReportingService:
             token = match.group(1)
             return match.group(0) if token in valid_source_ids else ""
 
-        return CITATION_PATTERN.sub(_replace, text)
+        return "".join(line if fenced else CITATION_PATTERN.sub(_replace, line) for line, fenced in iter_markdown_lines(text))
+
+    def _revise_markdown_report(self, report: str, state: SummaryState) -> str:
+        if report.startswith(("{", '"')):
+            report = normalize_agent_markdown(report)
+        rejected = self._rejected_claim_texts(state.todo_items)
+        for claim in sorted(rejected, key=lambda text: (-len(text), text)):
+            pattern = re.compile(re.escape(claim), re.IGNORECASE)
+            report = "".join(
+                line if fenced else pattern.sub("该陈述与所引证据不符，已省略。", line)
+                for line, fenced in iter_markdown_lines(report)
+            )
+
+        conflicts = self._filtered_conflicts(state, self._collect_valid_source_ids(state))
+        body = self._render_source_conflicts_body(conflicts)
+        if not body:
+            return report
+
+        lines = list(iter_markdown_lines(report))
+        reference_heading = f"## {self._CORE_SECTION_TITLES['references']}"
+        reference_position = next(
+            (i for i, (line, fenced) in enumerate(lines) if not fenced and line.strip() == reference_heading),
+            len(lines),
+        )
+        before = "".join(line for line, _ in lines[:reference_position]).rstrip()
+        after = "".join(line for line, _ in lines[reference_position:]).strip()
+        references = self._merge_reference_items(
+            None, cited_source_ids=self._collect_conflict_source_ids(conflicts), state=state,
+        )
+        end_of_references = next(
+            (
+                i for i in range(reference_position + 1, len(lines))
+                if not lines[i][1] and re.match(r"^ {0,3}#{1,2}\s", lines[i][0])
+            ),
+            len(lines),
+        )
+        if reference_position < len(lines):
+            reference_text = "".join(line for line, _ in lines[reference_position:end_of_references]).strip()
+            missing_references = [item for item in references if item["source_id"] not in extract_citation_ids(reference_text)]
+            if missing_references:
+                trailing = "".join(line for line, _ in lines[end_of_references:]).strip()
+                after = "\n\n".join(part for part in (reference_text, render_references(missing_references), trailing) if part)
+        else:
+            after = f"{reference_heading}\n{render_references(references)}"
+        heading = self._CORE_SECTION_TITLES["source_conflicts"]
+        return "\n\n".join(part for part in (before, f"## {heading}\n{body}", after) if part)
 
     @staticmethod
     def _split_report_chunks(report: str, *, max_chunk_chars: int = 800) -> list[str]:
@@ -304,7 +354,8 @@ class ReportingService:
             ("report_tasks", f"任务概览：\n{''.join(task_blocks)}"),
             ("context_delta", render_context_delta(state, self._config)),
         ]
-        raw_conflicts = getattr(state, "evidence_conflicts", None) or []
+        valid_ids = self._collect_valid_source_ids(state)
+        raw_conflicts = self._filtered_conflicts(state, valid_ids)
         if raw_conflicts:
             disputed_ids: list[str] = []
             conflict_hints: list[str] = []
@@ -316,10 +367,8 @@ class ReportingService:
                     for side in cluster.get("sides") or []
                     if isinstance(side, dict)
                 )
-                topic_label = " / ".join(
-                    part for part in (cluster.get("entity"), cluster.get("metric"), cluster.get("period")) if part
-                )
-                rationale = str(cluster.get("adjudication_rationale") or "").strip()
+                topic_label = " / ".join(str(cluster[key]) for key in ("entity", "metric", "period") if cluster.get(key))
+                rationale = self._conflict_rationale(cluster)
                 if topic_label:
                     conflict_hints.append(f"- {topic_label}：{truncate_text(rationale, 140)}")
             if conflict_hints:
@@ -332,7 +381,6 @@ class ReportingService:
                 )
 
             if covered_task_ids:
-                valid_ids = self._collect_valid_source_ids(state)
                 volatile_blocks.append((
                     "disputed_chunks",
                     render_disputed_source_chunks(
@@ -473,20 +521,39 @@ class ReportingService:
         return prompt
 
     @staticmethod
+    def _rejected_claim_texts(tasks: list[Any]) -> set[str]:
+        return {
+            clean
+            for task in tasks
+            for item in (getattr(task, "claims", None) or []) + (getattr(task, "atomic_claims", None) or [])
+            if isinstance(item, dict)
+            and (item.get("support_status") == "contradicted" or item.get("nli_label") == "CONTRADICTED")
+            and (clean := " ".join(strip_citation_markers(str(item.get("text") or "")).split()).rstrip("。.!?！？"))
+        }
+
+    @staticmethod
+    def _has_rejected_claim(text: Any, rejected: set[str]) -> bool:
+        if not rejected:
+            return False
+        cleaned = " ".join(strip_citation_markers(str(text or "")).split()).casefold()
+        return any(claim.casefold() in cleaned for claim in rejected)
+
+    @staticmethod
     def _task_prompt_summary(task: Any) -> str:
+        rejected = ReportingService._rejected_claim_texts([task])
         payload = task.summary_payload if isinstance(getattr(task, "summary_payload", None), dict) else {}
         findings = payload.get("key_findings") if isinstance(payload, dict) else None
         if isinstance(findings, list) and findings:
             lines = ["# 任务总结"]
             executive_summary = normalize_agent_markdown(str(payload.get("executive_summary") or "").strip())
-            if executive_summary:
+            if executive_summary and not ReportingService._has_rejected_claim(executive_summary, rejected):
                 lines.extend(["", "## 任务概述", executive_summary])
             lines.extend(["", "## 关键发现"])
             for index, item in enumerate(findings, start=1):
                 if not isinstance(item, dict):
                     continue
                 text = str(item.get("text") or "").strip()
-                if not text:
+                if not text or ReportingService._has_rejected_claim(text, rejected):
                     continue
                 citations = "".join(
                     f"[{source_id}]"
@@ -502,7 +569,7 @@ class ReportingService:
                     if text:
                         lines.append(f"- {text}")
             rendered = "\n".join(lines).strip()
-            if rendered:
+            if rendered and (len(lines) > 3 or not rejected):
                 return rendered
 
         claims = getattr(task, "claims", None)
@@ -512,18 +579,20 @@ class ReportingService:
                 if not isinstance(item, dict):
                     continue
                 text = str(item.get("text") or "").strip()
-                if not text:
+                if not text or ReportingService._has_rejected_claim(text, rejected):
                     continue
                 citations = "".join(
                     f"[{source_id}]"
                     for source_id in item.get("source_ids") or []
-                    if str(source_id).strip()
+                    if str(source_id).strip() and source_id not in extract_citation_ids(text)
                 )
                 lines.append(f"{index}. {text}{(' ' + citations) if citations else ''}".rstrip())
             rendered = "\n".join(lines).strip()
             if rendered:
                 return rendered
 
+        if ReportingService._has_rejected_claim(task.summary, rejected):
+            return "暂无经过引用校验的结论"
         return task.summary or "暂无可用信息"
 
     def _task_prompt_references(
@@ -574,7 +643,10 @@ class ReportingService:
             except json.JSONDecodeError:
                 index += 1
                 continue
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and payload.keys() & {
+                "background_overview", "key_findings", "evidence_and_data", "risks_and_challenges",
+                "custom_sections", "references",
+            }:
                 return payload
             index += max(end, 1)
         return None
@@ -793,6 +865,7 @@ class ReportingService:
     ) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
         seen: set[tuple[str, tuple[str, ...]]] = set()
+        rejected = self._rejected_claim_texts([task])
 
         def append_items(items: Any) -> None:
             if not isinstance(items, list):
@@ -808,7 +881,7 @@ class ReportingService:
                     if candidate:
                         raw_text = candidate
                         break
-                if not raw_text:
+                if not raw_text or self._has_rejected_claim(raw_text, rejected):
                     continue
                 if looks_like_source_label_text(raw_text):
                     replacements = derive_grounded_findings_from_evidence(
@@ -823,7 +896,7 @@ class ReportingService:
                             replacement.get("source_ids"),
                             valid_source_ids=valid_source_ids,
                         )
-                        if not replacement_text or not replacement_source_ids:
+                        if not replacement_text or not replacement_source_ids or self._has_rejected_claim(replacement_text, rejected):
                             continue
                         key = (replacement_text, tuple(replacement_source_ids))
                         if key in seen:
@@ -862,7 +935,7 @@ class ReportingService:
                     item.get("source_ids"),
                     valid_source_ids=valid_source_ids,
                 )
-                if not text or not source_ids:
+                if not text or not source_ids or self._has_rejected_claim(text, rejected):
                     continue
                 key = (text, tuple(source_ids))
                 if key in seen:
@@ -948,12 +1021,18 @@ class ReportingService:
         payload_references: Any,
         *,
         cited_source_ids: list[str],
+        state: SummaryState,
     ) -> list[dict[str, str]]:
+        candidates = self._evidence_store.build_reference_map(cited_source_ids) if self._evidence_store is not None else []
         references_by_id = {
             item["source_id"]: item
-            for item in self._evidence_store.build_reference_map(cited_source_ids)
+            for item in candidates
             if item.get("source_id")
         }
+        for task in state.todo_items:
+            for item in task.evidence_items or []:
+                if isinstance(item, dict) and item.get("source_id"):
+                    references_by_id.setdefault(item["source_id"], item)
 
         return [references_by_id[source_id] for source_id in cited_source_ids if source_id in references_by_id]
 
@@ -979,7 +1058,8 @@ class ReportingService:
         if str(section.get("content_type") or "").strip().lower() == "paragraph":
             text = str(section.get("text") or "").strip()
             citations = "".join(f"[{source_id}]" for source_id in section.get("source_ids") or [])
-            return f"{text}{(' ' + citations) if citations else ''}".rstrip() or "暂无相关信息"
+            separator = "\n\n" if "\n" in text else " "
+            return f"{text}{(separator + citations) if citations else ''}".rstrip() or "暂无相关信息"
         return self._render_bullets(section.get("items") or [])
 
     @staticmethod
@@ -1071,20 +1151,21 @@ class ReportingService:
 
     @classmethod
     def _strip_internal_process_sentences(cls, value: Any) -> str:
-        text = normalize_agent_markdown(str(value or "").strip())
+        text = str(value or "").strip()
+        if text.startswith(("{", '"')):
+            text = normalize_agent_markdown(text)
         if not text:
             return ""
 
-        parts = re.split(r"(?<=[。！？；\n])", text)
         kept: list[str] = []
-        for part in parts:
-            cleaned = normalize_agent_markdown(part.strip())
-            if not cleaned or cls._contains_internal_process_language(cleaned):
-                continue
-            kept.append(cleaned)
-
-        if not kept and not cls._contains_internal_process_language(text):
-            return text
+        for line, fenced in iter_markdown_lines(text):
+            if fenced or not cls._contains_internal_process_language(line):
+                kept.append(line)
+            elif "|" not in line:
+                parts = re.split(r"(?<=[。！？；])", line.rstrip("\r\n"))
+                clean = "".join(part for part in parts if not cls._contains_internal_process_language(part))
+                if clean.strip():
+                    kept.append(clean + line[len(line.rstrip("\r\n")):])
         return "".join(kept).strip()
 
     @staticmethod
@@ -1146,7 +1227,10 @@ class ReportingService:
 
         executive_summary = normalize_agent_markdown(str(payload.get("executive_summary") or "").strip())
         executive_summary = self._strip_internal_process_sentences(executive_summary)
-        if executive_summary and not self._is_placeholder_text(executive_summary):
+        if (
+            executive_summary and not self._is_placeholder_text(executive_summary)
+            and not self._has_rejected_claim(executive_summary, self._rejected_claim_texts([task]))
+        ):
             source_ids: list[str] = []
             for item in findings[:2]:
                 for source_id in item.get("source_ids") or []:
@@ -1229,6 +1313,10 @@ class ReportingService:
             return f"“{title}”这一维度当前缺少官方文档、论文或权威站点来源，可信度仍有提升空间。"
         if check in {"missing_citation", "invalid_citation"}:
             return f"“{title}”这一维度的部分结论仍需继续核对原始来源绑定。"
+        if check == "claim_contradicted":
+            return f"“{title}”这一维度的部分陈述与所引证据冲突。"
+        if check == "cross_source_conflict":
+            return ""
         message = normalize_agent_markdown(str(issue.get("message") or "").strip())
         if message:
             return f"“{title}”这一维度仍有待继续核实：{message}"
@@ -1264,7 +1352,10 @@ class ReportingService:
         state: SummaryState,
         observer: RequestTrace | None = None,
     ) -> dict[str, Any]:
+        rejected = self._rejected_claim_texts(state.todo_items)
         background = self._strip_internal_process_sentences(payload.get("background_overview")) or "暂无相关信息"
+        if self._has_rejected_claim(background, rejected):
+            background = "暂无相关信息"
         valid_source_ids = self._collect_valid_source_ids(state)
         key_findings, dropped_findings = self._normalize_structured_items(
             payload.get("key_findings"),
@@ -1285,6 +1376,18 @@ class ReportingService:
             payload.get("custom_sections"),
             valid_source_ids=valid_source_ids,
         )
+        for items in (key_findings, evidence_and_data, risks_and_challenges):
+            items[:] = [item for item in items if not self._has_rejected_claim(item["text"], rejected)]
+        for section in custom_sections:
+            if section.get("content_type") == "bullets":
+                section["items"] = [
+                    item for item in section["items"] if not self._has_rejected_claim(item["text"], rejected)
+                ]
+        custom_sections = [
+            section for section in custom_sections
+            if not self._has_rejected_claim(section.get("text"), rejected)
+            and (section.get("content_type") != "bullets" or section["items"])
+        ]
         dropped_items = dropped_findings + dropped_evidence + dropped_risks + dropped_custom_sections
 
         if dropped_items and observer:
@@ -1343,31 +1446,13 @@ class ReportingService:
             custom_sections,
         )
 
-        filtered_conflicts: list[dict[str, Any]] = []
-        seen_cited = set(cited_source_ids)
-        for cluster in getattr(state, "evidence_conflicts", None) or []:
-            if not isinstance(cluster, dict):
-                continue
-            valid_sides = [
-                dict(side)
-                for side in (cluster.get("sides") or [])
-                if isinstance(side, dict)
-                and str(side.get("source_id") or "").strip() in valid_source_ids
-            ]
-            if len(valid_sides) < 2:
-                continue
-            filtered_cluster = dict(cluster)
-            filtered_cluster["sides"] = valid_sides
-            filtered_conflicts.append(filtered_cluster)
-            for side in valid_sides:
-                sid = str(side.get("source_id") or "").strip()
-                if sid and sid not in seen_cited:
-                    cited_source_ids.append(sid)
-                    seen_cited.add(sid)
+        filtered_conflicts = self._filtered_conflicts(state, valid_source_ids)
+        cited_source_ids = list(dict.fromkeys([*cited_source_ids, *self._collect_conflict_source_ids(filtered_conflicts)]))
 
         references = self._merge_reference_items(
             payload.get("references"),
             cited_source_ids=cited_source_ids,
+            state=state,
         )
         if len(references) < len(cited_source_ids) and observer:
             observer.record_degraded("report_reference_resolution_incomplete")
@@ -1420,8 +1505,69 @@ class ReportingService:
         }
 
     @staticmethod
+    def _filtered_conflicts(state: SummaryState, valid_source_ids: set[str]) -> list[dict[str, Any]]:
+        conflicts = []
+        for cluster in getattr(state, "evidence_conflicts", None) or []:
+            if not isinstance(cluster, dict):
+                continue
+            sides: dict[str, dict[str, Any]] = {}
+            for side in cluster.get("sides") or []:
+                if not isinstance(side, dict):
+                    continue
+                sid = str(side.get("source_id") or "").strip()
+                if sid in valid_source_ids and CITATION_PATTERN.fullmatch(f"[{sid}]"):
+                    sides.setdefault(sid, {**side, "source_id": sid})
+            if len(sides) < 2:
+                continue
+            filtered = {**cluster, "sides": list(sides.values())}
+            if isinstance(cluster.get("edges"), list):
+                edges = []
+                seen_pairs = set()
+                for edge in cluster["edges"]:
+                    if not isinstance(edge, dict):
+                        continue
+                    a = str(edge.get("source_id_a") or "")
+                    b = str(edge.get("source_id_b") or "")
+                    key = tuple(sorted((a, b)))
+                    if a != b and a in sides and b in sides and key not in seen_pairs:
+                        seen_pairs.add(key)
+                        edges.append(dict(edge))
+                if not edges:
+                    continue
+                filtered["edges"] = edges
+                connected = {sid for pair in seen_pairs for sid in pair}
+                filtered["sides"] = [side for sid, side in sides.items() if sid in connected]
+            kept_ids = {side["source_id"] for side in filtered["sides"]}
+            if len(kept_ids) != len(cluster.get("sides") or ()):
+                filtered["adjudication_rationale"] = ""
+            if cluster.get("recommended_source_id") not in kept_ids:
+                filtered["recommended_source_id"] = None
+                filtered["adjudication_status"] = "unresolved_divergence"
+                filtered["adjudication_rationale"] = ""
+            conflicts.append(filtered)
+        return conflicts
+
+    @staticmethod
+    def _collect_conflict_source_ids(conflicts: list[dict[str, Any]]) -> list[str]:
+        return list(dict.fromkeys(side["source_id"] for cluster in conflicts for side in cluster["sides"]))
+
+    @staticmethod
     def _escape_table_cell(value: Any) -> str:
-        return " ".join(str(value or "").replace("|", "\\|").split()).strip()
+        text = escape(" ".join(str(value or "").split()), quote=False)
+        return (
+            text.replace("\\", "&#92;").replace("|", "\\|").replace("`", "&#96;")
+            .replace("[", "&#91;").replace("]", "&#93;").replace("*", "&#42;").replace("_", "&#95;")
+        )
+
+    @staticmethod
+    def _conflict_rationale(cluster: dict[str, Any]) -> str:
+        sid = cluster.get("recommended_source_id")
+        status = cluster.get("adjudication_status")
+        if status == "resolved_by_authority" and sid:
+            return f"依据来源权威性，优先参考 [{sid}]。"
+        if status == "resolved_by_recency" and sid:
+            return f"依据发布时间，优先参考 [{sid}]。"
+        return "这些来源存在口径差异，需结合各自的统计范围与前提阅读。"
 
     def _render_source_conflicts_body(self, source_conflicts: list[dict[str, Any]]) -> str:
         if not source_conflicts:
@@ -1431,7 +1577,7 @@ class ReportingService:
             "| :--- | :--- | :--- | :--- |",
         ]
         for cluster in source_conflicts:
-            sides = cluster.get("sides") or []
+            sides = {side["source_id"]: side for side in cluster.get("sides") or []}
             if len(sides) < 2:
                 continue
             topic_parts = [
@@ -1442,24 +1588,25 @@ class ReportingService:
             topic_cell = self._escape_table_cell(" / ".join(topic_parts) or "多源事实")
 
             def _fmt_side(side: dict[str, Any]) -> str:
-                sid = str(side.get("source_id") or "").strip()
-                title = truncate_text(str(side.get("title") or sid), 48)
+                sid = side["source_id"]
+                title = truncate_text(strip_citation_markers(str(side.get("title") or sid)), 48)
                 val = side.get("normalized_value")
                 unit = str(side.get("unit") or "").strip()
                 val_txt = f"{val:g}{unit}" if isinstance(val, (int, float)) else ""
                 excerpt = truncate_text(
-                    str(side.get("claim_text") or side.get("evidence_excerpt") or ""),
+                    strip_citation_markers(str(side.get("claim_text") or side.get("evidence_excerpt") or "")),
                     80,
                 )
-                detail = f"（{val_txt}）" if val_txt else f"：{excerpt}"
-                return self._escape_table_cell(f"《{title}》[{sid}]{detail}")
+                detail = f"：{excerpt}" if excerpt else f"（{val_txt}）" if val_txt else ""
+                return f"《{self._escape_table_cell(title)}》[{sid}]{self._escape_table_cell(detail)}"
 
-            rationale = self._escape_table_cell(
-                truncate_text(str(cluster.get("adjudication_rationale") or ""), 140)
-            )
-            lines.append(
-                f"| {topic_cell} | {_fmt_side(sides[0])} | {_fmt_side(sides[1])} | {rationale} |"
-            )
+            pairs = [(edge["source_id_a"], edge["source_id_b"]) for edge in cluster.get("edges") or []]
+            if not pairs:
+                first, *others = sides
+                pairs = [(first, other) for other in others]
+            rationale = self._conflict_rationale(cluster)
+            for a, b in pairs:
+                lines.append(f"| {topic_cell} | {_fmt_side(sides[a])} | {_fmt_side(sides[b])} | {rationale} |")
         return "\n".join(lines) if len(lines) > 2 else ""
 
     def _render_structured_report_fixed_layout(self, content: dict[str, Any]) -> str:
@@ -1500,7 +1647,7 @@ class ReportingService:
                 f"{render_references(content['references'])}"
             )
         )
-        return normalize_agent_markdown(markdown)
+        return markdown.strip()
 
     def _render_structured_report_flexible_layout(self, content: dict[str, Any]) -> str:
         section_registry: dict[str, dict[str, str]] = {
@@ -1549,7 +1696,8 @@ class ReportingService:
 
         conflicts_body = self._render_source_conflicts_body(content.get("source_conflicts") or [])
         if conflicts_body:
-            blocks.append(
+            blocks.insert(
+                ordered_section_ids.index("risks_and_challenges") + 1,
                 f"## {self._CORE_SECTION_TITLES['source_conflicts']}\n{conflicts_body}"
             )
 
@@ -1557,7 +1705,7 @@ class ReportingService:
         if process_notes_body:
             blocks.append(process_notes_body)
         blocks.append(f"## 参考来源\n{render_references(content['references'])}")
-        return normalize_agent_markdown("\n\n".join(blocks))
+        return "\n\n".join(blocks).strip()
 
     def _render_structured_report(
         self,
@@ -1657,28 +1805,39 @@ def build_report_workbench_payload(
             if isinstance(item, dict):
                 _ingest_record(item)
 
-    conflicts = [
-        dict(c)
-        for c in (getattr(state, "evidence_conflicts", None) or [])
-        if isinstance(c, dict)
-    ]
+    conflicts = ReportingService._filtered_conflicts(state, set(citation_index))
     conflicts_by_source: dict[str, list[str]] = {}
-    for cluster in conflicts:
+    # Older snapshots can still link surviving citations to a conflict ID when
+    # an evidence record is no longer available to render its side of the graph.
+    for cluster in getattr(state, "evidence_conflicts", None) or []:
+        if not isinstance(cluster, dict):
+            continue
         cid = str(cluster.get("conflict_id") or "").strip()
         if not cid:
             continue
         for side in cluster.get("sides") or []:
             if isinstance(side, dict):
                 sid = str(side.get("source_id") or "").strip()
-                if sid:
+                if sid in citation_index:
                     conflicts_by_source.setdefault(sid, [])
                     if cid not in conflicts_by_source[sid]:
                         conflicts_by_source[sid].append(cid)
 
     paragraph_bindings: list[dict[str, Any]] = []
-    paragraphs = [block.strip() for block in str(report_markdown or "").split("\n\n") if block.strip()]
-    for idx, para in enumerate(paragraphs):
-        raw_sids = CITATION_PATTERN.findall(para)
+    visible_report = "".join(
+        re.sub(r"[^\r\n]", " ", line) if fenced else line
+        for line, fenced in iter_markdown_lines(str(report_markdown or ""))
+    )
+    visible_paragraphs = visible_report.split("\n\n")
+    paragraph_index = 0
+    raw_paragraphs = str(report_markdown or "").split("\n\n")
+    for raw, visible in zip(raw_paragraphs, visible_paragraphs):
+        if not raw.strip():
+            continue
+        idx = paragraph_index
+        paragraph_index += 1
+        para = raw.strip()
+        raw_sids = CITATION_PATTERN.findall(visible)
         if not raw_sids:
             continue
         ordered_sids: list[str] = []

@@ -61,7 +61,8 @@ class PostgresRequestStateStore:
         "status = EXCLUDED.status, "
         "state_version = deepresearch_request_states.state_version + 1, "
         "updated_at = EXCLUDED.updated_at, "
-        "payload_json = EXCLUDED.payload_json"
+        "payload_json = EXCLUDED.payload_json "
+        "WHERE deepresearch_request_states.tenant_id = EXCLUDED.tenant_id"
     )
     _INSERT_CAS_SQL = (
         "INSERT INTO deepresearch_request_states "
@@ -74,7 +75,7 @@ class PostgresRequestStateStore:
         "tenant_id = %s, topic = %s, phase = %s, status = %s, "
         "state_version = %s, runner_backend = %s, workflow_run_id = %s, "
         "updated_at = %s, payload_json = %s "
-        "WHERE request_id = %s AND state_version = %s"
+        "WHERE tenant_id = %s AND request_id = %s AND state_version = %s"
     )
     _SELECT_BY_ID_SQL = (
         "SELECT tenant_id, payload_json FROM deepresearch_request_states WHERE request_id = %s"
@@ -194,6 +195,9 @@ class PostgresRequestStateStore:
                             serialized,
                         ),
                     )
+                    if getattr(cur, "rowcount", 1) == 0:
+                        conn.rollback()
+                        raise SnapshotConflictError(f"postgres snapshot owner conflict for request_id={request_id}")
                 elif int(expected_version) == 0:
                     cur.execute(
                         self._INSERT_CAS_SQL,
@@ -228,6 +232,7 @@ class PostgresRequestStateStore:
                             workflow_run_id,
                             stored["updated_at"],
                             serialized,
+                            resolved_tenant,
                             request_id,
                             int(expected_version),
                         ),

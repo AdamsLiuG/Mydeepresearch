@@ -8,11 +8,23 @@ import json
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+for root in (BACKEND_ROOT, BACKEND_ROOT / "src"):
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+from evals.metrics.factscore import (  # noqa: E402
+    aggregate_atomic_factscores,
+    aggregate_conflict_recall,
+    compute_atomic_factscore,
+    compute_conflict_recall,
+    summarize_conflict_resolution,
+)
+
 DEFAULT_REQUEST_STATE_DIR = BACKEND_ROOT / ".state" / "requests"
 DEFAULT_EVAL_RESULTS_DIRS = (
     BACKEND_ROOT / "evals" / "results",
@@ -48,6 +60,9 @@ class MetricRecord:
     cache_approximate_hybrid_hits: int
     todo_items: list[dict[str, Any]]
     source_label: str
+    claim_verification_summary: dict[str, Any] = field(default_factory=dict)
+    evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    expected_conflicts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -97,6 +112,19 @@ def _normalize_todo_items(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _claim_verification_summary(*payloads: dict[str, Any]) -> dict[str, Any]:
+    for payload in payloads:
+        summary = payload.get("claim_verification_summary")
+        if isinstance(summary, dict) and summary:
+            return summary
+        review = payload.get("review_summary")
+        if isinstance(review, dict):
+            summary = review.get("claim_verification_summary")
+            if isinstance(summary, dict) and summary:
+                return summary
+    return {}
 
 
 def _first_float(*values: Any) -> float | None:
@@ -165,6 +193,8 @@ def normalize_request_snapshot(
         ),
         todo_items=todo_items,
         source_label=source_label,
+        claim_verification_summary=_claim_verification_summary(payload, metrics),
+        evidence_conflicts=_normalize_todo_items(payload.get("evidence_conflicts")),
     )
 
 
@@ -176,6 +206,8 @@ def normalize_eval_result(
 ) -> MetricRecord | None:
     trace = payload.get("trace")
     trace_payload = trace if isinstance(trace, dict) else {}
+    metadata = payload.get("metadata")
+    expected = metadata.get("expected_conflicts") if isinstance(metadata, dict) else None
 
     request_id = str(payload.get("request_id") or trace_payload.get("request_id") or "").strip()
     if not request_id:
@@ -202,6 +234,9 @@ def normalize_eval_result(
         cache_approximate_hybrid_hits=_safe_int(trace_payload.get("cache_approximate_hybrid_hits")),
         todo_items=_normalize_todo_items(payload.get("todo_items") or trace_payload.get("todo_items")),
         source_label=source_label,
+        claim_verification_summary=_claim_verification_summary(payload, trace_payload),
+        evidence_conflicts=_normalize_todo_items(payload.get("evidence_conflicts", trace_payload.get("evidence_conflicts"))),
+        expected_conflicts=_normalize_todo_items(expected),
     )
 
 
@@ -209,6 +244,9 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
     request_status_counts: Counter[str] = Counter()
     task_status_counts: Counter[str] = Counter()
     claim_support_counts: Counter[str] = Counter()
+    atomic_scores = []
+    conflict_scores = []
+    conflict_resolution_counts: Counter[str] = Counter()
     latencies: list[float] = []
     cache_hits = 0
     cache_misses = 0
@@ -220,6 +258,15 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
     cache_approximate_hybrid_hits = 0
 
     for record in records:
+        atomic_scores.append(compute_atomic_factscore(record.todo_items, record.claim_verification_summary))
+        if record.expected_conflicts:
+            conflict_scores.append(compute_conflict_recall(record.evidence_conflicts, record.expected_conflicts))
+        if record.evidence_conflicts:
+            resolution = summarize_conflict_resolution(record.evidence_conflicts)
+            conflict_resolution_counts.update({
+                key: resolution[key]
+                for key in ("conflict_count", "resolved_by_authority", "resolved_by_recency", "unresolved_divergence")
+            })
         if record.status:
             request_status_counts[record.status] += 1
         if record.elapsed_ms is not None:
@@ -249,21 +296,15 @@ def aggregate_records(records: Sequence[MetricRecord]) -> dict[str, Any]:
     terminal_task_total = completed_tasks + failed_tasks + skipped_tasks
 
     supported_claims = claim_support_counts.get("supported", 0)
-    missing_citation_claims = claim_support_counts.get("missing_citation", 0)
-    invalid_citation_claims = claim_support_counts.get("invalid_citation", 0)
-    contradicted_claims = claim_support_counts.get("contradicted", 0)
-    unverified_claims = claim_support_counts.get("unverified_claim", 0)
-    reviewed_claim_total = (
-        supported_claims
-        + missing_citation_claims
-        + invalid_citation_claims
-        + contradicted_claims
-        + unverified_claims
-    )
+    reviewed_claim_total = sum(claim_support_counts[status] for status in REVIEWED_CLAIM_STATUSES)
 
     cache_total = cache_hits + cache_misses
 
     return {
+        **aggregate_atomic_factscores(atomic_scores),
+        **aggregate_conflict_recall(conflict_scores),
+        "conflict_count": conflict_resolution_counts["conflict_count"],
+        "conflict_resolution_counts": dict(conflict_resolution_counts),
         "request_count": len(records),
         "request_status_counts": dict(sorted(request_status_counts.items())),
         "task_counts": dict(sorted(task_status_counts.items())),
@@ -503,8 +544,12 @@ def _render_summary_block(title: str, summary: dict[str, Any] | None) -> list[st
             f"{_format_metric(summary.get('citation_validity_rate'))} "
             f"(supported={claim_counts.get('supported', 0)}, "
             f"missing={claim_counts.get('missing_citation', 0)}, "
-            f"invalid={claim_counts.get('invalid_citation', 0)})"
+            f"invalid={claim_counts.get('invalid_citation', 0)}, "
+            f"contradicted={claim_counts.get('contradicted', 0)}, "
+            f"unverified={claim_counts.get('unverified_claim', 0)})"
         ),
+        f"- 原子声明 FActScore：{_format_metric(summary.get('atomic_factscore'))}",
+        f"- 跨源冲突召回率：{_format_metric(summary.get('conflict_recall'))}",
         (
             "- 缓存命中率："
             f"{_format_metric(cache.get('hit_rate'))} "
@@ -524,7 +569,9 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "## 口径",
         "",
         "- 任务完成率 = completed / (completed + failed + skipped)",
-        "- 引用有效率 = supported / (supported + missing_citation + invalid_citation)",
+        "- 引用有效率 = supported / (supported + missing_citation + invalid_citation + contradicted + unverified_claim)",
+        "- 原子声明 FActScore = ENTAILED / (ENTAILED + CONTRADICTED + NEUTRAL)",
+        "- 跨源冲突召回率 = 已匹配的标注冲突组数 / 标注冲突组数",
         "- 缓存命中率 = cache_hits / (cache_hits + cache_misses)",
         "- 平均耗时 = 平均 request elapsed_ms",
         "",

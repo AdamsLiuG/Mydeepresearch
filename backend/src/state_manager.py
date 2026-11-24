@@ -26,6 +26,7 @@ class StateManagerMixin:
             skipped=sum(1 for task in state.todo_items if task.status == "skipped"),
             failed=sum(1 for task in state.todo_items if task.status == "failed"),
         )
+        observer.restore_review_result(state.review_summary, state.claim_verification_summary)
 
     def _persist_request_state(
         self,
@@ -167,7 +168,11 @@ class StateManagerMixin:
             payload = self._request_state_store.load(request_id, tenant_id=tenant_id)
         else:
             payload = self._request_state_store.load(request_id)
-        if not payload:
+        if (
+            not payload
+            or (payload.get("tenant_id") or "default") != tenant_id
+            or (payload.get("request_id") or request_id) != request_id
+        ):
             raise ValueError(f"resume snapshot not found: {request_id}")
         return payload
 
@@ -223,7 +228,11 @@ class StateManagerMixin:
             depends_on=normalize_depends_on(payload.get("depends_on")),
             upstream_context=str(payload.get("upstream_context") or "").strip(),
             fact_claims=list(payload.get("fact_claims") or []),
-            atomic_claims=list(payload.get("atomic_claims") or []),
+            atomic_claims=[
+                deepcopy(claim)
+                for claim in payload["atomic_claims"]
+                if isinstance(claim, dict)
+            ] if isinstance(payload.get("atomic_claims"), list) else [],
         )
 
     def _state_from_snapshot(self, payload: dict[str, Any]) -> tuple[SummaryState, str]:
@@ -286,12 +295,12 @@ class StateManagerMixin:
                 else list(payload["charts_spec"]) if isinstance(payload.get("charts_spec"), list) else []
             ),
             evidence_conflicts=(
-                list(payload.get("evidence_conflicts") or [])
+                [deepcopy(conflict) for conflict in payload["evidence_conflicts"] if isinstance(conflict, dict)]
                 if isinstance(payload.get("evidence_conflicts"), list)
                 else []
             ),
             claim_verification_summary=(
-                dict(payload.get("claim_verification_summary") or {})
+                deepcopy(payload["claim_verification_summary"])
                 if isinstance(payload.get("claim_verification_summary"), dict)
                 else {}
             ),

@@ -113,12 +113,12 @@ class ResearchResponse(BaseModel):
         default=None,
         description="Sanitized charts backed by calculation evidence",
     )
-    evidence_conflicts: list[dict[str, Any]] | None = Field(
-        default=None,
+    evidence_conflicts: list[dict[str, Any]] = Field(
+        default_factory=list,
         description="Detected cross-source conflicts and adjudication status",
     )
-    claim_verification_summary: dict[str, Any] | None = Field(
-        default=None,
+    claim_verification_summary: dict[str, Any] = Field(
+        default_factory=dict,
         description="Atomic claim NLI verification aggregate metrics",
     )
 
@@ -206,7 +206,7 @@ def _mask_secret(value: str | None, visible: int = 4) -> str:
     return f"{value[:visible]}...{value[-visible:]}"
 
 
-def _build_config(payload: ResearchRequest) -> Configuration:
+def _build_config(payload: ResearchRequest, *, base_config: Configuration) -> Configuration:
     overrides: Dict[str, Any] = {}
 
     if payload.search_api is not None:
@@ -214,7 +214,7 @@ def _build_config(payload: ResearchRequest) -> Configuration:
     if getattr(payload, "output_format", None) is not None and str(payload.output_format).strip():
         overrides["default_output_format"] = str(payload.output_format).strip().lower()
 
-    return Configuration.from_env(overrides=overrides)
+    return Configuration.model_validate({**base_config.model_dump(), **overrides})
 
 
 def _warmup_semantic_cache_model(config: Configuration) -> None:
@@ -621,8 +621,14 @@ def create_app(
         tenant_id: str | None,
     ) -> dict[str, Any] | None:
         if _store_supports_tenant_id(store, "load"):
-            return store.load(request_id, tenant_id=tenant_id)
-        return store.load(request_id)
+            snapshot = store.load(request_id, tenant_id=tenant_id)
+        else:
+            snapshot = store.load(request_id)
+        if not isinstance(snapshot, dict) or (snapshot.get("request_id") or request_id) != request_id:
+            return None
+        if tenant_id is not None and (snapshot.get("tenant_id") or "default") != tenant_id:
+            return None
+        return snapshot
 
     def _store_save(
         store: Any,
@@ -648,16 +654,19 @@ def create_app(
                 include_content=include_content,
                 tenant_id=tenant_id,
             )
-        return store.list_recent(limit=limit, include_content=include_content)
+        return [
+            item for item in store.list_recent(limit=limit, include_content=include_content)
+            if tenant_id is None or (item.get("tenant_id") or "default") == tenant_id
+        ]
 
     def _ensure_request_ownership(request_id: str, tenant: TenantContext) -> None:
         store = app.state.request_state_store
-        if store is None or not _store_supports_tenant_id(store, "load"):
+        if store is None:
             return
-        unfiltered = store.load(request_id, tenant_id=None)
+        unfiltered = _store_load(store, request_id, tenant_id=None)
         if unfiltered is None:
             return
-        owned = store.load(request_id, tenant_id=tenant.tenant_id)
+        owned = _store_load(store, request_id, tenant_id=tenant.tenant_id)
         if owned is None:
             raise HTTPException(
                 status_code=404,
@@ -702,8 +711,8 @@ def create_app(
 
     @app.get("/metrics/json")
     async def metrics_json(request: Request) -> Dict[str, Any]:
-        _resolve_tenant(request)
-        return metrics_registry.snapshot()
+        tenant = _resolve_tenant(request)
+        return metrics_registry.snapshot(tenant_id=tenant.tenant_id)
 
     @app.get("/skills")
     async def list_skills_catalog(request: Request) -> Dict[str, Any]:
@@ -714,13 +723,15 @@ def create_app(
         "/research",
         response_model=ResearchResponse,
         response_model_exclude_none=True,
+        response_model_exclude_unset=True,
     )
     def run_research(payload: ResearchRequest, request: Request) -> ResearchResponse:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
+        _ensure_request_ownership(request_id, tenant)
         _acquire_rate_limit(tenant)
         try:
-            config = _build_config(payload)
+            config = _build_config(payload, base_config=app.state.base_config)
             agent = _instantiate_agent(
                 config=config,
                 request_id=request_id,
@@ -729,6 +740,8 @@ def create_app(
             result = agent.run(payload.topic)
         except HTTPException:
             raise
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Request snapshot changed") from exc
         except ValueError as exc:  # Likely due to unsupported configuration
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -782,8 +795,8 @@ def create_app(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
             charts_spec=list(getattr(result, "report_charts", []) or []) or None,
-            evidence_conflicts=raw_conflicts or None,
-            claim_verification_summary=raw_summary or None,
+            **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
+            **({"claim_verification_summary": raw_summary} if raw_summary else {}),
         )
 
     @app.post("/research/clarify")
@@ -792,7 +805,8 @@ def create_app(
         _acquire_rate_limit(tenant)
         try:
             config = _build_config(
-                ResearchRequest(topic=payload.topic, search_api=payload.search_api)
+                ResearchRequest(topic=payload.topic, search_api=payload.search_api),
+                base_config=app.state.base_config,
             )
             skill_pack = SkillPackService(config)
             return HitlService.clarify_topic(
@@ -811,9 +825,10 @@ def create_app(
     def create_editable_plan(payload: ResearchRequest, request: Request) -> Dict[str, Any]:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
+        _ensure_request_ownership(request_id, tenant)
         _acquire_rate_limit(tenant)
         try:
-            config = _build_config(payload)
+            config = _build_config(payload, base_config=app.state.base_config)
             agent = _instantiate_agent(
                 config=config,
                 request_id=request_id,
@@ -822,6 +837,8 @@ def create_app(
             return agent.plan_only(payload.topic)
         except HTTPException:
             raise
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Request snapshot changed") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -860,7 +877,7 @@ def create_app(
         if snapshot.get("pending_tool_approval") or snapshot.get("approved_tool_calls"):
             raise HTTPException(status_code=409, detail="Request has a tool approval record")
 
-        config = Configuration.from_env()
+        config = app.state.base_config
         try:
             normalized_tasks = HitlService.validate_editable_tasks(
                 [item.model_dump() for item in payload.tasks],
@@ -874,6 +891,16 @@ def create_app(
         updated_snapshot["todo_items"] = normalized_tasks
         updated_snapshot["phase"] = "awaiting_approval"
         updated_snapshot["status"] = "awaiting_approval"
+        updated_snapshot["review_completed"] = False
+        updated_snapshot["report_repair_completed"] = False
+        updated_snapshot["review_summary"] = {}
+        updated_snapshot["evidence_conflicts"] = []
+        updated_snapshot["claim_verification_summary"] = {}
+        if isinstance(updated_snapshot.get("request_metrics"), dict):
+            updated_snapshot["request_metrics"] = {
+                key: value for key, value in updated_snapshot["request_metrics"].items()
+                if key not in {"review_summary", "claim_verification_summary", "todo_items"}
+            }
         saved = await asyncio.to_thread(
             _store_save,
             store,
@@ -903,7 +930,8 @@ def create_app(
         _acquire_rate_limit(tenant)
         try:
             config = _build_config(
-                ResearchRequest(topic="drilldown", search_api=payload.search_api)
+                ResearchRequest(topic="drilldown", search_api=payload.search_api),
+                base_config=app.state.base_config,
             )
             agent = _instantiate_agent(
                 config=config,
@@ -1127,6 +1155,7 @@ def create_app(
     ) -> Dict[str, Any]:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
         _acquire_rate_limit(tenant)
         try:
             config = _build_config(
@@ -1134,7 +1163,8 @@ def create_app(
                     topic=payload.topic,
                     search_api=payload.search_api,
                     output_format=payload.output_format,
-                )
+                ),
+                base_config=app.state.base_config,
             )
             runner = app.state.workflow_runner
             handle = await asyncio.to_thread(
@@ -1185,6 +1215,7 @@ def create_app(
         "/requests/{request_id}/resume",
         response_model=ResearchResponse,
         response_model_exclude_none=True,
+        response_model_exclude_unset=True,
     )
     def resume_research(
         request_id: str,
@@ -1200,7 +1231,8 @@ def create_app(
                 ResearchRequest(
                     topic="resume",
                     search_api=payload.search_api if payload else None,
-                )
+                ),
+                base_config=app.state.base_config,
             )
             agent = _instantiate_agent(
                 config=config,
@@ -1262,8 +1294,8 @@ def create_app(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
             charts_spec=list(getattr(result, "report_charts", []) or []) or None,
-            evidence_conflicts=raw_conflicts or None,
-            claim_verification_summary=raw_summary or None,
+            **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
+            **({"claim_verification_summary": raw_summary} if raw_summary else {}),
         )
 
     def _build_sse_stream(
@@ -1385,9 +1417,10 @@ def create_app(
     async def stream_research(payload: ResearchRequest, request: Request) -> StreamingResponse:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
         _acquire_rate_limit(tenant)
         try:
-            config = _build_config(payload)
+            config = _build_config(payload, base_config=app.state.base_config)
             agent = _instantiate_agent(
                 config=config,
                 request_id=request_id,
@@ -1442,7 +1475,8 @@ def create_app(
                 ResearchRequest(
                     topic="resume",
                     search_api=payload.search_api if payload else None,
-                )
+                ),
+                base_config=app.state.base_config,
             )
             agent = _instantiate_agent(
                 config=config,

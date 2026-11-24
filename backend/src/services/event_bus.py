@@ -182,7 +182,12 @@ class RedisStreamEventBus:
 
     @staticmethod
     def _stream_key(tenant_id: str, request_id: str) -> str:
-        return f"deepresearch:stream:{tenant_id or 'default'}:{request_id}"
+        tenant = tenant_id or "default"
+        if ":" in tenant or ":" in request_id:
+            # Use a separate namespace so ambiguous legacy keys are never read.
+            pair = json.dumps((tenant, request_id), ensure_ascii=False, separators=(",", ":"))
+            return f"deepresearch:stream-v2:{pair}"
+        return f"deepresearch:stream:{tenant}:{request_id}"
 
     @staticmethod
     def _decode_entry(entry_id: Any, fields: Any) -> EventEnvelope | None:

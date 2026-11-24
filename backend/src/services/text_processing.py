@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from typing import Any
 
 CITATION_TOKEN_REGEX = r"\[(T\d+-(?:S|M|C)\d+)\]"
 CITATION_PATTERN = re.compile(CITATION_TOKEN_REGEX)
+_MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 JSON_TEXT_KEYS = (
     "report_markdown",
     "report",
@@ -94,6 +96,22 @@ def strip_citation_markers(text: str) -> str:
     cleaned = CITATION_PATTERN.sub("", text)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
+
+
+def iter_markdown_lines(text: str) -> Iterator[tuple[str, bool]]:
+    """Yield lines with their endings and whether they belong to a fenced code block."""
+    fence = ""
+    for line in text.splitlines(keepends=True):
+        marker = _MARKDOWN_FENCE.match(line.rstrip("\r\n"))
+        if fence:
+            yield line, True
+            if marker and marker[1].startswith(fence) and not marker[2].strip():
+                fence = ""
+        elif marker and (marker[1][0] == "~" or "`" not in marker[2]):
+            fence = marker[1]
+            yield line, True
+        else:
+            yield line, False
 
 
 def truncate_cited_text(text: str, max_chars: int) -> str:

@@ -12,9 +12,10 @@ from metrics import RequestTrace
 class BenchmarkStubAgent:
     """Predictable agent implementation used for benchmark and CI smoke runs."""
 
-    def __init__(self, config: Any, request_id: str | None = None) -> None:
+    def __init__(self, config: Any, request_id: str | None = None, tenant_id: str | None = None) -> None:
         self.config = config
         self.request_id = request_id or "perf-stub"
+        self.tenant_id = tenant_id or getattr(config, "default_tenant_id", "default")
         self._request_trace: RequestTrace | None = None
 
     def run(self, topic: str) -> SimpleNamespace:
@@ -135,6 +136,7 @@ class BenchmarkStubAgent:
         )
         trace = RequestTrace(
             request_id=self.request_id,
+            tenant_id=self.tenant_id,
             topic=topic,
             search_api=search_api,
             provider=getattr(self.config, "llm_provider", "benchmark_stub"),

@@ -1107,6 +1107,7 @@ class DeepResearchAgent(
         )
         self._request_trace = RequestTrace(
             request_id=self.request_id,
+            tenant_id=getattr(self, "tenant_id", "default"),
             topic=topic,
             search_api=search_api,
             provider=self.config.llm_provider,
@@ -1384,6 +1385,8 @@ class DeepResearchAgent(
         orchestrator = getattr(self, "_claim_verification_orchestrator", None)
         if orchestrator is not None:
             orchestrator._config = target_config
+            if getattr(orchestrator, "_decomposer", None) is not None:
+                orchestrator._decomposer._decompose_with_fast_llm = target_config.nli_decompose_with_fast_llm
             if getattr(orchestrator, "_scorer", None) is not None:
                 orchestrator._scorer._config = target_config
             if getattr(orchestrator, "_conflict_builder", None) is not None:
@@ -2575,6 +2578,8 @@ class DeepResearchAgent(
         state, _ = self._state_from_snapshot(snapshot)
         topic = state.research_topic or str(snapshot.get("topic") or "").strip()
         observer = self._start_request_trace(topic)
+        if state.claim_verification_summary:
+            observer.restore_review_result(state.review_summary, state.claim_verification_summary)
 
         next_id = max((int(task.id) for task in state.todo_items), default=0) + 1
         drilldown_query = " ".join(part for part in (topic, section_title, question) if part.strip()).strip()

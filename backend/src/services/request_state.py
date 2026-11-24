@@ -68,12 +68,16 @@ class RequestStateStore:
     ) -> dict[str, Any]:
         self._directory.mkdir(parents=True, exist_ok=True)
         path = self.path_for(request_id)
+        resolved_tenant = str(tenant_id or payload.get("tenant_id") or "default").strip() or "default"
         with _lock_snapshot_directory(self._directory):
             current_version = 0
             if path.exists():
                 try:
                     existing = json.loads(path.read_text(encoding="utf-8"))
                     if isinstance(existing, dict):
+                        existing_tenant = str(existing.get("tenant_id") or "default").strip() or "default"
+                        if existing_tenant != resolved_tenant:
+                            raise SnapshotConflictError(f"snapshot owner conflict for request_id={request_id}")
                         current_version = max(0, int(existing.get("state_version") or 0))
                 except (OSError, json.JSONDecodeError, ValueError):
                     current_version = 0
@@ -87,7 +91,6 @@ class RequestStateStore:
             next_version = current_version + 1
             stored_payload = dict(payload)
             stored_payload.setdefault("request_id", request_id)
-            resolved_tenant = str(tenant_id or stored_payload.get("tenant_id") or "default").strip() or "default"
             stored_payload["tenant_id"] = resolved_tenant
             stored_payload["state_version"] = next_version
             stored_payload["updated_at"] = _utc_now()

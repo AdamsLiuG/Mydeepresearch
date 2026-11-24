@@ -398,12 +398,18 @@ class MetricsRegistry:
         with self._lock:
             self._recent_requests.appendleft(_clone_dict(payload))
 
-    def snapshot(self, *, include_recent_requests: bool = True) -> dict[str, Any]:
+    def snapshot(
+        self, *, include_recent_requests: bool = True, tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             counters = dict(self._counters)
             latencies = {name: stats.to_dict() for name, stats in self._latencies.items()}
             estimated_cost = round(self._estimated_cost, 6)
-            recent_requests = list(self._recent_requests) if include_recent_requests else []
+            recent_requests = [
+                _clone_dict(request)
+                for request in self._recent_requests
+                if tenant_id is None or request.get("tenant_id") == tenant_id
+            ] if include_recent_requests else []
             stop_reason_counts = dict(self._task_react_stop_reason_counts)
             kv_cache_by_stage = _clone_dict(self._kv_cache_by_stage)
 
@@ -634,8 +640,10 @@ class RequestTrace:
         provider: str | None,
         model: str | None,
         pricing_catalog: dict[str, Any] | None,
+        tenant_id: str = "default",
     ) -> None:
         self.request_id = request_id
+        self.tenant_id = tenant_id
         self.topic = topic
         self.search_api = search_api
         self.provider = provider
@@ -1098,6 +1106,16 @@ class RequestTrace:
         with self._lock:
             self.claim_verification_summary = _clone_dict(summary)
 
+    def restore_review_result(
+        self,
+        review_summary: dict[str, Any],
+        claim_verification_summary: dict[str, Any],
+    ) -> None:
+        """Populate a resumed trace without recording a second review or NLI execution."""
+        with self._lock:
+            self.review_summary = _clone_dict(review_summary)
+            self.claim_verification_summary = _clone_dict(claim_verification_summary)
+
     def attach_result(
         self,
         *,
@@ -1141,6 +1159,7 @@ class RequestTrace:
             )
             return {
                 "request_id": self.request_id,
+                "tenant_id": self.tenant_id,
                 "topic": self.topic,
                 "search_api": self.search_api,
                 "provider": self.provider,

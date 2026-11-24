@@ -11,6 +11,12 @@ from typing import Any, Callable, Sequence
 from config import Configuration
 from evals.judges.base import Judge
 from evals.judges.heuristic import HeuristicJudge
+from evals.metrics.factscore import (
+    aggregate_atomic_factscores,
+    aggregate_conflict_recall,
+    compute_atomic_factscore,
+    compute_conflict_recall,
+)
 from evals.schema import BenchmarkCase
 
 
@@ -45,6 +51,8 @@ def _serialize_todo_items(todo_items: Sequence[Any]) -> list[dict[str, Any]]:
                 "status": getattr(item, "status", None),
                 "note_id": getattr(item, "note_id", None),
                 "note_path": getattr(item, "note_path", None),
+                "claims": list(getattr(item, "claims", None) or []),
+                "atomic_claims": list(getattr(item, "atomic_claims", None) or []),
             }
         )
     return payload
@@ -64,6 +72,8 @@ def evaluate_case(
     report_markdown = ""
     todo_items: Sequence[Any] = []
     trace_snapshot: dict[str, Any] = {}
+    claim_summary: dict[str, Any] = {}
+    evidence_conflicts: list[dict[str, Any]] = []
     error: str | None = None
     agent = None
     started_at = perf_counter()
@@ -78,6 +88,8 @@ def evaluate_case(
             or ""
         )
         todo_items = getattr(result, "todo_items", []) or []
+        claim_summary = dict(getattr(result, "claim_verification_summary", None) or {})
+        evidence_conflicts = list(getattr(result, "evidence_conflicts", None) or [])
     except Exception as exc:  # pragma: no cover - exercised through batch runner tests
         error = str(exc)
     finally:
@@ -85,6 +97,10 @@ def evaluate_case(
             trace_snapshot = _trace_snapshot(agent)
         if not trace_snapshot.get("elapsed_ms"):
             trace_snapshot["elapsed_ms"] = round((perf_counter() - started_at) * 1000, 2)
+    if claim_summary:
+        trace_snapshot["claim_verification_summary"] = claim_summary
+    if evidence_conflicts:
+        trace_snapshot["evidence_conflicts"] = evidence_conflicts
 
     metrics = judge_impl.evaluate(
         case=case,
@@ -95,12 +111,14 @@ def evaluate_case(
 
     return {
         "id": case.id,
+        "request_id": trace_snapshot.get("request_id") or f"{request_id_prefix}-{case.id}",
         "topic": case.topic,
         "freshness_sensitive": case.freshness_sensitive,
         "metrics": metrics,
         "error": error,
         "report_markdown": report_markdown,
         "todo_items": _serialize_todo_items(todo_items),
+        "evidence_conflicts": evidence_conflicts,
         "trace": trace_snapshot,
         "metadata": case.metadata,
     }
@@ -108,9 +126,25 @@ def evaluate_case(
 
 def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate per-case results into a compact benchmark summary."""
+    atomic_scores = []
+    conflict_scores = []
+    for result in results:
+        trace = result.get("trace") or {}
+        atomic_scores.append(compute_atomic_factscore(
+            result.get("todo_items") or [], trace.get("claim_verification_summary"),
+        ))
+        expected = (result.get("metadata") or {}).get("expected_conflicts")
+        if isinstance(expected, list) and expected:
+            conflict_scores.append(compute_conflict_recall(result.get("evidence_conflicts") or [], expected))
+    direction04_metrics = {
+        **aggregate_atomic_factscores(atomic_scores),
+        **aggregate_conflict_recall(conflict_scores),
+    }
+
     total = len(results)
     if total == 0:
         return {
+            **direction04_metrics,
             "total_cases": 0,
             "reports_generated": 0,
             "degraded_cases": 0,
@@ -180,6 +214,7 @@ def build_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     )
 
     return {
+        **direction04_metrics,
         "total_cases": total,
         "reports_generated": report_generated,
         "degraded_cases": degraded_cases,

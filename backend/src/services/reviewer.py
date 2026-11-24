@@ -15,6 +15,7 @@ from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import get_current_date
+from services.claim_verifier import numeric_grounding_mismatch
 from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.evidence import extract_citation_ids, format_evidence_sources
 from services.evidence_index import (
@@ -29,6 +30,8 @@ from services.fact_ledger import (
 from services.mcp_bridge import MCPHitlApprovalRequired
 from services.skill_verifiers import run_skill_verifiers, verify_computation_lineage
 from services.text_processing import (
+    CITATION_PATTERN,
+    iter_markdown_lines,
     looks_like_meta_reasoning,
     normalize_agent_markdown,
     strip_citation_markers,
@@ -198,7 +201,7 @@ class ReviewService:
                 state,
                 claims_by_task=claims_by_task,
                 observer=observer,
-                fallback_claim_verifier=self._numeric_fallback_only,
+                fallback_claim_verifier=self._normalized_numeric_fallback,
             )
             claim_verification_summary = dict(nli_out.get("summary") or {})
             conflicts = nli_out.get("conflicts") or []
@@ -417,7 +420,8 @@ class ReviewService:
             for item in evidence_store.lookup(include_full_content=True) or []:
                 if isinstance(item, dict) and item.get("source_id"):
                     request_evidence_by_id[str(item["source_id"]).strip()] = item
-        request_valid_ids = set(request_evidence_by_id.keys())
+        lineage_errors = self._computation_lineage_errors(request_evidence_by_id)
+        request_valid_ids = request_evidence_by_id.keys() - lineage_errors.keys()
 
         for task in state.todo_items:
             task_issues, task_claims = self._review_task(
@@ -425,6 +429,7 @@ class ReviewService:
                 task,
                 request_valid_ids=request_valid_ids,
                 request_evidence_by_id=request_evidence_by_id,
+                lineage_errors=lineage_errors,
             )
             issues.extend(task_issues)
             claims_by_task[task.id] = task_claims
@@ -460,16 +465,19 @@ class ReviewService:
         *,
         request_valid_ids: set[str] | None = None,
         request_evidence_by_id: dict[str, dict[str, Any]] | None = None,
+        lineage_errors: dict[str, str] | None = None,
     ) -> tuple[list[ReviewIssue], list[dict[str, Any]]]:
         issues: list[ReviewIssue] = []
         claims: list[dict[str, Any]] = []
 
-        evidence_items = list(task.evidence_items or [])
-        valid_ids = {
-            str(item.get("source_id") or "").strip()
-            for item in evidence_items
-            if str(item.get("source_id") or "").strip()
+        evidence_items = [item for item in task.evidence_items or [] if isinstance(item, dict)]
+        local_by_id = {
+            sid: item for item in evidence_items if (sid := str(item.get("source_id") or "").strip())
         }
+        evidence_by_id = {**local_by_id, **(request_evidence_by_id or {})}
+        if lineage_errors is None:
+            lineage_errors = self._computation_lineage_errors(evidence_by_id)
+        valid_ids = local_by_id.keys() - lineage_errors.keys()
         effective_valid_ids = valid_ids | (request_valid_ids or set())
         unique_domains = {
             str(item.get("domain") or "").strip().lower()
@@ -559,11 +567,7 @@ class ReviewService:
             claim_text = str(claim_candidate.get("text") or "").strip()
             if not claim_text:
                 continue
-            citation_ids = [
-                source_id
-                for source_id in claim_candidate.get("source_ids") or extract_citation_ids(claim_text)
-                if source_id
-            ]
+            citation_ids = claim_candidate["source_ids"]
             missing = not citation_ids
             invalid_source_ids = [
                 source_id for source_id in citation_ids if source_id not in effective_valid_ids
@@ -585,7 +589,7 @@ class ReviewService:
                         severity="high",
                         check="invalid_citation",
                         message=(
-                            f"任务 {task.id} 使用了不存在的 source_id："
+                            f"任务 {task.id} 使用了不存在或未通过溯源校验的 source_id："
                             f"{', '.join(invalid_source_ids)}"
                         ),
                         source_ids=invalid_source_ids,
@@ -594,11 +598,6 @@ class ReviewService:
                 support_status = "invalid_citation"
             else:
                 support_status = "supported"
-                evidence_by_id = dict(request_evidence_by_id or {})
-                for item in evidence_items:
-                    sid_key = str(item.get("source_id") or "").strip()
-                    if sid_key:
-                        evidence_by_id[sid_key] = item
                 cited_records = [
                     evidence_by_id[sid] for sid in citation_ids if sid in evidence_by_id
                 ]
@@ -623,77 +622,48 @@ class ReviewService:
                 }
             )
 
-        evidence_by_id = dict(request_evidence_by_id or {})
-        evidence_by_id.update({
-            str(item.get("source_id") or "").strip(): item
-            for item in evidence_items
-            if str(item.get("source_id") or "").strip()
-            and str(item.get("source_id") or "").strip() not in evidence_by_id
-        })
-        for item in evidence_items:
-            sid = str(item.get("source_id") or "").strip()
-            is_sandbox = str(item.get("source_origin") or "").strip().lower() == "sandbox" or "-C" in sid
-            if not is_sandbox:
+        for sid, lineage_reason in lineage_errors.items():
+            if sid not in local_by_id and not sid.startswith(f"T{task.id}-"):
                 continue
-            lineage_reason = self._verify_computation_lineage(item, evidence_by_id)
-            if lineage_reason:
-                issues.append(
-                    ReviewIssue(
-                        task_id=task.id,
-                        severity="high",
-                        check="sandbox_input_ungrounded",
-                        message=f"任务 {task.id} 沙箱计算证据 [{sid}] 溯源校验失败：{lineage_reason}",
-                        source_ids=[sid] if sid else [],
-                    )
+            issues.append(
+                ReviewIssue(
+                    task_id=task.id,
+                    severity="high",
+                    check="sandbox_input_ungrounded",
+                    message=f"任务 {task.id} 沙箱计算证据 [{sid}] 溯源校验失败：{lineage_reason}",
+                    source_ids=[sid],
                 )
+            )
 
         return issues, claims
 
     @staticmethod
     def _claim_candidates(task: TodoItem) -> list[dict[str, Any]]:
-        claims = getattr(task, "claims", None)
-        if isinstance(claims, list) and claims:
+        payload = task.summary_payload if isinstance(task.summary_payload, dict) else {}
+        for claims in (task.claims, payload.get("key_findings")):
+            if not isinstance(claims, list):
+                continue
             normalized: list[dict[str, Any]] = []
             for item in claims:
                 if not isinstance(item, dict):
                     continue
-                text = normalize_agent_markdown(str(item.get("text") or "").strip())
-                text = strip_citation_markers(text)
-                if not text or looks_like_meta_reasoning(text):
+                raw_text = str(item.get("text") or item.get("claim") or item.get("point") or "").strip()
+                text = normalize_agent_markdown(raw_text) if raw_text.startswith(("{", '"')) else raw_text
+                visible_text = strip_citation_markers(text)
+                if not visible_text or looks_like_meta_reasoning(visible_text):
                     continue
-                normalized.append(
-                    {
-                        "text": text,
-                        "source_ids": [
-                            str(source_id).strip()
-                            for source_id in item.get("source_ids") or []
-                            if str(source_id).strip()
-                        ],
-                    }
-                )
+                raw_ids = item.get("source_ids")
+                if isinstance(raw_ids, str):
+                    raw_ids = [raw_ids]
+                declared_ids = [
+                    str(sid).strip().strip("[]")
+                    for sid in raw_ids if isinstance(sid, str) and sid.strip()
+                ] if isinstance(raw_ids, (list, tuple)) else []
+                inline_text = "".join(line for line, is_fenced in iter_markdown_lines(text) if not is_fenced)
+                source_ids = list(dict.fromkeys([*declared_ids, *extract_citation_ids(inline_text)]))
+                normalized.append({"text": text, "source_ids": source_ids})
             if normalized:
                 return normalized
-
-        payload = getattr(task, "summary_payload", None)
-        if isinstance(payload, dict):
-            findings = payload.get("key_findings")
-            if isinstance(findings, list):
-                normalized = []
-                for item in findings:
-                    if not isinstance(item, dict):
-                        continue
-                    text = normalize_agent_markdown(str(item.get("text") or "").strip())
-                    text = strip_citation_markers(text)
-                    if not text or looks_like_meta_reasoning(text):
-                        continue
-                    source_ids = [
-                        str(source_id).strip()
-                        for source_id in item.get("source_ids") or []
-                        if str(source_id).strip()
-                    ]
-                    normalized.append({"text": text, "source_ids": source_ids})
-                if normalized:
-                    return normalized
 
         return [
             {"text": claim_text, "source_ids": extract_citation_ids(claim_text)}
@@ -702,39 +672,39 @@ class ReviewService:
 
     @staticmethod
     def _extract_claim_texts(summary: str) -> list[str]:
-        normalized = normalize_agent_markdown(summary or "")
-        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
-
+        text = (summary or "").strip()
+        if text.startswith(("{", '"')):
+            text = normalize_agent_markdown(text)
+        lines = [line.strip() if not is_fenced else "" for line, is_fenced in iter_markdown_lines(text)]
         claims: list[str] = []
-        for line in lines:
-            if re.match(r"^#{1,6}\s+", line):
+        table_prefix: list[str] = []
+        last_claim_line = -2
+        table_delimiter = re.compile(r"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$")
+        for index, line in enumerate(lines):
+            if not line or re.match(r"^#{1,6}\s+", line):
+                table_prefix = []
                 continue
-            if re.match(r"^\|(?:[-:\s|]+)\|?$", line):
+            if "|" in line and index + 1 < len(lines) and table_delimiter.fullmatch(lines[index + 1]):
+                table_prefix = [CITATION_PATTERN.sub("", line), lines[index + 1]]
                 continue
-            cleaned = re.sub(r"^[-*]\s+", "", line)
-            cleaned = re.sub(r"^\d+\.\s+", "", cleaned)
-            claim_text = cleaned.strip()
+            if table_delimiter.fullmatch(line):
+                continue
+            if "|" not in line:
+                table_prefix = []
+            claim_text = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line).strip()
             visible_text = strip_citation_markers(claim_text)
-            if len(visible_text) < 8:
+            inline_ids = extract_citation_ids(claim_text)
+            if not visible_text and inline_ids and last_claim_line == index - 1:
+                claims[-1] += " " + claim_text
+                last_claim_line = index
+                continue
+            if not visible_text or (len(visible_text) < 8 and not inline_ids):
                 continue
             if looks_like_meta_reasoning(visible_text):
                 continue
-            claims.append(claim_text)
-
-        if claims:
-            return claims
-
-        paragraphs = [
-            paragraph.strip()
-            for paragraph in re.split(r"\n\s*\n", normalized)
-            if paragraph.strip()
-        ]
-        return [
-            paragraph
-            for paragraph in paragraphs
-            if len(strip_citation_markers(paragraph)) >= 8
-            and not looks_like_meta_reasoning(strip_citation_markers(paragraph))
-        ]
+            claims.append("\n".join([*table_prefix, claim_text]))
+            last_claim_line = index
+        return claims
 
     @staticmethod
     def _is_freshness_sensitive(topic: str, task: TodoItem) -> bool:
@@ -874,6 +844,26 @@ class ReviewService:
                 f"未在所引证据摘录中出现：{truncate_text(claim_text, 100)}"
             )
         return None
+
+    @staticmethod
+    def _normalized_numeric_fallback(claim_text: str, cited_records: list[dict[str, Any]]) -> str | None:
+        bodies = [
+            next(
+                (body for key in ("full_content", "raw_content", "snippet", "content")
+                 if (body := str(rec.get(key) or "").strip())),
+                "",
+            )
+            for rec in cited_records
+        ]
+        return numeric_grounding_mismatch(claim_text, [body for body in bodies if body])
+
+    def _computation_lineage_errors(self, evidence_by_id: dict[str, dict[str, Any]]) -> dict[str, str]:
+        return {
+            sid: error
+            for sid, item in evidence_by_id.items()
+            if (item.get("source_origin") == "sandbox" or re.fullmatch(r"T[0-9]+-C[0-9]+", sid))
+            and (error := self._verify_computation_lineage(item, evidence_by_id))
+        }
 
     def _verify_computation_lineage(
         self,

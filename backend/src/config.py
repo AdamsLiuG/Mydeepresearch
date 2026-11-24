@@ -616,6 +616,7 @@ class Configuration(BaseModel):
     nli_stage_budget_seconds: float = Field(
         default=8.0,
         gt=0.0,
+        allow_inf_nan=False,
         title="NLI Stage Budget Seconds",
         description="Wall-clock budget for NLI verification before degrading gracefully to numeric checks",
     )
@@ -1453,6 +1454,24 @@ class Configuration(BaseModel):
             if normalized not in {"off", "shadow", "canary", "active"}:
                 raise ValueError("policy_model_mode must be one of 'off', 'shadow', 'canary', 'active'")
             return normalized
+        return value
+
+    @field_validator("nli_model_backend", mode="before")
+    @classmethod
+    def _normalize_nli_model_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip().lower() or "auto"
+            if value not in {"auto", "cross_encoder", "transformers_nli", "minicheck", "disabled"}:
+                raise ValueError("nli_model_backend must be auto, cross_encoder, transformers_nli, minicheck, or disabled")
+        return value
+
+    @field_validator("nli_device", mode="before")
+    @classmethod
+    def _normalize_nli_device(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip().lower() or "auto"
+            if value not in {"auto", "cpu", "cuda", "mps"}:
+                raise ValueError("nli_device must be auto, cpu, cuda, or mps")
         return value
 
     @field_validator("workflow_runner", mode="before")

@@ -7,7 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -23,8 +25,8 @@ from evals.metrics.factscore import (
 )
 from evals.report_metrics import MetricRecord, aggregate_records
 from evals.schema import BenchmarkCase
-from main import _warmup_nli_model, create_app
-from metrics import RequestTrace
+from main import ResearchResponse, _warmup_nli_model, create_app
+from metrics import RequestTrace, metrics_registry
 from models import SummaryState, SummaryStateOutput, TodoItem
 from services.claim_verifier import (
     AtomicClaimDecomposer,
@@ -39,9 +41,10 @@ from services.claim_verifier import (
     clear_nli_model_cache,
     load_nli_model,
 )
+from services.event_bus import RedisStreamEventBus
 from services.evidence_index import EvidenceRetrievalService, EvidenceRuntimeIndex
 from services.reporter import ReportingService
-from services.request_state import RequestStateStore
+from services.request_state import RequestStateStore, SnapshotConflictError
 from services.reviewer import ReviewService
 from state_manager import StateManagerMixin
 
@@ -870,3 +873,769 @@ def test_nli_config_from_env_warmup_and_api_response(monkeypatch) -> None:
         assert body["evidence_conflicts"][0]["conflict_id"] == "CONF-API1"
         assert body["claim_verification_summary"]["atomic_faithfulness_rate"] == 1.0
         assert body["todo_items"][0]["atomic_claims"][0]["nli_label"] == "ENTAILED"
+
+
+def test_atomic_citations_follow_their_span_and_table_context() -> None:
+    claims = AtomicClaimDecomposer(decompose_with_fast_llm=False).decompose(
+        task_id=2,
+        parent_claims=[{
+            "text": (
+                "## Results\n"
+                "- Acme 营收 1.25 亿。 [T1-S1][T1-M1] 同时 Acme margin reached 24% [T2-C1].\n"
+                "| Entity | 2025 revenue | Source |\n"
+                "| --- | ---: | --- |\n"
+                "| Beta | USD 2 million | [T1-M1] |\n"
+                "```\nAcme made 0 [T1-S1]\n```"
+            ),
+            "source_ids": ["T1-S1", "T1-M1", "T2-C1"],
+        }],
+        valid_source_ids={"T1-S1", "T1-M1", "T2-C1"},
+    )
+    assert [claim.source_ids for claim in claims] == [["T1-S1", "T1-M1"], ["T2-C1"], ["T1-M1"]]
+    assert "1.25" in claims[0].text and "24%" in claims[1].text
+    assert "Beta" in claims[2].text and "2025 revenue" in claims[2].text
+
+
+def test_llm_partial_decomposition_cannot_drop_or_rebind_inline_clauses() -> None:
+    payload = {"claims": [
+        {"parent_index": 0, "atomics": [{"text": "   "}]},
+        {"parent_index": 1, "atomics": [
+            {"text": "Acme revenue was USD 2 million [T1-M1]", "source_ids": ["T1-M1"]},
+        ]},
+    ]}
+    claims = AtomicClaimDecomposer().decompose(
+        task_id=1,
+        parent_claims=[
+            {"text": "Acme latency was 60 ms [T1-S1]", "source_ids": ["T1-S1"]},
+            {
+                "text": "Acme revenue was USD 2 million [T1-S1]; margin was 30% [T1-M1]",
+                "source_ids": ["T1-S1", "T1-M1"],
+            },
+        ],
+        valid_source_ids={"T1-S1", "T1-M1"},
+        fast_llm=_MockLLM(json.dumps(payload)),
+    )
+    assert [claim.source_ids for claim in claims] == [["T1-S1"], ["T1-S1"], ["T1-M1"]]
+    assert "30%" in claims[2].text
+
+
+def test_numeric_grounding_normalizes_dimensions_and_scale() -> None:
+    from services.claim_verifier import (
+        _extract_numeric_and_unit,
+        numeric_grounding_mismatch,
+    )
+
+    assert _extract_numeric_and_unit("2025年Q4营收2,025万元") == (20_250_000, "cny")
+    assert _extract_numeric_and_unit("FY2025 revenue was USD 1.2 billion") == (1_200_000_000, "usd")
+    assert _extract_numeric_and_unit("毛利率增长2个百分点") == (2, "pp")
+    assert _extract_numeric_and_unit("Acme v2.5 has 1 亿 users") == (100_000_000, "scalar")
+    assert _extract_numeric_and_unit("营收为2025") == (2025, "scalar")
+    assert numeric_grounding_mismatch("营收为1.2亿美元", ["Revenue reached $120 million."]) is None
+    assert numeric_grounding_mismatch("营收为1亿元", ["营收为10000万元"]) is None
+    assert numeric_grounding_mismatch("Margin reached 42%", ["Margin reached 0.42."]) is None
+    assert numeric_grounding_mismatch("Latency was 0.5 seconds", ["Latency was 500 ms."]) is None
+    assert numeric_grounding_mismatch("Margin rose 2 pp", ["Margin rose 2 percentage points."]) is None
+    assert numeric_grounding_mismatch("FY2025 margin reached 98%", ["FY2025 margin reached 42%."])
+    assert numeric_grounding_mismatch("FY2025 margin reached 42%", ["FY2024 margin reached 42%."])
+    assert numeric_grounding_mismatch("Margin rose 2 pp", ["Margin rose 2%."])
+    assert numeric_grounding_mismatch("Revenue was USD 1 million", ["Revenue was EUR 1 million."])
+    assert numeric_grounding_mismatch("Revenue was USD 1 billion", ["Revenue was USD 1 million."])
+
+
+def test_scorer_rejects_ambiguous_labels_and_keeps_completed_batches() -> None:
+    assert _resolve_label_mapping({0: "LABEL_0", 1: "LABEL_1", 2: "LABEL_2"}) == {}
+    calls = 0
+
+    def predict(batch):
+        nonlocal calls
+        calls += 1
+        return [[0.0, 5.0, 0.0]] if calls == 1 else [[float("nan"), 0.0, 0.0]]
+
+    model = LoadedNLIModel(
+        backend="mock",
+        model_name="mock",
+        label_mapping={"contradiction": 0, "entailment": 1, "neutral": 2},
+        predict_logits_fn=predict,
+    )
+    scorer = LocalNLIScorer(Configuration(nli_batch_size=1), loaded_model=model)
+    result = scorer.score_pairs_batched([("A", "A"), ("B", "B")], deadline_monotonic=time.monotonic() + 2)
+    assert result and len(result) == 1 and result[0]["entailment"] > 0.9
+
+
+def test_conflict_graph_only_attributes_backed_conflicting_sources() -> None:
+    from services.claim_verifier import normalize_conflict_key
+
+    assert normalize_conflict_key("Acme", "营收同比增长率", "2025 年第四季度") == (
+        "acme", "revenue_growth_rate", "2025Q4",
+    )
+    assert normalize_conflict_key("Acme", "revenue_growth_rate", "Q4 2025") == (
+        "acme", "revenue_growth_rate", "2025Q4",
+    )
+    records = {
+        "T1-S1": {"source_type": "forum_general"},
+        "T1-M1": {"source_origin": "mcp", "source_type": "mcp_curated_filing"},
+        "T1-C1": {"source_origin": "sandbox", "source_type": "computed_sandbox", "derived_from_source_ids": ["T1-M1"]},
+        "T2-S1": {"source_type": "government"},
+    }
+
+    def claim(sid, value, unit, label, task_id=1):
+        return AtomicClaimRecord(
+            atomic_id=f"{task_id}-{sid}", task_id=task_id, parent_claim_index=0,
+            text="Acme Q4 gross margin", source_ids=[sid], best_source_id=sid, nli_label=label,
+            calibrated_confidence=0.9,
+            proposition=AtomicProposition(entity="Acme", metric="gross margin", period="Q4 2025",
+                                          numeric_value=value, unit=unit),
+        )
+
+    claims = [
+        claim("T1-S1", 42, "%", "ENTAILED"), claim("T1-M1", 0.42, "scalar", "ENTAILED"),
+        claim("T1-C1", 2, "pp", "ENTAILED"), claim("T2-S1", 16, "%", "SKIPPED"),
+    ]
+    builder = ConflictGraphBuilder(Configuration(nli_conflict_numeric_rel_tol=0))
+    assert builder.build(claims, evidence_by_id=records) == []
+    claims[-1].nli_label = "ENTAILED"
+    clusters = builder.build(claims, evidence_by_id=records)
+    assert len(clusters) == 1
+    assert {side.source_id for side in clusters[0].sides} == {"T1-S1", "T1-M1", "T2-S1"}
+    assert len(clusters[0].edges) == 2
+    assert clusters[0].recommended_source_id is None
+    assert clusters[0].to_dict() == builder.build(list(reversed(claims)), evidence_by_id=records)[0].to_dict()
+
+
+def test_scoped_retriever_fills_a_missing_source_without_broadening_scope() -> None:
+    from services.evidence_index import EvidenceRetrievalHit
+
+    evidence = [
+        {"source_id": "T1-M1", "full_content": "Acme margin was 42%."},
+        {"source_id": "T2-S1", "full_content": "Acme margin was 88%."},
+    ]
+
+    class Store(_FakeEvidenceStore):
+        def lookup(self, *, source_ids=None, include_full_content=False):
+            assert source_ids == ["T1-M1"]
+            return super().lookup(source_ids=source_ids, include_full_content=include_full_content)
+
+    def hit(sid, origin):
+        return EvidenceRetrievalHit(
+            origin=origin, citation_eligible=origin == "current", task_id=1,
+            source_id=sid, archive_doc_key=None, archive_version_id=None,
+            chunk_id=f"{sid}-chunk", text="Acme margin 21%", url="", title="", domain="",
+            quality_label="medium", freshness_label="unknown", score=1.0,
+        )
+
+    retriever = SimpleNamespace(query=lambda *args, **kwargs: SimpleNamespace(
+        hits=[hit("T1-S1", "current"), hit("T1-M1", "history"), hit("T2-S1", "current")],
+    ))
+    atomic = AtomicClaimRecord(
+        atomic_id="1-C0-A0", task_id=1, parent_claim_index=0,
+        text="Acme margin was 42%", source_ids=["T1-S1", "T1-M1"],
+    )
+    hits = ScopedEvidenceRetriever().fetch_for_claim(
+        atomic, retrieval_service=retriever, evidence_store=Store(evidence), cited_records_fallback=[],
+    )
+    assert [(item.source_id, item.origin) for item in hits] == [("T1-S1", "current"), ("T1-M1", "current")]
+    assert "42%" in hits[1].text
+
+
+def test_nli_numeric_guard_and_atomic_cap_reach_parent_rollup() -> None:
+    cfg = Configuration(nli_verifier_enabled=True, nli_max_atomic_claims_per_task=2)
+    score = LocalNLIScorer(cfg, loaded_model=LoadedNLIModel(
+        backend="test", model_name="test", label_mapping={"contradiction": 0, "entailment": 1, "neutral": 2},
+        predict_logits_fn=lambda batch: [[0, 8, 0] for _ in batch],
+    ))
+    state = SummaryState(research_topic="Test", todo_items=[TodoItem(
+        id=1, title="Data", intent="Check", query="Acme",
+        evidence_items=[{"source_id": "T1-S1", "snippet": "Acme margin was 42%. Acme revenue was USD 2 million."}],
+    )])
+    claims = {1: [
+        {"text": text, "source_ids": ["T1-S1"], "support_status": "supported"}
+        for text in ("Acme margin was 42%", "Acme revenue was USD 2 billion", "Acme margin was 80%")
+    ]}
+    out = ClaimVerificationOrchestrator(cfg, scorer=score).verify_request(state, claims_by_task=claims)
+    assert [row["nli_label"] for row in state.todo_items[0].atomic_claims] == ["ENTAILED", "NEUTRAL", "SKIPPED"]
+    assert [row["support_status"] for row in claims[1]] == ["supported", "unverified_claim", "unverified_claim"]
+    assert out["summary"]["degraded"] and out["summary"]["atomic_faithfulness_rate"] == 0.5
+
+
+def test_direction04_snapshot_and_event_payloads_are_tenant_scoped(tmp_path) -> None:
+    config = Configuration(
+        auth_enabled=True,
+        tenant_api_keys={"key-alpha": "alpha", "key-beta": "beta"},
+        request_state_dir=str(tmp_path),
+    )
+    app = create_app(base_config=config)
+    atomic = {"atomic_id": "1-C0-A0", "nli_label": "ENTAILED", "matched_excerpt": "private excerpt"}
+    conflicts = [{"conflict_id": "CONF-1", "sides": [{"evidence_excerpt": "private conflict"}]}]
+    summary = {"entailed_count": 1, "total_atomic_claims": 1}
+    app.state.request_state_store.save(
+        "req-nli",
+        {"todo_items": [{"atomic_claims": [atomic]}], "evidence_conflicts": conflicts,
+         "claim_verification_summary": summary},
+        tenant_id="alpha",
+    )
+    app.state.event_bus.publish(
+        "alpha", "req-nli",
+        {"type": "final_report", "evidence_conflicts": conflicts, "claim_verification_summary": summary},
+    )
+    with TestClient(app) as client:
+        for path in ("/requests/req-nli", "/requests/req-nli/events"):
+            assert client.get(path).status_code == 401
+            assert client.get(path, headers={"X-API-Key": "key-beta"}).status_code == 404
+        headers = {"X-API-Key": "key-alpha"}
+        detail = client.get("/requests/req-nli", headers=headers).json()
+        assert detail["evidence_conflicts"] == conflicts
+        assert detail["claim_verification_summary"] == summary
+        assert detail["todo_items"][0]["atomic_claims"] == [atomic]
+        events = client.get("/requests/req-nli/events", headers=headers).json()["events"]
+        assert events[0]["data"]["evidence_conflicts"] == conflicts
+        assert events[0]["data"]["claim_verification_summary"] == summary
+
+
+def test_direction04_metrics_only_returns_the_callers_request_traces(tmp_path) -> None:
+    config = Configuration(
+        auth_enabled=True,
+        tenant_api_keys={"key-alpha": "alpha", "key-beta": "beta"},
+        request_state_dir=str(tmp_path),
+    )
+    for tenant in ("alpha", "beta"):
+        metrics_registry.store_request(
+            {"request_id": f"nli-{tenant}", "tenant_id": tenant,
+             "todo_items": [{"atomic_claims": [{"matched_excerpt": f"{tenant} excerpt"}]}]},
+        )
+    with TestClient(create_app(base_config=config)) as client:
+        assert client.get("/metrics/json").status_code == 401
+        requests = client.get("/metrics/json", headers={"X-API-Key": "key-alpha"}).json()["recent_requests"]
+    assert [entry["request_id"] for entry in requests] == ["nli-alpha"]
+    assert requests[0]["todo_items"][0]["atomic_claims"][0]["matched_excerpt"] == "alpha excerpt"
+
+
+def test_direction04_snapshot_retains_owner_for_versioned_and_unversioned_saves(tmp_path) -> None:
+    store = RequestStateStore(str(tmp_path))
+    original = store.save("req-nli", {"evidence_conflicts": [{"conflict_id": "CONF-1"}]}, tenant_id="alpha")
+    for expected_version in (None, original["state_version"]):
+        with pytest.raises(SnapshotConflictError):
+            store.save("req-nli", {"evidence_conflicts": []}, tenant_id="beta", expected_version=expected_version)
+    assert store.load("req-nli", tenant_id="alpha") == original
+    assert store.load("req-nli", tenant_id="beta") is None
+
+
+def test_direction04_resume_restores_summary_without_recording_another_verification() -> None:
+    observer = RequestTrace(
+        request_id="req-resume-nli", topic="topic", search_api="test", provider=None,
+        model=None, pricing_catalog=None,
+    )
+    state = SummaryState(
+        review_completed=True,
+        claim_verification_summary={"total_atomic_claims": 2, "entailed_count": 1, "skipped_count": 1},
+    )
+    state.review_summary = {"overall_status": "passed", "claim_verification_summary": state.claim_verification_summary}
+    before = metrics_registry.snapshot(include_recent_requests=False)
+    StateManagerMixin()._restore_task_counters(observer, state)
+    snapshot = observer.snapshot()
+    after = metrics_registry.snapshot(include_recent_requests=False)
+    assert snapshot["claim_verification_summary"] == state.claim_verification_summary
+    assert snapshot["review_summary"] == state.review_summary
+    assert after["counters"]["nli_claims_verified_total"] == before["counters"]["nli_claims_verified_total"]
+    assert after["latencies_ms"]["nli_latency_ms"] == before["latencies_ms"]["nli_latency_ms"]
+
+
+def test_direction04_configuration_validates_nli_options_and_preserves_safe_defaults() -> None:
+    assert Configuration().nli_verifier_enabled is False
+    assert Configuration().nli_warmup_enabled is False
+    assert Configuration(nli_model_backend=" Transformers_NLI ", nli_device=" CPU ").nli_model_backend == "transformers_nli"
+    with pytest.raises(ValidationError):
+        Configuration(nli_model_backend="unknown")
+    with pytest.raises(ValidationError):
+        Configuration(nli_device="gpu")
+    with pytest.raises(ValidationError):
+        Configuration(nli_stage_budget_seconds=float("inf"))
+
+
+def test_direction04_api_response_fields_have_blueprint_defaults() -> None:
+    payload = ResearchResponse(report_markdown="report")
+    assert payload.evidence_conflicts == []
+    assert payload.claim_verification_summary == {}
+
+
+def test_direction04_snapshot_defaults_handle_legacy_and_malformed_atomic_fields() -> None:
+    host = StateManagerMixin()
+    host._evidence_store = SimpleNamespace(hydrate_from_tasks=lambda tasks: None)
+    state, _ = host._state_from_snapshot(
+        {"todo_items": [{"id": 0}, {"id": 0, "atomic_claims": "invalid"}]},
+    )
+    assert state.evidence_conflicts == []
+    assert state.claim_verification_summary == {}
+    assert [task.atomic_claims for task in state.todo_items] == [[], []]
+
+
+def test_direction04_research_runs_with_the_application_nli_configuration(tmp_path) -> None:
+    class _ConfigAgent:
+        def __init__(self, config, request_id=None):
+            self.config = config
+
+        def run(self, topic):
+            return SimpleNamespace(
+                report_markdown="report",
+                todo_items=[],
+                claim_verification_summary={
+                    "enabled": self.config.nli_verifier_enabled,
+                    "decompose_with_fast_llm": self.config.nli_decompose_with_fast_llm,
+                },
+            )
+
+    config = Configuration(
+        nli_verifier_enabled=True,
+        nli_decompose_with_fast_llm=False,
+        request_state_dir=str(tmp_path),
+    )
+    with TestClient(create_app(base_config=config, agent_factory=_ConfigAgent)) as client:
+        response = client.post("/research", json={"topic": "topic"})
+    assert response.status_code == 200
+    assert response.json()["claim_verification_summary"] == {
+        "enabled": True, "decompose_with_fast_llm": False,
+    }
+
+
+def test_direction04_plan_edits_invalidate_results_from_previous_tasks(tmp_path) -> None:
+    config = Configuration(request_state_dir=str(tmp_path))
+    app = create_app(base_config=config)
+    store = app.state.request_state_store
+    store.save(
+        "req-plan-review",
+        {
+            "phase": "completed",
+            "status": "success",
+            "review_completed": True,
+            "evidence_conflicts": [{"conflict_id": "CONF-old"}],
+            "claim_verification_summary": {"total_atomic_claims": 1},
+            "review_summary": {"claim_verification_summary": {"total_atomic_claims": 1}},
+            "todo_items": [{"id": 1, "atomic_claims": [{"atomic_id": "1-C0-A0"}]}],
+        },
+    )
+    with TestClient(app) as client:
+        response = client.put("/requests/req-plan-review/plan", json={
+            "tasks": [{"title": "Current task", "intent": "Verify", "query": "current"}],
+        })
+        assert response.status_code == 200
+        snapshot = client.get("/requests/req-plan-review").json()
+    assert snapshot["review_completed"] is False
+    assert snapshot["evidence_conflicts"] == []
+    assert snapshot["claim_verification_summary"] == {}
+    assert snapshot["review_summary"] == {}
+    assert not snapshot["todo_items"][0].get("atomic_claims")
+
+
+def test_direction04_redis_replay_keys_keep_tenant_and_request_boundaries() -> None:
+    key = RedisStreamEventBus._stream_key
+    assert key("alpha", "req-nli") == "deepresearch:stream:alpha:req-nli"
+    assert key("org:alpha", "req-nli") != key("org", "alpha:req-nli")
+    assert key("org:alpha", "req-nli") != key("org%3Aalpha", "req-nli")
+
+
+def test_scoped_retrieval_keeps_all_cited_sources_and_configured_chunks(monkeypatch):
+    from types import SimpleNamespace
+
+    from config import Configuration
+    from services import evidence_index
+    from services.evidence_index import EvidenceRetrievalService, EvidenceRuntimeIndex
+
+    monkeypatch.setattr(evidence_index, "encode_texts", lambda texts, **_: [None] * len(texts))
+    monkeypatch.setattr(evidence_index, "encode_text", lambda *_args, **_kwargs: None)
+    cfg = Configuration(evidence_runtime_enabled=True, nli_top_k_chunks_per_source=3)
+    index = EvidenceRuntimeIndex(cfg)
+    allowed = ["T1-S1", "T1-M1", "T1-C1", "T2-M1", "T2-C1"]
+    for sid in [*allowed, "T2-S5"]:
+        task_id = int(sid[1])
+        index.on_records_changed(
+            task_id=task_id,
+            records=[SimpleNamespace(
+                source_id=sid,
+                multimodal_blocks=[{"text": f"Revenue observation {i}"} for i in range(3)],
+            )],
+            reason="compute" if "-C" in sid else ("mcp" if "-M" in sid else "search"),
+        )
+
+    class History:
+        def query(self, **_):
+            raise AssertionError("Whitelisted retrieval must never query history")
+
+    retrieval = EvidenceRetrievalService(runtime_index=index, memory_service=History(), config=cfg)
+    result = retrieval.query(
+        "revenue", task_id=2, scope="hybrid", mode="repair",
+        top_k=15, allowed_source_ids=allowed,
+    )
+    assert (result.scope, result.mode) == ("current", "grounding")
+    assert {hit.source_id for hit in result.hits} == set(allowed)
+    assert all(sum(hit.source_id == sid for hit in result.hits) == 3 for sid in allowed)
+    assert not retrieval.query("revenue", task_id=2, allowed_source_ids=[]).hits
+
+
+def test_factscore_uses_typed_atomic_records_and_excludes_skipped():
+    from evals.judges.hybrid import HybridJudge
+    from evals.schema import BenchmarkCase
+    from models import TodoItem
+
+    task = TodoItem(id=1, title="test", intent="test", query="test", atomic_claims=[
+        {"nli_label": "ENTAILED"},
+        {"nli_label": "NEUTRAL"},
+        {"nli_label": "SKIPPED"},
+    ])
+    result = HybridJudge().evaluate(
+        case=BenchmarkCase(id="case", topic="topic"),
+        report_markdown="report",
+        todo_items=[task],
+        trace_snapshot={"claim_verification_summary": {"atomic_faithfulness_rate": 1, "total_atomic_claims": 1}},
+    )
+    assert result["atomic_faithfulness_rate"] == 0.5
+    assert result["evaluated_atomic_claims"] == 2
+    assert result["skipped_count"] == 1
+
+    task.atomic_claims = [{"nli_label": "SKIPPED"}]
+    result = HybridJudge().evaluate(
+        case=BenchmarkCase(id="case", topic="topic"),
+        report_markdown="report",
+        todo_items=[task],
+        trace_snapshot=None,
+    )
+    assert result["atomic_faithfulness_rate"] is None
+
+
+def test_eval_benchmark_and_project_report_aggregate_factscore_and_conflict_recall():
+    from types import SimpleNamespace
+
+    from config import Configuration
+    from evals.judges.hybrid import HybridJudge
+    from evals.report_metrics import aggregate_records, normalize_eval_result
+    from evals.runner import run_benchmark_suite
+    from evals.schema import BenchmarkCase
+    from models import TodoItem
+
+    class Agent:
+        def __init__(self, **_):
+            pass
+
+        def run(self, topic):
+            labels = ["ENTAILED", "SKIPPED"] if topic == "first" else ["CONTRADICTED"] * 2 + ["NEUTRAL"]
+            return SimpleNamespace(
+                report_markdown="Report",
+                todo_items=[TodoItem(
+                    id=1, title="test", intent="test", query="test",
+                    atomic_claims=[{"nli_label": label} for label in labels],
+                    claims=[{"support_status": "supported" if topic == "first" else "contradicted"}],
+                )],
+                evidence_conflicts=[{
+                    "conflict_id": "same", "entity": "acmecorp", "metric": "revenue",
+                    "period": "2025Q4", "adjudication_status": "unresolved_divergence", "severity": "high",
+                }] if topic == "first" else [],
+            )
+
+    first = {"entity": "ACME Corp", "metric": "营收", "period": "2025年第四季度"}
+    second = {"entity": "ACME Corp", "metric": "净利润", "period": "2025 Q4"}
+    third = {"entity": "ACME Corp", "metric": "毛利率", "period": "2025 Q4"}
+    benchmark = run_benchmark_suite(
+        [
+            BenchmarkCase(id="first", topic="first", metadata={"expected_conflicts": [first, first]}),
+            BenchmarkCase(id="second", topic="second", metadata={"expected_conflicts": [first, second, third]}),
+        ],
+        config=Configuration(),
+        agent_factory=Agent,
+        judge=HybridJudge(),
+    )
+    result_a, result_b = benchmark["results"]
+    assert result_a["metrics"]["conflict_recall"] == 1.0
+    assert result_b["metrics"]["conflict_recall"] == 0.0
+    assert len(result_a["todo_items"][0]["atomic_claims"]) == 2
+    assert result_a["evidence_conflicts"][0]["conflict_id"] == "same"
+    assert benchmark["summary"]["atomic_factscore"] == 0.25
+    assert benchmark["summary"]["conflict_recall"] == 0.25
+
+    records = [normalize_eval_result(item, source_label="unit", fallback_latency_keys=())
+               for item in benchmark["results"]]
+    assert all(record is not None for record in records)
+    aggregate = aggregate_records(records)
+    assert aggregate["atomic_factscore"] == 0.25
+    assert aggregate["contradiction_rate"] == 0.5
+    assert aggregate["skipped_count"] == 1
+    assert aggregate["conflict_recall"] == 0.25
+    assert aggregate["conflict_count"] == 1
+    assert aggregate["citation_validity_rate"] == 0.5
+
+
+def test_eval_conflict_resolution_ignores_malformed_and_duplicate_clusters():
+    from evals.metrics.factscore import summarize_conflict_resolution
+
+    resolved = {"conflict_id": "one", "adjudication_status": "resolved_by_authority", "severity": "low"}
+    summary = summarize_conflict_resolution([resolved, resolved.copy(), None])
+    assert summary["conflict_count"] == 1
+    assert summary["resolved_by_authority"] == 1
+    assert summary["resolution_rate"] == 1.0
+
+
+def test_project_report_recovers_atomic_counts_from_summary_only():
+    from evals.report_metrics import aggregate_records, normalize_request_snapshot
+
+    record = normalize_request_snapshot(
+        {
+            "request_id": "old-export",
+            "request_metrics": {
+                "claim_verification_summary": {
+                    "entailed_count": 3,
+                    "contradicted_count": 1,
+                    "neutral_count": 2,
+                    "skipped_count": 7,
+                }
+            },
+        },
+        source_label="unit",
+    )
+    assert record is not None
+    aggregate = aggregate_records([record])
+    assert aggregate["atomic_factscore"] == 0.5
+    assert aggregate["evaluated_atomic_claims"] == 6
+    assert aggregate["total_atomic_claims"] == 13
+    assert aggregate["conflict_recall"] is None
+
+
+def test_scoped_evidence_table_chunk_keeps_columns_with_late_rows(monkeypatch):
+    from types import SimpleNamespace
+
+    from config import Configuration
+    from services import evidence_index
+    from services.evidence_index import EvidenceRuntimeIndex
+
+    monkeypatch.setattr(evidence_index, "encode_texts", lambda texts, **_: [None] * len(texts))
+    monkeypatch.setattr(evidence_index, "encode_text", lambda *_args, **_kwargs: None)
+    cfg = Configuration(evidence_runtime_enabled=True, evidence_chunk_chars=240, evidence_chunk_overlap=0)
+    index = EvidenceRuntimeIndex(cfg)
+    table = (
+        "## Financial highlights\n\n"
+        "| Company | Gross margin (%) |\n| --- | ---: |\n"
+        + "\n".join(f"| Company Number {i} | 12.3 |" for i in range(25))
+        + "\n| TargetCorp | 42.5 |"
+    )
+    index.on_records_changed(
+        task_id=1,
+        records=[SimpleNamespace(source_id="T1-S1", full_content=table)],
+        reason="fetch",
+    )
+    hit, = index.query(text="TargetCorp", top_k=1, allowed_source_ids=["T1-S1"])
+    assert "| TargetCorp | 42.5 |" in hit.text
+    assert "| Company | Gross margin (%) |\n| --- | ---: |" in hit.text
+
+
+def test_table_cells_bind_each_value_to_its_own_citation() -> None:
+    claims = AtomicClaimDecomposer().decompose(
+        task_id=1,
+        parent_claims=[{
+            "text": "Company | Revenue | Margin\n--- | --- | ---\nAcme | USD 2 million [T1-M1] | 42% [T1-C1]",
+            "source_ids": ["T1-M1", "T1-C1"],
+        }],
+        valid_source_ids={"T1-M1", "T1-C1"},
+    )
+    assert [(claim.proposition.metric, claim.source_ids) for claim in claims] == [
+        ("revenue", ["T1-M1"]), ("gross_margin", ["T1-C1"]),
+    ]
+    assert all("Acme" in claim.text for claim in claims)
+def test_reviewer_preserves_citation_spans_validates_inline_ids_and_uses_current_record() -> None:
+    from types import SimpleNamespace
+
+    from config import Configuration
+    from models import SummaryState, TodoItem
+    from services.reviewer import ReviewService
+
+    source = {"source_id": "T1-S1", "snippet": "A sufficiently long old excerpt says 20%."}
+    full_source = {**source, "full_content": "The final metric published for the interval was 24%."}
+    task = TodoItem(
+        id=1, title="Results", intent="Review results", query="q", status="completed",
+        evidence_items=[source, {"source_id": "T1-M1"}],
+        claims=[
+            {"text": "Reported margin was 24% [T1-S1]; export status is stable [T1-M1]"},
+            {"text": "The export was available [T9-C9]", "source_ids": ["T1-S1"]},
+            {"text": "The published margin was 24%", "source_ids": ["T1-S1"]},
+        ],
+    )
+    service = ReviewService(
+        None, Configuration(nli_verifier_enabled=False, review_agent_enabled=False),
+        evidence_store=SimpleNamespace(lookup=lambda **_: [full_source]),
+    )
+    service.review_request(SummaryState(todo_items=[task], research_topic="Results"))
+    assert task.claims[0]["source_ids"] == ["T1-S1", "T1-M1"]
+    assert "[T1-S1];" in task.claims[0]["text"]
+    assert task.claims[1]["support_status"] == "invalid_citation"
+    assert task.claims[2]["support_status"] == "supported"
+
+
+def test_reviewer_ignores_table_headers_and_fenced_examples_as_claims() -> None:
+    from services.reviewer import ReviewService
+
+    claims = ReviewService._extract_claim_texts(
+        "## Findings\n\n"
+        "| Issuer | FY2025 margin | Source |\n"
+        "| :--- | ---: | --- |\n"
+        "| Example Corp | 18% | [T1-M1] |\n\n"
+        "```text\nexample statement without a source\n```\n\n"
+        "+ 第二个来源支持此结论 [T1-C1]"
+    )
+    assert len(claims) == 2
+    assert "FY2025 margin" in claims[0] and "[T1-M1]" in claims[0]
+    assert claims[1] == "第二个来源支持此结论 [T1-C1]"
+
+
+def test_reviewer_rejects_claim_citing_unverified_computation_across_tasks() -> None:
+    from config import Configuration
+    from models import SummaryState, TodoItem
+    from services.reviewer import ReviewService
+
+    original = TodoItem(
+        id=1, title="Original", intent="Compute", query="q", status="completed",
+        evidence_items=[{"source_id": "T1-C1", "source_origin": "sandbox", "snippet": "margin was 92%"}],
+    )
+    dependent = TodoItem(
+        id=2, title="Dependent", intent="Compare", query="q", status="completed",
+        claims=[{"text": "Margin was 92% [T1-C1]"}],
+    )
+    service = ReviewService(None, Configuration(review_agent_enabled=False))
+    service.review_request(SummaryState(research_topic="Margins", todo_items=[original, dependent]))
+    assert dependent.claims[0]["support_status"] == "invalid_citation"
+
+
+def test_reporting_fallback_omits_contradicted_claim_from_both_summary_paths() -> None:
+    from config import Configuration
+    from models import SummaryState, TodoItem
+    from services.reporter import ReportingService
+
+    contradicted = "Acme reported a 92% operating margin"
+    task = TodoItem(
+        id=1, title="Acme", intent="Measure margins", query="q", status="completed",
+        review_status="warning",
+        claims=[
+            {"text": contradicted, "source_ids": ["T1-S1"], "support_status": "contradicted", "nli_verdict": "CONTRADICTED"},
+            {"text": "Acme reported a 12% operating margin", "source_ids": ["T1-S1"], "support_status": "supported"},
+        ],
+        summary_payload={
+            "executive_summary": contradicted,
+            "key_findings": [{"text": contradicted, "source_ids": ["T1-S1"]}],
+        },
+        evidence_items=[{"source_id": "T1-S1", "title": "Acme filing", "snippet": "Acme reported a 12% operating margin."}],
+    )
+    state = SummaryState(research_topic="Acme", todo_items=[task])
+    service = ReportingService(None, Configuration(), evidence_store=None)
+    payload = {
+        "background_overview": contradicted,
+        "key_findings": [{"claim": contradicted, "source_ids": ["T1-S1"]}],
+    }
+    assert contradicted not in service._task_prompt_summary(task)
+    report = service._render_structured_report(payload, state=state)
+    assert contradicted not in report
+    assert "Acme reported a 12% operating margin" in report
+
+
+def test_reporting_markdown_preserves_fences_and_renders_all_conflict_edges() -> None:
+    import re
+    from types import SimpleNamespace
+
+    from config import Configuration
+    from models import SummaryState, TodoItem
+    from services.reporter import ReportingService
+
+    markdown = (
+        "## 风险与挑战\n\n"
+        "| Issuer | Margin |\n| --- | --- |\n| Acme | 12% |\n\n"
+        "```json\n{\"text\": \"[T9-S9]\"}\n## 参考来源\n```\n\n"
+        "## 参考来源\n"
+    )
+    evidence = [
+        {"source_id": source_id, "title": name, "url": "https://example.com/report"}
+        for source_id, name in (("T1-S1", "filing"), ("T1-M1", "archive"), ("T1-C1", "computation"))
+    ]
+    conflict = {
+        "conflict_id": "CONF-markdown",
+        "entity": "Acme | Global",
+        "metric": "margin",
+        "period": "2025",
+        "sides": [
+            {"source_id": "T1-S1", "title": r"Filing \| revision", "claim_text": "Margin was 12%."},
+            {"source_id": "T1-M1", "title": "Archive", "claim_text": "Margin was 24%."},
+            {"source_id": "T1-C1", "title": "Calculation", "claim_text": "Margin was 33%."},
+            {"source_id": "T9-C9", "title": "Foreign record", "claim_text": "unavailable"},
+        ],
+        "edges": [
+            {"source_id_a": "T1-S1", "source_id_b": "T1-M1"},
+            {"source_id_a": "T1-M1", "source_id_b": "T1-C1"},
+            {"source_id_a": "T1-C1", "source_id_b": "T9-C9"},
+        ],
+        "recommended_source_id": "T9-C9",
+        "adjudication_status": "resolved_by_authority",
+        "adjudication_rationale": "Foreign record [T9-C9]",
+    }
+    task = TodoItem(id=1, title="Acme", intent="Measure margins", query="q", evidence_items=evidence)
+    state = SummaryState(research_topic="Acme", todo_items=[task], evidence_conflicts=[conflict])
+    agent = SimpleNamespace(run=lambda *_args, **_kwargs: markdown, clear_history=lambda: None)
+    store = SimpleNamespace(list_task_evidence=lambda *_: evidence, build_reference_map=lambda _: evidence)
+    service = ReportingService(agent, Configuration(), evidence_store=store)
+    events = list(service.stream_generate_report(state))
+    report = "".join(event["content"] for event in events if event["type"] == "report_chunk")
+    assert "多源口径分歧与证据对照" in events[0]["sections"]
+    assert "```json\n{\"text\": \"[T9-S9]\"}\n## 参考来源\n```" in report
+    assert "| Issuer | Margin |\n| --- | --- |\n| Acme | 12% |" in report
+    section, references = report.rsplit("## 参考来源", 1)
+    rows = [line for line in section.splitlines() if line.startswith(r"| Acme \| Global")]
+    assert len(rows) == 2
+    assert all(len(re.split(r"(?<!\\)\|", row)) == 6 for row in rows)
+    assert "[T1-C1]" in section and "[T1-C1]" in references
+    assert "Foreign record" not in report and "[T9-C9]" not in report
+    exposed = service.build_workbench_payload(state, report)["evidence_conflicts"][0]
+    assert {side["source_id"] for side in exposed["sides"]} == {"T1-S1", "T1-M1", "T1-C1"}
+    assert exposed["recommended_source_id"] is None
+
+
+def test_structured_markdown_preserves_multiline_tables_and_code() -> None:
+    from config import Configuration
+    from models import SummaryState, TodoItem
+    from services.reporter import ReportingService
+
+    table = "| Issuer | Margin |\n| --- | --- |\n| Acme | 12% |"
+    code = "```text\nreview status blocked\n    2 | 3\n```"
+    task = TodoItem(
+        id=1, title="Acme", intent="Measure margins", query="q",
+        evidence_items=[{"source_id": "T1-S1", "title": "Acme"}],
+    )
+    service = ReportingService(None, Configuration(report_layout_mode="flexible"), evidence_store=None)
+    report = service._render_structured_report(
+        {"custom_sections": [{
+            "title": "Margin details", "content_type": "paragraph",
+            "content": f"{table}\n\n{code}", "source_ids": ["T1-S1"],
+        }]},
+        state=SummaryState(todo_items=[task]),
+    )
+    assert table in report
+    assert f"{code}\n\n[T1-S1]" in report
+
+
+def test_reviewer_uses_separate_citation_line_with_preceding_claim() -> None:
+    from services.reviewer import ReviewService
+
+    claims = ReviewService._extract_claim_texts(
+        "- Reported issuer margin was 12%.\n  [T1-S1] [T1-M1]\n"
+        "- The calculation is documented [T1-C1]"
+    )
+    assert claims == [
+        "Reported issuer margin was 12%. [T1-S1] [T1-M1]",
+        "The calculation is documented [T1-C1]",
+    ]
+
+
+def test_numeric_grounding_checks_quarter_and_currency_in_the_same_excerpt() -> None:
+    from services.claim_verifier import numeric_grounding_mismatch
+
+    assert numeric_grounding_mismatch("2025Q4营收2亿元", ["2025年第四季度营收20,000万元"]) is None
+    assert numeric_grounding_mismatch("Q4 2025 revenue reached $1 billion", ["2025 Q3 revenue was USD 1 billion."])
+    assert numeric_grounding_mismatch("Acme's gross margin was 42%", ["2025 margin was 42 percent."]) is None
+    assert numeric_grounding_mismatch("FY2025 revenue reached USD 2 million", [
+        "FY2024 revenue was USD 2 million.",
+        "FY2025 revenue was USD 1 million.",
+    ])
+
+
+def test_binary_non_entailment_does_not_become_contradiction() -> None:
+    assert _resolve_label_mapping({0: "unsupported", 1: "supported"}) == {"neutral": 0, "entailment": 1}

@@ -9,14 +9,16 @@ import math
 import os
 import re
 import time
+import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+from datetime import date
+from functools import partial
 from pathlib import Path
-from threading import Lock
-from typing import Any, Literal
+from threading import BoundedSemaphore, Lock
+from typing import Any, Literal, TypeVar
 
 try:  # pragma: no cover - optional runtime imports
     from huggingface_hub import constants as huggingface_constants
@@ -37,8 +39,13 @@ except Exception:  # pragma: no cover - optional runtime imports
     torch = None  # type: ignore[assignment]
 
 from metrics import metrics_registry
+from services.evidence import detect_source_type
 from services.evidence_index import EvidenceRetrievalHit, EvidenceRetrievalService
-from services.text_processing import CITATION_PATTERN, normalize_agent_markdown
+from services.text_processing import (
+    CITATION_PATTERN,
+    iter_markdown_lines,
+    normalize_agent_markdown,
+)
 from utils import truncate_text
 
 logger = logging.getLogger(__name__)
@@ -86,9 +93,10 @@ SOURCE_TIER_WEIGHT: dict[str, float] = {
 
 _METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "revenue": ("营业收入", "总营收", "营收", "销售额", "revenue", "sales"),
-    "gross_margin": ("毛利率", "gross margin"),
+    "gross_margin": ("毛利率", "gross margin", "gross profit margin"),
+    "net_margin": ("净利率", "净利润率", "net margin", "net profit margin"),
     "net_income": ("净利润", "净利", "盈利", "net income", "net profit"),
-    "growth_rate": ("同比增速", "同比增长", "年复合增长率", "增速", "增长率", "cagr", "yoy"),
+    "growth_rate": ("同比增速", "同比增长", "年复合增长率", "增速", "增长率", "growth rate", "cagr", "yoy"),
     "market_share": ("市场份额", "市占率", "占比", "份额", "market share"),
     "latency": ("p99延迟", "p95延迟", "首字延迟", "延迟", "ttft", "latency"),
     "throughput": ("吞吐量", "吞吐", "qps", "tps", "throughput"),
@@ -137,6 +145,27 @@ _POSITIVE_MARKERS = (
 
 _NLI_LOCK = Lock()
 _NLI_CACHE: dict[str, LoadedNLIModel] = {}
+_NLI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="claim-verifier")
+_NLI_WORK_SLOTS = BoundedSemaphore(4)
+_Result = TypeVar("_Result")
+
+
+def _within_budget(work: Callable[[], _Result], deadline: float) -> _Result | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _NLI_WORK_SLOTS.acquire(blocking=False):
+        return None
+    try:
+        future = _NLI_EXECUTOR.submit(work)
+    except RuntimeError:
+        _NLI_WORK_SLOTS.release()
+        return None
+    future.add_done_callback(lambda _: _NLI_WORK_SLOTS.release())
+    try:
+        return future.result(timeout=max(0, deadline - time.monotonic()))
+    except Exception as exc:
+        future.cancel()
+        logger.debug("Claim verification work interrupted: %s", exc)
+        return None
 
 
 @dataclass(kw_only=True)
@@ -281,6 +310,8 @@ class LoadedNLIModel:
     model_name: str
     label_mapping: dict[str, int]
     predict_logits_fn: Callable[[list[tuple[str, str]]], list[list[float]]]
+    device: str = "cpu"
+    predict_lock: Any = field(default_factory=Lock, repr=False, compare=False)
 
 
 def clear_nli_model_cache() -> None:
@@ -302,13 +333,13 @@ def _resolve_label_mapping(id2label: dict[Any, Any] | None) -> dict[str, int]:
         name = str(raw_name or "").strip().lower()
         if "entail" in name or name in {"support", "supported", "yes"}:
             mapping["entailment"] = idx
-        elif "contra" in name or name in {"refute", "refuted", "unsupport", "unsupported", "no"}:
+        elif "contra" in name or name in {"refute", "refuted"}:
             mapping["contradiction"] = idx
-        elif "neutral" in name or "unknown" in name:
+        elif "neutral" in name or "unknown" in name or name in {"unsupport", "unsupported", "no"}:
             mapping["neutral"] = idx
-    if len(mapping) >= 2:
+    if "entailment" in mapping and len(mapping) >= 2 and all(idx >= 0 for idx in mapping.values()):
         return mapping
-    return {"entailment": 1, "contradiction": 0}
+    return {}
 
 
 def _pick_device(device: str) -> str:
@@ -364,47 +395,43 @@ def _load_backend_impl(
     local_files_only: bool,
 ) -> LoadedNLIModel | None:
     resolved_backend = str(backend or "auto").strip().lower() or "auto"
-    if resolved_backend in {"auto", "cross_encoder", "minicheck"} and CrossEncoder is not None:
+    if resolved_backend in {"auto", "cross_encoder"} and CrossEncoder is not None:
         try:
             kwargs: dict[str, Any] = {
                 "device": device,
                 "max_length": max_length,
                 "local_files_only": local_files_only,
             }
-            try:
-                ce_model = CrossEncoder(model_name, **kwargs)
-            except TypeError:
-                kwargs.pop("local_files_only", None)
-                try:
-                    ce_model = CrossEncoder(model_name, **kwargs)
-                except TypeError:
-                    ce_model = CrossEncoder(model_name)
+            ce_model = CrossEncoder(model_name, **kwargs)
 
             config_obj = getattr(getattr(ce_model, "model", None), "config", None) or getattr(
                 ce_model, "config", None
             )
             label_mapping = _resolve_label_mapping(getattr(config_obj, "id2label", None))
+            if not label_mapping:
+                raise ValueError("NLI checkpoint lacks an entailment label mapping")
 
             def _predict_ce(batch: list[tuple[str, str]]) -> list[list[float]]:
-                raw = ce_model.predict(batch, apply_softmax=False)
+                raw = ce_model.predict(batch, apply_softmax=False, activation_fn=torch.nn.Identity() if torch is not None else None)
                 if hasattr(raw, "tolist"):
                     raw = raw.tolist()
                 if raw and not isinstance(raw[0], (list, tuple)):
-                    # Binary single logit fallback -> [1 - p, p] style logits
-                    return [[-float(val), float(val)] for val in raw]
+                    # A binary logit represents the log-odds of class 1.
+                    return [[0.0, float(val)] for val in raw]
                 return [[float(x) for x in row] for row in raw]
 
             return LoadedNLIModel(
-                backend="cross_encoder" if resolved_backend == "auto" else resolved_backend,
+                backend="cross_encoder",
                 model_name=model_name,
                 label_mapping=label_mapping,
                 predict_logits_fn=_predict_ce,
+                device=device,
             )
         except Exception as exc:
             logger.debug("CrossEncoder load failed (%s): %s", model_name, exc)
 
     if (
-        resolved_backend in {"auto", "transformers_nli", "minicheck"}
+        resolved_backend in {"auto", "transformers_nli"}
         and AutoModelForSequenceClassification is not None
         and AutoTokenizer is not None
         and torch is not None
@@ -422,6 +449,9 @@ def _load_backend_impl(
             label_mapping = _resolve_label_mapping(
                 getattr(getattr(hf_model, "config", None), "id2label", None)
             )
+
+            if not label_mapping:
+                raise ValueError("NLI checkpoint lacks an entailment label mapping")
 
             def _predict_hf(batch: list[tuple[str, str]]) -> list[list[float]]:
                 encoded = tok(
@@ -444,6 +474,7 @@ def _load_backend_impl(
                 model_name=model_name,
                 label_mapping=label_mapping,
                 predict_logits_fn=_predict_hf,
+                device=device,
             )
         except Exception as exc:
             logger.debug("Transformers NLI load failed (%s): %s", model_name, exc)
@@ -514,7 +545,6 @@ class LocalNLIScorer:
 
     def _resolve_model(self) -> LoadedNLIModel | None:
         if self._loaded_model is not None:
-            self.last_backend_used = self._loaded_model.backend
             return self._loaded_model
         model = load_nli_model(
             str(getattr(self._config, "nli_model_name", "") or ""),
@@ -522,8 +552,6 @@ class LocalNLIScorer:
             device=str(getattr(self._config, "nli_device", "auto") or "auto"),
             max_length=int(getattr(self._config, "nli_max_length", 512) or 512),
         )
-        if model is not None:
-            self.last_backend_used = model.backend
         return model
 
     def _logits_to_prob_dict(
@@ -533,8 +561,8 @@ class LocalNLIScorer:
     ) -> dict[str, float]:
         probs = self._softmax_calibrated(logits, temperature=self._temperature)
         n = len(probs)
-        ent_idx = label_mapping.get("entailment", 0)
-        con_idx = label_mapping.get("contradiction", 1 if n > 1 else 0)
+        ent_idx = label_mapping.get("entailment", -1)
+        con_idx = label_mapping.get("contradiction", -1)
         neu_idx = label_mapping.get("neutral")
         p_ent = probs[ent_idx] if 0 <= ent_idx < n else 0.0
         p_con = probs[con_idx] if 0 <= con_idx < n else 0.0
@@ -548,28 +576,29 @@ class LocalNLIScorer:
             "neutral": float(p_neu),
         }
 
-    def _predict_batch_with_timeout(
-        self,
-        model: LoadedNLIModel,
-        batch: list[tuple[str, str]],
-        *,
-        timeout: float,
+    def _predict_batch(
+        self, model: LoadedNLIModel, batch: list[tuple[str, str]],
     ) -> list[dict[str, float]] | None:
-        if timeout <= 0.01:
+        if not model.predict_lock.acquire(blocking=False):
             return None
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(model.predict_logits_fn, batch)
         try:
-            logits_rows = future.result(timeout=timeout)
-        except (FuturesTimeoutError, Exception) as exc:
-            logger.debug("NLI batch inference interrupted: %s", exc)
-            return None
+            rows = model.predict_logits_fn(batch)
         finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-
-        if not isinstance(logits_rows, list) or len(logits_rows) != len(batch):
+            model.predict_lock.release()
+        if not isinstance(rows, list) or len(rows) != len(batch):
             return None
-        return [self._logits_to_prob_dict(list(row), model.label_mapping) for row in logits_rows]
+        indices = set(model.label_mapping.values())
+        if "entailment" not in model.label_mapping:
+            return None
+        if any(
+            not isinstance(row, (list, tuple))
+            or indices != set(range(len(row)))
+            or len(model.label_mapping) != len(row)
+            or not all(math.isfinite(value) for value in row)
+            for row in rows
+        ):
+            return None
+        return [self._logits_to_prob_dict(list(row), model.label_mapping) for row in rows]
 
     def score_pairs_batched(
         self,
@@ -579,24 +608,23 @@ class LocalNLIScorer:
     ) -> list[dict[str, float]] | None:
         if not pairs:
             return []
-        model = self._resolve_model()
+        self.last_backend_used = "none"
+        model = _within_budget(self._resolve_model, deadline_monotonic)
         if model is None:
             return None
+        self.last_backend_used = model.backend
 
         batch_size = max(1, int(getattr(self._config, "nli_batch_size", 16) or 16))
-        if model and str(getattr(self._config, "nli_device", "auto")).lower() == "cpu":
+        if model.device == "cpu":
             batch_size = min(batch_size, 8)
         results: list[dict[str, float]] = []
         for offset in range(0, len(pairs), batch_size):
-            remaining = deadline_monotonic - time.monotonic()
-            if remaining <= 0.02:
-                return None
             batch = list(pairs[offset : offset + batch_size])
-            probs_batch = self._predict_batch_with_timeout(model, batch, timeout=remaining)
+            probs_batch = _within_budget(lambda batch=batch: self._predict_batch(model, batch), deadline_monotonic)
             if probs_batch is None:
-                return None
+                break
             results.extend(probs_batch)
-        return results
+        return results or None
 
 
 def _normalize_entity(raw: str) -> str:
@@ -605,70 +633,200 @@ def _normalize_entity(raw: str) -> str:
 
 
 def _normalize_period(raw_text: str) -> str:
-    text = str(raw_text or "")
+    text = unicodedata.normalize("NFKC", str(raw_text or ""))
     q_match = re.search(
-        r"(20\d{2}|19\d{2})\s*(?:年)?\s*[Qq]\s*([1-4])|(20\d{2})\s*年第([一二三四1-4])季度",
+        r"((?:19|20)\d{2})\s*(?:年\s*)?(?:Q\s*([1-4])|第?\s*([一二三四1-4])季度)"
+        r"|Q([1-4])\s*[-/ ]\s*((?:19|20)\d{2})",
         text,
+        flags=re.IGNORECASE,
     )
     if q_match:
-        if q_match.group(1):
-            return f"{q_match.group(1)}Q{q_match.group(2)}"
-        cn_map = {"一": "1", "二": "2", "三": "3", "四": "4"}
-        q_num = cn_map.get(q_match.group(4), q_match.group(4))
-        return f"{q_match.group(3)}Q{q_num}"
-
-    fy_match = re.search(r"(?:FY)?(20\d{2}|19\d{2})\s*年?", text, flags=re.IGNORECASE)
+        year, english_q, chinese_q, leading_q, trailing_year = q_match.groups()
+        quarter = english_q or chinese_q or leading_q
+        quarter = {"一": "1", "二": "2", "三": "3", "四": "4"}.get(quarter, quarter)
+        return f"{year or trailing_year}Q{quarter}"
+    year_text = re.sub(r"(?<![a-zA-Z])(?:USD|RMB|CNY|EUR|GBP|JPY|HKD|[$¥€£])\s*\d[\d,.]*", "", text)
+    fy_match = re.search(r"(?<![a-zA-Z0-9.])(?:FY\s*)?((?:19|20)\d{2})(?![\d.]|\s*(?:%|元|万|亿|USD|CNY))",
+                         year_text, flags=re.IGNORECASE)
     if fy_match:
-        return fy_match.group(1)
-
+        return fy_match[1]
     ver_match = re.search(r"\bv(\d+(?:\.\d+){1,2})\b", text, flags=re.IGNORECASE)
-    if ver_match:
-        return f"v{ver_match.group(1)}"
-    return ""
+    return f"v{ver_match[1]}" if ver_match else ""
 
 
 def _normalize_metric(raw_text: str) -> str:
-    lowered = str(raw_text or "").strip().lower()
+    lowered = unicodedata.normalize("NFKC", str(raw_text or "")).strip().lower()
+    lowered = re.sub(r"[_-]+", " ", lowered)
     if not lowered:
         return ""
-    for canonical, aliases in _METRIC_ALIASES.items():
-        if canonical == lowered or any(alias in lowered for alias in aliases):
-            return canonical
-    return re.sub(r"[\s_\-]+", "_", lowered)[:40] if len(lowered) <= 30 else ""
+    # Keep distinct percentiles, growth vs. level, and financing vs. valuation.
+    percentile = re.search(r"\bp\s*(\d{2,3})\s*[- ]?\s*(?:latency|延迟)", lowered)
+    if percentile:
+        return f"p{percentile[1]}_latency"
+    if re.search(r"首字延迟|\bttft\b", lowered):
+        return "ttft"
+    if re.search(r"估值|\bvaluation\b", lowered):
+        return "valuation"
+    matched = [
+        metric for metric, aliases in _METRIC_ALIASES.items()
+        if lowered == metric.replace("_", " ")
+        or any(
+            alias in lowered if not alias.isascii() else bool(re.search(rf"\b{re.escape(alias)}\b", lowered))
+            for alias in aliases
+        )
+    ]
+    if "growth_rate" in matched:
+        base = next((metric for metric in matched if metric != "growth_rate"), "")
+        if base:
+            return f"{base}_growth_rate"
+    if matched:
+        return matched[0]
+    if re.search(r"\bmargin\s*:", lowered):
+        return "gross_margin"
+    return re.sub(r"\s+", "_", lowered)[:40] if len(lowered) <= 30 else ""
+
+
+def normalize_conflict_key(entity: str, metric: str, period: str) -> tuple[str, str, str]:
+    return (
+        _normalize_entity(unicodedata.normalize("NFKC", entity)),
+        _normalize_metric(metric),
+        _normalize_period(period) or re.sub(r"\s+", "", period).casefold(),
+    )
+
+
+_PERIOD_YEAR = re.compile(
+    r"(?<![a-z0-9.])(?:FY\s*)?(?:19|20)\d{2}\s*(?:年\s*)?(?:Q\s*[1-4](?!\d)|第?\s*[一二三四1-4]季度)|"
+    r"(?<![a-z0-9.])FY\s*(?:19|20)\d{2}(?!\d)|"
+    r"(?<!\d)(?:19|20)\d{2}(?=\s*年)|"
+    r"(?<!\w)Q[1-4]\s*[-/ ]\s*(?:19|20)\d{2}(?!\d)",
+    re.IGNORECASE,
+)
+_VERSION = re.compile(r"(?<![a-z0-9])v\d+(?:\.\d+)+", re.IGNORECASE)
+_CURRENCY = r"(?:USD|CNY|RMB|EUR|GBP|JPY|HKD|US\$|HK\$|[$¥€£]|人民币|美元|港元|欧元|日元|英镑)"
+_SCALE = r"(?:万亿|亿|万|千|trillion\b|billion\b|million\b|thousand\b|tn\b|bn\b|mn\b|[kmbt]\b)"
+_QUANTITY = re.compile(
+    rf"(?<![a-z0-9.])(?P<prefix>{_CURRENCY})?\s*(?P<number>[+\-−]?(?:\d{{1,3}}(?:,\d{{3}})+|\d+)(?:\.\d+)?|[+\-−]?\.\d+)"
+    rf"(?:\s*(?P<scale>{_SCALE})(?![a-zA-Z]))?"
+    rf"(?:\s*(?P<unit>percentage\s+points?\b|percent(?:age)?\b|p\.?p\.?\b|basis\s+points?\b|bps?\b|个百分点|基点|%|"
+    rf"{_CURRENCY}(?![a-zA-Z])|元|milliseconds?\b|seconds?\b|ms\b|s\b|x\b|倍))?",
+    re.IGNORECASE,
+)
+_SCALE_FACTORS = {
+    "k": 1e3, "thousand": 1e3, "千": 1e3, "万": 1e4,
+    "m": 1e6, "mn": 1e6, "million": 1e6, "亿": 1e8,
+    "b": 1e9, "bn": 1e9, "billion": 1e9,
+    "t": 1e12, "tn": 1e12, "trillion": 1e12, "万亿": 1e12,
+}
+_CURRENCY_UNITS = {
+    "$": "usd", "us$": "usd", "usd": "usd", "美元": "usd",
+    "¥": "cny", "元": "cny", "cny": "cny", "rmb": "cny", "人民币": "cny",
+    "€": "eur", "eur": "eur", "欧元": "eur", "£": "gbp", "gbp": "gbp", "英镑": "gbp",
+    "jpy": "jpy", "日元": "jpy", "hkd": "hkd", "hk$": "hkd", "港元": "hkd",
+}
+_RATE_CONTEXT = re.compile(r"%|率|份额|占比|margin|rate|share|percent|cagr|yoy", re.IGNORECASE)
+
+
+def _normalize_quantity(value: float, unit: str) -> tuple[float, str]:
+    unit = unit.strip().lower()
+    if unit in {"%", "percent", "percentage"}:
+        return value, "%"
+    if unit.rstrip(".") in {"pp", "p.p"} or unit in {"个百分点", "percentage point", "percentage points"}:
+        return value, "pp"
+    if unit in {"bp", "bps", "基点", "basis point", "basis points"}:
+        return value / 100, "pp"
+    if unit in {"s", "second", "seconds"}:
+        return value * 1000, "ms"
+    if unit in {"ms", "millisecond", "milliseconds"}:
+        return value, "ms"
+    if unit in {"倍", "x"}:
+        return value, "x"
+    if unit in _SCALE_FACTORS:
+        return value * _SCALE_FACTORS[unit], "scalar"
+    if unit in {"万元", "亿元", "万亿元", "亿美元", "万美元"}:
+        scale, currency = re.fullmatch(r"(万亿|万|亿)(.+)", unit).groups()
+        return value * _SCALE_FACTORS[scale], _CURRENCY_UNITS[currency]
+    return value, _CURRENCY_UNITS.get(unit, unit or "scalar")
+
+
+def _extract_quantities(raw_text: str) -> list[tuple[float, str]]:
+    text = unicodedata.normalize("NFKC", CITATION_PATTERN.sub(" ", str(raw_text or "")))
+    text = _VERSION.sub(" ", text)
+    text = re.sub(r"(?<![a-z0-9])p\s*\d{2,3}(?=\s*(?:latency|延迟))", " ", text, flags=re.IGNORECASE)
+    quantities: list[tuple[float, str]] = []
+    cursor = 0
+    while cursor < len(text):
+        period = _PERIOD_YEAR.match(text, cursor)
+        if period:
+            canonical = _normalize_period(period[0])
+            quantities.append((float(canonical[:4]), "year"))
+            if len(canonical) == 6:
+                quantities.append((float(canonical.replace("Q", "")), "quarter"))
+            cursor = period.end()
+            continue
+        match = _QUANTITY.match(text, cursor)
+        if not match:
+            cursor += 1
+            continue
+        cursor = match.end()
+        value = float(match["number"].replace(",", "").replace("−", "-"))
+        scale = (match["scale"] or "").lower()
+        suffix = (match["unit"] or "").lower()
+        prefix = match["prefix"] or ""
+        if prefix and suffix in _CURRENCY_UNITS and _CURRENCY_UNITS[prefix.lower()] != _CURRENCY_UNITS[suffix]:
+            continue
+        if not (scale or suffix or prefix) and value.is_integer() and 1900 <= value <= 2100:
+            context = text[:match.start("number")].rstrip()
+            if not re.search(r"(?:[=：:为达到至]|was|is|of|reached|totaled)$", context, re.IGNORECASE):
+                quantities.append((value, "year"))
+                continue
+        normalized = _normalize_quantity(value * _SCALE_FACTORS.get(scale, 1), prefix or suffix)
+        if math.isfinite(normalized[0]):
+            quantities.append(normalized)
+    return quantities
 
 
 def _extract_numeric_and_unit(raw_text: str) -> tuple[float | None, str]:
-    match = re.search(
-        r"(-?\d+(?:,\d{3})*(?:\.\d+)?)\s*(%|％|个百分点|亿元|亿美元|万元|万|亿|美元|USD|RMB|元|ms|s|x|倍)?",
-        str(raw_text or ""),
-        flags=re.IGNORECASE,
+    return next(
+        ((value, unit) for value, unit in _extract_quantities(raw_text) if unit not in {"year", "quarter"}),
+        (None, ""),
     )
-    if not match:
-        return None, ""
-    # Skip standalone 4-digit year values (e.g. 2024, 2025) when unit is empty
-    raw_num = match.group(1).replace(",", "")
-    unit = (match.group(2) or "").strip()
-    try:
-        val = float(raw_num)
-    except ValueError:
-        return None, ""
-    if not unit and val.is_integer() and 1900 <= val <= 2100:
-        remainder = str(raw_text or "")[match.end() :]
-        second = _extract_numeric_and_unit(remainder)
-        if second[0] is not None:
-            return second
-        return None, ""
 
-    unit_lower = unit.lower()
-    if unit_lower in {"%", "％", "个百分点"}:
-        return val, "%"
-    if unit_lower in {"万"}:
-        return val * 1e4, "scalar"
-    if unit_lower in {"亿", "亿元"}:
-        return val * 1e8, "currency"
-    if unit_lower in {"亿美元"}:
-        return val * 1e8, "usd"
-    return val, unit_lower or "scalar"
+
+def _comparable_values(
+    left: tuple[float, str], right: tuple[float, str], *, rate_context: bool,
+) -> tuple[float, float] | None:
+    value, unit = left
+    other, other_unit = right
+    if unit == other_unit:
+        return value, other
+    if rate_context and {unit, other_unit} == {"%", "scalar"}:
+        scalar = value if unit == "scalar" else other
+        if abs(scalar) <= 1:
+            return (value * 100, other) if unit == "scalar" else (value, other * 100)
+    return None
+
+
+def numeric_grounding_mismatch(claim_text: str, evidence_texts: Sequence[str]) -> str | None:
+    """Require one cited excerpt to contain all expressed quantities in compatible units."""
+    expected = _extract_quantities(claim_text)
+    if not expected:
+        return None
+    is_rate = bool(_RATE_CONTEXT.search(claim_text))
+    evidence = [_extract_quantities(text) for text in evidence_texts]
+
+    def matches(left: tuple[float, str], right: tuple[float, str]) -> bool:
+        comparable = _comparable_values(left, right, rate_context=is_rate)
+        if comparable is None:
+            return False
+        if left[1] in {"year", "quarter"}:
+            return comparable[0] == comparable[1]
+        return math.isclose(*comparable, rel_tol=0.005, abs_tol=1e-9)
+
+    for quantities in evidence:
+        if all(any(matches(item, candidate) for candidate in quantities) for item in expected):
+            return None
+    values = "、".join(f"{value:g}{'' if unit in {'year', 'scalar'} else ' ' + unit}" for value, unit in expected)
+    return f"引用证据未同时支持所述数值或单位（{values}）"
 
 
 def _infer_polarity(text: str) -> Literal["positive", "negative", "neutral"]:
@@ -686,7 +844,7 @@ def _extract_entity_candidate(text: str) -> str:
     en_match = re.search(r"\b([A-Za-z][A-Za-z0-9.\-]{1,24})\b", cleaned)
     if en_match:
         return _normalize_entity(en_match.group(1))
-    zh_match = re.match(r"^([\u4e00-\u9fffA-Za-z0-9·]{2,12}?)(?:在|于|的|为|是|实现|营收|毛利率|净利|延迟|已|未)", cleaned)
+    zh_match = re.match(r"^([\u4e00-\u9fffA-Za-z0-9·]{2,12}?)(?:在|于|的|为|是|实现|营业收入|营收|毛利率|净利|延迟|已|未|\s+(?=20\d{2}))", cleaned)
     if zh_match:
         return _normalize_entity(zh_match.group(1))
     head = cleaned[:10]
@@ -700,13 +858,16 @@ def _extract_proposition_from_text(text: str, raw_prop: dict[str, Any] | None = 
     period = _normalize_period(str(prop_data.get("period") or "")) or _normalize_period(text)
     num_val = prop_data.get("numeric_value")
     unit = str(prop_data.get("unit") or "").strip()
-    if num_val is None:
-        num_val, unit = _extract_numeric_and_unit(text)
-    else:
+    text_value, text_unit = _extract_numeric_and_unit(text)
+    if text_value is not None:
+        num_val, unit = text_value, text_unit
+    elif num_val is not None:
         try:
-            num_val = float(num_val)
-        except (TypeError, ValueError):
-            num_val, unit = _extract_numeric_and_unit(text)
+            num_val, unit = _normalize_quantity(float(num_val), unit)
+        except (TypeError, ValueError, OverflowError):
+            num_val = None
+        if num_val is not None and not math.isfinite(num_val):
+            num_val = None
     polarity = str(prop_data.get("polarity") or "").strip().lower()
     if polarity not in {"positive", "negative", "neutral"}:
         polarity = _infer_polarity(text)
@@ -766,16 +927,77 @@ class AtomicClaimDecomposer:
 
     @staticmethod
     def _syntactic_split(text: str) -> list[str]:
-        normalized = normalize_agent_markdown(str(text or "").strip())
-        if not normalized:
-            return []
-        raw_parts = re.split(
-            r"(?:[；;。!?！？]+|\s*(?:，|,)\s*(?:且|同时|并且|并|而|但|however|while|whereas)\b|\b(?:however|while|whereas)\b)",
-            normalized,
-            flags=re.IGNORECASE,
+        lines = list(iter_markdown_lines(text))
+        clauses: list[str] = []
+        headers: list[str] = []
+        separator = re.compile(r"^\s*:?-{3,}:?\s*$")
+        boundaries = re.compile(
+            r"(?:[；;。!?！？]+|\.(?=\s|$))"
+            rf"(?:[ \t]*(?:{CITATION_PATTERN.pattern}))*"
+            r"|[，,]?\s*(?:并且|而且|同时|但是|然而|以及|且|但)"
+            r"|[，,]?\s*\b(?:however|while|whereas|but|and\s+also)\b"
+            r"|\s+\band\b(?=[^.!?;]*\b(?:was|were|is|are|has|had|reached|rose|fell|grew)\b)",
+            re.IGNORECASE,
         )
-        clauses = [part.strip(" ，,;；。") for part in raw_parts if part and part.strip(" ，,;；。")]
-        return clauses or [normalized]
+
+        for index, (raw_line, fenced) in enumerate(lines):
+            line = raw_line.strip()
+            if fenced or not line or re.match(r"^#{1,6}\s", line):
+                headers = []
+                continue
+            line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)
+            if "|" in line:
+                cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]
+                if len(cells) >= 2 and all(separator.fullmatch(cell) for cell in cells):
+                    continue
+                next_line = lines[index + 1][0].strip().strip("|") if index + 1 < len(lines) else ""
+                if "|" in next_line and all(separator.fullmatch(cell) for cell in next_line.split("|")):
+                    headers = cells
+                    continue
+                if headers and len(headers) == len(cells):
+                    fields = []
+                    shared_citations = []
+                    for header, cell in zip(headers, cells):
+                        plain = CITATION_PATTERN.sub("", cell).strip()
+                        if not plain:
+                            shared_citations.extend(CITATION_PATTERN.findall(cell))
+                        else:
+                            fields.append((header, cell))
+                    if fields:
+                        subject_header, subject = fields[0]
+                        if subject_header.strip().casefold() in {"entity", "company", "name", "metric", "指标", "主体", "公司", "名称"}:
+                            fields = fields[1:] or [(subject_header, subject)]
+                            subject = CITATION_PATTERN.sub("", subject).strip()
+                        else:
+                            subject = ""
+                        for header, cell in fields:
+                            suffix = "".join(f"[{sid}]" for sid in shared_citations)
+                            clauses.append(f"{subject} {header}: {cell} {suffix}".strip())
+                else:
+                    clauses.append(" | ".join(cells))
+                continue
+            headers = []
+            start = 0
+            for boundary in boundaries.finditer(line):
+                markers = CITATION_PATTERN.findall(boundary[0])
+                clause = line[start:boundary.start()].strip(" ，,;；。")
+                if markers:
+                    clause += " " + "".join(f"[{sid}]" for sid in markers)
+                if clause.strip():
+                    clauses.append(clause.strip())
+                start = boundary.end()
+            tail = line[start:].strip(" ，,;；。")
+            if tail:
+                clauses.append(tail)
+
+        merged: list[str] = []
+        for clause in clauses:
+            if not CITATION_PATTERN.sub("", clause).strip(" \t.,，。;；()（）"):
+                if merged:
+                    merged[-1] += " " + clause
+            else:
+                merged.append(clause)
+        return merged
 
     def _decompose_via_fast_llm(
         self,
@@ -843,16 +1065,15 @@ class AtomicClaimDecomposer:
         parent_claims: list[dict[str, Any]],
         valid_source_ids: set[str],
         fast_llm: Any | None = None,
-        max_atomic_per_task: int = 12,
+        max_atomic_per_task: int | None = 12,
     ) -> list[AtomicClaimRecord]:
-        if not parent_claims or max_atomic_per_task <= 0:
+        if not parent_claims or (max_atomic_per_task is not None and max_atomic_per_task <= 0):
             return []
 
+        splits = [self._syntactic_split(str(claim.get("text") or "")) for claim in parent_claims]
         has_compound = any(
-            len(str(c.get("text") or "")) >= 35
-            or len(c.get("source_ids") or []) > 1
-            or bool(re.search(r"[；;且]|however|while", str(c.get("text") or ""), flags=re.IGNORECASE))
-            for c in parent_claims
+            len(str(claim.get("text") or "")) >= 35 or len(claim.get("source_ids") or []) > 1 or len(parts) > 1
+            for claim, parts in zip(parent_claims, splits)
         )
         llm_results: dict[int, list[dict[str, Any]]] | None = None
         if self._decompose_with_fast_llm and fast_llm is not None and has_compound:
@@ -863,65 +1084,60 @@ class AtomicClaimDecomposer:
             )
 
         records: list[AtomicClaimRecord] = []
-        for p_idx, claim in enumerate(parent_claims):
-            if len(records) >= max_atomic_per_task:
-                break
-            parent_text = str(claim.get("text") or "").strip()
-            parent_sids = [str(s).strip() for s in (claim.get("source_ids") or []) if str(s).strip()]
-            if not parent_text:
+        for p_idx, (claim, clauses) in enumerate(zip(parent_claims, splits)):
+            if not clauses:
                 continue
+            parent_sids = list(dict.fromkeys(str(s).strip() for s in (claim.get("source_ids") or []) if s))
+            inline_ids = [CITATION_PATTERN.findall(clause) for clause in clauses]
+            candidates: list[tuple[str, Sequence[str] | None, dict[str, Any] | None]] = []
+            raw_atomics = (llm_results or {}).get(p_idx, [])
+            # Explicit spans control attribution.
+            if not any(inline_ids):
+                for atomic_item in raw_atomics:
+                    text = str(atomic_item.get("text") or "").strip()
+                    source_ids = atomic_item.get("source_ids")
+                    if CITATION_PATTERN.sub("", text).strip():
+                        candidates.append((
+                            text,
+                            source_ids if isinstance(source_ids, (list, tuple)) else None,
+                            atomic_item.get("proposition"),
+                        ))
+                parent_numbers = set(_extract_quantities(str(claim.get("text") or "")))
+                child_numbers = {value for text, _, _ in candidates for value in _extract_quantities(text)}
+                if len(candidates) < len(clauses) or not parent_numbers.issubset(child_numbers):
+                    candidates.clear()
+            use_rule_split = not candidates
+            if use_rule_split:
+                trailing = inline_ids[-1] if not any(inline_ids[:-1]) else []
+                explicitly_scoped = any(inline_ids)
+                candidates = [
+                    (clause, bound_ids or trailing or ([] if explicitly_scoped else None), None)
+                    for clause, bound_ids in zip(clauses, inline_ids)
+                ]
 
-            raw_atomics = (llm_results or {}).get(p_idx)
-            if raw_atomics:
-                for a_idx, atomic_item in enumerate(raw_atomics):
-                    if len(records) >= max_atomic_per_task:
-                        break
-                    sub_text = normalize_agent_markdown(str(atomic_item.get("text") or "").strip())
-                    if not sub_text:
-                        continue
-                    effective_sids = self._conserve_source_ids(
-                        atomic_item.get("source_ids"),
-                        parent_sids=parent_sids,
-                        valid_source_ids=valid_source_ids,
-                    )
-                    prop = _extract_proposition_from_text(
-                        sub_text,
-                        atomic_item.get("proposition"),
-                    )
-                    records.append(
-                        AtomicClaimRecord(
-                            atomic_id=f"{task_id}-C{p_idx}-A{a_idx}",
-                            task_id=task_id,
-                            parent_claim_index=p_idx,
-                            text=sub_text,
-                            source_ids=effective_sids,
-                            proposition=prop,
-                        )
-                    )
-                continue
-
-            clauses = self._syntactic_split(parent_text)
-            for a_idx, clause in enumerate(clauses):
-                if len(records) >= max_atomic_per_task:
-                    break
-                inline_sids = CITATION_PATTERN.findall(clause)
+            for a_idx, (text, source_ids, raw_prop) in enumerate(candidates):
+                text = normalize_agent_markdown(CITATION_PATTERN.sub("", text)).strip()
+                if not text:
+                    continue
                 effective_sids = self._conserve_source_ids(
-                    inline_sids or parent_sids,
+                    source_ids,
                     parent_sids=parent_sids,
                     valid_source_ids=valid_source_ids,
                 )
-                clean_clause = normalize_agent_markdown(CITATION_PATTERN.sub("", clause).strip()) or clause
-                prop = _extract_proposition_from_text(clean_clause)
+                if use_rule_split and source_ids is not None and not set(source_ids).intersection(parent_sids, valid_source_ids):
+                    effective_sids = []
                 records.append(
                     AtomicClaimRecord(
                         atomic_id=f"{task_id}-C{p_idx}-A{a_idx}",
                         task_id=task_id,
                         parent_claim_index=p_idx,
-                        text=clean_clause,
+                        text=text,
                         source_ids=effective_sids,
-                        proposition=prop,
+                        proposition=_extract_proposition_from_text(text, raw_prop),
                     )
                 )
+                if max_atomic_per_task is not None and len(records) >= max_atomic_per_task:
+                    return records
         return records
 
 
@@ -992,57 +1208,89 @@ class ScopedEvidenceRetriever:
         cited_records_fallback: list[dict[str, Any]],
         top_k_per_source: int = 3,
     ) -> list[EvidenceRetrievalHit]:
-        allowed_list = [str(s).strip() for s in (atomic_claim.source_ids or []) if str(s).strip()]
+        allowed_list = list(dict.fromkeys(sid.strip() for sid in atomic_claim.source_ids if sid.strip()))
         if not allowed_list:
             return []
         allowed_set = set(allowed_list)
 
-        hits: list[EvidenceRetrievalHit] = []
+        by_source: dict[str, list[EvidenceRetrievalHit]] = defaultdict(list)
         if retrieval_service is not None:
             result = retrieval_service.query(
                 atomic_claim.text,
                 task_id=atomic_claim.task_id,
                 scope="current",
                 mode="grounding",
-                top_k=max(1, len(allowed_list) * max(1, int(top_k_per_source or 3))),
+                top_k=len(allowed_list) * top_k_per_source,
                 allowed_source_ids=allowed_list,
             )
-            hits = [h for h in result.hits if h.source_id in allowed_set and h.origin == "current"]
+            seen_chunks: set[tuple[str, str]] = set()
+            for hit in result.hits:
+                key = (hit.source_id, hit.chunk_id)
+                if (
+                    hit.source_id in allowed_set and hit.origin == "current" and hit.citation_eligible
+                    and hit.text.strip() and key not in seen_chunks
+                    and len(by_source[hit.source_id]) < top_k_per_source
+                ):
+                    by_source[hit.source_id].append(hit)
+                    seen_chunks.add(key)
 
-        if not hits:
-            records: list[dict[str, Any]] = []
-            if evidence_store is not None and hasattr(evidence_store, "lookup"):
-                records = [
-                    rec
-                    for rec in (evidence_store.lookup(include_full_content=True) or [])
-                    if isinstance(rec, dict) and rec.get("source_id") in allowed_set
-                ]
-            if not records:
-                records = [
-                    rec
-                    for rec in (cited_records_fallback or [])
-                    if isinstance(rec, dict) and rec.get("source_id") in allowed_set
-                ]
-            hits = _inline_chunk_and_bm25_top_k(
+        missing = [sid for sid in allowed_list if not by_source.get(sid)]
+        if missing:
+            records = {
+                rec["source_id"]: rec for rec in cited_records_fallback
+                if isinstance(rec, dict) and rec.get("source_id") in missing
+            }
+            if evidence_store is not None:
+                records.update({
+                    rec["source_id"]: rec
+                    for rec in evidence_store.lookup(source_ids=missing, include_full_content=True)
+                    if isinstance(rec, dict) and rec.get("source_id") in missing
+                    and (rec.get("full_content") or rec.get("raw_content") or rec.get("snippet") or rec.get("multimodal_blocks"))
+                })
+            for hit in _inline_chunk_and_bm25_top_k(
                 query=atomic_claim.text,
-                records=records,
-                top_k_per_source=max(1, int(top_k_per_source or 3)),
-            )
-        return hits
+                records=list(records.values()),
+                top_k_per_source=top_k_per_source,
+            ):
+                by_source[hit.source_id].append(hit)
+        return [hit for sid in allowed_list for hit in by_source[sid]]
+
+
+def _authority_source_type(record: dict[str, Any]) -> str:
+    source_type = str(record.get("source_type") or "").strip().lower()
+    origin = str(record.get("source_origin") or "").strip().lower()
+    if origin == "sandbox":
+        return "computed_sandbox" if record.get("derived_from_source_ids") else "web_general"
+    if origin == "mcp" or source_type.startswith("mcp_"):
+        return source_type if source_type.startswith("mcp_") and source_type in SOURCE_TIER_WEIGHT else "mcp_tool"
+    if source_type not in SOURCE_TIER_WEIGHT or source_type in {"web", "web_general"}:
+        return detect_source_type(record)
+    return source_type
 
 
 def _compute_authority_rank(record: dict[str, Any], nli_support: float) -> float:
-    source_type = str(record.get("source_type") or "web_general").strip()
-    tier = SOURCE_TIER_WEIGHT.get(source_type, 0.40)
-    reliability = float(record.get("source_reliability_score") or 5.0)
+    tier = SOURCE_TIER_WEIGHT.get(_authority_source_type(record), 0.40)
+    try:
+        reliability = float(record.get("source_reliability_score", 5.0))
+    except (TypeError, ValueError):
+        reliability = 5.0
+    if not math.isfinite(reliability):
+        reliability = 5.0
     reliability_norm = max(0.0, min(1.0, reliability / 10.0))
     return (0.65 * tier) + (0.25 * reliability_norm) + (0.10 * max(0.0, min(1.0, nli_support)))
+
+
+def _publication_day(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
 
 
 def _adjudicate_cluster(sides: list[ConflictSide]) -> tuple[AdjudicationStatus, str | None, str]:
     ranked = sorted(
         sides,
-        key=lambda s: (s.authority_rank, s.published_at or ""),
+        key=lambda s: (s.authority_rank, _publication_day(s.published_at) or date.min, s.source_id),
         reverse=True,
     )
     top, runner_up = ranked[0], ranked[1]
@@ -1055,8 +1303,15 @@ def _adjudicate_cluster(sides: list[ConflictSide]) -> tuple[AdjudicationStatus, 
             f"优先采信权威等级更高的来源《{top.title}》（{top.domain or top.source_type}）[{top.source_id}]，"
             f"同时保留《{runner_up.title}》[{runner_up.source_id}] 口径供参考。",
         )
-    if top.published_at and runner_up.published_at and top.published_at[:7] != runner_up.published_at[:7]:
-        newer = top if top.published_at > runner_up.published_at else runner_up
+    dated = [(day, side) for side in ranked if (day := _publication_day(side.published_at))]
+    if len(dated) == len(ranked):
+        dated.sort(key=lambda item: item[0], reverse=True)
+    if (
+        len(dated) == len(ranked)
+        and (dated[0][0].year, dated[0][0].month) != (dated[1][0].year, dated[1][0].month)
+        and top.authority_rank - dated[0][1].authority_rank < 0.22
+    ):
+        newer = dated[0][1]
         older = runner_up if newer is top else top
         return (
             "resolved_by_recency",
@@ -1089,8 +1344,9 @@ class ConflictGraphBuilder:
         eligible = [
             claim
             for claim in atomic_claims
-            if claim.nli_label != "CONTRADICTED"
-            and (claim.best_source_id or (claim.source_ids[0] if claim.source_ids else None))
+            if claim.nli_label == "ENTAILED"
+            and claim.best_source_id in claim.source_ids
+            and claim.best_source_id in evidence_by_id
             and claim.proposition.entity
             and (claim.proposition.metric or claim.proposition.numeric_value is not None)
         ]
@@ -1099,21 +1355,18 @@ class ConflictGraphBuilder:
 
         buckets: dict[tuple[str, str, str], list[AtomicClaimRecord]] = defaultdict(list)
         for claim in eligible:
-            key = (
-                claim.proposition.entity,
-                claim.proposition.metric or "statement",
-                claim.proposition.period or "general",
-            )
+            prop = claim.proposition
+            key = normalize_conflict_key(prop.entity, prop.metric or "statement", prop.period or "general")
             buckets[key].append(claim)
 
-        rel_tol = float(getattr(self._config, "nli_conflict_numeric_rel_tol", 0.05) or 0.05)
-        min_nli_score = float(getattr(self._config, "nli_conflict_min_score", 0.70) or 0.70)
+        rel_tol = float(getattr(self._config, "nli_conflict_numeric_rel_tol", 0.05))
+        min_nli_score = float(getattr(self._config, "nli_conflict_min_score", 0.70))
 
         clusters: list[EvidenceConflictCluster] = []
         for (entity, metric, period), group_claims in sorted(buckets.items()):
             # Pick representative atomic claim per distinct source_id
             by_source: dict[str, AtomicClaimRecord] = {}
-            for c in group_claims:
+            for c in sorted(group_claims, key=lambda claim: (-claim.calibrated_confidence, claim.atomic_id, claim.text)):
                 sid = c.best_source_id or (c.source_ids[0] if c.source_ids else "")
                 if not sid:
                     continue
@@ -1124,9 +1377,9 @@ class ConflictGraphBuilder:
                 continue
 
             sides_list: list[ConflictSide] = []
-            for sid, c in by_source.items():
+            for sid, c in sorted(by_source.items()):
                 rec = evidence_by_id.get(sid) or {}
-                nli_supp = float((c.raw_probs or {}).get("entailment") or c.calibrated_confidence or 0.5)
+                nli_supp = float(c.raw_probs.get("entailment", c.calibrated_confidence))
                 sides_list.append(
                     ConflictSide(
                         source_id=sid,
@@ -1134,14 +1387,14 @@ class ConflictGraphBuilder:
                         title=str(rec.get("title") or sid),
                         url=str(rec.get("url") or ""),
                         domain=str(rec.get("domain") or ""),
-                        source_type=str(rec.get("source_type") or "web_general"),
+                        source_type=_authority_source_type(rec),
                         quality_label=str(rec.get("quality_label") or "medium"),
-                        published_at=rec.get("published_at"),
+                        published_at=str(rec["published_at"]) if rec.get("published_at") else None,
                         claim_text=c.text,
                         normalized_value=c.proposition.numeric_value,
                         unit=c.proposition.unit,
                         evidence_excerpt=truncate_text(
-                            c.matched_excerpt or str(rec.get("snippet") or ""),
+                            c.matched_excerpt or str(rec.get("snippet") or rec.get("full_content") or ""),
                             220,
                         ),
                         authority_rank=_compute_authority_rank(rec, nli_supp),
@@ -1152,18 +1405,26 @@ class ConflictGraphBuilder:
             edges: list[dict[str, Any]] = []
             conflict_types: set[str] = set()
             max_score = 0.0
-            cross_nli_pairs: list[tuple[int, int, str, str]] = []
+            cross_nli_pairs: list[tuple[int, int]] = []
 
             for i in range(len(sides_list)):
                 for j in range(i + 1, len(sides_list)):
                     sa, sb = sides_list[i], sides_list[j]
-                    va, vb = sa.normalized_value, sb.normalized_value
+                    if sa.url and sa.url == sb.url:
+                        continue
                     if (
-                        va is not None
-                        and vb is not None
-                        and (not sa.unit or not sb.unit or sa.unit == sb.unit)
+                        sa.source_id in (evidence_by_id[sb.source_id].get("derived_from_source_ids") or [])
+                        or sb.source_id in (evidence_by_id[sa.source_id].get("derived_from_source_ids") or [])
                     ):
-                        delta_ratio = abs(va - vb) / max(abs(va), abs(vb), 1e-9)
+                        continue
+                    va, vb = sa.normalized_value, sb.normalized_value
+                    comparable = (
+                        _comparable_values((va, sa.unit), (vb, sb.unit), rate_context=bool(_RATE_CONTEXT.search(metric)))
+                        if va is not None and vb is not None else None
+                    )
+                    if comparable is not None:
+                        left, right = comparable
+                        delta_ratio = abs(left - right) / max(abs(left), abs(right), 1e-9)
                         if delta_ratio > rel_tol:
                             score = min(1.0, 0.70 + 0.30 * min(delta_ratio, 1.0))
                             max_score = max(max_score, score)
@@ -1177,7 +1438,9 @@ class ConflictGraphBuilder:
                                     "kind": "numeric_divergence",
                                 }
                             )
-                            continue
+                        continue
+                    if va is not None and vb is not None:
+                        continue
                     # Polarity / Semantic branch
                     ca, cb = by_source[sa.source_id], by_source[sb.source_id]
                     if (
@@ -1196,24 +1459,24 @@ class ConflictGraphBuilder:
                             }
                         )
                     elif scorer is not None and deadline_monotonic is not None:
-                        cross_nli_pairs.append(
-                            (i, j, sa.evidence_excerpt or sa.claim_text, sb.claim_text)
-                        )
+                        cross_nli_pairs.append((i, j))
 
             if cross_nli_pairs and scorer is not None and deadline_monotonic is not None:
                 nli_inputs: list[tuple[str, str]] = []
-                for _, _, premise_a, hyp_b in cross_nli_pairs:
-                    nli_inputs.append((premise_a, hyp_b))
-                    nli_inputs.append((hyp_b, premise_a))
+                for i, j in cross_nli_pairs:
+                    sa, sb = sides_list[i], sides_list[j]
+                    nli_inputs.append((sa.evidence_excerpt or sa.claim_text, sb.claim_text))
+                    nli_inputs.append((sb.evidence_excerpt or sb.claim_text, sa.claim_text))
                 nli_scores = scorer.score_pairs_batched(
                     nli_inputs,
                     deadline_monotonic=deadline_monotonic,
                 )
-                if nli_scores and len(nli_scores) == len(nli_inputs):
-                    for idx, (i, j, _, _) in enumerate(cross_nli_pairs):
-                        fwd = nli_scores[2 * idx]["contradiction"]
-                        rev = nli_scores[2 * idx + 1]["contradiction"]
-                        pair_score = max(fwd, rev)
+                if nli_scores:
+                    for idx, (i, j) in enumerate(cross_nli_pairs):
+                        pair_scores = nli_scores[2 * idx:2 * idx + 2]
+                        if not pair_scores:
+                            break
+                        pair_score = max(score["contradiction"] for score in pair_scores)
                         if pair_score >= min_nli_score:
                             max_score = max(max_score, pair_score)
                             conflict_types.add("semantic_contradiction")
@@ -1230,7 +1493,13 @@ class ConflictGraphBuilder:
             if not edges:
                 continue
 
+            edge_sources = {edge[key] for edge in edges for key in ("source_id_a", "source_id_b")}
+            sides_list = [side for side in sides_list if side.source_id in edge_sources]
             adjudication_status, recommended_sid, rationale = _adjudicate_cluster(sides_list)
+            if recommended_sid and not all(recommended_sid in (edge["source_id_a"], edge["source_id_b"]) for edge in edges):
+                adjudication_status = "unresolved_divergence"
+                recommended_sid = None
+                rationale = "多个来源组合存在分歧，报告并列呈现各方依据与口径。"
             ctype: ConflictType = (
                 "numeric_divergence" if "numeric_divergence" in conflict_types else "semantic_contradiction"
             )
@@ -1256,7 +1525,10 @@ class ConflictGraphBuilder:
                     adjudication_status=adjudication_status,
                     recommended_source_id=recommended_sid,
                     adjudication_rationale=rationale,
-                    affected_task_ids=sorted({s.task_id for s in sides_list if s.task_id > 0}),
+                    affected_task_ids=sorted({
+                        claim.task_id for claim in group_claims
+                        if claim.best_source_id in edge_sources and claim.task_id > 0
+                    }),
                 )
             )
         return clusters
@@ -1294,11 +1566,11 @@ class ClaimVerificationOrchestrator:
             for item in getattr(task, "evidence_items", None) or []:
                 if isinstance(item, dict) and item.get("source_id"):
                     by_id[str(item["source_id"]).strip()] = item
-        if self._evidence_store is not None and hasattr(self._evidence_store, "lookup"):
-            for item in self._evidence_store.lookup(include_full_content=True) or []:
+        if self._evidence_store is not None:
+            for item in self._evidence_store.lookup() or []:
                 if isinstance(item, dict) and item.get("source_id"):
                     sid = str(item["source_id"]).strip()
-                    by_id[sid] = item
+                    by_id[sid] = {**by_id.get(sid, {}), **item}
         return by_id
 
     def verify_request(
@@ -1314,16 +1586,17 @@ class ClaimVerificationOrchestrator:
         if not enabled:
             return {"issues": [], "summary": {}, "conflicts": []}
 
-        budget_sec = max(0.1, float(getattr(self._config, "nli_stage_budget_seconds", 8.0) or 8.0))
+        budget_sec = float(getattr(self._config, "nli_stage_budget_seconds", 8.0))
         deadline = time.monotonic() + budget_sec
         evidence_by_id = self._collect_evidence_map(state)
         request_valid_ids = set(evidence_by_id.keys())
         max_atomics = int(getattr(self._config, "nli_max_atomic_claims_per_task", 12) or 12)
         top_k = int(getattr(self._config, "nli_top_k_chunks_per_source", 3) or 3)
-        entail_thresh = float(getattr(self._config, "nli_entailment_threshold", 0.60) or 0.60)
-        contra_thresh = float(getattr(self._config, "nli_contradiction_threshold", 0.65) or 0.65)
+        entail_thresh = float(getattr(self._config, "nli_entailment_threshold", 0.60))
+        contra_thresh = float(getattr(self._config, "nli_contradiction_threshold", 0.65))
 
         all_atomics: list[AtomicClaimRecord] = []
+        candidates: list[AtomicClaimRecord] = []
         atomics_by_task_parent: dict[tuple[int, int], list[AtomicClaimRecord]] = defaultdict(list)
 
         for task in getattr(state, "todo_items", []) or []:
@@ -1338,56 +1611,61 @@ class ClaimVerificationOrchestrator:
                 continue
             subset_claims = [c for _, c in verifiable_pairs]
             index_remap = {sub_idx: orig_idx for sub_idx, (orig_idx, _) in enumerate(verifiable_pairs)}
-            task_atomics = self._decomposer.decompose(
+            decompose = partial(
+                self._decomposer.decompose,
                 task_id=task.id,
-                parent_claims=subset_claims,
+                parent_claims=[dict(claim) for claim in subset_claims],
                 valid_source_ids=request_valid_ids,
-                fast_llm=self._fast_llm,
-                max_atomic_per_task=max_atomics,
+                max_atomic_per_task=None,
             )
-            for atomic in task_atomics:
-                orig_idx = index_remap.get(atomic.parent_claim_index, atomic.parent_claim_index)
+            task_atomics = None
+            if self._fast_llm is not None and getattr(self._config, "nli_decompose_with_fast_llm", True):
+                task_atomics = _within_budget(partial(decompose, fast_llm=self._fast_llm), deadline)
+            if task_atomics is None:
+                task_atomics = decompose()
+
+            for idx, atomic in enumerate(task_atomics):
+                orig_idx = index_remap[atomic.parent_claim_index]
                 atomic.parent_claim_index = orig_idx
                 atomic.atomic_id = f"{task.id}-C{orig_idx}-A{len(atomics_by_task_parent[(task.id, orig_idx)])}"
                 all_atomics.append(atomic)
                 atomics_by_task_parent[(task.id, orig_idx)].append(atomic)
+                if idx < max_atomics:
+                    candidates.append(atomic)
+                else:
+                    atomic.degraded_reason = "nli_atomic_limit"
 
-        # Step 2: Scoped retrieval per atomic claim -> prepare NLI pairs
+        # Step 2: prepare only the source-scoped pairs that fit the stage budget.
         pair_meta: list[tuple[AtomicClaimRecord, EvidenceRetrievalHit]] = []
         hits_by_atomic: dict[str, list[EvidenceRetrievalHit]] = {}
-        for atomic in all_atomics:
+        for atomic in candidates:
             cited_fallback = [evidence_by_id[sid] for sid in atomic.source_ids if sid in evidence_by_id]
-            hits = self._retriever.fetch_for_claim(
-                atomic,
-                retrieval_service=self._retrieval_service,
-                evidence_store=self._evidence_store,
-                cited_records_fallback=cited_fallback,
-                top_k_per_source=top_k,
+            hits = _within_budget(
+                lambda claim=atomic, records=cited_fallback: self._retriever.fetch_for_claim(
+                    claim,
+                    retrieval_service=self._retrieval_service,
+                    evidence_store=self._evidence_store,
+                    cited_records_fallback=records,
+                    top_k_per_source=top_k,
+                ),
+                deadline,
             )
-            hits_by_atomic[atomic.atomic_id] = hits
-            for hit in hits:
-                if hit.text:
-                    pair_meta.append((atomic, hit))
+            hits_by_atomic[atomic.atomic_id] = hits or []
+            if hits:
+                pair_meta.extend((atomic, hit) for hit in hits if hit.text)
 
-        # Step 3: Batch NLI scoring
-        degraded = False
-        degraded_reason: str | None = None
-        scored_probs: list[dict[str, float]] | None = None
-        if pair_meta:
-            scored_probs = self._scorer.score_pairs_batched(
-                [(hit.text, atomic.text) for atomic, hit in pair_meta],
-                deadline_monotonic=deadline,
-            )
-            if scored_probs is None:
-                degraded = True
-                degraded_reason = (
-                    "nli_budget_exhausted"
-                    if time.monotonic() >= deadline
-                    else "nli_model_unavailable"
-                )
-                if observer is not None and hasattr(observer, "record_degraded"):
-                    observer.record_degraded(degraded_reason)
-                metrics_registry.increment("nli_degraded_total")
+        # Step 3: retain completed batches and fall back for incomplete atomics.
+        scored_probs = self._scorer.score_pairs_batched(
+            [(hit.text, atomic.text) for atomic, hit in pair_meta],
+            deadline_monotonic=deadline,
+        ) if pair_meta else None
+        backend_used = self._scorer.last_backend_used if scored_probs else "none"
+        scoring_reason = (
+            "nli_budget_exhausted" if time.monotonic() >= deadline else "nli_model_unavailable"
+        )
+        counts = defaultdict(int)
+        for atomic, _ in pair_meta:
+            counts[atomic.atomic_id] += 1
 
         probs_by_atomic: dict[str, list[tuple[EvidenceRetrievalHit, dict[str, float]]]] = defaultdict(list)
         if scored_probs is not None:
@@ -1395,14 +1673,21 @@ class ClaimVerificationOrchestrator:
                 probs_by_atomic[atomic.atomic_id].append((hit, probs))
 
         issues: list[dict[str, Any]] = []
+        fallback_failures: set[str] = set()
+        fallback_records: dict[str, dict[str, Any]] = {}
         entailed_cnt = contradicted_cnt = neutral_cnt = skipped_cnt = 0
 
         for atomic in all_atomics:
             hit_probs = probs_by_atomic.get(atomic.atomic_id)
-            if hit_probs:
-                max_ent_pair = max(hit_probs, key=lambda hp: hp[1]["entailment"])
+            if hit_probs and len(hit_probs) == counts[atomic.atomic_id]:
+                supported_hits = [
+                    pair for pair in hit_probs
+                    if pair[1]["entailment"] >= entail_thresh
+                    and numeric_grounding_mismatch(atomic.text, [pair[0].text]) is None
+                ]
+                max_ent_pair = max(supported_hits, key=lambda hp: hp[1]["entailment"], default=None)
                 max_con_pair = max(hit_probs, key=lambda hp: hp[1]["contradiction"])
-                max_ent = max_ent_pair[1]["entailment"]
+                max_ent = max_ent_pair[1]["entailment"] if max_ent_pair else 0.0
                 max_con = max_con_pair[1]["contradiction"]
 
                 if max_con >= contra_thresh and max_con > max_ent + 0.10:
@@ -1412,50 +1697,64 @@ class ClaimVerificationOrchestrator:
                     atomic.best_source_id = max_con_pair[0].source_id
                     atomic.matched_chunk_ids = [max_con_pair[0].chunk_id]
                     atomic.matched_excerpt = truncate_text(max_con_pair[0].text, 220)
-                    atomic.verifier_backend = self._scorer.last_backend_used
+                    atomic.verifier_backend = backend_used
                     contradicted_cnt += 1
                     metrics_registry.increment("nli_contradictions_total")
-                elif max_ent >= entail_thresh:
+                elif max_ent_pair is not None:
                     atomic.nli_label = "ENTAILED"
                     atomic.raw_probs = max_ent_pair[1]
                     atomic.calibrated_confidence = max_ent
                     atomic.best_source_id = max_ent_pair[0].source_id
                     atomic.matched_chunk_ids = [max_ent_pair[0].chunk_id]
                     atomic.matched_excerpt = truncate_text(max_ent_pair[0].text, 220)
-                    atomic.verifier_backend = self._scorer.last_backend_used
+                    atomic.verifier_backend = backend_used
                     entailed_cnt += 1
                 else:
                     atomic.nli_label = "NEUTRAL"
-                    best_pair = max_ent_pair
+                    best_pair = max(hit_probs, key=lambda hp: hp[1]["neutral"])
                     atomic.raw_probs = best_pair[1]
-                    atomic.calibrated_confidence = max(max_ent, best_pair[1].get("neutral", 0.0))
+                    atomic.calibrated_confidence = best_pair[1]["neutral"]
                     atomic.best_source_id = best_pair[0].source_id
                     atomic.matched_chunk_ids = [best_pair[0].chunk_id]
                     atomic.matched_excerpt = truncate_text(best_pair[0].text, 220)
-                    atomic.verifier_backend = self._scorer.last_backend_used
+                    atomic.verifier_backend = backend_used
                     neutral_cnt += 1
                 metrics_registry.increment("nli_claims_verified_total")
             else:
                 atomic.nli_label = "SKIPPED"
                 atomic.verifier_backend = "numeric_fallback" if fallback_claim_verifier else "none"
-                atomic.degraded_reason = degraded_reason or (
-                    "no_scoped_chunks" if not hits_by_atomic.get(atomic.atomic_id) else "nli_unavailable"
+                atomic.degraded_reason = atomic.degraded_reason or (
+                    scoring_reason if hits_by_atomic.get(atomic.atomic_id) or time.monotonic() >= deadline
+                    else "no_scoped_chunks"
                 )
                 skipped_cnt += 1
-                if fallback_claim_verifier is not None:
-                    cited_recs = [evidence_by_id[s] for s in atomic.source_ids if s in evidence_by_id]
-                    reason = fallback_claim_verifier(atomic.text, cited_recs)
-                    if reason:
-                        issues.append(
-                            {
-                                "task_id": atomic.task_id,
-                                "severity": "medium",
-                                "check": "claim_evidence_mismatch",
-                                "message": f"任务 {atomic.task_id} 原子结论与引用证据不一致：{reason}",
-                                "source_ids": list(atomic.source_ids),
-                                "origin": "claim_verifier:numeric_fallback",
-                            }
-                        )
+                reason = None
+                if not atomic.source_ids:
+                    reason = "未找到有效引用"
+                elif fallback_claim_verifier is not None:
+                    missing = [sid for sid in atomic.source_ids if sid not in fallback_records]
+                    for sid in missing:
+                        fallback_records[sid] = evidence_by_id.get(sid, {})
+                    if missing and self._evidence_store is not None:
+                        for record in self._evidence_store.lookup(source_ids=missing, include_full_content=True):
+                            sid = record.get("source_id")
+                            if sid in missing:
+                                fallback_records[sid] = {**fallback_records[sid], **record}
+                    reason = fallback_claim_verifier(
+                        atomic.text, [fallback_records[sid] for sid in atomic.source_ids],
+                    )
+                if reason:
+                    fallback_failures.add(atomic.atomic_id)
+                    issues.append(
+                        {
+                            "task_id": atomic.task_id,
+                            "severity": "medium",
+                            "check": "claim_evidence_mismatch",
+                            "message": f"任务 {atomic.task_id} 原子结论与引用证据不一致：{reason}",
+                            "source_ids": list(atomic.source_ids),
+                            "origin": "claim_verifier:numeric_fallback",
+                        }
+                    )
 
         # Roll up atomic judgments onto parent claims in-place + attach task.atomic_claims
         for task in getattr(state, "todo_items", []) or []:
@@ -1465,6 +1764,8 @@ class ClaimVerificationOrchestrator:
             for p_idx, parent_claim in enumerate(parent_list):
                 children = atomics_by_task_parent.get((task.id, p_idx))
                 if not children:
+                    parent_claim.pop("atomic_claim_ids", None)
+                    parent_claim.pop("nli_verdict", None)
                     continue
                 parent_claim["atomic_claim_ids"] = [c.atomic_id for c in children]
                 labels = {c.nli_label for c in children}
@@ -1505,11 +1806,26 @@ class ClaimVerificationOrchestrator:
                 elif labels == {"ENTAILED"}:
                     parent_claim["support_status"] = "supported"
                     parent_claim["nli_verdict"] = "ENTAILED"
+                elif "SKIPPED" in labels:
+                    parent_claim["nli_verdict"] = "SKIPPED"
+                    if any(
+                        c.atomic_id in fallback_failures
+                        or c.degraded_reason in {"no_scoped_chunks", "nli_atomic_limit"}
+                        for c in children
+                    ):
+                        parent_claim["support_status"] = "unverified_claim"
+
+        degraded_reasons = {atomic.degraded_reason for atomic in all_atomics if atomic.degraded_reason}
+        if degraded_reasons:
+            metrics_registry.increment("nli_degraded_total")
+            if observer is not None and hasattr(observer, "record_degraded"):
+                for reason in sorted(degraded_reasons):
+                    observer.record_degraded(reason)
 
         # Step 4: Cross-source conflict graph
         clusters: list[EvidenceConflictCluster] = []
         if bool(getattr(self._config, "nli_conflict_graph_enabled", True)):
-            conflict_scorer = None if degraded else self._scorer
+            conflict_scorer = self._scorer if scored_probs and time.monotonic() < deadline else None
             clusters = self._conflict_builder.build(
                 all_atomics,
                 evidence_by_id=evidence_by_id,
@@ -1549,12 +1865,12 @@ class ClaimVerificationOrchestrator:
             "contradicted_count": contradicted_cnt,
             "neutral_count": neutral_cnt,
             "skipped_count": skipped_cnt,
-            "atomic_faithfulness_rate": round(entailed_cnt / denom, 4) if denom > 0 else 0.0,
+            "atomic_faithfulness_rate": entailed_cnt / denom if denom else 0.0,
             "conflict_count": len(clusters),
             "unresolved_conflict_count": unresolved_cnt,
-            "backend_used": self._scorer.last_backend_used,
+            "backend_used": backend_used if denom else ("numeric_fallback" if skipped_cnt and fallback_claim_verifier else "none"),
             "elapsed_ms": elapsed_ms,
-            "degraded": degraded,
+            "degraded": bool(degraded_reasons),
         }
         state.claim_verification_summary = summary
         if observer is not None and hasattr(observer, "record_nli_verification"):
@@ -1579,9 +1895,9 @@ class ClaimVerificationOrchestrator:
                 parent_claims=[{"text": claim_text, "source_ids": sorted(valid_ids)}],
                 valid_source_ids=valid_ids,
                 fast_llm=None,
-                max_atomic_per_task=int(getattr(self._config, "nli_max_atomic_claims_per_task", 12) or 12),
+                max_atomic_per_task=None,
             )
-            if not atomics:
+            if not atomics or len(atomics) > int(getattr(self._config, "nli_max_atomic_claims_per_task", 12)):
                 return None
             deadline = time.monotonic() + float(
                 getattr(self._config, "nli_stage_budget_seconds", 8.0) or 8.0
@@ -1590,8 +1906,8 @@ class ClaimVerificationOrchestrator:
             for atomic in atomics:
                 hits = self._retriever.fetch_for_claim(
                     atomic,
-                    retrieval_service=self._retrieval_service,
-                    evidence_store=self._evidence_store,
+                    retrieval_service=None,
+                    evidence_store=None,
                     cited_records_fallback=cited_records,
                     top_k_per_source=int(getattr(self._config, "nli_top_k_chunks_per_source", 3) or 3),
                 )
@@ -1604,22 +1920,26 @@ class ClaimVerificationOrchestrator:
                 [(h.text, a.text) for a, h in pairs],
                 deadline_monotonic=deadline,
             )
-            if probs is None:
+            if not probs or len(probs) != len(pairs):
                 return None
-            entail_thresh = float(getattr(self._config, "nli_entailment_threshold", 0.60) or 0.60)
-            contra_thresh = float(getattr(self._config, "nli_contradiction_threshold", 0.65) or 0.65)
-            by_aid: dict[str, list[dict[str, float]]] = defaultdict(list)
-            for (atomic, _), p in zip(pairs, probs):
-                by_aid[atomic.atomic_id].append(p)
+            entail_thresh = float(getattr(self._config, "nli_entailment_threshold", 0.60))
+            contra_thresh = float(getattr(self._config, "nli_contradiction_threshold", 0.65))
+            by_aid: dict[str, list[tuple[EvidenceRetrievalHit, dict[str, float]]]] = defaultdict(list)
+            for (atomic, hit), p in zip(pairs, probs):
+                by_aid[atomic.atomic_id].append((hit, p))
             for atomic in atomics:
                 plist = by_aid.get(atomic.atomic_id) or []
                 if not plist:
-                    continue
-                max_ent = max(x["entailment"] for x in plist)
-                max_con = max(x["contradiction"] for x in plist)
+                    return None
+                grounded_scores = [
+                    p["entailment"] for hit, p in plist
+                    if numeric_grounding_mismatch(atomic.text, [hit.text]) is None
+                ]
+                max_ent = max(grounded_scores, default=0.0)
+                max_con = max(p["contradiction"] for _, p in plist)
                 if max_con >= contra_thresh and max_con > max_ent + 0.10:
                     return False, f"原子结论「{truncate_text(atomic.text, 60)}」与引用原文矛盾"
-                if max_ent < entail_thresh:
+                if not grounded_scores or max_ent < entail_thresh:
                     return False, f"原子结论「{truncate_text(atomic.text, 60)}」未获引用原文充分蕴含"
             return True, ""
 

@@ -36,6 +36,12 @@ _CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _CJK_RUN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _MARKDOWN_HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _SENTENCE_BOUNDARY_PATTERN = re.compile(r"[。！？；!?;]\s*|\.(?=\s|$)")
+_MARKDOWN_TABLE_PATTERN = re.compile(
+    r"^(?P<header>[^\n]*\|[^\n]*\n"
+    r"\|? *:?-+:? *(?:\| *:?-+:? *)+\|?\n)"
+    r"(?P<rows>(?:[^\n]*\|[^\n]*(?:\n|$))+)",
+    re.MULTILINE,
+)
 _RUNTIME_RRF_K = 20.0
 _TRACKING_QUERY_PARAMS = {
     "fbclid",
@@ -537,28 +543,39 @@ def _chunk_text(
 
         start = 0
         body_len = len(section_body)
+        tables = list(_MARKDOWN_TABLE_PATTERN.finditer(section_body))
         is_first_in_section = True
         while start < body_len and len(chunks) < normalized_max_chunks:
-            active_prefix = "" if is_first_in_section or not prefix else prefix
+            active_prefix = "" if is_first_in_section or section_body.startswith(heading_breadcrumb, start) else prefix
+            for table in tables:
+                if table.start("rows") <= start < table.end() and len(table["header"]) <= normalized_max // 2:
+                    active_prefix += table["header"]
+                    break
             budget = max(120, normalized_max - len(active_prefix))
             end = min(body_len, start + budget)
             if end < body_len:
                 min_boundary = start + int(budget * 0.5)
-                candidate_end = _find_bilingual_split_boundary(section_body, start, end, min_boundary)
+                end_table = next((table for table in tables if table.start() < end < table.end()), None)
+                if end_table is not None:
+                    # Keep a row together whenever there is a complete line in this window.
+                    candidate_end = section_body.rfind("\n", min_boundary, end) + 1
+                else:
+                    candidate_end = _find_bilingual_split_boundary(section_body, start, end, min_boundary)
                 if candidate_end > start:
                     end = candidate_end
             segment = section_body[start:end].strip()
             if segment:
-                chunk_text = (
-                    f"{active_prefix}{segment}"
-                    if active_prefix and not segment.startswith(heading_breadcrumb)
-                    else segment
-                )
+                chunk_text = f"{active_prefix}{segment}"
                 chunks.append((section_offset + start, section_offset + end, chunk_text))
                 is_first_in_section = False
             if end >= body_len:
                 break
-            start = max(start + 1, end - normalized_overlap)
+            next_start = max(start + 1, end - normalized_overlap)
+            if any(table.start("rows") < next_start < table.end() for table in tables):
+                row_start = section_body.find("\n", next_start - 1, end) + 1
+                if row_start >= next_start:
+                    next_start = row_start
+            start = next_start
 
     return chunks or [(0, len(cleaned), cleaned)]
 
@@ -1839,6 +1856,8 @@ class EvidenceRetrievalService:
                 text=text,
                 task_id=int(task_id or 0),
                 top_k=requested_top_k,
+                per_source_limit=self._config.nli_top_k_chunks_per_source if allowed_source_ids is not None else 2,
+                max_sources=len(allowed_source_ids) if allowed_source_ids is not None else 4,
                 allowed_source_ids=allowed_source_ids,
             )
             hits.extend(current_hits)
