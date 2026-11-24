@@ -15,7 +15,7 @@ from typing import Any
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from services.embeddings import embeddings_available, encode_text, encode_texts
-from services.memory_sanitizer import collapse_whitespace, sanitize_injection_text
+from services.memory_sanitizer import collapse_whitespace, sanitize_memory_text
 from utils import truncate_text
 
 try:  # pragma: no cover - exercised through runtime fallback
@@ -945,33 +945,18 @@ class NoteMemoryService:
         remaining -= len(header)
 
         for hit in hits:
-            excerpt = truncate_text(
-                sanitize_injection_text(hit.content),
-                max(80, min(remaining, 260)),
-            )
-            topic = hit.resolved_topic or "未知主题"
-            item_lines = [
-                f"- 标题：{hit.title}",
-                f"  主题：{topic}",
-                f"  note_type：{hit.note_type}；匹配原因：{hit.match_reason}",
-                f"  摘录：{excerpt}",
+            content = sanitize_memory_text(hit.content)
+            metadata = [
+                f"- 标题：{sanitize_memory_text(hit.title)}",
+                f"  主题：{sanitize_memory_text(hit.resolved_topic) or '未知主题'}",
+                f"  note_type：{sanitize_memory_text(hit.note_type)}；匹配原因：{sanitize_memory_text(hit.match_reason)}",
             ]
-            block = "\n".join(item_lines)
+            excerpt = truncate_text(content, max(80, min(remaining, 260)))
+            block = "\n".join([*metadata, f"  摘录：{excerpt}"])
             if len(block) > remaining and len(lines) > 1:
                 break
             if len(block) > remaining:
-                excerpt = truncate_text(
-                    sanitize_injection_text(hit.content),
-                    max(40, remaining - 60),
-                )
-                block = "\n".join(
-                    [
-                        f"- 标题：{hit.title}",
-                        f"  主题：{topic}",
-                        f"  note_type：{hit.note_type}；匹配原因：{hit.match_reason}",
-                        f"  摘录：{excerpt}",
-                    ]
-                )
+                block = truncate_text(block, remaining)
             lines.append(block)
             remaining -= len(block)
             if remaining <= 80:

@@ -19,9 +19,21 @@ from services.evidence import (
     looks_like_source_label_text,
     render_references,
 )
-from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.evidence_index import (
+    EvidenceRetrievalService,
+    render_disputed_source_chunks,
+)
+from services.fact_ledger import (
+    context_covered_task_ids,
+    render_context_checkpoint,
+    render_context_delta,
+)
 from services.sandbox_executor import sanitize_chart_spec
-from services.text_processing import CITATION_PATTERN, normalize_agent_markdown
+from services.text_processing import (
+    CITATION_PATTERN,
+    normalize_agent_markdown,
+    truncate_cited_text,
+)
 from utils import strip_thinking_tokens, truncate_text
 
 _STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
@@ -81,10 +93,12 @@ class ReportingService:
         config: Configuration,
         *,
         evidence_store,
+        retrieval_service: EvidenceRetrievalService | None = None,
     ) -> None:
         self._agent = report_agent
         self._config = config
         self._evidence_store = evidence_store
+        self._retrieval_service = retrieval_service
 
     def generate_report(
         self,
@@ -143,14 +157,10 @@ class ReportingService:
 
         payload = self._extract_json_payload(cleaned)
         if isinstance(payload, dict):
-            return self._render_structured_report(
-                payload,
-                state=state,
-                observer=observer,
-            )
-
-        report_text = normalize_agent_markdown(cleaned)
-        return report_text or "报告生成失败，请检查输入。"
+            report = self._render_structured_report(payload, state=state, observer=observer)
+        else:
+            report = normalize_agent_markdown(cleaned)
+        return self._sanitize_chunk_citations(report, self._collect_valid_source_ids(state)) or "报告生成失败，请检查输入。"
 
     def stream_generate_report(
         self,
@@ -195,11 +205,9 @@ class ReportingService:
             observer=observer,
             skill_pack_context=skill_pack_context,
         )
-        valid_source_ids = self._collect_valid_source_ids(state)
-        sanitized_report = self._sanitize_chunk_citations(report, valid_source_ids)
-        state.structured_report = sanitized_report
+        state.structured_report = report
 
-        chunks = self._split_report_chunks(sanitized_report)
+        chunks = self._split_report_chunks(report)
         total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             yield {
@@ -234,9 +242,7 @@ class ReportingService:
             token = match.group(1)
             return match.group(0) if token in valid_source_ids else ""
 
-        cleaned = CITATION_PATTERN.sub(_replace, text)
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-        return cleaned
+        return CITATION_PATTERN.sub(_replace, text)
 
     @staticmethod
     def _split_report_chunks(report: str, *, max_chunk_chars: int = 800) -> list[str]:
@@ -263,9 +269,14 @@ class ReportingService:
         *,
         skill_pack_context: str | None = None,
     ) -> PromptEnvelope:
+        builder = ContextPrefixBuilder(self._config)
+        covered_task_ids = context_covered_task_ids(state, self._config)
         task_blocks: list[str] = []
         for task in state.todo_items:
-            summary_block = truncate_text(
+            if task.id in covered_task_ids:
+                task_blocks.append(f"### 任务 {task.id}: {task.title}\n- 任务目标：{task.intent}\n")
+                continue
+            summary_block = truncate_cited_text(
                 self._task_prompt_summary(task),
                 self._config.resolved_report_summary_char_limit(),
             )
@@ -285,50 +296,26 @@ class ReportingService:
 
         tools_enabled = self._tools_enabled()
         layout_mode = self._config.resolved_report_layout_mode()
-        if layout_mode == self._FIXED_LAYOUT_MODE:
-            static_contract = self._build_fixed_prompt(
-                research_topic=state.research_topic,
-                task_blocks=[],
-                tools_enabled=tools_enabled,
-            )
-        else:
-            static_contract = self._build_flexible_prompt(
-                research_topic=state.research_topic,
-                task_blocks=[],
-                tools_enabled=tools_enabled,
-            )
+        build_contract = self._build_fixed_prompt if layout_mode == self._FIXED_LAYOUT_MODE else self._build_flexible_prompt
+        static_schema = build_contract(tools_enabled=tools_enabled)
 
-        # Strip variable topic & empty placeholder from static schema so prefix remains maximally stable
-        static_schema = re.sub(
-            r"研究主题：[^\n]*\n任务概览：\n\n",
-            "",
-            static_contract,
-            count=1,
-        )
-
-        frozen_parts: list[str] = []
-        raw_ledger = getattr(state, "fact_ledger", None)
-        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
-            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
-                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
-            )
-            if ledger_md:
-                frozen_parts.append(ledger_md)
-        raw_cards = getattr(state, "evidence_index_cards", None) or []
-        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
-            cards_md = render_evidence_index_cards_block(raw_cards)
-            if cards_md:
-                frozen_parts.append(cards_md)
-
+        frozen = render_context_checkpoint(state, self._config)
         volatile_blocks: list[tuple[str, str]] = [
             ("report_tasks", f"任务概览：\n{''.join(task_blocks)}"),
+            ("context_delta", render_context_delta(state, self._config)),
         ]
         raw_conflicts = getattr(state, "evidence_conflicts", None) or []
         if raw_conflicts:
+            disputed_ids: list[str] = []
             conflict_hints: list[str] = []
             for cluster in raw_conflicts[:5]:
                 if not isinstance(cluster, dict):
                     continue
+                disputed_ids.extend(
+                    str(side.get("source_id") or "").strip()
+                    for side in cluster.get("sides") or []
+                    if isinstance(side, dict)
+                )
                 topic_label = " / ".join(
                     part for part in (cluster.get("entity"), cluster.get("metric"), cluster.get("period")) if part
                 )
@@ -344,16 +331,36 @@ class ReportingService:
                     )
                 )
 
-        builder = ContextPrefixBuilder(self._config)
+            if covered_task_ids:
+                valid_ids = self._collect_valid_source_ids(state)
+                volatile_blocks.append((
+                    "disputed_chunks",
+                    render_disputed_source_chunks(
+                        self._retrieval_service, [sid for sid in disputed_ids if sid in valid_ids]
+                    ),
+                ))
+
+        role = str(getattr(self._agent, "system_prompt", "") or "")
+        if not builder.enabled():
+            return builder.build_envelope(
+                stage="report",
+                system_role=role,
+                volatile_blocks=[
+                    ("topic", f"研究主题：{state.research_topic}"),
+                    *volatile_blocks,
+                    ("output_contract", static_schema),
+                    ("checkpoint", frozen),
+                    ("skills", str(skill_pack_context or "")),
+                ],
+            )
         return builder.build_envelope(
             stage="report",
-            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            system_role=role,
             static_schema_and_rules=static_schema,
             research_topic=state.research_topic or "",
             skill_pack_context=str(skill_pack_context or "").strip(),
-            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            frozen_index_and_ledger=frozen,
             volatile_blocks=volatile_blocks,
-            cache_key_scope="request",
         )
 
     def _build_prompt(self, state: SummaryState) -> str:
@@ -370,26 +377,22 @@ class ReportingService:
     @staticmethod
     def _build_fixed_prompt(
         *,
-        research_topic: str,
-        task_blocks: list[str],
         tools_enabled: bool = True,
     ) -> str:
         tool_guidance = (
             "你必须先使用 `evidence_lookup` 检查各任务的 source_id；当任务总结缺少支撑时，"
-            "可使用 `fetch_page` 读取某个 source_id 的网页正文。请勿编造不存在的 source_id。\n"
+            "可使用 `evidence_lookup(mode=\"lazy_chunks\")` 按 source_id 读取正文。请勿编造不存在的 source_id。\n"
             if tools_enabled
-            else "请直接基于上方「任务概览」与「来源概览」中已登记的 source_id 组织报告，"
+            else "请直接基于任务概览、事实账本和来源目录中已登记的 source_id 组织报告，"
             "不要尝试调用任何工具，也不要编造不存在的 source_id。\n"
         )
         citation_rule = (
             "2. 引用只能使用 evidence_lookup 返回的 source_id；\n"
             if tools_enabled
-            else "2. 引用只能使用上方任务概览与来源概览中已登记的 source_id；\n"
+            else "2. 引用只能使用任务概览、事实账本和来源目录中已登记的 source_id；\n"
         )
         prompt = (
             "报告布局模式：fixed（固定结构备份模式）\n"
-            f"研究主题：{research_topic}\n"
-            f"任务概览：\n{''.join(task_blocks)}\n"
             f"{tool_guidance}"
             "请严格输出 JSON，格式如下：\n"
             "{\n"
@@ -413,26 +416,22 @@ class ReportingService:
     @staticmethod
     def _build_flexible_prompt(
         *,
-        research_topic: str,
-        task_blocks: list[str],
         tools_enabled: bool = True,
     ) -> str:
         tool_guidance = (
             "你必须先使用 `evidence_lookup` 检查各任务的 source_id；当任务总结缺少支撑时，"
-            "可使用 `fetch_page` 读取某个 source_id 的网页正文。请勿编造不存在的 source_id。\n"
+            "可使用 `evidence_lookup(mode=\"lazy_chunks\")` 按 source_id 读取正文。请勿编造不存在的 source_id。\n"
             if tools_enabled
-            else "请直接基于上方「任务概览」与「来源概览」中已登记的 source_id 组织报告，"
+            else "请直接基于任务概览、事实账本和来源目录中已登记的 source_id 组织报告，"
             "不要尝试调用任何工具，也不要编造不存在的 source_id。\n"
         )
         citation_rule = (
             "6. 引用只能使用 evidence_lookup 返回的 source_id；\n"
             if tools_enabled
-            else "6. 引用只能使用上方任务概览与来源概览中已登记的 source_id；\n"
+            else "6. 引用只能使用任务概览、事实账本和来源目录中已登记的 source_id；\n"
         )
         prompt = (
             "报告布局模式：flexible（核心必选章节 + 可选自定义章节/动态排序）\n"
-            f"研究主题：{research_topic}\n"
-            f"任务概览：\n{''.join(task_blocks)}\n"
             f"{tool_guidance}"
             "请严格输出 JSON，格式如下：\n"
             "{\n"

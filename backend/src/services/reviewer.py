@@ -17,14 +17,22 @@ from models import SummaryState, TodoItem
 from prompts import get_current_date
 from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.evidence import extract_citation_ids, format_evidence_sources
-from services.evidence_index import EvidenceRetrievalService
-from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.evidence_index import (
+    EvidenceRetrievalService,
+    render_disputed_source_chunks,
+)
+from services.fact_ledger import (
+    context_covered_task_ids,
+    render_context_checkpoint,
+    render_context_delta,
+)
 from services.mcp_bridge import MCPHitlApprovalRequired
 from services.skill_verifiers import run_skill_verifiers, verify_computation_lineage
 from services.text_processing import (
     looks_like_meta_reasoning,
     normalize_agent_markdown,
     strip_citation_markers,
+    truncate_cited_text,
 )
 from utils import strip_thinking_tokens, truncate_text
 
@@ -70,12 +78,14 @@ class ReviewIssue:
         }
 
 
+_UNIT_SUFFIX = r"%|‰|ms|s|TB|GB|MB|KB|x|倍|亿|万|千|美元|元|B|M|K"
+_NUMBER = r"[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
 _SALIENT_CLAIM_NUMBER_PATTERN = re.compile(
-    r"(?:"
-    r"\b(?:19|20)\d{2}\b"
-    r"|\b\d+(?:\.\d+)?\s*(?:%|ms|s|GB|MB|TB|KB|x|倍|亿|万|千|美元|元|B|M|K)\b"
-    r"|\d+(?:\.\d+)?%"
-    r")",
+    rf"(?<![0-9.])(?:{_NUMBER}\s*(?:{_UNIT_SUFFIX})(?![a-z])|(?:19|20)[0-9]{{2}})(?![0-9]|\.[0-9])",
+    re.IGNORECASE,
+)
+_NUMBER_WITH_UNIT_PATTERN = re.compile(
+    rf"(?P<value>{_NUMBER})\s*(?P<unit>{_UNIT_SUFFIX})?",
     re.IGNORECASE,
 )
 
@@ -104,13 +114,21 @@ def _evidence_body_text(item: dict[str, Any]) -> str:
 
 
 def _number_token_supported_in_text(token: str, corpus_lower: str) -> bool:
-    if token in corpus_lower:
-        return True
-    digits_match = re.match(r"(\d+(?:\.\d+)?)", token)
-    if digits_match:
-        bare = digits_match.group(1)
-        # Allow formatted variants like "45 %" or "45.0" or "45,"
-        if re.search(rf"(?<![0-9.]){re.escape(bare)}(?![0-9])", corpus_lower):
+    expected = _NUMBER_WITH_UNIT_PATTERN.fullmatch(token)
+    if expected is None:
+        return False
+
+    def normalize(match: re.Match[str]) -> tuple[str, str]:
+        value = match["value"].replace(",", "")
+        integer, _, fraction = value.partition(".")
+        return integer.removeprefix("+") + ("." + fraction.rstrip("0") if fraction.rstrip("0") else ""), (
+            match["unit"] or ""
+        ).lower()
+
+    target = normalize(expected)
+    for match in _SALIENT_CLAIM_NUMBER_PATTERN.finditer(corpus_lower):
+        candidate = _NUMBER_WITH_UNIT_PATTERN.fullmatch(match.group())
+        if candidate is not None and normalize(candidate) == target:
             return True
     return False
 
@@ -260,8 +278,24 @@ class ReviewService:
         *,
         skill_pack_context: str | None = None,
     ) -> PromptEnvelope:
+        builder = ContextPrefixBuilder(self._config)
+        covered_task_ids = context_covered_task_ids(state, self._config)
         task_blocks: list[str] = []
         for task in state.todo_items:
+            issue_text = "\n".join(
+                f"  - [{issue.severity}] {issue.check}: {issue.message}"
+                for issue in issues
+                if issue.task_id == task.id
+            ) or "  - 暂无规则审查问题"
+            task_header = (
+                f"### 任务 {task.id}: {task.title}\n"
+                f"- 目标：{task.intent}\n"
+                f"- 状态：{task.status}\n"
+            )
+            if task.id in covered_task_ids:
+                task_blocks.append(f"{task_header}- 规则审查结果：\n{issue_text}\n")
+                continue
+
             sources = format_evidence_sources(task.evidence_items) or "- 暂无来源"
             excerpt_lines: list[str] = []
             for item in (task.evidence_items or [])[:6]:
@@ -274,24 +308,17 @@ class ReviewService:
                     or ""
                 ).strip()
                 if sid and snippet:
-                    excerpt_lines.append(f"  - [{sid}] {truncate_text(snippet, 240)}")
+                    excerpt_lines.append(f"  - [{sid}] {truncate_cited_text(snippet, 240)}")
             excerpt_text = "\n".join(excerpt_lines) or "  - 暂无正文摘录"
             repair_hits = self._repair_hits_for_task(state, task)
             repair_text = "\n".join(
                 f"  - [{hit['origin']}] {hit['title']} ({hit['quality_label']}/{hit['freshness_label']}) {hit['url']}"
                 for hit in repair_hits
             ) or "  - 暂无额外修补候选"
-            issue_text = "\n".join(
-                f"  - [{issue.severity}] {issue.check}: {issue.message}"
-                for issue in issues
-                if issue.task_id == task.id
-            ) or "  - 暂无规则审查问题"
             task_blocks.append(
-                f"### 任务 {task.id}: {task.title}\n"
-                f"- 目标：{task.intent}\n"
-                f"- 状态：{task.status}\n"
-                f"- 总结：\n{truncate_text(task.summary or '暂无可用信息', 1200)}\n"
-                f"- 来源目录：\n{truncate_text(sources, 1200)}\n"
+                f"{task_header}"
+                f"- 总结：\n{truncate_cited_text(task.summary or '暂无可用信息', 1200)}\n"
+                f"- 来源目录：\n{truncate_cited_text(sources, 1200)}\n"
                 f"- 关键证据摘录：\n{excerpt_text}\n"
                 f"- 修补候选：\n{repair_text}\n"
                 f"- 规则审查结果：\n{issue_text}\n"
@@ -299,11 +326,12 @@ class ReviewService:
 
         tools_enabled = self._tools_enabled()
         tool_guidance = (
-            "你可以调用 evidence_lookup；若需要检索历史修补线索，请使用 `scope=hybrid, mode=repair`。"
+            '你可以调用 evidence_lookup(mode="lazy_chunks") 按来源编号核验原文。'
+            "若需要检索历史修补线索，请使用 `scope=hybrid, mode=repair`。"
             "历史命中只能作为线索，不能直接当作当前 source_id 引用。"
             "你也可以调用 fetch_page 重新抓取 URL，把线索提升为当前证据。"
             if tools_enabled
-            else "当前运行模式不启用工具调用，请直接基于下方任务总结、来源目录、修补候选和规则审查结果补充指出证据问题。"
+            else "当前运行模式不启用工具调用，请直接基于任务概览、事实账本、来源目录和规则审查结果补充指出证据问题。"
             "历史修补候选只能作为线索，不能直接当作当前 source_id 引用。"
         )
         static_rules = (
@@ -312,31 +340,46 @@ class ReviewService:
             "不要重写报告正文，也不要重复输出规则已明确指出的问题。"
         )
 
-        frozen_parts: list[str] = []
-        raw_ledger = getattr(state, "fact_ledger", None)
-        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
-            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
-                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
-            )
-            if ledger_md:
-                frozen_parts.append(ledger_md)
-        raw_cards = getattr(state, "evidence_index_cards", None) or []
-        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
-            cards_md = render_evidence_index_cards_block(raw_cards)
-            if cards_md:
-                frozen_parts.append(cards_md)
-
+        frozen = render_context_checkpoint(state, self._config)
         volatile_delta = f"当前日期：{get_current_date()}\n\n{''.join(task_blocks)}"
-        builder = ContextPrefixBuilder(self._config)
+        volatile_blocks = [("review_tasks", volatile_delta), ("context_delta", render_context_delta(state, self._config))]
+        if builder.enabled() and self._config.evidence_pointer_disclosure_enabled:
+            flagged_checks = {
+                "claim_evidence_mismatch", "numeric_audit_mismatch", "timeline_inconsistency",
+                "claim_contradicted", "claim_unsupported",
+            }
+            valid_ids = {
+                str(item.get("source_id") or "") for task in state.todo_items for item in task.evidence_items
+            }
+            if self._evidence_store is not None:
+                valid_ids.update(item["source_id"] for item in self._evidence_store.lookup() if item.get("source_id"))
+            flagged_ids = sorted({
+                sid for issue in issues if issue.check in flagged_checks for sid in issue.source_ids
+                if sid in valid_ids
+            })
+            volatile_blocks.append(("disputed_chunks", render_disputed_source_chunks(self._retrieval_service, flagged_ids)))
+
+        role = str(getattr(self._agent, "system_prompt", "") or "")
+        if not builder.enabled():
+            return builder.build_envelope(
+                stage="review",
+                system_role=role,
+                volatile_blocks=[
+                    ("research_topic", f"研究主题：{state.research_topic}"),
+                    *volatile_blocks,
+                    ("output_contract", static_rules),
+                    ("checkpoint", frozen),
+                    ("skills", str(skill_pack_context or "")),
+                ],
+            )
         return builder.build_envelope(
             stage="review",
-            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            system_role=role,
             static_schema_and_rules=static_rules,
             research_topic=state.research_topic or "",
             skill_pack_context=str(skill_pack_context or "").strip(),
-            frozen_index_and_ledger="\n\n".join(frozen_parts),
-            volatile_blocks=[("review_tasks", volatile_delta)],
-            cache_key_scope="request",
+            frozen_index_and_ledger=frozen,
+            volatile_blocks=volatile_blocks,
         )
 
     def _build_prompt(

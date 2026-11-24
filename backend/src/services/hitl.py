@@ -183,9 +183,9 @@ class HitlService:
 
     @staticmethod
     def sanitize_citations(text: str, valid_source_ids: set[str]) -> str:
-        """Strip hallucinated [T{task}-S{seq}] tokens not present in the whitelist."""
+        """Strip web, MCP, and computation citations absent from the whitelist."""
         cleaned = str(text or "").strip()
-        if not cleaned or not valid_source_ids:
+        if not cleaned:
             return cleaned
 
         def _replace(match: re.Match[str]) -> str:

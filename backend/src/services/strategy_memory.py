@@ -19,7 +19,7 @@ from services.memory_sanitizer import (
     collapse_whitespace,
     normalize_list,
     parse_json_list,
-    sanitize_injection_text,
+    sanitize_memory_text,
 )
 from services.strategy_synthesizer import (
     DOMAIN_GENERAL,
@@ -1063,18 +1063,18 @@ class StrategyMemoryService:
         remaining = max(240, int(self._config.strategy_memory_prompt_char_limit or 240)) - len(header)
 
         for hit in hits:
-            action_line = sanitize_injection_text("；".join(hit.recommended_actions[:3])) or "暂无明确推荐动作"
-            query_line = sanitize_injection_text("；".join(hit.query_templates[:2])) or "暂无固定检索模板"
-            pitfall_line = sanitize_injection_text("；".join(hit.pitfalls_to_avoid[:2])) or "暂无显式反模式"
-            applicable_when = sanitize_injection_text(hit.applicable_when)
-            signal_line = sanitize_injection_text("；".join(hit.match_signals[:3])) or truncate_text(
+            action_line = sanitize_memory_text("；".join(hit.recommended_actions[:3])) or "暂无明确推荐动作"
+            query_line = sanitize_memory_text("；".join(hit.query_templates[:2])) or "暂无固定检索模板"
+            pitfall_line = sanitize_memory_text("；".join(hit.pitfalls_to_avoid[:2])) or "暂无显式反模式"
+            applicable_when = sanitize_memory_text(hit.applicable_when)
+            signal_line = sanitize_memory_text("；".join(hit.match_signals[:3])) or truncate_text(
                 applicable_when,
                 100,
             )
             block = "\n".join(
                 [
-                    f"- 标题：{sanitize_injection_text(hit.title)}",
-                    f"  类型：{hit.strategy_kind}；匹配原因：{hit.match_reason}",
+                    f"- 标题：{sanitize_memory_text(hit.title)}",
+                    f"  类型：{sanitize_memory_text(hit.strategy_kind)}；匹配原因：{sanitize_memory_text(hit.match_reason)}",
                     f"  适用场景：{truncate_text(applicable_when, 160)}",
                     f"  触发信号：{truncate_text(signal_line, 120)}",
                     f"  推荐动作：{truncate_text(action_line, 160)}",

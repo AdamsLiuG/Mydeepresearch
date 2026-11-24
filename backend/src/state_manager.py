@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from typing import Any
 
 from metrics import RequestTrace
 from models import SummaryState, TodoItem
 from services.dag_scheduler import normalize_depends_on
-from services.evidence import format_evidence_sources
+from services.evidence import EvidenceStore, format_evidence_sources
 from services.mcp_bridge import tool_approval_expired
 from services.request_state import SnapshotConflictError
 
@@ -47,12 +48,6 @@ class StateManagerMixin:
             "cache_misses": observer_snapshot.get("cache_misses", 0),
             "last_search_cache_details": dict(observer_snapshot.get("last_search_cache_details") or {}),
         }
-        serialized_tasks = [self._serialize_task(task) for task in state.todo_items]
-        if getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)():
-            for task, serialized in zip(state.todo_items, serialized_tasks):
-                evidence = self._evidence_store.list_task_evidence(task.id, include_full_content=True)
-                if evidence:
-                    serialized["evidence_items"] = evidence
         payload = {
             "snapshot_version": 2,
             "request_id": self.request_id,
@@ -67,7 +62,6 @@ class StateManagerMixin:
             **({"charts_spec": list(state.report_charts)} if state.report_charts else {}),
             "report_note_id": state.report_note_id,
             "report_note_path": state.report_note_path,
-            "todo_items": serialized_tasks,
             "review_summary": dict(state.review_summary or {}),
             "reflection_completed": bool(state.reflection_completed),
             "review_completed": bool(state.review_completed),
@@ -75,9 +69,6 @@ class StateManagerMixin:
             "report_repair_cycles": int(state.report_repair_cycles or 0),
             "topic_cache_warmup_completed": bool(state.topic_cache_warmup_completed),
             "skill_pack": dict(state.skill_pack_metadata or {}),
-            "fact_ledger": dict(getattr(state, "fact_ledger", None) or {}),
-            "evidence_index_cards": list(getattr(state, "evidence_index_cards", None) or []),
-            "frozen_prefix_version": int(getattr(state, "frozen_prefix_version", 0) or 0),
             "pending_tool_approval": (
                 dict(state.pending_tool_approval)
                 if isinstance(getattr(state, "pending_tool_approval", None), dict)
@@ -98,6 +89,22 @@ class StateManagerMixin:
         }
         tenant_id = str(getattr(self, "tenant_id", "default") or "default").strip() or "default"
         with getattr(self, "_request_snapshot_lock", nullcontext()):
+            serialized_tasks = [self._serialize_task(task) for task in state.todo_items]
+            if isinstance(self._evidence_store, EvidenceStore) and (
+                getattr(self.config, "evidence_pointer_disclosure_enabled", True)
+                or getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)()
+            ):
+                for task in serialized_tasks:
+                    evidence = self._evidence_store.list_task_evidence(task["id"], include_full_content=True)
+                    if evidence:
+                        task["evidence_items"] = evidence
+            payload.update(
+                todo_items=serialized_tasks,
+                fact_ledger=deepcopy(state.fact_ledger),
+                evidence_index_cards=deepcopy(state.evidence_index_cards),
+                frozen_prefix_version=state.frozen_prefix_version,
+                context_checkpoint_blocks=deepcopy(state.context_checkpoint_blocks),
+            )
             payload["approved_tool_calls"] = dict(getattr(state, "approved_tool_calls", None) or {})
             payload["state_version"] = int(getattr(state, "state_version", 0) or 0)
             if self._store_supports_tenant_id("save"):
@@ -256,12 +263,13 @@ class StateManagerMixin:
                 else {}
             ),
             fact_ledger=(
-                dict(payload.get("fact_ledger") or {})
+                deepcopy(payload["fact_ledger"])
                 if isinstance(payload.get("fact_ledger"), dict)
                 else {}
             ),
-            evidence_index_cards=list(payload.get("evidence_index_cards") or []),
+            evidence_index_cards=deepcopy(payload.get("evidence_index_cards") or []),
             frozen_prefix_version=int(payload.get("frozen_prefix_version") or 0),
+            context_checkpoint_blocks=deepcopy(payload.get("context_checkpoint_blocks") or []),
             pending_tool_approval=(
                 dict(payload.get("pending_tool_approval"))
                 if isinstance(payload.get("pending_tool_approval"), dict)

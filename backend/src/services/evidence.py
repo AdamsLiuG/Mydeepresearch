@@ -8,6 +8,7 @@ import math
 import re
 import socket
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,15 +45,20 @@ except Exception:  # pragma: no cover - test stubs may only expose a partial mod
 from config import Configuration
 from metrics import RequestTrace
 from services.evidence_index import (
+    ChunkLazyLoadResult,
+    EvidenceChunk,
     EvidenceRetrievalHit,
     EvidenceRetrievalService,
     EvidenceStoreListener,
+    pack_lazy_chunks,
 )
+from services.memory_sanitizer import sanitize_injection_text
 from services.search import dispatch_search
 from services.text_processing import (
     CITATION_PATTERN,
     normalize_agent_markdown,
     strip_citation_markers,
+    truncate_cited_text,
 )
 from utils import truncate_text
 
@@ -2062,48 +2068,87 @@ class EvidenceStore:
         self._notify_listeners(task_id=task_id, records=[rec], reason="compute")
         return rec.to_dict(include_full_content=True)
 
+    def _select_ids_locked(self, task_id: int | None, source_ids: Sequence[str] | None) -> list[str]:
+        if source_ids is None:
+            return (
+                list(self._task_source_ids.get(task_id, [])) if task_id is not None
+                else [sid for tid in sorted(self._task_source_ids) for sid in self._task_source_ids[tid]]
+            )
+        return [
+            sid for sid in dict.fromkeys(source_ids)
+            if sid in self._records_by_id and (
+                task_id is None or self._records_by_id[sid].task_id == task_id
+            )
+        ]
+
     def list_index_cards(
         self,
         *,
         task_id: int | None = None,
+        source_ids: Sequence[str] | None = None,
         max_gist_chars: int = 120,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Return lightweight pointer cards for progressive disclosure without injecting full text."""
+        """Return scoped, lightweight pointer cards for progressive disclosure."""
 
         with self._lock:
-            if task_id is not None:
-                candidate_ids = list(self._task_source_ids.get(task_id, []))
-            else:
-                candidate_ids = [
-                    sid
-                    for tid in sorted(self._task_source_ids.keys())
-                    for sid in self._task_source_ids.get(tid, [])
-                ]
+            ids = self._select_ids_locked(task_id, source_ids)
             cards: list[dict[str, Any]] = []
-            for sid in candidate_ids:
-                rec = self._records_by_id.get(sid)
-                if rec is None:
-                    continue
-                gist_source = (rec.snippet or rec.full_content or rec.raw_content or rec.title).replace("\n", " ").strip()
+            for sid in ids if limit is None else ids[:max(0, limit)]:
+                rec = self._records_by_id[sid]
+                gist = sanitize_injection_text(rec.snippet or rec.full_content or rec.raw_content or rec.title)
                 cards.append(
                     {
                         "source_id": rec.source_id,
                         "task_id": rec.task_id,
                         "source_origin": rec.source_origin,
                         "modality": rec.modality,
-                        "title": rec.title,
-                        "domain": rec.domain,
+                        "title": sanitize_injection_text(rec.title)[:100],
+                        "domain": sanitize_injection_text(rec.domain)[:80],
                         "source_type": rec.source_type,
                         "quality_label": rec.quality_label,
                         "freshness_label": rec.freshness_label,
                         "published_at": rec.published_at,
-                        "has_full_content": bool(rec.full_content),
+                        "has_full_content": bool(rec.full_content or rec.archive_has_full_content),
                         "page_no": rec.page_no,
-                        "char_len": len(rec.full_content or rec.raw_content or rec.snippet or ""),
-                        "one_line_gist": truncate_text(gist_source, max(40, int(max_gist_chars or 120))),
+                        "char_len": len(rec.full_content or rec.raw_content or rec.snippet),
+                        "one_line_gist": gist[:max(0, max_gist_chars)],
                     }
                 )
             return cards
+
+    def get_lazy_source_chunks(
+        self,
+        source_ids: Sequence[str],
+        *,
+        chunk_indices: Sequence[int] | None,
+        max_chunks_per_source: int,
+        char_budget: int,
+    ) -> list[ChunkLazyLoadResult]:
+        """Expose a bounded record excerpt when no indexed chunk is available."""
+
+        with self._lock:
+            by_source: dict[str, list[EvidenceChunk]] = {}
+            for sid in source_ids:
+                rec = self._records_by_id.get(sid)
+                if rec is None:
+                    continue
+                body = rec.full_content or rec.raw_content or rec.snippet
+                if body:
+                    by_source[sid] = [
+                        EvidenceChunk(
+                            f"{sid}::chunk::1", rec.task_id, sid, body, 0, len(body),
+                            bool(rec.full_content), "current", page_no=rec.page_no,
+                            modality=rec.modality, anchor_id=rec.anchor_id,
+                        ),
+                    ]
+        return pack_lazy_chunks(
+            source_ids,
+            by_source,
+            chunk_indices=chunk_indices,
+            max_chunks_per_source=max_chunks_per_source,
+            char_budget=char_budget,
+        )
 
     def list_task_evidence(
         self,
@@ -2144,30 +2189,16 @@ class EvidenceStore:
         include_full_content: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        if source_ids:
-            items = [
-                self.get_evidence(source_id, include_full_content=include_full_content)
-                for source_id in source_ids
-            ]
-            return [item for item in items if item is not None]
-
-        if task_id is not None:
-            return self.list_task_evidence(
-                task_id,
-                include_full_content=include_full_content,
-                limit=limit,
-            )
-
         with self._lock:
-            source_ids = sorted(self._records_by_id.keys())
-        if limit is not None:
-            source_ids = source_ids[: max(limit, 0)]
-        items: list[dict[str, Any]] = []
-        for source_id in source_ids:
-            item = self.get_evidence(source_id, include_full_content=include_full_content)
-            if item is not None:
-                items.append(item)
-        return items
+            ids = self._select_ids_locked(task_id, source_ids)
+            if source_ids is None and task_id is None:
+                ids.sort()
+            if limit is not None:
+                ids = ids[:max(0, limit)]
+            return [
+                self._records_by_id[sid].to_dict(include_full_content=include_full_content)
+                for sid in ids
+            ]
 
     def build_reference_map(self, source_ids: list[str]) -> list[dict[str, str]]:
         """Resolve source ids to compact reference records."""
@@ -2209,6 +2240,10 @@ class EvidenceStore:
         """Rebuild the in-memory indices from persisted task evidence payloads."""
 
         hydrated_by_task: dict[int, list[EvidenceRecord]] = {}
+        for listener in self._listeners:
+            reset = getattr(listener, "reset", None)
+            if callable(reset):
+                reset()
         with self._lock:
             self._records_by_id = {}
             self._task_source_ids = {}
@@ -2239,7 +2274,11 @@ class EvidenceStore:
                         continue
 
                     source_id = str(item.get("source_id") or "").strip()
-                    if not source_id or source_id in self._records_by_id:
+                    if (
+                        not source_id.startswith(f"T{task_id}-")
+                        or not CITATION_PATTERN.fullmatch(f"[{source_id}]")
+                        or source_id in self._records_by_id
+                    ):
                         continue
 
                     title = str(item.get("title") or item.get("url") or source_id).strip()
@@ -2405,7 +2444,7 @@ def build_task_context(
         freshness_label = str(item.get("freshness_label") or "")
         published_at = str(item.get("published_at") or "")
         body = full_content or snippet
-        body = truncate_text(body, config.resolved_max_tokens_per_source() * 4)
+        body = truncate_cited_text(body, config.resolved_max_tokens_per_source() * 4)
         blocks.append(
             f"[{source_id}] {title}\n"
             f"URL: {url}\n"
@@ -2419,7 +2458,7 @@ def build_task_context(
         )
 
     context = "\n\n".join(blocks).strip()
-    return truncate_text(context, config.resolved_task_context_char_limit())
+    return truncate_cited_text(context, config.resolved_task_context_char_limit())
 
 
 def build_task_context_from_hits(
@@ -2447,6 +2486,7 @@ def build_task_context_from_hits(
             freshness_label = str(hit.get("freshness_label") or "")
             body = str(hit.get("text") or "")
             chunk_id = str(hit.get("chunk_id") or "")
+            citation_eligible = hit.get("citation_eligible", hit.get("origin") != "history")
         else:
             source_id = str(hit.source_id or "")
             title = str(hit.title or hit.url or "未知来源")
@@ -2456,8 +2496,11 @@ def build_task_context_from_hits(
             freshness_label = str(hit.freshness_label or "")
             body = str(hit.text or "")
             chunk_id = str(hit.chunk_id or "")
+            citation_eligible = hit.citation_eligible
 
-        excerpt = truncate_text(body, config.resolved_max_tokens_per_source() * 4)
+        if not citation_eligible:
+            continue
+        excerpt = truncate_cited_text(body, config.resolved_max_tokens_per_source() * 4)
         blocks.append(
             f"[{source_id}] {title}\n"
             f"URL: {url}\n"
@@ -2469,7 +2512,7 @@ def build_task_context_from_hits(
         )
 
     context = "\n\n".join(blocks).strip()
-    return truncate_text(context, config.resolved_task_context_char_limit())
+    return truncate_cited_text(context, config.resolved_task_context_char_limit())
 
 
 def render_references(reference_items: list[dict[str, Any]]) -> str:
@@ -2845,6 +2888,7 @@ class EvidenceLookupTool(Tool):
         evidence_store: EvidenceStore,
         retrieval_service: EvidenceRetrievalService | None = None,
         request_id_getter: Callable[[], str | None] | None = None,
+        config: Configuration | None = None,
     ) -> None:
         super().__init__(
             name="evidence_lookup",
@@ -2855,6 +2899,7 @@ class EvidenceLookupTool(Tool):
         self._evidence_store = evidence_store
         self._retrieval_service = retrieval_service
         self._request_id_getter = request_id_getter
+        self._config = config or getattr(retrieval_service, "config", None)
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
@@ -2888,59 +2933,33 @@ class EvidenceLookupTool(Tool):
 
         task_id_raw = parameters.get("task_id")
         task_id = int(task_id_raw) if task_id_raw not in (None, "") else None
+        source_filter = normalized_source_ids if source_ids is not None or source_id else None
         include_full_content = bool(parameters.get("include_full_content", False))
         limit = int(parameters.get("limit") or 0) or None
         query_text = str(parameters.get("query") or "").strip()
         mode = str(parameters.get("mode") or "grounding").strip().lower() or "grounding"
 
-        if mode == "index_cards":
-            cards = self._evidence_store.list_index_cards(task_id=task_id)
+        if mode in {"index_cards", "lazy_chunks"}:
+            payload_key = "index_cards" if mode == "index_cards" else "results"
+            if not getattr(self._config, "evidence_pointer_disclosure_enabled", True):
+                return json.dumps({"mode": mode, payload_key: [], "notice": "evidence pointer disclosure disabled"})
+            card_limit = 24 if mode == "index_cards" else (6 if source_filter is None else None)
             if limit is not None:
-                cards = cards[: max(0, limit)]
-            return json.dumps({"mode": "index_cards", "index_cards": cards}, ensure_ascii=False)
-
-        if mode == "lazy_chunks":
-            raw_indices = parameters.get("chunk_indices")
-            parsed_indices: list[int] | None = None
-            if isinstance(raw_indices, list):
-                parsed_indices = [int(i) for i in raw_indices if str(i).strip().isdigit()]
-            elif isinstance(raw_indices, str) and raw_indices.strip():
-                parsed_indices = [
-                    int(tok.strip())
-                    for tok in re.split(r"[\s,]+", raw_indices)
-                    if tok.strip().isdigit()
-                ]
-            target_ids = normalized_source_ids or [
-                card["source_id"]
-                for card in self._evidence_store.list_index_cards(task_id=task_id)[: (limit or 6)]
-            ]
-            max_chunks = max(1, int(parameters.get("max_chunks_per_source") or 2))
-            char_budget = max(200, int(parameters.get("char_budget") or 1800))
-            if self._retrieval_service is not None and hasattr(self._retrieval_service, "get_source_chunks"):
-                lazy_results = self._retrieval_service.get_source_chunks(
-                    source_ids=target_ids,
-                    chunk_indices=parsed_indices,
-                    max_chunks_per_source=max_chunks,
-                    char_budget=char_budget,
-                )
-                return json.dumps(
-                    {
-                        "mode": "lazy_chunks",
-                        "results": [item.to_dict() for item in lazy_results],
-                    },
-                    ensure_ascii=False,
-                )
-            fallback_items = self._evidence_store.lookup(
-                task_id=task_id,
-                source_ids=target_ids or None,
-                include_full_content=True,
-                limit=limit,
+                card_limit = limit if card_limit is None else min(card_limit, limit)
+            cards = self._evidence_store.list_index_cards(
+                task_id=task_id, source_ids=source_filter, limit=card_limit,
             )
-            return json.dumps({"mode": "lazy_chunks", "evidence": fallback_items}, ensure_ascii=False)
+            if mode == "index_cards":
+                count_chunks = getattr(self._retrieval_service, "chunk_counts_by_source", None)
+                counts = count_chunks() if callable(count_chunks) else {}
+                for card in cards:
+                    card["chunk_count"] = counts.get(card["source_id"], 0)
+                return json.dumps({"mode": mode, payload_key: cards}, ensure_ascii=False)
+            return self._load_lazy_chunks(parameters, [card["source_id"] for card in cards])
 
         evidence = self._evidence_store.lookup(
             task_id=task_id,
-            source_ids=normalized_source_ids or None,
+            source_ids=source_filter,
             include_full_content=include_full_content,
             limit=limit,
         )
@@ -2952,7 +2971,9 @@ class EvidenceLookupTool(Tool):
                 mode=mode,
                 top_k=int(parameters.get("top_k") or 0) or None,
                 request_id=self._request_id_getter() if self._request_id_getter else None,
-                allowed_source_ids=normalized_source_ids or None,
+                allowed_source_ids=(
+                    [item["source_id"] for item in evidence] if source_filter is not None else None
+                ),
             )
             return json.dumps(
                 {
@@ -2963,3 +2984,34 @@ class EvidenceLookupTool(Tool):
             )
 
         return json.dumps({"evidence": evidence}, ensure_ascii=False)
+
+    def _load_lazy_chunks(self, parameters: dict[str, Any], target_ids: list[str]) -> str:
+        raw_indices = parameters.get("chunk_indices")
+        indices = re.split(r"[\s,]+", raw_indices) if isinstance(raw_indices, str) else raw_indices
+        parsed_indices = None
+        if raw_indices is not None:
+            parsed_indices = [
+                int(value) for item in (indices if isinstance(indices, list) else [])
+                if (value := str(item).strip()).isascii() and value.isdecimal() and len(value) <= 12
+            ]
+        chunk_cap = getattr(self._config, "evidence_lazy_load_max_chunks_per_source", 2)
+        char_cap = getattr(self._config, "evidence_lazy_load_char_budget", 1800)
+        requested_chunks = parameters.get("max_chunks_per_source")
+        requested_chars = parameters.get("char_budget")
+        max_chunks = chunk_cap if requested_chunks in (None, "") else min(chunk_cap, max(0, int(requested_chunks)))
+        char_budget = char_cap if requested_chars in (None, "") else min(char_cap, max(0, int(requested_chars)))
+        load_chunks = getattr(self._retrieval_service, "get_source_chunks", None)
+        results = load_chunks(
+            source_ids=target_ids,
+            chunk_indices=parsed_indices,
+            max_chunks_per_source=max_chunks,
+            char_budget=char_budget,
+        ) if callable(load_chunks) and target_ids else []
+        if not any(result.total_available_chunks for result in results):
+            results = self._evidence_store.get_lazy_source_chunks(
+                target_ids, chunk_indices=parsed_indices,
+                max_chunks_per_source=max_chunks, char_budget=char_budget,
+            )
+        return json.dumps(
+            {"mode": "lazy_chunks", "results": [result.to_dict() for result in results]}, ensure_ascii=False,
+        )

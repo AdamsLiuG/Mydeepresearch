@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -79,19 +80,21 @@ class ContextPrefixBuilder:
     def enabled(self) -> bool:
         return bool(getattr(self._config, "kv_cache_prefix_optimization_enabled", True))
 
-    def resolve_provider_mode(self) -> str:
+    def resolve_provider_mode(self, *, llm: Any = None) -> str:
         if not self.enabled():
             return "disabled"
         explicit = str(getattr(self._config, "kv_cache_provider_mode", "auto") or "auto").strip().lower()
         if explicit in {"openai", "anthropic", "vllm", "disabled"}:
             return explicit
-        provider = str(getattr(self._config, "llm_provider", "") or "").strip().lower()
-        base_url = str(getattr(self._config, "llm_base_url", "") or "").strip().lower()
-        model_fn = getattr(self._config, "resolved_model", None)
-        model_name = str(model_fn() if callable(model_fn) else getattr(self._config, "llm_model_id", "") or "").lower()
+        provider = str(getattr(llm, "provider", None) or getattr(self._config, "llm_provider", "") or "").lower()
+        base_url = str(getattr(llm, "base_url", None) or getattr(self._config, "llm_base_url", "") or "").lower()
+        model_name = getattr(llm, "model", None)
+        if not model_name:
+            model_fn = getattr(self._config, "resolved_model", None)
+            model_name = model_fn() if callable(model_fn) else getattr(self._config, "llm_model_id", "")
         if provider == "vllm" or ":8000" in base_url:
             return "vllm"
-        if "anthropic" in provider or "anthropic" in base_url or "claude" in model_name:
+        if "anthropic" in provider or "anthropic" in base_url or "claude" in str(model_name or "").lower():
             return "anthropic"
         return "openai"
 
@@ -173,10 +176,14 @@ class ContextPrefixBuilder:
             if str(text or "").strip()
         ]
 
-        sys_material = "\n".join(seg.text for seg in sys_segments if seg.text)
-        prefix_material = "\n".join(seg.text for seg in (*sys_segments, *frozen_segments) if seg.text)
+        sys_material = "\n\n".join(seg.text for seg in sys_segments)
+        # Encode the message boundary as well as the rendered text to avoid ambiguous joins.
+        prefix_material = json.dumps(
+            [sys_material, "\n\n".join(seg.text for seg in frozen_segments)],
+            ensure_ascii=False,
+        )
         system_fp = hashlib.sha256(sys_material.encode("utf-8")).hexdigest()[:16] if sys_material else ""
-        prefix_fp = hashlib.sha256(prefix_material.encode("utf-8")).hexdigest()[:16] if prefix_material else ""
+        prefix_fp = hashlib.sha256(prefix_material.encode("utf-8")).hexdigest()[:16] if sys_segments or frozen_segments else ""
 
         return PromptEnvelope(
             stage=stage,
@@ -195,8 +202,18 @@ class ProviderCacheAdapter:
     """Render PromptEnvelope into provider-specific OpenAI, Anthropic, or vLLM payloads."""
 
     @staticmethod
-    def build_tenant_cache_key(envelope: PromptEnvelope) -> str:
-        raw = f"{envelope.tenant_id}:{envelope.stage}:{envelope.cache_key_scope}:{envelope.prefix_fingerprint}"
+    def _request_scope(envelope: PromptEnvelope) -> str:
+        material = json.dumps([envelope.tenant_id, envelope.request_id], ensure_ascii=False)
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def build_tenant_cache_key(envelope: PromptEnvelope, *, request_tools: bool = False) -> str:
+        scope = (
+            "global" if envelope.cache_key_scope == "global"
+            and not envelope.frozen_segments and not envelope.volatile_segments and not request_tools
+            else ProviderCacheAdapter._request_scope(envelope)
+        )
+        raw = json.dumps([scope, envelope.stage, envelope.cache_key_scope, envelope.system_fingerprint])
         return "dr_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     @classmethod
@@ -206,6 +223,7 @@ class ProviderCacheAdapter:
         *,
         provider_mode: str,
         enhanced_tool_section: str = "",
+        request_tool_section: str = "",
         history_messages: list[dict[str, Any]] | None = None,
         config: Any = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -215,8 +233,18 @@ class ProviderCacheAdapter:
                 part for part in (system_text, str(enhanced_tool_section).strip()) if part
             )
 
-        frozen_text = "\n\n".join(seg.text for seg in envelope.frozen_segments if seg.text).strip()
+        frozen_text = "\n\n".join(
+            part for part in (request_tool_section.strip(), *(seg.text for seg in envelope.frozen_segments))
+            if part
+        )
         volatile_text = "\n\n".join(seg.text for seg in envelope.volatile_segments if seg.text).strip()
+        if frozen_text or volatile_text:
+            # Providers may reuse implicit prefixes even when they ignore prompt_cache_key.
+            marker = f"<CACHE_SCOPE>{cls._request_scope(envelope)}</CACHE_SCOPE>"
+            if frozen_text:
+                frozen_text = f"{marker}\n\n{frozen_text}"
+            else:
+                volatile_text = f"{marker}\n\n{volatile_text}"
         extra_kwargs: dict[str, Any] = {}
 
         anthropic_enabled = bool(getattr(config, "kv_cache_anthropic_breakpoints_enabled", True))
@@ -243,10 +271,10 @@ class ProviderCacheAdapter:
             if volatile_text:
                 user_blocks.append({"type": "text", "text": volatile_text})
 
-            return [
-                {"role": "system", "content": [system_block] if system_text else []},
-                {"role": "user", "content": user_blocks or [{"type": "text", "text": ""}]},
-            ], extra_kwargs
+            if breakpoints_used:
+                messages = [{"role": "system", "content": [system_block]}] if system_text else []
+                messages.append({"role": "user", "content": user_blocks or [{"type": "text", "text": ""}]})
+                return messages, extra_kwargs
 
         messages: list[dict[str, Any]] = []
         if system_text:
@@ -259,5 +287,7 @@ class ProviderCacheAdapter:
         messages.append({"role": "user", "content": user_text})
 
         if prompt_key_enabled and provider_mode in {"openai", "vllm"} and envelope.prefix_fingerprint:
-            extra_kwargs["prompt_cache_key"] = cls.build_tenant_cache_key(envelope)
+            extra_kwargs["prompt_cache_key"] = cls.build_tenant_cache_key(
+                envelope, request_tools=bool(request_tool_section.strip())
+            )
         return messages, extra_kwargs

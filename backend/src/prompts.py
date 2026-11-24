@@ -36,34 +36,37 @@ todo_planner_system_prompt = """
 """
 
 
-todo_planner_instructions = """
-
-<CONTEXT>
-当前日期：{current_date}
-研究主题：{research_topic}
-</CONTEXT>
-
+planner_output_contract = """
 <FORMAT>
 请严格以 JSON 格式回复：
-{{
+{
   "tasks": [
-    {{
+    {
       "id": 1,
       "title": "任务名称（10字内，突出重点）",
       "intent": "任务要解决的核心问题，用1-2句描述",
       "query": "建议使用的检索关键词",
       "depends_on": []
-    }}
+    }
   ]
-}}
+}
 </FORMAT>
 
-注意：仅当后置任务确实依赖前置任务的检索结果才能开展时（例如先筛出候选名单再针对性评估），才在 `depends_on` 中填入前置任务编号数组 `[1]`；默认保持 `[]` 以便并行执行。如果主题信息不足以规划任务，请输出空数组：{{"tasks": []}}。必要时使用笔记工具记录你的思考过程。
+仅当前置任务的检索结果是后置任务开展的必要条件时，才在 `depends_on` 中填写前置任务编号；默认保持 `[]` 以便并行执行。没有需要规划的任务时，输出 {"tasks": []}。
+"""
+
+
+todo_planner_instructions = """
+<CONTEXT>
+当前日期：{current_date}
+研究主题：{research_topic}
+</CONTEXT>
+
+必要时使用笔记工具记录你的思考过程。
 """
 
 
 supplemental_planner_instructions = """
-
 <CONTEXT>
 当前日期：{current_date}
 研究主题：{research_topic}
@@ -83,19 +86,6 @@ supplemental_planner_instructions = """
 - 若已有任务已足够覆盖，请输出空数组；
 - 如需记录补充任务，继续使用 `note` 工具创建/更新任务笔记。
 </GOAL>
-
-<FORMAT>
-请严格以 JSON 格式回复：
-{{
-  "tasks": [
-    {{
-      "title": "任务名称（10字内，突出缺口维度）",
-      "intent": "任务要解决的缺失问题，用1-2句描述",
-      "query": "建议使用的检索关键词"
-    }}
-  ]
-}}
-</FORMAT>
 """
 
 
@@ -221,7 +211,7 @@ request_reflection_system_prompt = """
 """
 
 
-request_reflection_instructions = """
+reflection_output_contract = """
 
 <REQUEST>
 请根据下面的研究状态做一次覆盖评估。
@@ -230,6 +220,27 @@ request_reflection_instructions = """
 - 只有当你能明确写出 1-3 个缺失维度时，才允许输出 `needs_more_research`。
 </REQUEST>
 
+<OUTPUT_RULES>
+- 只输出单个 JSON object；
+- 不要使用 Markdown 代码块；
+- 不要在 JSON 前后添加解释文字；
+- `gap_signals` 必须是字符串数组；
+- `missing_angles` 最多 3 项，且每项必须是研究维度短语，不得重复已有任务标题。
+</OUTPUT_RULES>
+
+<FORMAT>
+请严格输出 JSON：
+{
+  "coverage_status": "sufficient | needs_more_research",
+  "reason": "一句话说明判断原因",
+  "gap_signals": ["命中的缺口信号"],
+  "missing_angles": ["缺失维度 1", "缺失维度 2"]
+}
+</FORMAT>
+"""
+
+
+request_reflection_instructions = """
 <SUMMARY>
 当前日期：{current_date}
 研究主题：{research_topic}
@@ -246,23 +257,6 @@ request_reflection_instructions = """
 {reflection_context_json}
 </JSON_CONTEXT>
 
-<OUTPUT_RULES>
-- 只输出单个 JSON object；
-- 不要使用 Markdown 代码块；
-- 不要在 JSON 前后添加解释文字；
-- `gap_signals` 必须是字符串数组；
-- `missing_angles` 最多 3 项，且每项必须是研究维度短语，不得重复已有任务标题。
-</OUTPUT_RULES>
-
-<FORMAT>
-请严格输出 JSON：
-{{
-  "coverage_status": "sufficient | needs_more_research",
-  "reason": "一句话说明判断原因",
-  "gap_signals": ["命中的缺口信号"],
-  "missing_angles": ["缺失维度 1", "缺失维度 2"]
-}}
-</FORMAT>
 """
 
 
@@ -332,17 +326,4 @@ report_repair_task_prompt = """
 待修补问题：
 {repair_candidates}
 </CONTEXT>
-
-<FORMAT>
-请严格输出 JSON：
-{{
-  "tasks": [
-    {{
-      "title": "任务名称（10字内，突出修补目标）",
-      "intent": "任务要修补的证据缺口，用1-2句描述",
-      "query": "建议使用的定向检索查询"
-    }}
-  ]
-}}
-</FORMAT>
 """

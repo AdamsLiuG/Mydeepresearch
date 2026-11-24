@@ -59,6 +59,93 @@ def extract_llm_usage(agent_or_llm: Any) -> dict[str, int] | None:
     return None
 
 
+_REPORTED_USAGE_KEYS = (
+    "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens",
+    "cached_prompt_tokens", "cached_tokens", "cache_read_input_tokens",
+    "cache_creation_tokens", "cache_creation_input_tokens", "provider_calls",
+    "estimated_provider_calls",
+)
+
+
+def _token_count(value: Any) -> int | None:
+    try:
+        return max(0, int(value)) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def reported_usage_fields(raw: Any) -> dict[str, int]:
+    """Read optional counters without conflating an omitted count with zero."""
+
+    def get_field(name: str) -> Any:
+        return raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
+
+    fields = {
+        key: count
+        for key in _REPORTED_USAGE_KEYS
+        if (count := _token_count(get_field(key))) is not None
+    }
+    details = get_field("prompt_tokens_details")
+    detailed_count = _token_count(
+        details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    )
+    if detailed_count is not None:
+        fields["cached_tokens"] = detailed_count
+    return fields
+
+
+def normalize_reported_usage(raw: Any) -> dict[str, int] | None:
+    fields = reported_usage_fields(raw)
+    cached = fields.get("cached_tokens", fields.get("cached_prompt_tokens", fields.get("cache_read_input_tokens")))
+    creation = fields.get("cache_creation_tokens", fields.get("cache_creation_input_tokens"))
+    prompt = fields.get("prompt_tokens")
+    if prompt is None:
+        prompt = fields.get("input_tokens", 0)
+        if "cache_read_input_tokens" in fields or "cache_creation_input_tokens" in fields:
+            prompt += (cached or 0) + (creation or 0)
+    completion = fields.get("completion_tokens", fields.get("output_tokens", 0))
+    total = max(prompt + completion, fields.get("total_tokens", 0))
+    if not fields or not (total or fields.get("provider_calls")):
+        return None
+    normalized = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    if cached is not None:
+        normalized["cached_tokens"] = min(prompt, cached)
+    if creation is not None:
+        normalized["cache_creation_tokens"] = min(prompt - (normalized.get("cached_tokens") or 0), creation)
+    for key in ("provider_calls", "estimated_provider_calls"):
+        if key in fields:
+            normalized[key] = fields[key]
+    return normalized
+
+
+def _cache_hit_ratio(cached_tokens: int, prompt_tokens: int) -> float:
+    return round(cached_tokens / prompt_tokens, 4) if prompt_tokens > 0 else 0.0
+
+
+def _add_kv_cache_stage(
+    stages: dict[str, dict[str, Any]],
+    stage: str,
+    *,
+    calls: int,
+    prompt_tokens: int,
+    cached_prompt_tokens: int,
+    cache_creation_tokens: int,
+    uncached_prompt_tokens: int,
+) -> None:
+    entry = stages.setdefault(
+        stage,
+        {"calls": 0, "prompt_tokens": 0, "cached_prompt_tokens": 0,
+         "cache_creation_tokens": 0, "uncached_prompt_tokens": 0},
+    )
+    entry["calls"] += calls
+    entry["prompt_tokens"] += prompt_tokens
+    entry["cached_prompt_tokens"] += cached_prompt_tokens
+    entry["cache_creation_tokens"] += cache_creation_tokens
+    entry["uncached_prompt_tokens"] += uncached_prompt_tokens
+    ratio = _cache_hit_ratio(entry["cached_prompt_tokens"], entry["prompt_tokens"])
+    entry.update(cache_hit_ratio=ratio, prompt_cache_hit_ratio=ratio)
+
+
 def _safe_error(error: Any) -> str | None:
     if error is None:
         return None
@@ -209,6 +296,7 @@ class MetricsRegistry:
             "policy_circuit_breaker_open_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
+        self._kv_cache_by_stage: dict[str, dict[str, Any]] = {}
         self._estimated_cost = 0.0
         self._latencies: dict[str, LatencyStats] = {
             "planning_latency_ms": LatencyStats(),
@@ -236,6 +324,7 @@ class MetricsRegistry:
             for key in list(self._counters.keys()):
                 self._counters[key] = 0
             self._task_react_stop_reason_counts = {}
+            self._kv_cache_by_stage.clear()
             self._estimated_cost = 0.0
             self._latencies = {
                 "planning_latency_ms": LatencyStats(),
@@ -263,6 +352,8 @@ class MetricsRegistry:
         cached_prompt_tokens: int = 0,
         cache_creation_tokens: int = 0,
         uncached_prompt_tokens: int | None = None,
+        stage: str | None = None,
+        calls: int = 1,
     ) -> None:
         resolved_cached = max(0, int(cached_prompt_tokens or 0))
         resolved_creation = max(0, int(cache_creation_tokens or 0))
@@ -279,6 +370,16 @@ class MetricsRegistry:
             self._counters["cache_creation_tokens"] += resolved_creation
             self._counters["uncached_prompt_tokens"] += resolved_uncached
             self._estimated_cost += estimated_cost
+            if stage:
+                _add_kv_cache_stage(
+                    self._kv_cache_by_stage,
+                    stage,
+                    calls=calls,
+                    prompt_tokens=prompt_tokens,
+                    cached_prompt_tokens=resolved_cached,
+                    cache_creation_tokens=resolved_creation,
+                    uncached_prompt_tokens=resolved_uncached,
+                )
 
     def add_latency(self, metric: str, elapsed_ms: float) -> None:
         with self._lock:
@@ -304,6 +405,7 @@ class MetricsRegistry:
             estimated_cost = round(self._estimated_cost, 6)
             recent_requests = list(self._recent_requests) if include_recent_requests else []
             stop_reason_counts = dict(self._task_react_stop_reason_counts)
+            kv_cache_by_stage = _clone_dict(self._kv_cache_by_stage)
 
         request_total = counters.get("request_total", 0)
         success_total = counters.get("request_success_total", 0)
@@ -324,6 +426,7 @@ class MetricsRegistry:
         cache_creation_tokens = counters.get("cache_creation_tokens", 0)
         uncached_prompt_tokens = counters.get("uncached_prompt_tokens", 0)
         prompt_tokens_total = counters.get("prompt_tokens", 0)
+        kv_cache_ratio = _cache_hit_ratio(cached_prompt_tokens, prompt_tokens_total)
 
         return {
             "generated_at": _utc_now(),
@@ -344,9 +447,10 @@ class MetricsRegistry:
             "cached_prompt_tokens": cached_prompt_tokens,
             "cache_creation_tokens": cache_creation_tokens,
             "uncached_prompt_tokens": uncached_prompt_tokens,
-            "kv_cache_hit_ratio": round((cached_prompt_tokens / prompt_tokens_total), 4)
-            if prompt_tokens_total
-            else 0.0,
+            "cache_hit_ratio": kv_cache_ratio,
+            "kv_cache_hit_ratio": kv_cache_ratio,
+            "prompt_cache_hit_ratio": kv_cache_ratio,
+            "kv_cache_by_stage": kv_cache_by_stage,
             "latencies_ms": latencies,
             "estimated_cost": estimated_cost,
             "task_react_stop_reason_counts": stop_reason_counts,
@@ -363,7 +467,7 @@ metrics_registry = MetricsRegistry()
 def _pricing_entry_from_catalog(model_catalog: dict[str, Any]) -> dict[str, float]:
     prompt_rate = float(model_catalog.get("prompt_per_1k_tokens", 0.0))
     completion_rate = float(model_catalog.get("completion_per_1k_tokens", 0.0))
-    cached_prompt_rate = float(model_catalog.get("cached_prompt_per_1k_tokens", prompt_rate * 0.25))
+    cached_prompt_rate = float(model_catalog.get("cached_prompt_per_1k_tokens", prompt_rate * 0.5))
     cache_creation_rate = float(model_catalog.get("cache_creation_per_1k_tokens", prompt_rate * 1.25))
     return {
         "prompt_per_1k_tokens": prompt_rate,
@@ -407,34 +511,35 @@ def build_token_usage(
     completion_tokens = 0
     cached_prompt_tokens = 0
     cache_creation_tokens = 0
-    token_source = "unavailable"
-
-    if usage:
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        raw_cached = int(usage.get("cached_tokens") or usage.get("cache_read_input_tokens") or 0)
-        cached_prompt_tokens = max(0, min(prompt_tokens, raw_cached)) if prompt_tokens > 0 else max(0, raw_cached)
-        cache_creation_tokens = max(
-            0,
-            int(usage.get("cache_creation_tokens") or usage.get("cache_creation_input_tokens") or 0),
-        )
-        token_source = "reported"
-
-    if token_source == "unavailable":
+    provider_calls = 1
+    normalized = normalize_reported_usage(usage)
+    if normalized is not None:
+        prompt_tokens = normalized["prompt_tokens"]
+        completion_tokens = normalized["completion_tokens"]
+        total_tokens = normalized["total_tokens"]
+        cached_prompt_tokens = normalized.get("cached_tokens", 0)
+        cache_creation_tokens = normalized.get("cache_creation_tokens", 0)
+        provider_calls = max(1, normalized.get("provider_calls", 1))
+        estimated_calls = normalized.get("estimated_provider_calls", 0)
+        if estimated_calls == 0:
+            token_source = "reported"
+        else:
+            token_source = "estimated" if estimated_calls >= provider_calls else "mixed"
+    else:
         prompt_tokens = _estimate_tokens(prompt_text)
         completion_tokens = _estimate_tokens(completion_text)
+        total_tokens = prompt_tokens + completion_tokens
         token_source = "estimated"
 
-    uncached_prompt_tokens = max(0, prompt_tokens - cached_prompt_tokens)
-    total_tokens = prompt_tokens + completion_tokens
+    uncached_prompt_tokens = prompt_tokens - cached_prompt_tokens
     pricing, pricing_source = resolve_pricing(provider, model, pricing_catalog)
     estimated_cost = (
-        (uncached_prompt_tokens / 1000) * pricing["prompt_per_1k_tokens"]
+        ((uncached_prompt_tokens - cache_creation_tokens) / 1000) * pricing["prompt_per_1k_tokens"]
         + (cached_prompt_tokens / 1000) * pricing["cached_prompt_per_1k_tokens"]
         + (cache_creation_tokens / 1000) * pricing["cache_creation_per_1k_tokens"]
         + (completion_tokens / 1000) * pricing["completion_per_1k_tokens"]
     )
-    cache_hit_ratio = round(cached_prompt_tokens / prompt_tokens, 4) if prompt_tokens > 0 else 0.0
+    cache_hit_ratio = _cache_hit_ratio(cached_prompt_tokens, prompt_tokens)
 
     return {
         "prompt_tokens": prompt_tokens,
@@ -444,6 +549,8 @@ def build_token_usage(
         "cache_creation_tokens": cache_creation_tokens,
         "uncached_prompt_tokens": uncached_prompt_tokens,
         "cache_hit_ratio": cache_hit_ratio,
+        "prompt_cache_hit_ratio": cache_hit_ratio,
+        "provider_calls": provider_calls,
         "token_source": token_source,
         "estimated_cost": round(estimated_cost, 6),
         "pricing_source": pricing_source,
@@ -704,12 +811,6 @@ class RequestTrace:
         error: Any = None,
         stage: str | None = None,
     ) -> dict[str, Any]:
-        metrics_registry.increment("llm_call_total")
-        if success:
-            metrics_registry.increment("llm_success_total")
-        else:
-            metrics_registry.increment("llm_failed_total")
-
         token_usage = build_token_usage(
             prompt_text=prompt_text,
             completion_text=completion_text,
@@ -718,6 +819,9 @@ class RequestTrace:
             pricing_catalog=self.pricing_catalog,
             usage=usage,
         )
+        calls = token_usage["provider_calls"]
+        metrics_registry.increment("llm_call_total", calls)
+        metrics_registry.increment("llm_success_total" if success else "llm_failed_total", calls)
         metrics_registry.add_tokens(
             prompt_tokens=token_usage["prompt_tokens"],
             completion_tokens=token_usage["completion_tokens"],
@@ -726,6 +830,8 @@ class RequestTrace:
             cached_prompt_tokens=token_usage["cached_prompt_tokens"],
             cache_creation_tokens=token_usage["cache_creation_tokens"],
             uncached_prompt_tokens=token_usage["uncached_prompt_tokens"],
+            stage=stage,
+            calls=calls,
         )
 
         with self._lock:
@@ -736,29 +842,19 @@ class RequestTrace:
             self.cache_creation_tokens += token_usage["cache_creation_tokens"]
             self.uncached_prompt_tokens += token_usage["uncached_prompt_tokens"]
             self.estimated_cost += token_usage["estimated_cost"]
-            self.token_sources.add(token_usage["token_source"])
+            if token_usage["token_source"] == "mixed":
+                self.token_sources.update(("reported", "estimated"))
+            else:
+                self.token_sources.add(token_usage["token_source"])
             if stage:
-                stage_key = str(stage).strip() or "unknown"
-                entry = self.kv_cache_by_stage.setdefault(
-                    stage_key,
-                    {
-                        "calls": 0,
-                        "prompt_tokens": 0,
-                        "cached_prompt_tokens": 0,
-                        "cache_creation_tokens": 0,
-                        "uncached_prompt_tokens": 0,
-                        "cache_hit_ratio": 0.0,
-                    },
-                )
-                entry["calls"] += 1
-                entry["prompt_tokens"] += token_usage["prompt_tokens"]
-                entry["cached_prompt_tokens"] += token_usage["cached_prompt_tokens"]
-                entry["cache_creation_tokens"] += token_usage["cache_creation_tokens"]
-                entry["uncached_prompt_tokens"] += token_usage["uncached_prompt_tokens"]
-                entry["cache_hit_ratio"] = (
-                    round(entry["cached_prompt_tokens"] / entry["prompt_tokens"], 4)
-                    if entry["prompt_tokens"] > 0
-                    else 0.0
+                _add_kv_cache_stage(
+                    self.kv_cache_by_stage,
+                    stage,
+                    calls=calls,
+                    prompt_tokens=token_usage["prompt_tokens"],
+                    cached_prompt_tokens=token_usage["cached_prompt_tokens"],
+                    cache_creation_tokens=token_usage["cache_creation_tokens"],
+                    uncached_prompt_tokens=token_usage["uncached_prompt_tokens"],
                 )
 
         if error:
@@ -1077,11 +1173,8 @@ class RequestTrace:
                 "cached_prompt_tokens": self.cached_prompt_tokens,
                 "cache_creation_tokens": self.cache_creation_tokens,
                 "uncached_prompt_tokens": self.uncached_prompt_tokens,
-                "cache_hit_ratio": (
-                    round(self.cached_prompt_tokens / self.prompt_tokens, 4)
-                    if self.prompt_tokens > 0
-                    else 0.0
-                ),
+                "cache_hit_ratio": _cache_hit_ratio(self.cached_prompt_tokens, self.prompt_tokens),
+                "prompt_cache_hit_ratio": _cache_hit_ratio(self.cached_prompt_tokens, self.prompt_tokens),
                 "kv_cache_by_stage": _clone_dict(self.kv_cache_by_stage),
                 "token_source": token_source,
                 "estimated_cost": round(self.estimated_cost, 6),

@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +35,10 @@ from services.evidence_index import (
 from services.fact_ledger import (
     FactLedger,
     FactLedgerCompactor,
+    append_context_checkpoint,
     build_evidence_index_cards,
+    render_context_checkpoint,
+    render_context_delta,
     render_evidence_index_cards_block,
 )
 from services.hitl import HitlService
@@ -49,6 +53,90 @@ class UnifiedEvidenceAndContextTests(unittest.TestCase):
     def setUp(self) -> None:
         metrics_registry.reset()
         self.config = Configuration.from_env(load_env_file=False)
+
+    @staticmethod
+    def _fact_task(task_id, value, *, source_kind="S", metric="latency", **extra):
+        sid = f"T{task_id}-{source_kind}1"
+        return TodoItem(
+            id=task_id, title=f"Task {task_id}", intent="measure", query="benchmark",
+            status="completed", evidence_items=[{"source_id": sid}],
+            fact_claims=[{
+                "entity": "Engine", "metric": metric, "period": "2025",
+                "value": value, "statement": f"Measured {value}", "source_ids": [sid], **extra,
+            }],
+        )
+
+    def test_ledger_parallel_updates_preserve_snapshot_and_replay_idempotently(self) -> None:
+        first = self._fact_task(1, "10 ms")
+        duplicate = self._fact_task(2, "10 ms", source_kind="M")
+        conflict = self._fact_task(3, "12 ms", source_kind="C")
+        compactor = FactLedgerCompactor()
+        original = compactor.update_ledger(None, [first])
+        saved = original.to_dict()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            branches = list(pool.map(
+                lambda _: compactor.update_ledger(original, [conflict, first, duplicate]).to_dict(),
+                range(10),
+            ))
+        self.assertEqual(original.to_dict(), saved)
+        self.assertTrue(all(branch == branches[0] for branch in branches))
+        restored = FactLedger.from_dict(json.loads(json.dumps(branches[0])))
+        self.assertEqual(compactor.update_ledger(restored, [first, duplicate, conflict]).to_dict(), branches[0])
+        self.assertEqual(restored.conflict_groups, {"CG-C-001": ["C-001", "C-002"]})
+        self.assertEqual(restored.entries[0].source_ids, ["T1-S1", "T2-M1"])
+
+    def test_ledger_budget_prioritizes_complete_conflicts_and_canonical_citations(self) -> None:
+        filler = self._fact_task(1, "x" * 200, metric="finding")
+        first = self._fact_task(2, "10 ms", source_kind="M", statement="Quoted [T99-S99] value")
+        second = self._fact_task(3, "12 ms", source_kind="C")
+        ledger = FactLedgerCompactor().update_ledger(None, [filler, first, second])
+        text = ledger.render_frozen_markdown(char_budget=180, max_entries=2)
+        self.assertLessEqual(len(text), 180)
+        self.assertIn("[T2-M1]", text)
+        self.assertIn("[T3-C1]", text)
+        self.assertNotIn("[T99-S99]", text)
+        self.assertNotIn("[T1-S1]", text)
+        self.assertEqual(ledger.render_frozen_markdown(char_budget=12), "")
+
+    def test_upstream_context_includes_corroborating_task_and_scoped_pointer(self) -> None:
+        first = self._fact_task(1, "10 ms")
+        duplicate = self._fact_task(2, "10 ms", source_kind="M")
+        ledger = FactLedgerCompactor().update_ledger(None, [first, duplicate])
+        downstream = TodoItem(id=3, title="Downstream", intent="verify", query="q", depends_on=[2])
+        cards = [
+            {"task_id": 1, "source_id": "T1-S1", "title": "Unrelated"},
+            {"task_id": 2, "source_id": "T2-M1", "title": "Filing", "chunk_count": 2},
+        ]
+        text = build_upstream_context(downstream, [first, duplicate], fact_ledger=ledger, evidence_index_cards=cards)
+        self.assertIn("C-001", text)
+        self.assertIn("[T2-M1] Filing", text)
+        self.assertNotIn("Unrelated", text)
+        limited = build_upstream_context(downstream, [first, duplicate], fact_ledger=ledger, evidence_index_cards=cards, max_chars=48)
+        self.assertLessEqual(len(limited), 48)
+        self.assertNotIn("[T2-", limited)
+
+    def test_checkpoint_persists_prefix_bytes_and_surfaces_late_conflicts(self) -> None:
+        first = self._fact_task(2, "10 ms", source_kind="M")
+        other = self._fact_task(10, "1 GB", metric="memory")
+        later = self._fact_task(11, "12 ms", source_kind="C")
+        compactor = FactLedgerCompactor()
+        state = SummaryState(research_topic="Engine")
+        state.fact_ledger = compactor.update_ledger(None, [first, other]).to_dict()
+        state.evidence_index_cards = [
+            {"source_id": "T2-M1", "title": "Filing"},
+            {"source_id": "T10-S1", "title": "Measurements"},
+        ]
+        self.assertTrue(append_context_checkpoint(state, self.config))
+        frozen = render_context_checkpoint(state, self.config)
+        state.context_checkpoint_blocks = json.loads(json.dumps(state.context_checkpoint_blocks, sort_keys=True))
+        self.assertEqual(render_context_checkpoint(state, self.config), frozen)
+
+        state.fact_ledger = compactor.update_ledger(FactLedger.from_dict(state.fact_ledger), [later]).to_dict()
+        self.assertTrue(append_context_checkpoint(state, self.config))
+        self.assertTrue(render_context_checkpoint(state, self.config).startswith(frozen + "\n\n"))
+        self.assertIn("C-001 [CONFLICT:CG-C-001]", render_context_delta(state, self.config))
+        self.assertEqual(state.fact_ledger["prior_revisions"][0]["stance"], "asserted")
+        self.assertFalse(append_context_checkpoint(state, self.config))
 
     def test_unified_citation_tokens_across_all_sanitizers(self) -> None:
         sample = "公网 [T1-S1]、MCP 研报 [T1-M2] 与沙箱计算 [T2-C1] 均可识别，非法 [T9-S9] 应剔除。"
@@ -178,6 +266,16 @@ class UnifiedEvidenceAndContextTests(unittest.TestCase):
             )
             self.assertNotIn("finarag://abc123", manifest_raw)
             self.assertNotIn("sandbox://compute", manifest_raw)
+            web_record = store.get_evidence("T1-S1")
+            archive_version = web_record["archive_version_id"]
+            self.assertTrue(archive_version)
+            self.assertEqual(memory.load_runtime_chunks(
+                archive_version, task_id=1, source_id="T1-S1", expected_url="https://other.example/",
+            ), [])
+            restored_chunks = memory.load_runtime_chunks(
+                archive_version, task_id=1, source_id="T1-S1", expected_url=web_record["url"],
+            )
+            self.assertTrue(restored_chunks[0].chunk_id.endswith("::chunk::1"))
 
             cards = build_evidence_index_cards(store, runtime_index=runtime)
             self.assertEqual(len(cards), 3)
@@ -482,7 +580,8 @@ class UnifiedEvidenceAndContextTests(unittest.TestCase):
                 self.tenant_id = "t1"
                 self.config = Configuration.from_env(load_env_file=False)
                 self._request_state_store = _JsonMemoryStore()
-                self._evidence_store = EvidenceStore()
+                self.runtime = EvidenceRuntimeIndex(self.config)
+                self._evidence_store = EvidenceStore(listeners=[self.runtime])
                 self._request_trace = trace
                 self._cache_stats = {}
 
@@ -507,6 +606,17 @@ class UnifiedEvidenceAndContextTests(unittest.TestCase):
             evidence_index_cards=[{"source_id": "T1-S1"}],
             frozen_prefix_version=3,
         )
+        mgr._evidence_store.record_search_results(
+            task_id=1, query="q1", backend="stub", search_payload={"results": [
+                {"title": "Original", "url": "https://example.org", "content": "short excerpt"},
+            ]},
+        )
+        mgr._evidence_store.update_full_content(
+            task_id=1, source_id="T1-S1", url="https://example.org",
+            title="Original", full_content="Hydrated evidence survives the round trip.",
+        )
+        self.assertTrue(append_context_checkpoint(state, mgr.config))
+        frozen = render_context_checkpoint(state, mgr.config)
         mgr._persist_request_state(state, phase="review", status="in_progress")
         loaded_payload = mgr._load_resume_snapshot("req-kv")
         restored_state, phase = mgr._state_from_snapshot(loaded_payload)
@@ -515,7 +625,483 @@ class UnifiedEvidenceAndContextTests(unittest.TestCase):
         self.assertEqual(FactLedger.from_dict(restored_state.fact_ledger).version, 2)
         self.assertEqual(restored_state.evidence_index_cards, [{"source_id": "T1-S1"}])
         self.assertEqual(restored_state.todo_items[0].fact_claims, [{"entity": "X"}])
+        self.assertEqual(render_context_checkpoint(restored_state, mgr.config), frozen)
+        self.assertEqual(
+            mgr._evidence_store.get_evidence("T1-S1", include_full_content=True)["full_content"],
+            "Hydrated evidence survives the round trip.",
+        )
 
+
+    def test_lazy_lookup_filters_exact_sources_and_obeys_configured_budgets(self) -> None:
+        config = Configuration.from_env(
+            overrides={
+                "evidence_runtime_enabled": True,
+                "evidence_chunk_chars": 200,
+                "evidence_lazy_load_char_budget": 200,
+                "evidence_lazy_load_max_chunks_per_source": 1,
+            },
+            load_env_file=False,
+        )
+        runtime = EvidenceRuntimeIndex(config)
+        store = EvidenceStore(listeners=[runtime])
+        for task_id in (1, 2):
+            store.record_search_results(
+                task_id=task_id,
+                query="source",
+                search_payload={"results": [
+                    {"title": "source", "url": "https://example.org/source", "content": "result text " * 120},
+                ]},
+                backend="stub",
+            )
+        retrieval = EvidenceRetrievalService(runtime_index=runtime, memory_service=None, config=config)
+        tool = EvidenceLookupTool(evidence_store=store, retrieval_service=retrieval)
+        cards = json.loads(tool.run({"mode": "index_cards", "source_ids": ["T1-S1"]}))["index_cards"]
+        self.assertEqual([card["source_id"] for card in cards], ["T1-S1"])
+        self.assertGreater(cards[0]["chunk_count"], 1)
+        options = {"mode": "lazy_chunks", "source_ids": ["T1-S1", "T1-S1", "T2-S1"], "task_id": 1}
+        result = json.loads(tool.run({
+            **options, "chunk_indices": [2, 2, 3], "max_chunks_per_source": 9, "char_budget": 900,
+        }))["results"]
+        self.assertEqual([item["source_id"] for item in result], ["T1-S1"])
+        self.assertEqual(len(result[0]["chunks"]), 1)
+        self.assertEqual(result[0]["chunks"][0]["chunk_id"], "T1-S1::chunk::2")
+        self.assertTrue(result[0]["truncated"])
+        self.assertLessEqual(len(result[0]["chunks"][0]["text"]), 200)
+
+        result = json.loads(tool.run({**options, "char_budget": 12}))["results"][0]
+        self.assertEqual(len(result["chunks"][0]["text"]), 12)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(json.loads(tool.run({**options, "source_id": "T2-S1"}))["results"], [])
+        self.assertEqual(json.loads(tool.run({**options, "task_id": 0}))["results"], [])
+
+        fallback = EvidenceLookupTool(evidence_store=store)
+        result = json.loads(fallback.run({**options, "char_budget": 12}))["results"][0]
+        self.assertEqual(len(result["chunks"][0]["text"]), 12)
+        self.assertTrue(result["truncated"])
+
+    def test_explicit_cross_task_retrieval_and_resume_drop_stale_index_sources(self) -> None:
+        config = Configuration.from_env(overrides={"evidence_runtime_enabled": True}, load_env_file=False)
+        runtime = EvidenceRuntimeIndex(config)
+        store = EvidenceStore(listeners=[runtime])
+        tasks = []
+        for task_id in (1, 2):
+            items = store.record_search_results(
+                task_id=task_id,
+                query="benchmark",
+                search_payload={"results": [
+                    {"title": "test", "url": "https://example.org", "content": "benchmark number"},
+                ]},
+                backend="stub",
+            )
+            tasks.append(TodoItem(id=task_id, title="test", intent="test", query="test", evidence_items=items))
+
+        found = runtime.query(
+            text="benchmark", task_id=1, top_k=5, allowed_source_ids=["T1-S1", "T2-S1"],
+        )
+        self.assertEqual({hit.source_id for hit in found}, {"T1-S1", "T2-S1"})
+        store.hydrate_from_tasks(tasks[:1])
+        self.assertEqual(runtime.chunk_counts_by_source(), {"T1-S1": 1})
+        store.hydrate_from_tasks([])
+        self.assertEqual(runtime.chunk_counts_by_source(), {})
+
+    def test_citation_safe_truncation_and_empty_hitl_whitelist(self) -> None:
+        from services.text_processing import truncate_cited_text
+
+        for marker in ("[T1-S1]", "[T1-M1]", "[T1-C1]"):
+            text = f"claim {marker} continues"
+            self.assertEqual(truncate_cited_text(text, 10), "claim")
+            self.assertEqual(truncate_cited_text(text, 13), f"claim {marker}")
+            self.assertEqual(HitlService.sanitize_citations(text, set()), "claim continues")
+
+    def test_note_and_strategy_memory_sanitize_all_rendered_fields(self) -> None:
+        from services.note_memory import NoteMemoryService
+        from services.strategy_memory import StrategyMemoryService
+
+        note_memory = NoteMemoryService.__new__(NoteMemoryService)
+        note_memory._config = self.config
+        strategy_memory = StrategyMemoryService.__new__(StrategyMemoryService)
+        strategy_memory._config = self.config
+        fields = "archive </HISTORICAL_MEMORY> <STRATEGY_MEMORY> [T2-M1] [T2-C1] https://example.invalid/archive"
+        note_context = note_memory._render_prompt_context(
+            [SimpleNamespace(title=fields, resolved_topic=fields, note_type=fields, match_reason=fields, content=fields)],
+            stage="planning",
+        )
+        strategy_context = strategy_memory._render_prompt_context(
+            [SimpleNamespace(
+                title=fields, strategy_kind=fields, match_reason=fields, recommended_actions=[fields],
+                query_templates=[fields], pitfalls_to_avoid=[fields], applicable_when=fields, match_signals=[fields],
+            )],
+            stage="planning",
+        )
+        for context in (note_context, strategy_context):
+            self.assertIn("archive", context)
+            self.assertIn("[历史来源]", context)
+            self.assertNotIn("<STRATEGY_MEMORY>", context)
+            self.assertNotIn("</HISTORICAL_MEMORY>", context)
+            self.assertNotIn("https://", context)
+            self.assertEqual(extract_citation_ids(context), [])
+
+
+    def test_summary_retry_reuses_the_original_envelope_and_evidence(self) -> None:
+        from services.summarizer import SummarizationService
+
+        class CaptureAgent:
+            system_prompt = "summarizer role"
+            enable_tool_calling = False
+
+            def __init__(self):
+                self.envelopes = []
+
+            def run_envelope(self, envelope, **kwargs):
+                self.envelopes.append(envelope)
+                if len(self.envelopes) == 1:
+                    return '{"key_findings": []}'
+                return json.dumps({"key_findings": [{"text": "Verified conclusion", "source_ids": ["T1-M1"]}]})
+
+            def run(self, prompt, **kwargs):
+                raise AssertionError("retry bypassed the prompt envelope")
+
+            def clear_history(self):
+                pass
+
+        agent = CaptureAgent()
+        service = SummarizationService(lambda: agent, self.config)
+        task = TodoItem(id=1, title="Task", intent="Verify", query="query", evidence_items=[{"source_id": "T1-M1"}])
+        result = service.summarize_task(SummaryState(research_topic="Research"), task, "original evidence")
+        self.assertEqual(agent.envelopes[0].system_text(), "summarizer role\n\n" + agent.envelopes[0].system_segments[-1].text)
+        self.assertTrue(agent.envelopes[1].user_text().startswith(agent.envelopes[0].user_text()))
+        self.assertEqual(agent.envelopes[1].prefix_fingerprint, agent.envelopes[0].prefix_fingerprint)
+        self.assertIn("[T1-M1]", result.markdown)
+
+    def test_optional_model_fact_fields_are_grounded_and_default_to_deterministic(self) -> None:
+        from services.summarizer import SummarizationService
+
+        finding = {"text": "Engine latency is 10 ms", "source_ids": ["T1-M1"]}
+        raw = {"key_findings": [finding], "fact_claims": [{
+            "finding_index": 1, "entity": "Engine", "metric": "p99 latency", "value": "10",
+            "unit": "ms", "period": "2025", "source_ids": ["T1-M1", "T2-C1"],
+        }]}
+        task = self._fact_task(1, "10 ms", source_kind="M")
+        disabled = SummarizationService(lambda: None, self.config)
+        self.assertFalse(self.config.fact_ledger_llm_compaction_enabled)
+        self.assertEqual(disabled._build_fact_claims(task, [finding], raw)[0]["metric"], "latency")
+        enabled = SummarizationService(lambda: None, self.config.model_copy(update={
+            "fact_ledger_llm_compaction_enabled": True,
+        }))
+        facts = enabled._build_fact_claims(task, [finding], raw)
+        self.assertEqual(facts[0]["metric"], "p99 latency")
+        self.assertEqual(facts[0]["source_ids"], ["T1-M1"])
+        raw["fact_claims"][0]["source_ids"] = ["T2-C1"]
+        self.assertEqual(enabled._build_fact_claims(task, [finding], raw)[0]["metric"], "latency")
+
+    def test_report_prefix_excludes_multiline_topic_and_sync_filters_all_citations(self) -> None:
+        class MarkdownAgent:
+            def run(self, prompt, **kwargs):
+                return "Preserve [T1-C1], remove [T2-M2] and [T3-S3]."
+
+            def clear_history(self):
+                pass
+
+        task = TodoItem(id=1, title="Task", intent="Verify", query="query", evidence_items=[{"source_id": "T1-C1"}])
+        state = SummaryState(research_topic="Test topic\nPrivate line", todo_items=[task])
+        service = ReportingService(MarkdownAgent(), self.config, evidence_store=EvidenceStore())
+        first = service._build_envelope(state)
+        state.research_topic = "Different topic"
+        second = service._build_envelope(state)
+        self.assertEqual(first.system_fingerprint, second.system_fingerprint)
+        self.assertNotIn("Private line", first.system_text())
+        result = service.generate_report(state)
+        self.assertIn("[T1-C1]", result)
+        self.assertNotIn("[T2-M2]", result)
+        self.assertNotIn("[T3-S3]", result)
+
+    def test_planning_and_reflection_put_schema_before_date_or_tasks(self) -> None:
+        from unittest.mock import patch
+
+        from services.planner import PlanningService
+        from services.reflection import ReflectionService
+
+        class CaptureAgent:
+            system_prompt = "static role"
+
+            def run_envelope(self, envelope, **kwargs):
+                self.envelope = envelope
+                return '{"tasks": []}'
+
+            def clear_history(self):
+                pass
+
+        planner_agent = CaptureAgent()
+        planner = PlanningService(planner_agent, self.config)
+        state = SummaryState(research_topic="Private topic")
+        with patch("services.planner.get_current_date", return_value="date-one"):
+            planner.plan_todo_list(state)
+        first = planner_agent.envelope
+        with patch("services.planner.get_current_date", return_value="date-two"):
+            planner.plan_todo_list(state)
+        second = planner_agent.envelope
+        self.assertIn("<FORMAT>", first.system_text())
+        self.assertNotIn("date-one", first.system_text())
+        self.assertEqual(first.prefix_fingerprint, second.prefix_fingerprint)
+        self.assertIn("date-two", second.volatile_segments[0].text)
+
+        task = TodoItem(id=1, title="Task", intent="Verify", query="query", summary="Distinct legacy evidence")
+        state.todo_items = [task]
+        reflection = ReflectionService(CaptureAgent(), self.config)
+        context = reflection._build_reflection_context(state, gap_signals=[])
+        envelope = reflection._build_envelope(state, context)
+        self.assertIn("<FORMAT>", envelope.system_text())
+        self.assertEqual(envelope.user_text().count("Distinct legacy evidence"), 1)
+
+    def test_compact_review_hydrates_flagged_sources_and_keeps_uncovered_tasks(self) -> None:
+        from services.reviewer import ReviewIssue, ReviewService
+
+        class Retrieval:
+            def get_source_chunks(self, *, source_ids):
+                self.source_ids = source_ids
+                return [SimpleNamespace(source_id="T1-M1", chunks=[{"text": "disputed raw figure"}])]
+
+            def query(self, *args, **kwargs):
+                return SimpleNamespace(hits=[])
+
+        tasks = [
+            TodoItem(id=1, title="Covered", intent="Verify", query="query", status="completed",
+                     summary="covered legacy prose", evidence_items=[{"source_id": "T1-M1"}]),
+            TodoItem(id=2, title="Uncovered", intent="Verify", query="query", status="completed",
+                     summary="uncovered legacy prose", evidence_items=[{"source_id": "T2-C1"}]),
+        ]
+        ledger = {
+            "entries": [{"claim_id": "C-001", "task_id": 1, "statement": "compact fact", "source_ids": ["T1-M1"]}],
+        }
+        state = SummaryState(research_topic="test", todo_items=tasks, fact_ledger=ledger)
+        retrieval = Retrieval()
+        reviewer = ReviewService(None, self.config, retrieval_service=retrieval)
+        issues = [ReviewIssue(1, "medium", "numeric_audit_mismatch", "disputed", ["T1-M1"])]
+        envelope = reviewer._build_envelope(state, issues)
+        self.assertEqual(retrieval.source_ids, ["T1-M1"])
+        self.assertIn("[T1-M1] disputed raw figure", envelope.user_text())
+        self.assertNotIn("covered legacy prose", envelope.user_text().replace("uncovered legacy prose", ""))
+        self.assertIn("uncovered legacy prose", envelope.user_text())
+
+        ledger["entries"].append({
+            "claim_id": "C-002", "task_id": 1, "statement": "omitted fact", "source_ids": ["T1-M1"],
+        })
+        capped_config = self.config.model_copy(update={"fact_ledger_max_entries": 1})
+        capped_prompt = ReviewService(None, capped_config)._build_prompt(state, issues)
+        self.assertIn("covered legacy prose", capped_prompt.replace("uncovered legacy prose", ""))
+
+    def test_numeric_review_does_not_match_the_tail_of_another_figure(self) -> None:
+        from services.reviewer import _number_token_supported_in_text
+
+        self.assertFalse(_number_token_supported_in_text("24%", "actual reduction: 124%"))
+        self.assertFalse(_number_token_supported_in_text("24%", "actual reduction: 24.5%"))
+        self.assertFalse(_number_token_supported_in_text("24ms", "actual latency: 24 seconds"))
+        self.assertTrue(_number_token_supported_in_text("24%", "actual reduction: 24.0 %"))
+
+class Direction03CacheTests(unittest.TestCase):
+    def test_anthropic_usage_includes_cache_in_prompt_and_bills_creation_once(self):
+        from agent import SafeHelloAgentsLLM
+
+        raw_usage = SimpleNamespace(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_input_tokens=800,
+            cache_creation_input_tokens=200,
+        )
+        usage = SafeHelloAgentsLLM._extract_chunk_usage(SimpleNamespace(usage=raw_usage))
+        self.assertEqual(usage["prompt_tokens"], 1100)
+        self.assertEqual(usage["total_tokens"], 1120)
+
+        recorded = build_token_usage(
+            prompt_text="ignored",
+            completion_text="ignored",
+            provider="anthropic",
+            model="demo",
+            pricing_catalog={
+                "anthropic": {"demo": {
+                    "prompt_per_1k_tokens": 1.0,
+                    "cached_prompt_per_1k_tokens": 0.1,
+                    "cache_creation_per_1k_tokens": 1.25,
+                    "completion_per_1k_tokens": 2.0,
+                }}
+            },
+            usage=vars(raw_usage),
+        )
+        self.assertEqual(recorded["uncached_prompt_tokens"], 300)
+        self.assertEqual(recorded["prompt_cache_hit_ratio"], 0.7273)
+        self.assertAlmostEqual(recorded["estimated_cost"], 0.47)
+
+    def test_stream_usage_combines_partial_frames_and_ignores_malformed_fields(self):
+        llm = self._make_llm(
+            [
+                SimpleNamespace(choices=[], usage={"input_tokens": 8, "cache_read_input_tokens": 40}),
+                SimpleNamespace(choices=[], usage={"output_tokens": 5, "cache_creation_input_tokens": "bad"}),
+            ]
+        )
+        llm.invoke([{"role": "user", "content": "test"}])
+        self.assertEqual(llm.consume_last_usage(), {
+            "prompt_tokens": 48, "completion_tokens": 5, "total_tokens": 53, "cached_tokens": 40,
+        })
+
+    def test_cache_isolation_survives_plain_message_fallback_without_volatile_history(self):
+        from agent import CacheAwareToolAgent
+
+        config = Configuration(kv_cache_min_segment_tokens=0, kv_cache_prompt_cache_key_enabled=False)
+        builder = ContextPrefixBuilder(config)
+        env = builder.build_envelope(
+            stage="report", tenant_id="a", request_id="r", system_role="role",
+            research_topic="shared", volatile_blocks=[("date", "2026-11-25")],
+        )
+        next_request = builder.build_envelope(
+            stage="report", tenant_id="a", request_id="another", system_role="role",
+            research_topic="shared", volatile_blocks=[("date", "2026-11-26")],
+        )
+        self.assertEqual(env.prefix_fingerprint, next_request.prefix_fingerprint)
+        self.assertNotEqual(
+            ProviderCacheAdapter.build_tenant_cache_key(env),
+            ProviderCacheAdapter.build_tenant_cache_key(next_request),
+        )
+        rendered, _ = ProviderCacheAdapter.render_messages_and_kwargs(env, provider_mode="openai", config=config)
+        other, _ = ProviderCacheAdapter.render_messages_and_kwargs(next_request, provider_mode="openai", config=config)
+        self.assertEqual(rendered[0], other[0])
+        self.assertNotEqual(rendered[1]["content"].splitlines()[0], other[1]["content"].splitlines()[0])
+        self.assertNotIn("another", other[1]["content"])
+        self.assertNotIn("2026-11-26", other[0]["content"])
+
+        stage = CacheAwareToolAgent.__new__(CacheAwareToolAgent)
+        stage.system_prompt = "role"
+        stage.enable_tool_calling = False
+        stage._history = [SimpleNamespace(role="user", content="previous volatile task")]
+        messages, _ = stage._prepare_envelope_messages(env, config=config)
+        self.assertNotIn("previous volatile task", str(messages))
+        self.assertEqual(messages, rendered)
+
+    def test_global_stage_metrics_weight_actual_prompt_tokens(self):
+        metrics_registry.reset()
+        for request, prompt, cached in (("a", 100, 100), ("b", 900, 0)):
+            trace = RequestTrace(request_id=request, topic="topic", search_api="test", provider="openai", model="demo", pricing_catalog=None)
+            trace.record_llm_call(
+                success=True, prompt_text="", completion_text="",
+                usage={"prompt_tokens": prompt, "cached_tokens": cached}, stage="report",
+            )
+        snap = metrics_registry.snapshot()
+        self.assertEqual(snap["prompt_cache_hit_ratio"], 0.1)
+        self.assertEqual(snap["kv_cache_by_stage"]["report"]["calls"], 2)
+        self.assertEqual(snap["kv_cache_by_stage"]["report"]["cache_hit_ratio"], 0.1)
+
+    def test_envelope_accounting_includes_tool_iterations(self):
+        from agent import CacheAwareToolAgent
+
+        class LLM:
+            def __init__(self):
+                self.usage = None
+                self.index = 0
+
+            def invoke(self, messages, **kwargs):
+                self.index += 1
+                self.usage = {
+                    "prompt_tokens": self.index * 100,
+                    "completion_tokens": 10,
+                    "cached_tokens": 150 if self.index == 2 else 0,
+                }
+                return "call tool" if self.index == 1 else "done"
+
+            def consume_last_usage(self):
+                usage, self.usage = self.usage, None
+                return usage
+
+        stage = CacheAwareToolAgent.__new__(CacheAwareToolAgent)
+        stage.llm = LLM()
+        stage.system_prompt = "role"
+        stage.enable_tool_calling = True
+        stage.tool_registry = None
+        stage._parse_tool_calls = lambda response: (
+            [{"tool_name": "test", "parameters": "{}"}] if response == "call tool" else []
+        )
+        stage._execute_tool_call = lambda name, parameters: "data"
+        envelope = ContextPrefixBuilder(Configuration()).build_envelope(stage="report", research_topic="topic")
+        self.assertEqual(stage.run_envelope(envelope), "done")
+        usage = stage.consume_last_usage()
+        self.assertEqual(usage["prompt_tokens"], 300)
+        self.assertEqual(usage["cached_tokens"], 150)
+        self.assertEqual(usage["provider_calls"], 2)
+        self.assertIsNone(stage.consume_last_usage())
+
+    def test_cache_rejection_downgrades_once_without_retrying_stream_usage(self):
+        class Completions:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                if "prompt_cache_key" in kwargs:
+                    raise RuntimeError("extra_forbidden: prompt_cache_key")
+                return []
+
+        fake = Completions()
+        llm = self._make_llm([])
+        llm._client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
+        messages = [{"role": "user", "content": "test"}]
+        llm.invoke(messages, prompt_cache_key="test")
+        self.assertTrue(llm.consume_cache_downgrade())
+        llm.invoke(messages, prompt_cache_key="test")
+        self.assertFalse(llm.consume_cache_downgrade())
+        self.assertEqual(len(fake.calls), 3)
+        self.assertTrue(all("stream_options" in call for call in fake.calls))
+
+    @staticmethod
+    def _make_llm(chunks):
+        from agent import SafeHelloAgentsLLM, local
+
+        llm = SafeHelloAgentsLLM.__new__(SafeHelloAgentsLLM)
+        llm.model = "demo"
+        llm.provider = "test"
+        llm.temperature = 0.0
+        llm.max_tokens = 64
+        llm.allow_reasoning_fallback = False
+        llm._usage_local = local()
+        llm._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: chunks)))
+        return llm
+
+class ScopedToolPrefixTests(unittest.TestCase):
+    def test_scoped_tools_are_after_request_scope_and_plain_global_prompt_can_share(self):
+        config = Configuration()
+        builder = ContextPrefixBuilder(config)
+        first = builder.build_envelope(stage="review", tenant_id="A", request_id="one", system_role="role", cache_key_scope="global")
+        second = builder.build_envelope(stage="review", tenant_id="B", request_id="one", system_role="role", cache_key_scope="global")
+        expected_global_key = ProviderCacheAdapter.build_tenant_cache_key(first)
+        self.assertEqual(ProviderCacheAdapter.build_tenant_cache_key(second), expected_global_key)
+        plain_first, _ = ProviderCacheAdapter.render_messages_and_kwargs(
+            first, provider_mode="openai", request_tool_section="private tool", config=config,
+        )
+        plain_second, _ = ProviderCacheAdapter.render_messages_and_kwargs(
+            second, provider_mode="openai", request_tool_section="private tool", config=config,
+        )
+        self.assertEqual(plain_first[0], plain_second[0])
+        self.assertNotEqual(plain_first[1], plain_second[1])
+        self.assertNotIn("private tool", plain_first[0]["content"])
+        _, options = ProviderCacheAdapter.render_messages_and_kwargs(
+            first, provider_mode="openai", request_tool_section="private tool", config=config,
+        )
+        self.assertNotEqual(options["prompt_cache_key"], expected_global_key)
+
+class CacheProviderModeTests(unittest.TestCase):
+    def test_auto_mode_uses_stage_model_and_endpoint(self):
+        from agent import CacheAwareToolAgent
+
+        config = Configuration(llm_provider="openai", kv_cache_min_segment_tokens=0)
+        agent = CacheAwareToolAgent.__new__(CacheAwareToolAgent)
+        agent.llm = SimpleNamespace(
+            base_url="https://api.anthropic.com/v1",
+            provider="custom",
+            model="claude-sonnet-4-5",
+        )
+        agent.system_prompt = "role"
+        agent.enable_tool_calling = False
+        envelope = ContextPrefixBuilder(config).build_envelope(stage="reflection", research_topic="topic")
+        messages, kwargs = agent._prepare_envelope_messages(envelope, config=config)
+        self.assertNotIn("prompt_cache_key", kwargs)
+        self.assertEqual(messages[0]["content"][0]["cache_control"], {"type": "ephemeral"})
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from hello_agents import ToolAwareSimpleAgent
@@ -13,7 +13,8 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
-from services.context_builder import ContextPrefixBuilder, PromptEnvelope
+from prompts import task_summarizer_instructions
+from services.context_builder import ContextPrefixBuilder, PromptEnvelope, PromptSegment
 from services.evidence import (
     derive_grounded_findings_from_evidence,
     extract_citation_ids,
@@ -21,9 +22,9 @@ from services.evidence import (
     looks_like_source_label_text,
 )
 from services.fact_ledger import (
-    FactLedger,
     FactLedgerCompactor,
-    render_evidence_index_cards_block,
+    render_context_checkpoint,
+    render_context_delta,
 )
 from services.notes import build_note_guidance
 from services.text_processing import (
@@ -195,6 +196,7 @@ class SummarizationService:
         previous_output: str,
         error: ValueError,
         observer: RequestTrace | None,
+        envelope: PromptEnvelope,
     ) -> TaskSummaryResult:
         valid_ids = self._valid_source_ids(task)
         if not valid_ids:
@@ -207,9 +209,17 @@ class SummarizationService:
             valid_source_ids=valid_ids,
             error_message=str(error),
         )
+        repair_envelope = replace(
+            envelope,
+            volatile_segments=[
+                *envelope.volatile_segments,
+                PromptSegment("grounding_repair", "volatile_suffix", repair_prompt, cacheable=False),
+            ],
+        )
+        repair_prompt = repair_envelope.to_flat_prompt()
         agent.clear_history()
         try:
-            repair_response = self._run_with_json_fallback(agent, repair_prompt)
+            repair_response = self._run_with_json_fallback(agent, repair_prompt, envelope=repair_envelope)
         except Exception as repair_exc:
             if observer:
                 observer.record_llm_call(
@@ -250,6 +260,7 @@ class SummarizationService:
             historical_memory_context=historical_memory_context,
             skill_pack_context=skill_pack_context,
             tools_enabled=self._tools_enabled(agent),
+            system_role=str(getattr(agent, "system_prompt", "") or ""),
         )
         prompt = envelope.to_flat_prompt()
 
@@ -288,6 +299,7 @@ class SummarizationService:
                     previous_output=response,
                     error=exc,
                     observer=observer,
+                    envelope=envelope,
                 )
         finally:
             agent.clear_history()
@@ -311,6 +323,7 @@ class SummarizationService:
             historical_memory_context=historical_memory_context,
             skill_pack_context=skill_pack_context,
             tools_enabled=self._tools_enabled(agent),
+            system_role=str(getattr(agent, "system_prompt", "") or ""),
         )
         prompt = envelope.to_flat_prompt()
         raw_parts: list[str] = []
@@ -351,6 +364,7 @@ class SummarizationService:
                         previous_output=raw_text,
                         error=exc,
                         observer=observer,
+                        envelope=envelope,
                     )
                 except Exception as retry_exc:
                     error_holder["error"] = retry_exc
@@ -394,6 +408,7 @@ class SummarizationService:
         historical_memory_context: str | None = None,
         skill_pack_context: str | None = None,
         tools_enabled: bool | None = None,
+        system_role: str = "",
     ) -> PromptEnvelope:
         trimmed_context = truncate_text(
             context,
@@ -465,22 +480,12 @@ class SummarizationService:
             "7. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
             f"{sandbox_rule_snippet}"
         )
-
-        frozen_parts: list[str] = []
-        if memory_block.strip():
-            frozen_parts.append(memory_block.strip())
-        raw_ledger = getattr(state, "fact_ledger", None)
-        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
-            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
-                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
+        if self._config.fact_ledger_llm_compaction_enabled:
+            static_rules += (
+                '\n可选字段 `fact_claims` 为数组，每项包含 `finding_index`（从 1 开始，指向 key_findings）、'
+                '`entity`、`metric`、`value`、`unit`、`period` 与 `source_ids`。'
+                '只提取该发现直接支持的主体、指标、数值和口径，引用必须来自该发现。'
             )
-            if ledger_md:
-                frozen_parts.append(ledger_md)
-        raw_cards = getattr(state, "evidence_index_cards", None) or []
-        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
-            cards_md = render_evidence_index_cards_block(raw_cards)
-            if cards_md:
-                frozen_parts.append(cards_md)
 
         task_delta = (
             f"任务主题：{state.research_topic}\n"
@@ -492,17 +497,39 @@ class SummarizationService:
             f"{build_note_guidance(task)}"
         ).strip()
 
-        agent_sys = ""
         builder = ContextPrefixBuilder(self._config)
+        frozen = render_context_checkpoint(state, self._config)
+        delta = render_context_delta(state, self._config)
+        # The full legacy role instructs tool use. Keep only task goals and output
+        # constraints for prompt-only providers.
+        role = system_role
+        if not effective_tools_enabled and role == task_summarizer_instructions.strip():
+            role = role.partition("<NOTES>")[0].strip()
+        if not builder.enabled():
+            return builder.build_envelope(
+                stage="task_summarization",
+                system_role=role,
+                volatile_blocks=[
+                    ("task_delta", task_delta),
+                    ("historical_memory", memory_block),
+                    ("output_contract", static_rules),
+                    ("checkpoint", frozen),
+                    ("context_delta", delta),
+                    ("skills", str(skill_pack_context or "")),
+                ],
+            )
         return builder.build_envelope(
             stage="task_summarization",
-            system_role=agent_sys,
+            system_role=role,
             static_schema_and_rules=static_rules,
             research_topic=state.research_topic or "",
             skill_pack_context=str(skill_pack_context or "").strip(),
-            frozen_index_and_ledger="\n\n".join(frozen_parts),
-            volatile_blocks=[("task_delta", task_delta)],
-            cache_key_scope="request",
+            frozen_index_and_ledger=frozen,
+            volatile_blocks=[
+                ("task_delta", task_delta),
+                ("context_delta", delta),
+                ("historical_memory", memory_block),
+            ],
         )
 
     def _build_prompt(
@@ -580,16 +607,42 @@ class SummarizationService:
             }
             for item in normalized["key_findings"]
         ]
-        compactor = FactLedgerCompactor()
-        task.fact_claims = [
-            compactor._structured_from_text(
-                item["text"],
-                list(item["source_ids"]),
-                task,
-            )
-            for item in normalized["key_findings"]
-        ]
+        task.fact_claims = self._build_fact_claims(task, normalized["key_findings"], payload)
         return TaskSummaryResult(markdown=markdown, payload=normalized, claims=claims)
+
+    def _build_fact_claims(
+        self, task: TodoItem, findings: list[dict[str, Any]], payload: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        compactor = FactLedgerCompactor()
+        raw_claims = (payload or {}).get("fact_claims")
+        by_finding: dict[str, list[dict[str, Any]]] = {}
+        if self._config.fact_ledger_llm_compaction_enabled and isinstance(raw_claims, list):
+            # Normalization can remove or reorder findings. Resolve the original index by text.
+            originals = (payload or {}).get("key_findings")
+            if isinstance(originals, list):
+                for claim in raw_claims:
+                    if not isinstance(claim, dict):
+                        continue
+                    index = claim.get("finding_index")
+                    if type(index) is int and 1 <= index <= len(originals) and isinstance(originals[index - 1], dict):
+                        text = strip_citation_markers(str(originals[index - 1].get("text") or ""))
+                        by_finding.setdefault(text, []).append(claim)
+
+        facts: list[dict[str, Any]] = []
+        for finding in findings:
+            text, source_ids = finding["text"], finding["source_ids"]
+            accepted = []
+            for claim in by_finding.get(text, []):
+                fields = {
+                    key: str(claim[key]).strip()
+                    for key in ("entity", "metric", "value", "unit", "period")
+                    if type(claim.get(key)) in (str, int, float)
+                }
+                cited = self._normalize_source_ids(claim.get("source_ids"), set(source_ids))
+                if cited and all(fields.get(key) for key in ("entity", "metric", "value")):
+                    accepted.append({**fields, "source_ids": cited, "statement": text})
+            facts.extend(accepted or [compactor._structured_from_text(text, source_ids, task)])
+        return facts
 
     @staticmethod
     def _extract_json_payload(text: str) -> dict[str, Any] | None:

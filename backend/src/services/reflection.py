@@ -12,9 +12,17 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import extract_llm_usage
 from models import SummaryState, TodoItem
-from prompts import get_current_date, request_reflection_instructions
+from prompts import (
+    get_current_date,
+    reflection_output_contract,
+    request_reflection_instructions,
+)
 from services.context_builder import ContextPrefixBuilder, PromptEnvelope
-from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.fact_ledger import (
+    context_covered_task_ids,
+    render_context_checkpoint,
+    render_context_delta,
+)
 from utils import strip_thinking_tokens, truncate_text
 
 logger = logging.getLogger(__name__)
@@ -207,16 +215,27 @@ class ReflectionService:
         )
         gap_signal_lines = "\n".join(f"- {signal}" for signal in context.get("gap_signals", [])) or "- 无显式缺口信号"
 
+        builder = ContextPrefixBuilder(self._config)
+        compact = builder.enabled() and getattr(self._config, "context_compaction_enabled", True)
         task_overview_lines: list[str] = []
         for task in context.get("task_snapshots", []):
             task_overview_lines.append(
                 f"- 任务 {task['id']} | {task['title']} | 状态={task['status']} | "
                 f"来源={task['evidence_count']} / 域名={task['unique_domain_count']} / notice={task['notice_count']} | "
                 f"摘要缺失={'是' if task['summary_missing'] else '否'} | 来源缺失={'是' if task['sources_missing'] else '否'}\n"
-                f"  摘要：{task['summary_excerpt']}\n"
+                + (f"  摘要：{task['summary_excerpt']}\n" if not compact else "")
             )
         task_overview = "\n".join(task_overview_lines) or "- 暂无任务结果"
-        compact_context_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        covered_task_ids = context_covered_task_ids(state, self._config) if state is not None else set()
+        compact_context = {
+            **context,
+            "task_snapshots": [
+                {key: value for key, value in task.items() if key not in {"summary_excerpt", "sources_excerpt"}}
+                if task["id"] in covered_task_ids else task
+                for task in context.get("task_snapshots", [])
+            ],
+        }
+        compact_context_json = json.dumps(compact_context, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         volatile_body = request_reflection_instructions.format(
             current_date=context.get("current_date"),
             research_topic=context.get("research_topic"),
@@ -226,33 +245,33 @@ class ReflectionService:
             reflection_context_json=compact_context_json,
         )
 
-        frozen_parts: list[str] = []
-        strategy_block = self._strategy_memory_block(strategy_memory_context).strip()
-        if strategy_block:
-            frozen_parts.append(strategy_block)
-        if state is not None:
-            raw_ledger = getattr(state, "fact_ledger", None)
-            if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
-                ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
-                    max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
-                )
-                if ledger_md:
-                    frozen_parts.append(ledger_md)
-            raw_cards = getattr(state, "evidence_index_cards", None) or []
-            if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
-                cards_md = render_evidence_index_cards_block(raw_cards)
-                if cards_md:
-                    frozen_parts.append(cards_md)
-
-        builder = ContextPrefixBuilder(self._config)
+        strategy_block = self._strategy_memory_block(strategy_memory_context)
+        frozen = render_context_checkpoint(state, self._config) if state is not None else ""
+        delta = render_context_delta(state, self._config) if state is not None else ""
+        role = str(getattr(self._agent, "system_prompt", "") or "")
+        if not builder.enabled():
+            return builder.build_envelope(
+                stage="reflection",
+                system_role=role,
+                volatile_blocks=[
+                    ("reflection_delta", volatile_body),
+                    ("output_contract", reflection_output_contract),
+                    ("checkpoint", frozen),
+                    ("context_delta", delta),
+                    ("strategy_memory", strategy_block),
+                    ("skills", str(skill_pack_context or "")),
+                ],
+            )
         return builder.build_envelope(
             stage="reflection",
-            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            system_role=role,
+            static_schema_and_rules=reflection_output_contract,
             research_topic=str(context.get("research_topic") or ""),
-            skill_pack_context=str(skill_pack_context or "").strip(),
-            frozen_index_and_ledger="\n\n".join(frozen_parts),
-            volatile_blocks=[("reflection_delta", volatile_body)],
-            cache_key_scope="request",
+            skill_pack_context="\n\n".join(
+                part.strip() for part in (str(skill_pack_context or ""), strategy_block) if part.strip()
+            ),
+            frozen_index_and_ledger=frozen,
+            volatile_blocks=[("reflection_delta", volatile_body), ("context_delta", delta)],
         )
 
     def _build_prompt(

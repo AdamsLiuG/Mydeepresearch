@@ -14,13 +14,14 @@ from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import (
     get_current_date,
+    planner_output_contract,
     report_repair_task_prompt,
     supplemental_planner_instructions,
     todo_planner_instructions,
 )
 from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.dag_scheduler import normalize_depends_on, sanitize_task_dependencies
-from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.fact_ledger import render_context_checkpoint, render_context_delta
 from utils import strip_thinking_tokens
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,8 @@ class PlanningService:
             repair_envelope = self._build_planner_envelope(
                 state,
                 body_prompt=repair_prompt,
+                historical_memory_context=historical_memory_context,
+                strategy_memory_context=strategy_memory_context,
                 skill_pack_context=skill_pack_context,
             )
             repaired_response = self._invoke_planner(
@@ -1043,37 +1046,39 @@ class PlanningService:
         strategy_memory_context: str | None = None,
         skill_pack_context: str | None = None,
     ) -> PromptEnvelope:
-        frozen_parts: list[str] = []
-        hist_block = self._historical_memory_block(historical_memory_context).strip()
-        if hist_block:
-            frozen_parts.append(hist_block)
-        strat_block = self._strategy_memory_block(strategy_memory_context).strip()
-        if strat_block:
-            frozen_parts.append(strat_block)
-
-        raw_ledger = getattr(state, "fact_ledger", None)
-        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
-            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
-                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
-            )
-            if ledger_md:
-                frozen_parts.append(ledger_md)
-
-        raw_cards = getattr(state, "evidence_index_cards", None) or []
-        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
-            cards_md = render_evidence_index_cards_block(raw_cards)
-            if cards_md:
-                frozen_parts.append(cards_md)
-
+        hist_block = self._historical_memory_block(historical_memory_context)
+        strat_block = self._strategy_memory_block(strategy_memory_context)
         builder = ContextPrefixBuilder(self._config)
+        frozen = render_context_checkpoint(state, self._config)
+        delta = render_context_delta(state, self._config)
+        rules = planner_output_contract
+        role = str(getattr(self._agent, "system_prompt", "") or "")
+        if not builder.enabled():
+            return builder.build_envelope(
+                stage="planning",
+                system_role=role,
+                volatile_blocks=[
+                    ("planning_delta", body_prompt),
+                    ("output_contract", rules),
+                    ("checkpoint", frozen),
+                    ("context_delta", delta),
+                    ("historical_memory", hist_block),
+                    ("strategy_memory", strat_block),
+                    ("skills", str(skill_pack_context or "")),
+                ],
+            )
         return builder.build_envelope(
             stage="planning",
-            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            system_role=role,
+            static_schema_and_rules=rules,
             research_topic=state.research_topic or "",
-            skill_pack_context=str(skill_pack_context or "").strip(),
-            frozen_index_and_ledger="\n\n".join(frozen_parts),
-            volatile_blocks=[("planning_delta", body_prompt)],
-            cache_key_scope="request",
+            skill_pack_context="\n\n".join(part.strip() for part in (str(skill_pack_context or ""), strat_block) if part.strip()),
+            frozen_index_and_ledger=frozen,
+            volatile_blocks=[
+                ("planning_delta", body_prompt),
+                ("context_delta", delta),
+                ("historical_memory", hist_block),
+            ],
         )
 
     def _invoke_planner(
@@ -1253,15 +1258,4 @@ class PlanningService:
 
 你上一轮的错误输出如下，仅供参考，请不要复用其中的流程标题：
 {previous_response}
-
-请严格只输出 JSON：
-{{
-  "tasks": [
-    {{
-      "title": "任务名称（10字内，突出主题内容）",
-      "intent": "任务要解决的核心问题，用1-2句描述",
-      "query": "建议使用的检索关键词"
-    }}
-  ]
-}}
 """

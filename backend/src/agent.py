@@ -5,10 +5,13 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
+from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock, Semaphore, Thread, local
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 from hello_agents import HelloAgentsLLM, ToolAwareSimpleAgent
@@ -17,7 +20,13 @@ from hello_agents.tools.builtin.note_tool import NoteTool
 from openai import OpenAI
 
 from config import Configuration
-from metrics import RequestTrace, metrics_registry
+from metrics import (
+    RequestTrace,
+    _estimate_tokens,
+    metrics_registry,
+    normalize_reported_usage,
+    reported_usage_fields,
+)
 from models import SummaryState, SummaryStateOutput, TodoItem
 from prompts import (
     report_writer_instructions,
@@ -32,6 +41,7 @@ from services.claim_verifier import ClaimVerificationOrchestrator
 from services.context_builder import (
     ContextPrefixBuilder,
     PromptEnvelope,
+    PromptSegment,
     ProviderCacheAdapter,
 )
 from services.dag_scheduler import build_upstream_context, partition_into_waves
@@ -50,6 +60,7 @@ from services.evidence_index import (
 from services.fact_ledger import (
     FactLedger,
     FactLedgerCompactor,
+    append_context_checkpoint,
     build_evidence_index_cards,
 )
 from services.hitl import HitlService
@@ -98,6 +109,7 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         self.allow_reasoning_fallback = allow_reasoning_fallback
         self._usage_local = local()
         self._cache_header_unsupported = False
+        self._cache_header_lock = Lock()
 
     def consume_last_usage(self) -> dict[str, int] | None:
         """Return and clear the most recent API-reported token usage on this thread."""
@@ -107,52 +119,24 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 
     @staticmethod
     def _extract_chunk_usage(chunk: Any) -> dict[str, int] | None:
-        raw_usage = getattr(chunk, "usage", None)
-        if raw_usage is None:
-            return None
-        if isinstance(raw_usage, dict):
-            usage_dict = raw_usage
-        elif hasattr(raw_usage, "model_dump"):
-            usage_dict = raw_usage.model_dump(exclude_none=True)
-        else:
-            usage_dict = {
-                "prompt_tokens": getattr(raw_usage, "prompt_tokens", None),
-                "completion_tokens": getattr(raw_usage, "completion_tokens", None),
-                "total_tokens": getattr(raw_usage, "total_tokens", None),
-                "cache_read_input_tokens": getattr(raw_usage, "cache_read_input_tokens", None),
-                "cache_creation_input_tokens": getattr(raw_usage, "cache_creation_input_tokens", None),
-                "prompt_tokens_details": getattr(raw_usage, "prompt_tokens_details", None),
-            }
-        prompt_tokens = int(usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens") or 0)
-        completion_tokens = int(usage_dict.get("completion_tokens") or usage_dict.get("output_tokens") or 0)
-        total_tokens = int(usage_dict.get("total_tokens") or (prompt_tokens + completion_tokens))
-        if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
-            return None
-        parsed: dict[str, int] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
-        prompt_details = usage_dict.get("prompt_tokens_details")
-        if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens") is not None:
-            parsed["cached_tokens"] = max(0, int(prompt_details.get("cached_tokens") or 0))
-        elif usage_dict.get("cached_tokens") is not None:
-            parsed["cached_tokens"] = max(0, int(usage_dict.get("cached_tokens") or 0))
-        elif usage_dict.get("cache_read_input_tokens") is not None:
-            parsed["cached_tokens"] = max(0, int(usage_dict.get("cache_read_input_tokens") or 0))
+        return normalize_reported_usage(getattr(chunk, "usage", None))
 
-        creation_val = usage_dict.get("cache_creation_tokens")
-        if creation_val is None:
-            creation_val = usage_dict.get("cache_creation_input_tokens")
-        if creation_val is not None:
-            parsed["cache_creation_tokens"] = max(0, int(creation_val or 0))
-        return parsed
+    def _capture_stream_usage(self, chunk: Any, counters: dict[str, int]) -> None:
+        fields = reported_usage_fields(getattr(chunk, "usage", None))
+        if fields:
+            counters.update(fields)
+            self._usage_local.last_usage = normalize_reported_usage(counters)
+
+    def consume_cache_downgrade(self) -> bool:
+        downgraded = bool(getattr(self._usage_local, "cache_downgraded", False))
+        self._usage_local.cache_downgraded = False
+        return downgraded
 
     @staticmethod
     def _stream_options_unsupported(exc: Exception) -> bool:
-        if isinstance(exc, TypeError):
-            return True
         message = str(exc or "").lower()
+        if any(field in message for field in ("prompt_cache_key", "cache_control", "ephemeral")):
+            return False
         return any(
             token in message
             for token in (
@@ -167,21 +151,16 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 
     @staticmethod
     def _cache_options_unsupported(exc: Exception) -> bool:
-        if isinstance(exc, TypeError):
-            return True
         message = str(exc or "").lower()
-        return any(
-            token in message
-            for token in (
-                "prompt_cache_key",
-                "cache_control",
-                "ephemeral",
-                "extra_forbidden",
-                "extra inputs are not permitted",
-                "unknown parameter",
-                "unrecognized request argument",
-                "unsupported",
-            )
+        return any(token in message for token in ("prompt_cache_key", "cache_control", "ephemeral")) or (
+            any(token in message for token in ("content", "messages"))
+            and any(token in message for token in ("string", "multipart", "array", "unsupported"))
+        )
+
+    @staticmethod
+    def _has_cache_breakpoint(content: Any) -> bool:
+        return isinstance(content, list) and any(
+            isinstance(block, dict) and "cache_control" in block for block in content
         )
 
     @staticmethod
@@ -208,13 +187,14 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
     ) -> dict[str, Any]:
         stripped = dict(request_kwargs)
         stripped.pop("prompt_cache_key", None)
-        stripped["messages"] = [
-            {
-                **msg,
-                "content": cls._flatten_message_content(msg.get("content")),
-            }
-            for msg in messages
-        ]
+        if any(cls._has_cache_breakpoint(msg.get("content")) for msg in messages):
+            stripped["messages"] = [
+                {**msg, "content": cls._flatten_message_content(blocks)}
+                if isinstance(blocks := msg.get("content"), list)
+                and all(isinstance(block, dict) and block.get("type") == "text" for block in blocks)
+                else msg
+                for msg in messages
+            ]
         return stripped
 
     def _open_stream(self, req_kwargs: dict[str, Any]) -> Any:
@@ -239,7 +219,7 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
     ) -> Any:
         request_kwargs = self._build_request_kwargs(messages, **kwargs)
         has_cache_options = ("prompt_cache_key" in request_kwargs) or any(
-            isinstance(msg.get("content"), list) for msg in messages if isinstance(msg, dict)
+            self._has_cache_breakpoint(msg.get("content")) for msg in messages
         )
         if getattr(self, "_cache_header_unsupported", False) and has_cache_options:
             request_kwargs = self._strip_cache_options(messages, request_kwargs)
@@ -248,7 +228,13 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
             return self._open_stream(request_kwargs)
         except Exception as exc:
             if has_cache_options and self._cache_options_unsupported(exc):
-                self._cache_header_unsupported = True
+                cache_lock = getattr(self, "_cache_header_lock", None)
+                if cache_lock is None:
+                    cache_lock = self._cache_header_lock = Lock()
+                with cache_lock:
+                    if not getattr(self, "_cache_header_unsupported", False):
+                        self._cache_header_unsupported = True
+                        self._usage_local.cache_downgraded = True
                 stripped_kwargs = self._strip_cache_options(messages, request_kwargs)
                 return self._open_stream(stripped_kwargs)
             raise
@@ -398,13 +384,12 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         visible_parts: list[str] = []
         reasoning_parts: list[str] = []
         self._usage_local.last_usage = None
+        counters: dict[str, int] = {}
 
         response = self._create_stream_completion(messages, **kwargs)
 
         for chunk in response:
-            chunk_usage = self._extract_chunk_usage(chunk)
-            if chunk_usage is not None:
-                self._usage_local.last_usage = chunk_usage
+            self._capture_stream_usage(chunk, counters)
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 visible_parts.append(content)
@@ -425,13 +410,12 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         saw_visible_content = False
         buffered_reasoning: list[str] = []
         self._usage_local.last_usage = None
+        counters: dict[str, int] = {}
 
         response = self._create_stream_completion(messages, **kwargs)
 
         for chunk in response:
-            chunk_usage = self._extract_chunk_usage(chunk)
-            if chunk_usage is not None:
-                self._usage_local.last_usage = chunk_usage
+            self._capture_stream_usage(chunk, counters)
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 saw_visible_content = True
@@ -463,6 +447,8 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
 
 class CacheAwareToolAgent(ToolAwareSimpleAgent):
     """ToolAwareSimpleAgent subclass supporting KV-Cache structured PromptEnvelope dispatch."""
+
+    _envelope_usage_local = local()
 
     def _execute_tool_call(self, tool_name: str, parameters: str) -> str:  # type: ignore[override]
         if not self.tool_registry:
@@ -517,35 +503,80 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
         *,
         config: Configuration | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        history_messages: list[dict[str, Any]] = []
-        for msg in getattr(self, "_history", None) or ():
-            role = getattr(msg, "role", None)
-            content = getattr(msg, "content", None)
-            if role:
-                history_messages.append({"role": role, "content": content or ""})
+        scope = getattr(self, "_request_cache_scope", None)
+        if scope is not None:
+            envelope = replace(envelope, tenant_id=scope[0], request_id=scope[1])
+        role = str(getattr(self, "system_prompt", "") or "").strip()
+        if role and not any(segment.name == "role" for segment in envelope.system_segments):
+            envelope = replace(envelope, system_segments=[
+                PromptSegment(name="role", tier="global_static", text=role), *envelope.system_segments,
+            ])
         builder = ContextPrefixBuilder(config) if config is not None else None
-        provider_mode = builder.resolve_provider_mode() if builder is not None else "openai"
-        if builder is not None and not builder.enabled():
-            provider_mode = "disabled"
+        provider_mode = (
+            builder.resolve_provider_mode(llm=getattr(self, "llm", None)) if builder is not None else "openai"
+        )
+        tool_section = self._extract_tool_section()
+        request_tools = bool(getattr(getattr(self, "tool_registry", None), "injected_mcp_tools", ()))
         return ProviderCacheAdapter.render_messages_and_kwargs(
             envelope,
             provider_mode=provider_mode,
-            enhanced_tool_section=self._extract_tool_section(),
-            history_messages=history_messages,
+            enhanced_tool_section="" if request_tools else tool_section,
+            request_tool_section=tool_section if request_tools else "",
             config=config,
         )
 
-    def _record_envelope_history(self, user_text: str, assistant_text: str) -> None:
-        add_msg = getattr(self, "add_message", None)
-        if not callable(add_msg):
-            return
-        try:
-            from hello_agents.core.message import Message
+    def consume_last_usage(self) -> dict[str, int] | None:
+        usage = getattr(self._envelope_usage_local, "last_usage", None)
+        self._envelope_usage_local.last_usage = None
+        return usage[1] if usage is not None and usage[0] is self else None
 
-            add_msg(Message(user_text, "user"))
-            add_msg(Message(assistant_text, "assistant"))
-        except Exception:
-            pass
+    @contextmanager
+    def _measure_provider_turn(self, messages: list[dict[str, Any]], completion: list[str]) -> Iterator[None]:
+        try:
+            yield
+        finally:
+            consume = getattr(self.llm, "consume_last_usage", None)
+            usage = normalize_reported_usage(consume()) if callable(consume) else None
+            if usage is None:
+                rendered_messages = [
+                    SafeHelloAgentsLLM._flatten_message_content(message.get("content")) for message in messages
+                ]
+                prompt_tokens = _estimate_tokens("\n\n".join(rendered_messages))
+                completion_tokens = _estimate_tokens("".join(completion))
+                usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "estimated_provider_calls": 1,
+                }
+            usage["provider_calls"] = 1
+            pending = getattr(self._envelope_usage_local, "last_usage", None)
+            totals = pending[1] if pending is not None and pending[0] is self else {}
+            for key, count in usage.items():
+                totals[key] = totals.get(key, 0) + count
+            self._envelope_usage_local.last_usage = (self, totals)
+
+            consume_downgrade = getattr(self.llm, "consume_cache_downgrade", None)
+            if callable(consume_downgrade) and consume_downgrade():
+                get_observer = getattr(self, "_cache_observer_getter", None)
+                observer = get_observer() if callable(get_observer) else None
+                if observer is not None:
+                    observer.record_degraded("kv_cache_header_unsupported")
+
+    def _invoke_provider_turn(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        completion: list[str] = []
+        with self._measure_provider_turn(messages, completion):
+            response = self.llm.invoke(messages, **kwargs)
+            completion.append(response)
+        return response
+
+    def _stream_provider_turn(self, messages: list[dict[str, Any]], **kwargs: Any) -> Iterator[str]:
+        completion: list[str] = []
+        with self._measure_provider_turn(messages, completion):
+            for chunk in self.llm.stream_invoke(messages, **kwargs):
+                if chunk:
+                    completion.append(chunk)
+                yield chunk
 
     def run_envelope(
         self,
@@ -555,6 +586,7 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
         max_tool_iterations: int = 3,
         **kwargs: Any,
     ) -> str:
+        self._envelope_usage_local.last_usage = None
         llm = getattr(self, "llm", None)
         if llm is None or not hasattr(llm, "invoke"):
             return self.run(envelope.to_flat_prompt(), **kwargs)
@@ -568,7 +600,7 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
         )
 
         while current_iteration < max_tool_iterations:
-            response = llm.invoke(messages, **invoke_kwargs)
+            response = self._invoke_provider_turn(messages, **invoke_kwargs)
             tool_calls = self._parse_tool_calls(response) if tools_enabled else []
             if tool_calls:
                 messages.append({"role": "assistant", "content": response})
@@ -592,9 +624,8 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
             break
 
         if current_iteration >= max_tool_iterations and not final_response:
-            final_response = llm.invoke(messages, **invoke_kwargs)
+            final_response = self._invoke_provider_turn(messages, **invoke_kwargs)
 
-        self._record_envelope_history(envelope.user_text(), final_response)
         return final_response
 
     def stream_run_envelope(
@@ -605,6 +636,7 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
         max_tool_iterations: int = 3,
         **kwargs: Any,
     ) -> Iterator[str]:
+        self._envelope_usage_local.last_usage = None
         llm = getattr(self, "llm", None)
         if llm is None or not hasattr(llm, "stream_invoke"):
             if hasattr(self, "stream_run"):
@@ -620,7 +652,6 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
             getattr(self, "_parse_tool_calls", None)
         )
         find_end = getattr(self, "_find_tool_call_end", None)
-        final_segments: list[str] = []
         final_response_text = ""
         current_iteration = 0
 
@@ -659,7 +690,7 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
                     tool_call_texts.append(residual[: end + 1])
                     residual = residual[end + 1 :]
 
-            for chunk in llm.stream_invoke(messages, **invoke_kwargs):
+            for chunk in self._stream_provider_turn(messages, **invoke_kwargs):
                 if not chunk:
                     continue
                 residual += chunk
@@ -667,14 +698,12 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
                     if not seg:
                         continue
                     segments_this_round.append(seg)
-                    final_segments.append(seg)
                     yield seg
 
             for seg in process_residual(final_pass=True):
                 if not seg:
                     continue
                 segments_this_round.append(seg)
-                final_segments.append(seg)
                 yield seg
 
             clean_response = "".join(segments_this_round)
@@ -706,15 +735,8 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
             break
 
         if current_iteration >= max_tool_iterations and not final_response_text:
-            fallback_response = llm.invoke(messages, **invoke_kwargs)
-            final_segments.append(fallback_response)
-            final_response_text = fallback_response
+            fallback_response = self._invoke_provider_turn(messages, **invoke_kwargs)
             yield fallback_response
-
-        self._record_envelope_history(
-            envelope.user_text(),
-            final_response_text or "".join(final_segments),
-        )
 
 
 class DeepResearchAgent(
@@ -744,6 +766,7 @@ class DeepResearchAgent(
             ).strip()
             or "default"
         )
+        self._request_cache_scope = (self.tenant_id, request_id or uuid4().hex)
         self._mcp_bridge = mcp_bridge
         self._owns_mcp_bridge = mcp_bridge is None
         self._active_state: SummaryState | None = None
@@ -845,6 +868,7 @@ class DeepResearchAgent(
         self.evidence_lookup_tool = EvidenceLookupTool(
             evidence_store=self._evidence_store,
             retrieval_service=self._evidence_retrieval,
+            config=self.config,
             request_id_getter=lambda: self.request_id,
         )
         self.run_python_sandbox_tool = RunPythonSandboxTool(
@@ -930,6 +954,7 @@ class DeepResearchAgent(
         self.reporting = ReportingService(
             self.report_agent,
             self.config,
+            retrieval_service=self._evidence_retrieval,
             evidence_store=self._evidence_store,
         )
         if self.config.resolved_sandbox_effective_enabled():
@@ -1043,7 +1068,7 @@ class DeepResearchAgent(
             if isinstance(ToolAwareSimpleAgent, type) and issubclass(CacheAwareToolAgent, ToolAwareSimpleAgent)
             else ToolAwareSimpleAgent
         )
-        return agent_cls(
+        stage_agent = agent_cls(
             name=name,
             llm=llm or self.llm,
             system_prompt=system_prompt,
@@ -1051,6 +1076,10 @@ class DeepResearchAgent(
             tool_registry=self.tools_registry,
             tool_call_listener=self._tool_tracker.record,
         )
+        if isinstance(stage_agent, CacheAwareToolAgent):
+            stage_agent._request_cache_scope = self._request_cache_scope
+            stage_agent._cache_observer_getter = lambda: getattr(self, "_request_trace", None)
+        return stage_agent
 
     def _provider_requires_prompt_only_agents(self) -> bool:
         """Return whether the active provider should avoid auto tool-calling.
@@ -1320,6 +1349,10 @@ class DeepResearchAgent(
             service = getattr(self, attr, None)
             if service is not None and hasattr(service, "_config"):
                 service._config = target_config
+        if getattr(self, "evidence_lookup_tool", None) is not None:
+            self.evidence_lookup_tool._config = target_config
+        if getattr(self, "_evidence_retrieval", None) is not None:
+            self._evidence_retrieval._config = target_config
         sandbox_service = getattr(self, "_sandbox_service", None)
         if sandbox_service is not None:
             sandbox_service.enabled = bool(
@@ -1359,43 +1392,43 @@ class DeepResearchAgent(
     def _refresh_context_checkpoints(self, state: SummaryState) -> None:
         """Advance frozen FactLedger and EvidenceIndexCard checkpoints between waves/stages."""
 
-        changed = False
-        evidence_store = getattr(self, "_evidence_store", None)
-        if getattr(self.config, "context_compaction_enabled", True):
-            valid_ids: set[str] = set()
-            for task in state.todo_items:
-                for item in task.evidence_items or ():
-                    sid = str(item.get("source_id") or "").strip()
-                    if sid:
-                        valid_ids.add(sid)
-            if evidence_store is not None:
-                for item in evidence_store.lookup() or ():
-                    sid = str(item.get("source_id") or "").strip()
-                    if sid:
-                        valid_ids.add(sid)
-            existing = FactLedger.from_dict(getattr(state, "fact_ledger", None))
-            updated = FactLedgerCompactor().update_ledger(
-                existing,
-                state.todo_items,
-                valid_source_ids=valid_ids,
-            )
-            new_ledger = updated.to_dict()
-            if new_ledger != state.fact_ledger:
-                state.fact_ledger = new_ledger
-                changed = True
+        with getattr(self, "_request_snapshot_lock", nullcontext()):
+            changed = False
+            evidence_store = getattr(self, "_evidence_store", None)
+            if getattr(self.config, "context_compaction_enabled", True):
+                valid_ids = {
+                    item["source_id"] for item in evidence_store.lookup() if item.get("source_id")
+                } if evidence_store is not None else set()
+                existing = FactLedger.from_dict(state.fact_ledger)
+                updated = FactLedgerCompactor().update_ledger(
+                    existing, state.todo_items, valid_source_ids=valid_ids,
+                )
+                if updated.version != existing.version:
+                    state.fact_ledger = updated.to_dict()
+                    changed = True
 
-        if getattr(self.config, "evidence_pointer_disclosure_enabled", True) and evidence_store is not None:
-            runtime_idx = getattr(self, "_evidence_runtime", None)
-            cards = build_evidence_index_cards(
-                evidence_store,
-                runtime_index=runtime_idx,
-            )
-            if cards != state.evidence_index_cards:
-                state.evidence_index_cards = cards
-                changed = True
+            if getattr(self.config, "evidence_pointer_disclosure_enabled", True) and evidence_store is not None:
+                cards = build_evidence_index_cards(
+                    evidence_store, runtime_index=getattr(self, "_evidence_runtime", None), max_cards=None,
+                )
+                committed_ids = {card["source_id"] for card in state.evidence_index_cards}
+                new_cards = [card for card in cards if card["source_id"] not in committed_ids]
+                if new_cards:
+                    state.evidence_index_cards = [*state.evidence_index_cards, *new_cards]
+                    changed = True
 
-        if changed or not int(getattr(state, "frozen_prefix_version", 0) or 0):
-            state.frozen_prefix_version = int(getattr(state, "frozen_prefix_version", 0) or 0) + 1
+            checkpoint_changed = append_context_checkpoint(state, self.config)
+            if changed or checkpoint_changed:
+                state.frozen_prefix_version += 1
+
+    def _prepare_upstream_contexts(self, state: SummaryState, tasks: list[TodoItem]) -> None:
+        compact_enabled = getattr(self.config, "context_compaction_enabled", True)
+        cards = state.evidence_index_cards if self.config.evidence_pointer_disclosure_enabled else []
+        for task in tasks:
+            task.upstream_context = build_upstream_context(
+                task, state.todo_items, fact_ledger=state.fact_ledger,
+                evidence_index_cards=cards, compact_enabled=compact_enabled,
+            )
 
     def _active_strategy_topic_domains(self) -> set[str] | None:
         """Return strategy-memory domain filter derived from the active skill pack."""
@@ -1826,6 +1859,7 @@ class DeepResearchAgent(
                 return
             if resumed and resume_phase:
                 self._restore_task_counters(observer, state)
+                self._refresh_context_checkpoints(state)
                 self._persist_request_state(state, phase=resume_phase, status="in_progress")
                 if emit_stream:
                     yield {
@@ -1920,6 +1954,7 @@ class DeepResearchAgent(
                 }
                 waves = partition_into_waves(pending_tasks, completed_ids=completed_ids)
                 if len(waves) <= 1:
+                    self._prepare_upstream_contexts(state, pending_tasks)
                     if emit_stream:
                         for event in self._execute_task_batch_stream(state, pending_tasks, channel_map):
                             yield event
@@ -1932,17 +1967,7 @@ class DeepResearchAgent(
                     for wave_index, wave_tasks in enumerate(waves, start=1):
                         if self._is_cancelled():
                             break
-                        if wave_index > 1:
-                            compact_enabled = bool(
-                                getattr(self.config, "context_compaction_enabled", True)
-                            )
-                            for downstream_task in wave_tasks:
-                                downstream_task.upstream_context = build_upstream_context(
-                                    downstream_task,
-                                    state.todo_items,
-                                    fact_ledger=getattr(state, "fact_ledger", None),
-                                    compact_enabled=compact_enabled,
-                                )
+                        self._prepare_upstream_contexts(state, wave_tasks)
                         if emit_stream:
                             yield {
                                 "type": "wave_started",
@@ -2181,6 +2206,7 @@ class DeepResearchAgent(
                                 ):
                                     yield event
 
+                                self._refresh_context_checkpoints(state)
                                 repair_review_step = next_step
                                 repair_review_span = observer.start_stage(
                                     "review",
@@ -2215,10 +2241,10 @@ class DeepResearchAgent(
                                 next_step = repair_review_step + 1
                             else:
                                 self._execute_task_batch_sync(state, repair_tasks)
+                                self._refresh_context_checkpoints(state)
                                 review_summary = self._run_review_stage(state, observer)
                                 if hasattr(observer, "record_review_summary"):
                                     observer.record_review_summary(review_summary)
-                            self._refresh_context_checkpoints(state)
                         elif repair_notice or emit_stream:
                             observer.record_degraded("report_repair_not_executed")
                             if emit_stream:
@@ -2484,8 +2510,12 @@ class DeepResearchAgent(
         target = next((task for task in state.todo_items if task.id == task_id), None)
         if target is None:
             raise ValueError(f"task_id not found: {task_id}")
+        self._refresh_context_checkpoints(state)
+        self._prepare_upstream_contexts(state, [target])
         for _ in self._execute_task(state, target, emit_stream=False):
             pass
+        self._refresh_context_checkpoints(state)
+        self._persist_request_state(state, phase="task_execution", status="in_progress")
         return target
 
     def plan_only(self, topic: str) -> dict[str, Any]:
@@ -2559,8 +2589,10 @@ class DeepResearchAgent(
         state.todo_items.append(target_task)
         observer.set_task_totals(total_tasks=len(state.todo_items))
 
+        self._refresh_context_checkpoints(state)
         for _ in self._execute_task(state, target_task, emit_stream=False):
             pass
+        self._refresh_context_checkpoints(state)
 
         valid_ids = {
             str(item.get("source_id") or "").strip()

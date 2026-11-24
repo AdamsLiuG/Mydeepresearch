@@ -6,7 +6,8 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from models import TodoItem
-from utils import truncate_text
+from services.fact_ledger import FactLedger, render_evidence_index_card
+from services.text_processing import truncate_cited_text
 
 
 def normalize_depends_on(raw_value: Any) -> list[int]:
@@ -131,64 +132,52 @@ def build_upstream_context(
     all_tasks: Sequence[TodoItem],
     *,
     max_chars: int = 800,
-    fact_ledger: dict[str, Any] | Any | None = None,
+    fact_ledger: dict[str, Any] | FactLedger | None = None,
+    evidence_index_cards: Sequence[dict[str, Any]] = (),
     compact_enabled: bool = True,
 ) -> str:
-    """Build concise upstream dependency findings injected into downstream wave execution."""
-
-    dep_ids = normalize_depends_on(getattr(task, "depends_on", None))
-    if not dep_ids:
-        return ""
-
-    entries_by_task: dict[int, list[str]] = {}
-    if compact_enabled and fact_ledger:
-        raw_entries = (
-            fact_ledger.get("entries")
-            if isinstance(fact_ledger, dict)
-            else getattr(fact_ledger, "entries", None)
-        )
-        for item in raw_entries or ():
-            if isinstance(item, dict):
-                tid = int(item.get("task_id") or 0)
-                cid = str(item.get("claim_id") or "").strip()
-                stmt = str(item.get("statement") or "").strip()
-                cites = ",".join(str(s) for s in (item.get("source_ids") or []) if s)
-                conflict = str(item.get("conflict_group_id") or "").strip()
-            else:
-                tid = int(getattr(item, "task_id", 0) or 0)
-                cid = str(getattr(item, "claim_id", "") or "").strip()
-                stmt = str(getattr(item, "statement", "") or "").strip()
-                cites = ",".join(str(s) for s in (getattr(item, "source_ids", ()) or ()) if s)
-                conflict = str(getattr(item, "conflict_group_id", "") or "").strip()
-            if tid and stmt:
-                tag = f" [CONFLICT:{conflict}]" if conflict else ""
-                entries_by_task.setdefault(tid, []).append(
-                    f"  - {cid}{tag} ({cites}): {truncate_text(stmt, 140)}"
-                )
-
+    """Render dependency-local facts and pointer cards within the supplied budget."""
+    dep_ids = normalize_depends_on(task.depends_on)
+    ledger = fact_ledger if isinstance(fact_ledger, FactLedger) else FactLedger.from_dict(fact_ledger)
     by_id = {int(item.id): item for item in all_tasks}
-    blocks: list[str] = []
+    lines: list[str] = []
+    remaining = max_chars
+
+    def append(line: str) -> bool:
+        nonlocal remaining
+        cost = len(line) + bool(lines)
+        if line and cost <= remaining:
+            lines.append(line)
+            remaining -= cost
+            return True
+        return False
+
     for dep_id in dep_ids:
         upstream = by_id.get(dep_id)
-        if upstream is None:
+        if upstream is None or upstream.status != "completed":
             continue
-        summary_text = str(upstream.summary or "").strip()
-        if not summary_text and isinstance(upstream.summary_payload, dict):
-            summary_text = str(upstream.summary_payload.get("executive_summary") or "").strip()
-        ledger_lines = entries_by_task.get(int(upstream.id), [])
-        if not summary_text and not ledger_lines:
+        rows = [
+            entry for entry in ledger.entries
+            if compact_enabled and (entry.task_id == dep_id or dep_id in entry.supporting_task_ids)
+        ]
+        rows.sort(key=lambda entry: not bool(entry.conflict_group_id))
+        cards = [
+            card for card in evidence_index_cards if compact_enabled and card.get("task_id") == dep_id
+        ]
+        summary = str(upstream.summary or (upstream.summary_payload or {}).get("executive_summary") or "").strip()
+        if not (rows or cards or summary):
             continue
-        if summary_text:
-            summary_cap = 180 if ledger_lines else 280
-            blocks.append(
-                f"- 前置任务 {upstream.id}（{upstream.title}）结论：{truncate_text(summary_text, summary_cap)}"
-            )
-        else:
-            blocks.append(f"- 前置任务 {upstream.id}（{upstream.title}）结构化事实：")
-        if ledger_lines:
-            blocks.extend(ledger_lines[:4])
-
-    if not blocks:
-        return ""
-    joined = "\n".join(blocks)
-    return truncate_text(joined, max(120, int(max_chars or 800)))
+        header = f"- 前置任务 {dep_id}（{' '.join(upstream.title.split())[:80]}）结论："
+        if not (rows or cards):
+            append(truncate_cited_text(f"{header}{summary}", min(len(header) + 280, remaining - bool(lines))))
+            continue
+        if not append(header):
+            continue
+        # Guarantee room for a compact pointer before attempting full fact lines.
+        if cards:
+            append(render_evidence_index_card(cards[0]))
+        for entry in rows[:4]:
+            append(entry.to_compact_line())
+        for card in cards[1:3]:
+            append(render_evidence_index_card(card))
+    return "\n".join(lines)

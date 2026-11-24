@@ -21,7 +21,7 @@ from services.evidence import (
     format_evidence_sources,
 )
 from services.evidence_index import EvidenceRetrievalHit
-from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.fact_ledger import render_context_checkpoint, render_context_delta
 from services.mcp_bridge import MCPHitlApprovalRequired, _scope_allows_tool
 from services.policy_controller import (
     PolicyStateFeatures,
@@ -996,27 +996,32 @@ class TaskExecutorMixin:
             f"最相关来源：{json.dumps({'source_id': top_item.get('source_id'), 'title': top_item.get('title'), 'url': top_item.get('url')}, ensure_ascii=False)}\n"
             f"建议基线动作：{json.dumps({'action': fallback.action, 'query': fallback.query, 'source_id': fallback.source_id, 'url': fallback.url, 'reason': fallback.reason}, ensure_ascii=False)}"
         )
-        frozen_parts: list[str] = []
-        raw_ledger = getattr(state, "fact_ledger", None)
-        if getattr(self.config, "context_compaction_enabled", True) and raw_ledger:
-            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
-                max_entries=int(getattr(self.config, "fact_ledger_max_entries", 40) or 40),
+        builder = ContextPrefixBuilder(self.config)
+        frozen = render_context_checkpoint(state, self.config)
+        volatile_blocks = [
+            ("task_react_delta", volatile_delta),
+            ("context_delta", render_context_delta(state, self.config)),
+        ]
+        role = str(getattr(self.task_react_agent, "system_prompt", "") or "")
+        if builder.enabled():
+            envelope = builder.build_envelope(
+                stage="task_react",
+                system_role=role,
+                research_topic=state.research_topic or "",
+                skill_pack_context=self._skill_stage_context("task_execution"),
+                frozen_index_and_ledger=frozen,
+                volatile_blocks=volatile_blocks,
             )
-            if ledger_md:
-                frozen_parts.append(ledger_md)
-        raw_cards = getattr(state, "evidence_index_cards", None) or []
-        if getattr(self.config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
-            cards_md = render_evidence_index_cards_block(raw_cards)
-            if cards_md:
-                frozen_parts.append(cards_md)
-        envelope = ContextPrefixBuilder(self.config).build_envelope(
-            stage="task_react",
-            system_role=str(getattr(self.task_react_agent, "system_prompt", "") or ""),
-            research_topic=state.research_topic or "",
-            frozen_index_and_ledger="\n\n".join(frozen_parts),
-            volatile_blocks=[("task_react_delta", volatile_delta)],
-            cache_key_scope="request",
-        )
+        else:
+            envelope = builder.build_envelope(
+                stage="task_react",
+                system_role=role,
+                volatile_blocks=[
+                    ("topic", f"研究主题：{state.research_topic}"),
+                    *volatile_blocks,
+                    ("checkpoint", frozen),
+                ],
+            )
         prompt = envelope.to_flat_prompt()
         run_env = getattr(self.task_react_agent, "run_envelope", None)
 

@@ -88,12 +88,26 @@ def normalize_agent_markdown(text: str) -> str:
 
 
 def strip_citation_markers(text: str) -> str:
-    """Remove `[Tn-Sm]` style citation markers from a text fragment."""
+    """Remove web, MCP, and computation citation markers from a text fragment."""
     if not text:
         return text
     cleaned = CITATION_PATTERN.sub("", text)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
+
+
+def truncate_cited_text(text: str, max_chars: int) -> str:
+    """Truncate a fragment without splitting a citation marker."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    for match in CITATION_PATTERN.finditer(text):
+        if match.start() >= max_chars:
+            break
+        if match.end() > max_chars:
+            return text[: match.start()].rstrip()
+    return text[:max_chars]
 
 
 def looks_like_meta_reasoning(text: str) -> bool:

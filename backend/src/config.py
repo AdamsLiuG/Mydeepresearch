@@ -340,7 +340,7 @@ class Configuration(BaseModel):
     fact_ledger_llm_compaction_enabled: bool = Field(
         default=False,
         title="Fact Ledger LLM Compaction Enabled",
-        description="Whether to invoke Fast LLM when deterministic extraction yields no claims",
+        description="Whether the task summarizer may include structured ledger fields in its existing response",
     )
     fact_ledger_max_entries: int = Field(
         default=40,

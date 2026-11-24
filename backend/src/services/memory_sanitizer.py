@@ -28,7 +28,11 @@ _TOOL_CALL_START_PATTERN = re.compile(r"\[TOOL_CALL:", re.IGNORECASE)
 
 # Prompt wrapper boundary tags that untrusted memory text must never forge or close.
 _BOUNDARY_TAG_PATTERN = re.compile(
-    r"</?\s*(?:RESEARCH_MEMORY|RESEARCH_SKILL|SYSTEM|ASSISTANT|USER)\b[^>]*>",
+    r"</?\s*[a-z][\w:-]*\b[^<>]*>|<\|[^<>\n]+\|>|\[/?INST\]",
+    re.IGNORECASE,
+)
+_MEMORY_URL_PATTERN = re.compile(
+    r"(?:\b(?:[a-z][a-z0-9+.-]*://|(?:file|data|javascript):|www\.)|(?<![:/])//)[^\s<>\"\]]+",
     re.IGNORECASE,
 )
 
@@ -142,7 +146,7 @@ def neutralize_source_ids(value: Any) -> str:
 def neutralize_boundary_tags(value: Any) -> str:
     """Neutralize XML-style prompt boundary tags so memory text cannot break out of its block."""
 
-    return _BOUNDARY_TAG_PATTERN.sub("", str(value or ""))
+    return _BOUNDARY_TAG_PATTERN.sub(" ", str(value or ""))
 
 
 def contains_tool_directive(value: Any) -> bool:
@@ -169,3 +173,9 @@ def sanitize_injection_text(value: Any) -> str:
     text = neutralize_boundary_tags(text)
     text = neutralize_source_ids(text)
     return collapse_whitespace(text)
+
+
+def sanitize_memory_text(value: Any) -> str:
+    """Sanitize historical prompt text and redact direct navigation targets."""
+
+    return _MEMORY_URL_PATTERN.sub("[历史链接]", sanitize_injection_text(value))
