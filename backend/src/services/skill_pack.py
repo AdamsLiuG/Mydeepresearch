@@ -524,6 +524,8 @@ def _validate_budget_and_layout(pack: SkillPack) -> list[str]:
 
 def _validate_mcp_tool_scopes(pack: SkillPack) -> list[str]:
     scopes = pack.mcp_tool_scopes
+    if not isinstance(scopes, dict):
+        return ["mcp_tool_scopes must be a mapping"]
     if not scopes:
         return []
     errors: list[str] = []
@@ -538,24 +540,46 @@ def _validate_mcp_tool_scopes(pack: SkillPack) -> list[str]:
     for key in scopes:
         if key not in allowed_keys:
             errors.append(f"mcp_tool_scopes key '{key}' is not in the allowed whitelist")
-    for list_key in ("allowed_servers", "allowed_tools", "auto_query_tools"):
+    for required_list in ("allowed_servers", "allowed_tools"):
+        if not isinstance(scopes.get(required_list), list) or not scopes.get(required_list):
+            errors.append(f"mcp_tool_scopes.{required_list} must be a non-empty list")
+    lists = {}
+    for list_key in ("allowed_servers", "allowed_tools", "auto_query_tools", "stage_allowlist"):
         raw = scopes.get(list_key)
-        if raw is None:
+        if list_key not in scopes:
             continue
         if not isinstance(raw, list):
             errors.append(f"mcp_tool_scopes.{list_key} must be a list")
             continue
+        lists[list_key] = []
         for item in raw:
-            tok = str(item or "").strip()
-            if "*" in tok:
+            if not isinstance(item, str) or not item or item != item.strip():
+                errors.append(f"mcp_tool_scopes.{list_key} must contain non-empty strings without padding")
+            elif "*" in item:
                 errors.append(f"mcp_tool_scopes.{list_key} must not contain wildcard '*'")
+            else:
+                lists[list_key].append(item)
+    servers = set(lists.get("allowed_servers", []))
+    tools = set(lists.get("allowed_tools", []))
+    for tool_ref in tools:
+        if ":" not in tool_ref:
+            errors.append("mcp_tool_scopes.allowed_tools entries must use 'server:tool' format")
+            continue
+        server_id, tool_name = tool_ref.split(":", 1)
+        if not tool_name or ":" in tool_name or server_id not in servers:
+            errors.append(f"mcp_tool_scopes.allowed_tools entry '{tool_ref}' is outside allowed_servers")
+    for tool_ref in lists.get("auto_query_tools", []):
+        if tool_ref not in tools:
+            errors.append(f"mcp_tool_scopes.auto_query_tools entry '{tool_ref}' is not in allowed_tools")
+    if any(stage not in {STAGE_PLANNING, STAGE_TASK_EXECUTION, STAGE_REVIEW}
+           for stage in lists.get("stage_allowlist", [])):
+        errors.append("mcp_tool_scopes.stage_allowlist contains an unsupported stage")
+    if "readonly_only" in scopes and not isinstance(scopes["readonly_only"], bool):
+        errors.append("mcp_tool_scopes.readonly_only must be a boolean")
     if "max_tools_injected" in scopes:
-        try:
-            cap = int(scopes["max_tools_injected"])
-            if cap < 0 or cap > 12:
-                errors.append("mcp_tool_scopes.max_tools_injected must be in [0, 12]")
-        except (TypeError, ValueError):
-            errors.append("mcp_tool_scopes.max_tools_injected must be an integer")
+        cap = scopes["max_tools_injected"]
+        if type(cap) is not int or not 0 <= cap <= 12:
+            errors.append("mcp_tool_scopes.max_tools_injected must be an integer in [0, 12]")
     return errors
 
 
@@ -738,6 +762,8 @@ def apply_skill_pack_overrides(
 
     updates: dict[str, Any] = {}
     knob_updates: dict[str, Any] = {}
+    if getattr(base_config, "active_mcp_tool_scopes", None):
+        updates["active_mcp_tool_scopes"] = {}
 
     if not pack.is_neutral:
         source_packs = [pack]
@@ -796,21 +822,26 @@ def apply_skill_pack_overrides(
         if merged_verifiers and hasattr(base_config, "active_skill_verifiers"):
             updates["active_skill_verifiers"] = merged_verifiers
 
-        merged_scopes: dict[str, Any] = {}
-        for current_pack in source_packs:
-            raw_scopes = getattr(current_pack, "mcp_tool_scopes", None) or {}
-            if not raw_scopes:
-                continue
-            if not merged_scopes:
-                merged_scopes = deepcopy(raw_scopes)
-            else:
-                for list_key in ("allowed_servers", "allowed_tools", "auto_query_tools"):
-                    existing_vals = list(merged_scopes.get(list_key) or [])
-                    for item in raw_scopes.get(list_key) or ():
-                        if item not in existing_vals:
-                            existing_vals.append(item)
-                    if existing_vals:
-                        merged_scopes[list_key] = existing_vals
+        merged_scopes = deepcopy(pack.mcp_tool_scopes) if not _validate_mcp_tool_scopes(pack) else {}
+        for current_pack in source_packs[1:]:
+            raw_scopes = current_pack.mcp_tool_scopes
+            if merged_scopes and raw_scopes and not _validate_mcp_tool_scopes(current_pack):
+                for list_key in ("allowed_servers", "allowed_tools", "auto_query_tools", "stage_allowlist"):
+                    default = [STAGE_TASK_EXECUTION, STAGE_REVIEW] if list_key == "stage_allowlist" else []
+                    merged_scopes[list_key] = [
+                        item for item in merged_scopes.get(list_key, default)
+                        if item in raw_scopes.get(list_key, default)
+                    ]
+                merged_scopes["readonly_only"] = bool(
+                    merged_scopes.get("readonly_only", True) or raw_scopes.get("readonly_only", True)
+                )
+                caps = [
+                    int(scopes["max_tools_injected"])
+                    for scopes in (merged_scopes, raw_scopes)
+                    if "max_tools_injected" in scopes
+                ]
+                if caps:
+                    merged_scopes["max_tools_injected"] = min(caps)
         if merged_scopes and hasattr(base_config, "active_mcp_tool_scopes"):
             updates["active_mcp_tool_scopes"] = merged_scopes
 

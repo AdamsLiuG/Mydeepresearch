@@ -22,7 +22,7 @@ from services.evidence import (
 )
 from services.evidence_index import EvidenceRetrievalHit
 from services.fact_ledger import FactLedger, render_evidence_index_cards_block
-from services.mcp_bridge import MCPHitlApprovalRequired
+from services.mcp_bridge import MCPHitlApprovalRequired, _scope_allows_tool
 from services.policy_controller import (
     PolicyStateFeatures,
     build_policy_controller,
@@ -1406,6 +1406,7 @@ class TaskExecutorMixin:
                         evidence_store,
                         observer=observer,
                     )
+                    notices = self._merge_notices(notices, task.notices)
 
                 if search_span:
                     cache_details = {}
@@ -1915,11 +1916,11 @@ class TaskExecutorMixin:
     ) -> None:
         """Deterministically prefetch private MCP evidence when the active skill declares auto_query_tools."""
 
-        if not bool(getattr(self.config, "mcp_enabled", False)):
+        if not getattr(self.config, "mcp_enabled", False) or not getattr(self.config, "mcp_max_tools_per_stage", 6):
             return
         scopes = getattr(self.config, "active_mcp_tool_scopes", None) or {}
-        auto_tools = list(scopes.get("auto_query_tools") or [])
-        if not auto_tools:
+        auto_tools = scopes.get("auto_query_tools") if isinstance(scopes, dict) else None
+        if not isinstance(auto_tools, list) or not auto_tools:
             return
         ensurer = getattr(self, "_ensure_mcp_bridge", None)
         bridge = ensurer() if callable(ensurer) else None
@@ -1928,55 +1929,58 @@ class TaskExecutorMixin:
 
         tenant_id = str(getattr(self, "tenant_id", "default") or "default")
         request_id = str(getattr(self, "request_id", "local") or "local")
-        approved_registry = getattr(state, "approved_tool_calls", None)
         query_text = (task.query or task.intent or task.title or state.research_topic or "").strip()
+        if not query_text:
+            return
 
-        for tool_ref in auto_tools:
-            ref = str(tool_ref or "").strip()
-            if not ref or ":" not in ref:
+        def allowed(server: str, tool: str) -> bool:
+            return _scope_allows_tool(
+                scopes, server_id=server, tool_name=tool, stage="task_execution", readonly=True,
+            )
+
+        def call(server: str, tool: str, **arguments: Any) -> Any:
+            result = bridge.call_tool(
+                server_id=server, tool_name=tool, arguments=arguments, tenant_id=tenant_id,
+                request_id=request_id, task_id=task.id, active_scopes=scopes, readonly_required=True,
+                stage="task_execution", observer=observer,
+            )
+            if not result.ok:
+                notice = f"MCP {server}:{tool} unavailable ({result.error_code})."
+                if notice not in task.notices:
+                    task.notices.append(notice)
+            return result
+
+        for ref in dict.fromkeys(ref for ref in auto_tools if isinstance(ref, str)):
+            server_id, _, tool_name = ref.partition(":")
+            if not tool_name or not allowed(server_id, tool_name):
                 continue
-            server_id, tool_name = ref.split(":", 1)
             args: dict[str, Any] = {"query": query_text}
-            if server_id == "finarag":
-                companies_res = bridge.call_tool(
-                    server_id="finarag",
-                    tool_name="finarag_list_companies",
-                    arguments={"limit": 50},
-                    tenant_id=tenant_id,
-                    request_id=request_id,
-                    task_id=task.id,
-                    approved_registry=approved_registry,
-                    observer=observer,
-                )
+            if server_id == "finarag" and tool_name in {"finarag_filings", "finarag_structured_query"}:
+                if not allowed("finarag", "finarag_list_companies"):
+                    continue
+                companies_res = call("finarag", "finarag_list_companies", limit=200)
                 companies = (
                     (companies_res.structured_payload or {}).get("companies") or []
                     if companies_res.ok
                     else []
                 )
-                matched_company = None
-                haystack = f"{state.research_topic or ''} {task.title or ''} {query_text}".casefold()
-                for item in companies:
-                    cname = str((item or {}).get("company_name") or "").strip()
-                    if cname and cname.casefold() in haystack:
-                        matched_company = cname
+                names = {
+                    item["company_name"].strip() for item in companies if isinstance(item, dict)
+                    and isinstance(item.get("company_name"), str) and item["company_name"].strip()
+                }
+                matches = set()
+                for text in (f"{task.title} {query_text}", state.research_topic or ""):
+                    matches = {name for name in names if re.search(
+                        rf"(?<![a-z0-9]){re.escape(name.casefold())}(?![a-z0-9])", text.casefold(),
+                    )}
+                    if matches:
                         break
-                if matched_company:
-                    args["company_name"] = matched_company
-                elif companies:
-                    args["company_name"] = str((companies[0] or {}).get("company_name") or "").strip()
-                if not args.get("company_name"):
+                if len(matches) != 1:
                     continue
+                query_key = "question" if tool_name == "finarag_structured_query" else "query"
+                args = {query_key: query_text, "company_name": matches.pop()}
 
-            call_res = bridge.call_tool(
-                server_id=server_id,
-                tool_name=tool_name,
-                arguments=args,
-                tenant_id=tenant_id,
-                request_id=request_id,
-                task_id=task.id,
-                approved_registry=approved_registry,
-                observer=observer,
-            )
+            call_res = call(server_id, tool_name, **args)
             if call_res.ok and call_res.normalized_evidence:
                 evidence_store.record_mcp_results(
                     task_id=task.id,

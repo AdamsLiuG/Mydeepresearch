@@ -23,7 +23,12 @@ from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
 from services.event_bus import build_stream_event_bus
 from services.hitl import HitlService
-from services.mcp_bridge import MCPBridgeManager
+from services.mcp_bridge import (
+    MCPBridgeManager,
+    compute_arguments_digest,
+    tool_approval_expired,
+)
+from services.request_state import SnapshotConflictError
 from services.skill_pack import SkillPackService
 from services.storage_backends import build_request_state_store
 from services.tenant import (
@@ -157,7 +162,13 @@ class ToolApprovalDecisionRequest(BaseModel):
     """Payload for approving or rejecting a paused non-readonly MCP tool call."""
 
     decision: Literal["approve", "reject"] = Field(..., description="Approval decision")
-    reason: str = Field(default="", description="Optional operator reason")
+    reason: str = Field(default="", max_length=2000, description="Optional operator reason")
+    arguments_digest: str | None = None
+
+
+class ResearchToolApprovalRequest(ToolApprovalDecisionRequest):
+    request_id: str
+    approval_id: str
 
 
 class AsyncResearchRequest(BaseModel):
@@ -440,6 +451,7 @@ def create_app(
             bridge = getattr(app.state, "mcp_bridge", None)
             if bridge is not None and hasattr(bridge, "close"):
                 bridge.close()
+                app.state.mcp_bridge = None
             state_store = getattr(app.state, "request_state_store", None)
             if state_store is not None and hasattr(state_store, "close"):
                 state_store.close()
@@ -648,6 +660,38 @@ def create_app(
                 detail=f"request snapshot not found: {request_id}",
             )
 
+    def _save_tool_approval_snapshot(store: Any, snapshot: dict[str, Any], tenant: TenantContext) -> None:
+        if not _accepts_kwarg(store.save, "expected_version") or "state_version" not in snapshot:
+            raise HTTPException(status_code=409, detail="Tool approvals require a versioned request snapshot")
+        store.save(
+            snapshot["request_id"], snapshot, tenant_id=tenant.tenant_id,
+            expected_version=snapshot["state_version"],
+        )
+
+    def _expire_tool_approval(snapshot: dict[str, Any], pending: dict[str, Any]) -> None:
+        pending["status"] = "expired"
+        snapshot["status"] = "expired"
+        snapshot["approved_tool_calls"] = {}
+
+    def _check_tool_approval_before_resume(request_id: str, tenant: TenantContext) -> None:
+        store = app.state.request_state_store
+        snapshot = _store_load(store, request_id, tenant_id=tenant.tenant_id) if store is not None else None
+        if not snapshot or snapshot.get("phase") != "awaiting_tool_approval":
+            return
+        pending = snapshot.get("pending_tool_approval")
+        if not isinstance(pending, dict) or pending.get("status") == "rejected":
+            raise HTTPException(status_code=409, detail="Tool approval is closed")
+        if tool_approval_expired(pending):
+            if pending.get("status") != "expired":
+                _expire_tool_approval(snapshot, pending)
+                try:
+                    _save_tool_approval_snapshot(store, snapshot, tenant)
+                except SnapshotConflictError as exc:
+                    raise HTTPException(status_code=409, detail="Tool approval state changed") from exc
+            raise HTTPException(status_code=410, detail="Tool approval expired")
+        if pending.get("status") != "approved_once":
+            raise HTTPException(status_code=409, detail="Tool approval is required before resuming")
+
     @app.get("/healthz")
     async def health_check() -> Dict[str, str]:
         return {"status": "ok"}
@@ -807,6 +851,9 @@ def create_app(
         )
         if snapshot is None:
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
+
+        if snapshot.get("pending_tool_approval") or snapshot.get("approved_tool_calls"):
+            raise HTTPException(status_code=409, detail="Request has a tool approval record")
 
         config = Configuration.from_env()
         try:
@@ -1141,6 +1188,7 @@ def create_app(
     ) -> ResearchResponse:
         tenant = _resolve_tenant(request)
         _ensure_request_ownership(request_id, tenant)
+        _check_tool_approval_before_resume(request_id, tenant)
         _acquire_rate_limit(tenant)
         try:
             config = _build_config(
@@ -1381,6 +1429,7 @@ def create_app(
     ) -> StreamingResponse:
         tenant = _resolve_tenant(request)
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
+        await asyncio.to_thread(_check_tool_approval_before_resume, request_id, tenant)
         _acquire_rate_limit(tenant)
         try:
             config = _build_config(
@@ -1429,7 +1478,7 @@ def create_app(
         )
 
     @app.post("/requests/{request_id}/tool-approvals/{approval_id}")
-    async def resolve_mcp_tool_approval(
+    def resolve_mcp_tool_approval(
         request_id: str,
         approval_id: str,
         payload: ToolApprovalDecisionRequest,
@@ -1441,7 +1490,11 @@ def create_app(
         if store is None:
             raise HTTPException(status_code=400, detail="request_state store is disabled")
         snapshot = _store_load(store, request_id, tenant_id=tenant.tenant_id)
-        if not isinstance(snapshot, dict):
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("request_id") != request_id
+            or snapshot.get("tenant_id") != tenant.tenant_id
+        ):
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
         pending = snapshot.get("pending_tool_approval")
         if not isinstance(pending, dict) or str(pending.get("approval_id") or "") != approval_id:
@@ -1449,35 +1502,76 @@ def create_app(
         digest = str(pending.get("arguments_digest") or "").strip()
         server_id = str(pending.get("server_id") or "").strip()
         tool_name = str(pending.get("tool_name") or "").strip()
-        if not digest or not server_id or not tool_name:
+        if (
+            pending.get("request_id") != request_id
+            or pending.get("tenant_id") != tenant.tenant_id
+            or not server_id or not tool_name
+            or not isinstance(pending.get("arguments_preview"), dict)
+            or digest != compute_arguments_digest(pending["arguments_preview"])
+            or (payload.arguments_digest is not None and digest != payload.arguments_digest)
+        ):
             raise HTTPException(status_code=409, detail="pending tool approval metadata is incomplete")
 
+        desired = "approved_once" if payload.decision == "approve" else "rejected"
+        response = {
+            "request_id": request_id,
+            "approval_id": approval_id,
+            "decision": payload.decision,
+            "status": desired,
+        }
+        status = pending.get("status")
+        if status == "rejected" and status == desired:
+            return response
+        if status == "expired" or (status in {"awaiting_approval", "approved_once"} and tool_approval_expired(pending)):
+            if status != "expired":
+                _expire_tool_approval(snapshot, pending)
+                try:
+                    _save_tool_approval_snapshot(store, snapshot, tenant)
+                except SnapshotConflictError as exc:
+                    raise HTTPException(status_code=409, detail="Tool approval state changed") from exc
+            raise HTTPException(status_code=410, detail="Tool approval expired")
+        if status == "approved_once" and status == desired:
+            return response
+        if status != "awaiting_approval" or snapshot.get("phase") != "awaiting_tool_approval":
+            raise HTTPException(status_code=409, detail="Tool approval is already resolved")
+
         approved_map = dict(snapshot.get("approved_tool_calls") or {})
+        approval_key = f"{server_id}:{tool_name}:{digest}"
         if payload.decision == "approve":
-            approval_key = f"{server_id}:{tool_name}:{digest}"
             approved_map[approval_key] = {
                 "approval_id": approval_id,
                 "server_id": server_id,
                 "tool_name": tool_name,
                 "arguments_digest": digest,
+                "tenant_id": tenant.tenant_id,
+                "request_id": request_id,
+                "task_id": pending.get("task_id"),
+                "expires_at": pending["expires_at"],
                 "status": "approved_once",
                 "reason": payload.reason,
             }
             pending["status"] = "approved_once"
             snapshot["status"] = "approved_ready"
         else:
+            approved_map.pop(approval_key, None)
             pending["status"] = "rejected"
             pending["reason"] = payload.reason
             snapshot["status"] = "rejected"
         snapshot["pending_tool_approval"] = pending
         snapshot["approved_tool_calls"] = approved_map
-        _store_save(store, request_id, snapshot, tenant_id=tenant.tenant_id)
-        return {
-            "request_id": request_id,
-            "approval_id": approval_id,
-            "decision": payload.decision,
-            "status": pending["status"],
-        }
+        try:
+            _save_tool_approval_snapshot(store, snapshot, tenant)
+        except SnapshotConflictError as exc:
+            latest = _store_load(store, request_id, tenant_id=tenant.tenant_id) or {}
+            resolved = latest.get("pending_tool_approval") or {}
+            if resolved.get("approval_id") == approval_id and resolved.get("status") == desired:
+                return response
+            raise HTTPException(status_code=409, detail="Tool approval state changed") from exc
+        return response
+
+    @app.post("/api/research/tool-approval")
+    def resolve_research_tool_approval(payload: ResearchToolApprovalRequest, request: Request) -> Dict[str, Any]:
+        return resolve_mcp_tool_approval(payload.request_id, payload.approval_id, payload, request)
 
     return app
 

@@ -11,20 +11,38 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import time
+from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Literal, Union
+from typing import Annotated, Any, Callable, Iterator, Literal, TextIO, Union
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+|[\u4e00-\u9fff]+")
-_NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?%?")
+_REPORT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_PROTOCOL_VERSION = "2025-03-26"
+_MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 
-class FinaragListCompaniesInput(BaseModel):
+class _ReportUnavailable(ValueError):
+    pass
+
+
+class FinaragInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True, str_max_length=4000)
+
+
+CompanyName = Annotated[str, Field(min_length=1, max_length=300)]
+PageNumber = Annotated[int, Field(ge=1)]
+
+
+class FinaragListCompaniesInput(FinaragInput):
     industry: str | None = Field(default=None, description="Filter by subset.csv major_industry")
     currency: str | None = Field(default=None, description="Filter by currency such as USD/EUR/CHF")
     keyword: str | None = Field(default=None, description="Substring match against company_name")
@@ -45,10 +63,10 @@ class FinaragListCompaniesOutput(BaseModel):
     total: int = 0
 
 
-class FinaragFilingsInput(BaseModel):
-    company_name: str = Field(..., min_length=1, description="Exact company_name in FinaRAG repository")
+class FinaragFilingsInput(FinaragInput):
+    company_name: CompanyName = Field(description="Exact company_name in FinaRAG repository")
     query: str = Field(..., min_length=1, description="Filing semantic or lexical retrieval query")
-    retrieval_mode: Literal["vector", "hybrid", "bm25"] = Field(default="hybrid")
+    retrieval_mode: Literal["vector", "hybrid", "bm25"] = Field(default="vector")
     top_n: int = Field(default=6, ge=1, le=20)
     return_parent_pages: bool = Field(default=True)
     llm_reranking_sample_size: int = Field(default=28, ge=5, le=60)
@@ -76,8 +94,8 @@ class FinaragFilingsOutput(BaseModel):
     notices: list[str] = Field(default_factory=list)
 
 
-class FinaragStructuredQueryInput(BaseModel):
-    company_name: str = Field(..., min_length=1)
+class FinaragStructuredQueryInput(FinaragInput):
+    company_name: CompanyName
     question: str = Field(..., min_length=1)
     answer_schema: Literal["number", "name", "names", "boolean"] = Field(default="number")
     top_n_retrieval: int = Field(default=6, ge=1, le=15)
@@ -110,9 +128,9 @@ class FinaragStructuredQueryOutput(BaseModel):
     answer_reason: str
 
 
-class FinaragGetPagesInput(BaseModel):
-    company_name: str = Field(..., min_length=1)
-    page_numbers: list[int] = Field(..., min_length=1, max_length=10)
+class FinaragGetPagesInput(FinaragInput):
+    company_name: CompanyName
+    page_numbers: list[PageNumber] = Field(..., min_length=1, max_length=10)
     include_serialized_tables: bool = Field(default=True)
 
 
@@ -137,7 +155,7 @@ def _verify_hmac_token(
     expected_sig = base64.urlsafe_b64encode(
         hmac.new(secret.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256).digest()
     ).decode("ascii").rstrip("=")
-    if not hmac.compare_digest(sig_b64, expected_sig):
+    if not sig_b64.isascii() or not hmac.compare_digest(sig_b64, expected_sig):
         raise PermissionError("invalid scoped tenant token signature")
     padded = payload_b64 + "=" * (-len(payload_b64) % 4)
     try:
@@ -146,8 +164,8 @@ def _verify_hmac_token(
         raise PermissionError("malformed scoped tenant token payload") from exc
     if not isinstance(claims, dict):
         raise PermissionError("invalid scoped tenant token claims")
-    exp = float(claims.get("exp") or 0)
-    if exp < time.time():
+    exp = claims.get("exp")
+    if type(exp) is not int or exp <= time.time():
         raise PermissionError("scoped tenant token expired")
     if expected_server_id and str(claims.get("server_id") or "") != expected_server_id:
         raise PermissionError("scoped tenant token server mismatch")
@@ -187,7 +205,9 @@ class TenantACL:
             normalized: dict[str, list[str]] = {}
             for tid, entry in raw["tenants"].items():
                 if isinstance(entry, dict):
-                    normalized[str(tid)] = list(entry.get("companies") or entry.get("allowed_companies") or [])
+                    companies = entry.get("companies", entry.get("allowed_companies"))
+                    if isinstance(companies, list):
+                        normalized[str(tid)] = companies
                 elif isinstance(entry, list):
                     normalized[str(tid)] = list(entry)
             return cls(normalized, enforce=enforce)
@@ -250,10 +270,10 @@ class FinaRAGAdapter:
             data_root
             or os.getenv("FINARAG_DATA_ROOT")
             or "/media/main/hjz/llm/FinaRAG"
-        )
+        ).expanduser().resolve()
         self._acl = acl or TenantACL.from_path(
             os.getenv("FINARAG_TENANT_ACL_PATH"),
-            enforce=bool(os.getenv("FINARAG_TENANT_ACL_PATH")),
+            enforce=True,
         )
         self._token_secret = token_secret if token_secret is not None else os.getenv("MCP_TENANT_TOKEN_SECRET")
         self._answer_fn = answer_fn
@@ -265,10 +285,12 @@ class FinaRAGAdapter:
         *,
         tenant_id: str,
         scoped_token: str | None,
+        request_id: str | None = None,
+        require_token: bool = False,
     ) -> str:
         resolved_tenant = str(tenant_id or "").strip() or "default"
-        if self._token_secret:
-            if not scoped_token:
+        if self._token_secret or require_token:
+            if not scoped_token or not self._token_secret:
                 raise PermissionError("missing scoped tenant token")
             claims = _verify_hmac_token(
                 token=scoped_token,
@@ -276,16 +298,41 @@ class FinaRAGAdapter:
                 expected_server_id="finarag",
                 expected_tenant_id=resolved_tenant,
             )
+            if claims.get("scope") != "mcp:read" or claims.get("request_id") != request_id or not request_id:
+                raise PermissionError("invalid FinaRAG token scope or request")
             resolved_tenant = str(claims.get("tenant_id") or resolved_tenant)
+        elif resolved_tenant != "default":
+            raise PermissionError("tenant identity requires a scoped token")
         return resolved_tenant
+
+    @contextmanager
+    def _open_data_file(self, path: Path) -> Iterator[TextIO]:
+        parts = path.relative_to(self._root).parts
+        if not parts or any(part in {".", ".."} for part in parts):
+            raise ValueError("Invalid FinaRAG data path")
+        # Resolve each component through its parent descriptor and refuse symlinks.
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        parent = os.open(self._root, directory_flags)
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, directory_flags, dir_fd=parent)
+                os.close(parent)
+                parent = child
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, encoding="utf-8") as file:
+                if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                    raise ValueError("Invalid FinaRAG data file")
+                yield file
+        finally:
+            os.close(parent)
 
     def _load_subset_meta(self) -> dict[str, dict[str, Any]]:
         if self._subset_meta is not None:
             return self._subset_meta
         meta: dict[str, dict[str, Any]] = {}
         subset_csv = self._root / "subset.csv"
-        if subset_csv.exists():
-            with subset_csv.open("r", encoding="utf-8", errors="replace") as fh:
+        try:
+            with self._open_data_file(subset_csv) as fh:
                 reader = csv.DictReader(fh)
                 for row in reader:
                     cname = str(row.get("company_name") or "").strip()
@@ -296,6 +343,8 @@ class FinaRAGAdapter:
                             "currency": str(row.get("cur") or row.get("currency") or "").strip() or None,
                             "major_industry": str(row.get("major_industry") or "").strip() or None,
                         }
+        except FileNotFoundError:
+            pass
         self._subset_meta = meta
         return meta
 
@@ -303,9 +352,7 @@ class FinaRAGAdapter:
         if use_serialized_tables in self._reports_cache:
             return self._reports_cache[use_serialized_tables]
 
-        suffix = "_ser_tab" if use_serialized_tables else ""
         candidates = [
-            self._root / f"databases{suffix}" / "chunked_reports",
             self._root / "databases" / "chunked_reports",
             self._root / "chunked_reports",
         ]
@@ -313,23 +360,33 @@ class FinaRAGAdapter:
             candidates.insert(0, self._root / "databases_ser_tab" / "chunked_reports")
 
         reports: dict[str, dict[str, Any]] = {}
+        subset = self._load_subset_meta()
+        has_subset = (self._root / "subset.csv").exists()
         for report_dir in candidates:
-            if not report_dir.exists() or not report_dir.is_dir():
+            if report_dir.resolve() != report_dir:
                 continue
             for json_path in sorted(report_dir.glob("*.json")):
                 try:
-                    payload = json.loads(json_path.read_text(encoding="utf-8"))
-                except Exception:
+                    with self._open_data_file(json_path) as file:
+                        payload = json.load(file)
+                except (OSError, ValueError, RecursionError):
                     continue
                 if not isinstance(payload, dict):
                     continue
-                metainfo = payload.get("metainfo") or {}
+                metainfo = payload.get("metainfo")
+                if not isinstance(metainfo, dict) or not isinstance(payload.get("content"), dict):
+                    continue
                 company_name = str(metainfo.get("company_name") or "").strip()
                 if not company_name:
                     continue
-                reports[company_name.casefold()] = payload
-            if reports:
-                break
+                key = company_name.casefold()
+                expected_sha = (subset.get(key) or {}).get("sha1")
+                sha = str(metainfo.get("sha1_name") or metainfo.get("sha1") or expected_sha or "").strip()
+                if has_subset and (key not in subset or (expected_sha and sha != expected_sha)):
+                    continue
+                if not _REPORT_ID_RE.fullmatch(sha):
+                    continue
+                reports.setdefault(key, {**payload, "metainfo": {**metainfo, "sha1_name": sha}})
 
         self._reports_cache[use_serialized_tables] = reports
         return reports
@@ -347,19 +404,7 @@ class FinaRAGAdapter:
         key = company_name.strip().casefold()
         doc = reports.get(key)
         if doc is None:
-            for cand_key, cand_doc in reports.items():
-                if key in cand_key or cand_key in key:
-                    if not self._acl.is_company_allowed(
-                        tenant_id,
-                        str((cand_doc.get("metainfo") or {}).get("company_name") or cand_key),
-                    ):
-                        raise PermissionError(
-                            f"tenant '{tenant_id}' is not authorized to access matching company"
-                        )
-                    doc = cand_doc
-                    break
-        if doc is None:
-            raise ValueError(f"No report found with '{company_name}' company name.")
+            raise _ReportUnavailable("FinaRAG report unavailable")
         return doc
 
     def list_companies(
@@ -400,7 +445,7 @@ class FinaRAGAdapter:
             items.append(
                 FinaragCompanyMeta(
                     company_name=cname,
-                    sha1_name=sha1 or hashlib.sha1(cname.encode("utf-8")).hexdigest()[:12],
+                    sha1_name=sha1,
                     currency=currency,
                     major_industry=industry,
                     pages_amount=int(metainfo.get("pages_amount") or len(pages)),
@@ -429,40 +474,31 @@ class FinaRAGAdapter:
         canon_name = str(metainfo.get("company_name") or params.company_name).strip()
         currency = str(metainfo.get("currency") or "").strip() or None
 
-        chunks = list(content.get("chunks") or [])
-        pages = list(content.get("pages") or [])
-        pages_by_no = {int(p.get("page") or 0): str(p.get("text") or "") for p in pages if isinstance(p, dict)}
-
-        query_tokens = _tokenize(params.query)
-        q_set = set(query_tokens)
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for idx, chunk in enumerate(chunks):
-            if not isinstance(chunk, dict):
-                continue
-            text = str(chunk.get("text") or "")
-            if not text.strip():
-                continue
-            c_tokens = _tokenize(text)
-            if not c_tokens:
-                continue
-            tf_hits = sum(1 for tok in c_tokens if tok in q_set)
-            unique_hits = len(q_set & set(c_tokens))
-            raw_score = (unique_hits * 2.5 + tf_hits * 0.4) / math.sqrt(len(c_tokens) + 8.0)
-            scored.append((round(raw_score, 4), {**chunk, "_idx": idx}))
-
-        if not scored and pages:
-            for page in pages[: params.top_n]:
-                pno = int(page.get("page") or 1)
-                scored.append((0.1, {"page": pno, "text": str(page.get("text") or ""), "type": "page"}))
-
-        scored.sort(key=lambda item: (-item[0], int(item[1].get("page") or 0)))
+        pages = self._valid_passages(content.get("pages"))
+        pages_by_no = {page["page"]: page["text"] for page in pages}
+        chunks = self._valid_passages(content.get("chunks")) or pages
+        terms = set(_tokenize(params.query))
+        counts = [Counter(_tokenize(chunk["text"])) for chunk in chunks]
+        average_length = sum(c.total() for c in counts) / max(1, len(counts)) or 1.0
+        weights = {
+            term: math.log1p((len(counts) - frequency + 0.5) / (frequency + 0.5))
+            for term in terms
+            for frequency in [sum(term in count for count in counts)]
+        }
+        scored = []
+        for chunk, count in zip(chunks, counts):
+            normalization = 1.5 * (0.25 + 0.75 * count.total() / average_length)
+            score = sum(weights[term] * count[term] * 2.5 / (count[term] + normalization)
+                        for term in terms if term in count)
+            if score > 0:
+                scored.append((score, chunk))
+        scored.sort(key=lambda item: (-item[0], item[1]["page"]))
 
         passages: list[FinaragPassageItem] = []
         seen_pages: set[int] = set()
         for score, chunk in scored:
-            raw_page = int(chunk.get("page") or 1)
-            page_1based = max(1, raw_page)
-            page_0based = max(0, page_1based - 1)
+            page_1based = chunk["page"]
+            page_0based = page_1based - 1
             if params.return_parent_pages and page_1based in pages_by_no:
                 if page_1based in seen_pages:
                     continue
@@ -490,10 +526,23 @@ class FinaRAGAdapter:
             company_name=canon_name,
             pdf_sha1=sha1,
             currency=currency,
-            retrieval_mode=params.retrieval_mode,
+            retrieval_mode="bm25",
             passages=passages,
-            notices=[],
+            notices=(
+                [f"{params.retrieval_mode} retrieval is unavailable. Used local BM25."]
+                if params.retrieval_mode != "bm25" else []
+            ),
         )
+
+    @staticmethod
+    def _valid_passages(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        return [
+            item for item in raw if isinstance(item, dict)
+            and type(item.get("page")) is int and item["page"] > 0
+            and isinstance(item.get("text"), str) and item["text"].strip()
+        ]
 
     def structured_query(
         self,
@@ -527,28 +576,13 @@ class FinaRAGAdapter:
         ]
 
         final_answer: Any = "N/A"
-        reasoning = "Synthesized directly from retrieved filing excerpts."
-        if self._answer_fn is not None:
+        reasoning = "Structured answer generation is unavailable. Retrieved filing excerpts are provided."
+        if self._answer_fn is not None and filings.passages:
             final_answer, reasoning = self._answer_fn(
                 params.question,
                 [p.model_dump() for p in filings.passages],
                 params.answer_schema,
             )
-        elif filings.passages:
-            top_text = filings.passages[0].text
-            if params.answer_schema == "number":
-                nums = _NUMBER_RE.findall(top_text)
-                if nums:
-                    tok = nums[0].replace(",", "").rstrip("%")
-                    try:
-                        final_answer = float(tok) if "." in tok else int(tok)
-                    except ValueError:
-                        final_answer = nums[0]
-            elif params.answer_schema == "boolean":
-                lowered = top_text.lower()
-                final_answer = "yes" in lowered or "true" in lowered or "increased" in lowered
-            else:
-                final_answer = top_text.splitlines()[0][:180] if top_text.splitlines() else "N/A"
 
         return FinaragStructuredQueryOutput(
             company_name=filings.company_name,
@@ -560,7 +594,10 @@ class FinaRAGAdapter:
             relevant_pages=relevant_pages,
             references=refs,
             excerpts=excerpts,
-            answer_reason="grounded_filings_lookup" if excerpts else "no_matching_pages",
+            answer_reason=(
+                "no_matching_pages" if not excerpts else
+                "grounded_filings_lookup" if self._answer_fn is not None else "answerer_unavailable"
+            ),
         )
 
     def get_report_pages(
@@ -578,14 +615,10 @@ class FinaRAGAdapter:
         content = doc.get("content") or {}
         sha1 = str(metainfo.get("sha1_name") or metainfo.get("sha1") or "unknown").strip()
         canon_name = str(metainfo.get("company_name") or params.company_name).strip()
-        pages_by_no = {
-            int(p.get("page") or 0): str(p.get("text") or "")
-            for p in (content.get("pages") or [])
-            if isinstance(p, dict)
-        }
+        pages_by_no = {p["page"]: p["text"] for p in self._valid_passages(content.get("pages"))}
         selected = [
             FinaragPageExcerpt(page_index=int(pno), text=pages_by_no[int(pno)])
-            for pno in params.page_numbers
+            for pno in dict.fromkeys(params.page_numbers)
             if int(pno) in pages_by_no
         ]
         return FinaragGetPagesOutput(
@@ -649,99 +682,94 @@ class FinaRAGMCPServer:
             },
         ]
 
+    @staticmethod
+    def _error(request_id: str | int | None, code: int, message: str) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
     def handle_jsonrpc(
-        self,
-        payload: dict[str, Any],
-        *,
-        headers: dict[str, str] | None = None,
+        self, payload: Any, *, headers: dict[str, str] | None = None, require_token: bool = False,
     ) -> dict[str, Any] | None:
-        req_id = payload.get("id")
-        method = str(payload.get("method") or "").strip()
-        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
-
-        if method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2025-03-26",
-                    "serverInfo": {"name": "finarag-mcp", "version": "1.0.0"},
-                    "capabilities": {"tools": {"listChanged": False}},
-                },
-            }
-
-        if method == "notifications/initialized":
+        if not isinstance(payload, dict):
+            return self._error(None, -32600, "Invalid Request")
+        request_id = payload.get("id")
+        method = payload.get("method")
+        notification = "id" not in payload
+        if (
+            payload.get("jsonrpc") != "2.0" or not isinstance(method, str) or not method
+            or (not notification and type(request_id) not in {str, int})
+        ):
+            return self._error(None, -32600, "Invalid Request")
+        if notification:
             return None
 
-        if method == "tools/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"tools": self._tools},
+        params = payload.get("params", {})
+        if not isinstance(params, dict):
+            return self._error(request_id, -32602, "Invalid params")
+        if method == "initialize":
+            if (
+                not isinstance(params.get("protocolVersion"), str)
+                or not isinstance(params.get("capabilities"), dict)
+                or not isinstance(params.get("clientInfo"), dict)
+                or not all(isinstance(params["clientInfo"].get(k), str) for k in ("name", "version"))
+            ):
+                return self._error(request_id, -32602, "Invalid initialize params")
+            result = {
+                "protocolVersion": _PROTOCOL_VERSION,
+                "serverInfo": {"name": "finarag-mcp", "version": "1.0.0"},
+                "capabilities": {"tools": {"listChanged": False}},
             }
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            if "cursor" in params:
+                return self._error(request_id, -32602, "Invalid tools cursor")
+            result = {"tools": self._tools}
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            meta = params.get("_meta", {})
+            if not isinstance(tool_name, str) or not isinstance(arguments, dict) or not isinstance(meta, dict):
+                return self._error(request_id, -32602, "Invalid tool call params")
+            if tool_name not in {spec["name"] for spec in self._tools}:
+                return self._error(request_id, -32602, "Unknown FinaRAG tool")
 
-        if method == "tools/call":
-            tool_name = str(params.get("name") or "").strip()
-            arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-            norm_headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
-            tenant_id = str(
-                meta.get("tenant_id") or norm_headers.get("x-tenant-id") or "default"
-            ).strip()
-            scoped_token = str(
-                meta.get("scoped_token")
-                or norm_headers.get("authorization", "").removeprefix("Bearer ").strip()
-            ).strip() or None
-
+            norm_headers = {k.lower(): v for k, v in (headers or {}).items()}
+            auth_parts = norm_headers.get("authorization", "").split(None, 1)
+            bearer = auth_parts[1] if len(auth_parts) == 2 and auth_parts[0].lower() == "bearer" else None
+            identities = {
+                "tenant_id": norm_headers.get("x-tenant-id"),
+                "request_id": norm_headers.get("x-request-id"),
+                "scoped_token": bearer,
+            }
+            for key, value in identities.items():
+                metadata_value = meta.get(key)
+                if metadata_value is not None and (not isinstance(metadata_value, str) or value and metadata_value != value):
+                    return self._error(request_id, -32003, "Conflicting MCP identity metadata")
+                identities[key] = value or metadata_value
             try:
-                resolved_tenant = self._adapter.authorize_request(
-                    tenant_id=tenant_id,
-                    scoped_token=scoped_token,
+                tenant = self._adapter.authorize_request(
+                    tenant_id=identities["tenant_id"] or "default",
+                    scoped_token=identities["scoped_token"],
+                    request_id=identities["request_id"],
+                    require_token=require_token,
                 )
-                structured = self._dispatch_tool(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    tenant_id=resolved_tenant,
-                )
-            except PermissionError as exc:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32003, "message": str(exc)},
-                }
-            except ValueError as exc:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32602, "message": str(exc)},
-                }
-            except Exception as exc:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32000, "message": str(exc)},
-                }
-
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(structured, ensure_ascii=False),
-                        }
-                    ],
+                structured = self._dispatch_tool(tool_name=tool_name, arguments=arguments, tenant_id=tenant)
+                result = {
+                    "content": [{"type": "text", "text": json.dumps(structured, ensure_ascii=False, allow_nan=False)}],
                     "structuredContent": structured,
                     "isError": False,
-                },
-            }
-
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
+                }
+            except PermissionError as exc:
+                return self._error(request_id, -32003, str(exc))
+            except ValidationError:
+                return self._error(request_id, -32602, "Invalid tool arguments")
+            except _ReportUnavailable:
+                result = {"content": [{"type": "text", "text": "FinaRAG report unavailable"}], "isError": True}
+            except Exception:
+                return self._error(request_id, -32603, "Internal error")
+        else:
+            return self._error(request_id, -32601, "Method not found")
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     def _dispatch_tool(
         self,
@@ -768,28 +796,38 @@ class FinaRAGMCPServer:
         router = APIRouter()
 
         @router.post("/mcp")
-        async def handle_mcp_post(request: Request) -> JSONResponse:
-            payload = await request.json()
-            reply = self.handle_jsonrpc(payload, headers=dict(request.headers))
-            return JSONResponse(content=reply or {})
+        async def handle_mcp_post(request: Request) -> Response:
+            origin = request.headers.get("origin")
+            if origin:
+                return Response(status_code=403)
+            if request.headers.get("mcp-protocol-version", _PROTOCOL_VERSION) != _PROTOCOL_VERSION:
+                return Response(status_code=400)
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > _MAX_REQUEST_BYTES:
+                    return Response(status_code=413)
+            try:
+                payload = json.loads(body)
+            except (ValueError, RecursionError):
+                return JSONResponse(self._error(None, -32700, "Parse error"), status_code=400)
+            reply = await run_in_threadpool(
+                self.handle_jsonrpc, payload, headers=dict(request.headers), require_token=True,
+            )
+            return Response(status_code=202) if reply is None else JSONResponse(reply)
 
         return router
 
     def run_stdio(self) -> None:
-        for line in sys.stdin:
-            stripped = line.strip()
-            if not stripped:
-                continue
+        for line in iter(lambda: sys.stdin.buffer.readline(_MAX_REQUEST_BYTES + 1), b""):
+            if len(line) > _MAX_REQUEST_BYTES:
+                return
             try:
-                payload = json.loads(stripped)
-            except json.JSONDecodeError:
-                err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
-                sys.stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-                continue
-            if not isinstance(payload, dict):
-                continue
-            reply = self.handle_jsonrpc(payload)
+                payload = json.loads(line)
+            except (ValueError, RecursionError):
+                reply = self._error(None, -32700, "Parse error")
+            else:
+                reply = self.handle_jsonrpc(payload)
             if reply is not None:
                 sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
                 sys.stdout.flush()
@@ -797,7 +835,7 @@ class FinaRAGMCPServer:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FinaRAG MCP Server")
-    parser.add_argument("--transport", choices=("stdio", "http"), default="stdio")
+    parser.add_argument("--transport", choices=("stdio", "http", "streamable-http"), default="stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     args = parser.parse_args()

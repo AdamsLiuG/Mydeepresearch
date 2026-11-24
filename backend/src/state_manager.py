@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 from metrics import RequestTrace
 from models import SummaryState, TodoItem
 from services.dag_scheduler import normalize_depends_on
 from services.evidence import format_evidence_sources
+from services.mcp_bridge import tool_approval_expired
+from services.request_state import SnapshotConflictError
 
 
 class StateManagerMixin:
@@ -87,13 +90,46 @@ class StateManagerMixin:
             "request_metrics": observer_snapshot,
         }
         tenant_id = str(getattr(self, "tenant_id", "default") or "default").strip() or "default"
-        if self._store_supports_tenant_id("save"):
-            saved = self._request_state_store.save(self.request_id, payload, tenant_id=tenant_id)
-        else:
-            saved = self._request_state_store.save(self.request_id, payload)
-        if isinstance(saved, dict) and "state_version" in saved:
-            state.state_version = int(saved.get("state_version") or state.state_version or 0)
+        with getattr(self, "_request_snapshot_lock", nullcontext()):
+            payload["approved_tool_calls"] = dict(getattr(state, "approved_tool_calls", None) or {})
+            payload["state_version"] = int(getattr(state, "state_version", 0) or 0)
+            if self._store_supports_tenant_id("save"):
+                kwargs: dict[str, Any] = {"tenant_id": tenant_id}
+                if payload["pending_tool_approval"] or payload["approved_tool_calls"]:
+                    kwargs["expected_version"] = payload["state_version"]
+                saved = self._request_state_store.save(self.request_id, payload, **kwargs)
+            else:
+                saved = self._request_state_store.save(self.request_id, payload)
+            if isinstance(saved, dict) and "state_version" in saved:
+                state.state_version = int(saved.get("state_version") or state.state_version or 0)
         self._refresh_note_memory_for_state(state, observer=self._request_trace)
+
+    def _consume_mcp_approval(self, key: str, entry: dict[str, Any]) -> bool:
+        state = self._active_state
+        if state is None or self._request_state_store is None:
+            return False
+        with getattr(self, "_request_snapshot_lock", nullcontext()):
+            snapshot = self._load_resume_snapshot(self.request_id)
+            registry = dict(snapshot.get("approved_tool_calls") or {})
+            current = registry.get(key)
+            if (
+                snapshot.get("state_version") != state.state_version
+                or current != entry or not isinstance(current, dict) or current.get("status") != "approved_once"
+                or tool_approval_expired(current)
+            ):
+                return False
+            consumed = {**current, "status": "consumed"}
+            registry[key] = consumed
+            snapshot["approved_tool_calls"] = registry
+            try:
+                saved = self._request_state_store.save(
+                    self.request_id, snapshot, tenant_id=self.tenant_id, expected_version=state.state_version,
+                )
+            except SnapshotConflictError:
+                return False
+            state.state_version = saved["state_version"]
+            state.approved_tool_calls[key] = consumed
+        return True
 
     def _store_supports_tenant_id(self, method_name: str) -> bool:
         import inspect
@@ -179,6 +215,15 @@ class StateManagerMixin:
     def _state_from_snapshot(self, payload: dict[str, Any]) -> tuple[SummaryState, str]:
         """Restore SummaryState and phase from a persisted snapshot."""
 
+        if payload.get("phase") == "awaiting_tool_approval":
+            pending = payload.get("pending_tool_approval")
+            if (
+                not isinstance(pending, dict)
+                or pending.get("status") != "approved_once"
+                or tool_approval_expired(pending)
+            ):
+                raise ValueError("A valid tool approval is required before resuming")
+
         todo_items = []
         for item in payload.get("todo_items") or []:
             if isinstance(item, dict):
@@ -246,4 +291,5 @@ class StateManagerMixin:
                 if evidence_items:
                     task.evidence_items = evidence_items
                     task.sources_summary = format_evidence_sources(evidence_items)
-        return state, str(payload.get("phase") or "planning").strip() or "planning"
+        phase = str(payload.get("phase") or "planning").strip() or "planning"
+        return state, "task_execution" if phase == "awaiting_tool_approval" else phase

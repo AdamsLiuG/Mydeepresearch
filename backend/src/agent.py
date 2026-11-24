@@ -745,6 +745,7 @@ class DeepResearchAgent(
             or "default"
         )
         self._mcp_bridge = mcp_bridge
+        self._owns_mcp_bridge = mcp_bridge is None
         self._active_state: SummaryState | None = None
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
@@ -772,6 +773,7 @@ class DeepResearchAgent(
             config=self.config,
         )
         self._request_state_store = build_request_state_store(self.config)
+        self._request_snapshot_lock = Lock()
         self._policy_controller = build_policy_controller(self.config)
         self._note_memory = NoteMemoryService(self.config)
         self._strategy_synthesizer = StrategySynthesizer(
@@ -926,7 +928,7 @@ class DeepResearchAgent(
             self.config,
             evidence_store=self._evidence_store,
         )
-        if self.config.resolved_sandbox_effective_enabled() or bool(getattr(self.config, "mcp_enabled", False)):
+        if self.config.resolved_sandbox_effective_enabled():
             self._refresh_scoped_tools_for_request()
         self._last_search_notices: list[str] = []
         self._request_trace: RequestTrace | None = None
@@ -1127,7 +1129,11 @@ class DeepResearchAgent(
         """Pick research skill pack bundle (primary + secondary + output format) before planning."""
 
         self._skill_selection = None
+        if getattr(self.config, "active_mcp_tool_scopes", None):
+            self._base_config = getattr(self, "_base_config", None) or self.config
+            self._swap_runtime_config(self.config.model_copy(update={"active_mcp_tool_scopes": {}}))
         if not self._skill_pack.enabled:
+            self._refresh_scoped_tools_for_request()
             return
         try:
             selection = self._skill_pack.select(
@@ -1138,11 +1144,13 @@ class DeepResearchAgent(
             logger.warning("skill pack selection failed error=%s", exc)
             if observer is not None:
                 observer.record_degraded("skill_pack_invalid")
+            self._refresh_scoped_tools_for_request()
             return
         if selection is None:
             # Even the neutral fallback is missing/invalid; proceed with built-in prompts.
             if observer is not None:
                 observer.record_degraded("skill_pack_unavailable")
+            self._refresh_scoped_tools_for_request()
             return
         self._skill_selection = selection
         applied_overrides: dict[str, Any] = {}
@@ -1199,7 +1207,7 @@ class DeepResearchAgent(
         if base_reg is None:
             base_reg = getattr(self, "tools_registry", None)
         mcp_adapters: list[Any] = []
-        if mcp_enabled:
+        if mcp_enabled and getattr(self.config, "mcp_max_tools_per_stage", 6):
             bridge = self._ensure_mcp_bridge()
             if bridge is not None:
                 try:
@@ -1207,7 +1215,10 @@ class DeepResearchAgent(
                         evidence_store=self._evidence_store,
                         tenant_id_getter=lambda: self.tenant_id,
                         request_id_getter=lambda: self.request_id,
+                        active_scopes_getter=lambda: getattr(self.config, "active_mcp_tool_scopes", None),
+                        stage=stage,
                         approved_registry_getter=lambda: getattr(self._active_state, "approved_tool_calls", None),
+                        consume_approval=self._consume_mcp_approval if self._request_state_store is not None else None,
                         observer_getter=lambda: self._request_trace,
                     )
                 except Exception as exc:
@@ -1225,7 +1236,7 @@ class DeepResearchAgent(
             mcp_adapters=mcp_adapters,
             active_scopes=getattr(self.config, "active_mcp_tool_scopes", None),
             stage=stage,
-            max_mcp_tools=int(getattr(self.config, "mcp_max_tools_per_stage", 6) or 6),
+            max_mcp_tools=int(getattr(self.config, "mcp_max_tools_per_stage", 6)),
             enforce_readonly=bool(getattr(self.config, "mcp_enforce_readonly", True)),
         )
 
@@ -1798,13 +1809,11 @@ class DeepResearchAgent(
             state.pending_tool_approval = None
         report = state.structured_report or ""
         request_completed = False
-        self._select_skill_pack(state.research_topic or topic, observer, state=state)
-
-        if emit_stream:
-            logger.debug("Starting streaming research: topic=%s", topic)
-            yield {"type": "status", "message": "初始化研究流程"}
-
         try:
+            self._select_skill_pack(state.research_topic or topic, observer, state=state)
+            if emit_stream:
+                logger.debug("Starting streaming research: topic=%s", topic)
+                yield {"type": "status", "message": "初始化研究流程"}
             if self._is_cancelled():
                 observer.record_degraded("client_disconnected")
                 observer.complete_request(status="cancelled")
@@ -2097,6 +2106,8 @@ class DeepResearchAgent(
                             "tasks": [self._serialize_task(task) for task in state.todo_items],
                         }
                         yield observer.metrics_event()
+                except MCPHitlApprovalRequired:
+                    raise
                 except Exception as exc:
                     completed_event = review_span.complete(status="failed", error=exc)
                     if emit_stream:
@@ -2382,6 +2393,7 @@ class DeepResearchAgent(
                 yield {"type": "done"}
         except MCPHitlApprovalRequired as hitl_exc:
             pending_payload = hitl_exc.to_dict()
+            pending_payload.update(request_id=self.request_id, tenant_id=self.tenant_id)
             state.pending_tool_approval = pending_payload
             if not request_completed:
                 observer.complete_request(status="awaiting_approval")
@@ -2396,7 +2408,7 @@ class DeepResearchAgent(
                 yield {
                     "type": "tool_approval_required",
                     "request_id": self.request_id,
-                    **pending_payload,
+                    **{key: value for key, value in pending_payload.items() if key != "tenant_id"},
                 }
                 yield observer.metrics_event()
             return
@@ -2419,6 +2431,9 @@ class DeepResearchAgent(
             self._active_state = None
             self._cancel_event = None
             self._restore_request_config()
+            if getattr(self, "_owns_mcp_bridge", False) and self._mcp_bridge is not None:
+                bridge, self._mcp_bridge = self._mcp_bridge, None
+                bridge.close()
 
     def run(
         self,

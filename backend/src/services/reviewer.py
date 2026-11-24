@@ -19,6 +19,7 @@ from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.evidence import extract_citation_ids, format_evidence_sources
 from services.evidence_index import EvidenceRetrievalService
 from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.mcp_bridge import MCPHitlApprovalRequired
 from services.skill_verifiers import run_skill_verifiers
 from services.text_processing import (
     looks_like_meta_reasoning,
@@ -214,6 +215,8 @@ class ReviewService:
                     response = run_env(envelope, config=self._config)
                 else:
                     response = self._agent.run(prompt)
+            except MCPHitlApprovalRequired:
+                raise
             except Exception as exc:
                 if observer:
                     observer.record_llm_call(

@@ -488,6 +488,10 @@ def _normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, urlencode(filtered_query, doseq=True), ""))
 
 
+def _mcp_evidence_key(server_id: str, tenant_id: str, url: str) -> str:
+    return f"mcp::{tenant_id}::{server_id}::{url}"
+
+
 def extract_domain(url: str) -> str:
     raw = (url or "").strip()
     try:
@@ -1833,8 +1837,11 @@ class EvidenceStore:
         with self._lock:
             task_ids = self._task_source_ids.setdefault(task_id, [])
             url_index = self._task_url_index.setdefault(task_id, {})
-            existing_m = [sid for sid in task_ids if sid.startswith(prefix)]
-            next_m = len(existing_m) + 1
+            next_m = 1 + max(
+                (int(sid[len(prefix):]) for sid in task_ids
+                 if sid.startswith(prefix) and sid[len(prefix):].isascii() and sid[len(prefix):].isdigit()),
+                default=0,
+            )
 
             for item in items:
                 if not isinstance(item, dict):
@@ -1846,8 +1853,8 @@ class EvidenceStore:
                 if not snippet:
                     snippet = truncate_text(raw_content, 600)
                 title = str(item.get("title") or f"{server_id}:{tool_name} #{next_m}").strip()
-                url = str(item.get("url") or f"mcp://{server_id}/{tool_name}/{next_m}").strip()
-                dedup_key = _normalize_url(url) or f"mcp::{server_id}::{tool_name}::{title.casefold()}"
+                url = str(item.get("citation_uri") or item.get("url") or f"mcp://{server_id}/{tool_name}/{next_m}").strip()
+                dedup_key = _mcp_evidence_key(server_id, normalized_tenant, url)
                 existing_id = url_index.get(dedup_key)
                 if existing_id and existing_id in self._records_by_id:
                     rec = self._records_by_id[existing_id]
@@ -1871,9 +1878,6 @@ class EvidenceStore:
                 source_type = raw_type if raw_type.startswith("mcp_") else tier_fallback
                 page_no_raw = item.get("page_no")
                 page_no = int(page_no_raw) if isinstance(page_no_raw, int) and not isinstance(page_no_raw, bool) else None
-                parsed_domain = extract_domain(url)
-                if not parsed_domain or "://" in url and parsed_domain == server_id:
-                    parsed_domain = f"{server_id}.mcp.internal"
                 rec = EvidenceRecord(
                     source_id=source_id,
                     task_id=task_id,
@@ -1886,13 +1890,13 @@ class EvidenceStore:
                     backend=f"mcp:{server_id}",
                     backend_sources=[f"mcp:{server_id}"],
                     provider_count=1,
-                    domain=parsed_domain or f"{server_id}.mcp.internal",
+                    domain=f"{server_id}.mcp.internal",
                     source_type=source_type,
                     source_origin="mcp",
                     mcp_server_id=server_id,
                     mcp_tool_name=tool_name,
                     tenant_id=normalized_tenant,
-                    provenance_meta=dict(item.get("provenance_meta") or {}),
+                    provenance_meta=dict(item["provenance_meta"]) if isinstance(item.get("provenance_meta"), dict) else {},
                     modality=str(item.get("modality") or "text").strip() or "text",
                     page_no=page_no,
                     published_at=str(item.get("published_at") or "").strip() or None,
@@ -2254,7 +2258,10 @@ class EvidenceStore:
                     _apply_quality_metadata(record)
                     self._records_by_id[source_id] = record
                     task_ids.append(source_id)
-                    dedup_key = _normalize_url(url) or f"title::{title.casefold()}"
+                    dedup_key = (
+                        _mcp_evidence_key(record.mcp_server_id or "", record.tenant_id, url)
+                        if record.source_origin == "mcp" else _normalize_url(url) or f"title::{title.casefold()}"
+                    )
                     url_index[dedup_key] = source_id
                     hydrated_by_task.setdefault(task_id, []).append(record)
 

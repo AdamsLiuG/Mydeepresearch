@@ -390,6 +390,7 @@ class Configuration(BaseModel):
         title="MCP Allowed Private Hosts",
         description="Whitelist of internal sidecar hostnames or CIDRs allowed past SSRF check",
     )
+    mcp_approval_timeout_seconds: float = Field(default=86400, gt=0, allow_inf_nan=False)
     mcp_allow_insecure_http: bool = Field(
         default=False,
         title="MCP Allow Insecure HTTP",
@@ -1490,10 +1491,17 @@ class Configuration(BaseModel):
 
         return value
 
-    @field_validator("cors_origins", "mcp_allowed_private_hosts", mode="before")
+    @field_validator("cors_origins", mode="before")
     @classmethod
     def _normalize_cors_origins(cls, value: Any) -> Any:
         return _normalize_origin_values(value)
+
+    @field_validator("mcp_allowed_private_hosts", mode="before")
+    @classmethod
+    def _normalize_mcp_private_hosts(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return [host.strip() for host in value.split(",") if host.strip()]
+        return [] if value is None else value
 
     @field_validator("llm_pricing_json", "tenant_api_keys", mode="before")
     @classmethod
@@ -1717,6 +1725,7 @@ class Configuration(BaseModel):
             "mcp_config_path": os.getenv("MCP_CONFIG_PATH"),
             "mcp_enforce_readonly": os.getenv("MCP_ENFORCE_READONLY"),
             "mcp_allow_hitl_write_tools": os.getenv("MCP_ALLOW_HITL_WRITE_TOOLS"),
+            "mcp_approval_timeout_seconds": os.getenv("MCP_APPROVAL_TIMEOUT_SECONDS"),
             "mcp_allowed_private_hosts": os.getenv("MCP_ALLOWED_PRIVATE_HOSTS"),
             "mcp_allow_insecure_http": os.getenv("MCP_ALLOW_INSECURE_HTTP"),
             "mcp_tool_timeout_seconds": os.getenv("MCP_TOOL_TIMEOUT_SECONDS"),

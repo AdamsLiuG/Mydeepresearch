@@ -3,9 +3,8 @@ servers:
     transport: stdio
     enabled: false
     command:
-      - python3
-      - -m
-      - services.finarag_mcp_server
+      - "{python}"
+      - src/services/finarag_mcp_server.py
       - --transport
       - stdio
     cwd: "."

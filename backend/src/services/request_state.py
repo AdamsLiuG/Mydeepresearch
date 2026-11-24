@@ -3,11 +3,34 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
+
+try:
+    import fcntl
+except ImportError:  # Windows uses the shared in-process lock.
+    fcntl = None
+
+_SAVE_LOCK = Lock()
+
+
+@contextmanager
+def _lock_snapshot_directory(directory: Path) -> Iterator[None]:
+    if fcntl is None:
+        with _SAVE_LOCK:
+            yield
+        return
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 class SnapshotConflictError(RuntimeError):
@@ -24,7 +47,6 @@ class RequestStateStore:
     def __init__(self, directory: str, *, recent_limit: int = 50) -> None:
         self._directory = Path(directory)
         self._recent_limit = max(1, int(recent_limit or 1))
-        self._save_lock = Lock()
 
     @property
     def directory(self) -> Path:
@@ -46,7 +68,7 @@ class RequestStateStore:
     ) -> dict[str, Any]:
         self._directory.mkdir(parents=True, exist_ok=True)
         path = self.path_for(request_id)
-        with self._save_lock:
+        with _lock_snapshot_directory(self._directory):
             current_version = 0
             if path.exists():
                 try:
