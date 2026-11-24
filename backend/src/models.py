@@ -38,6 +38,7 @@ class TodoItem:
     react_observation: dict[str, Any] = field(default_factory=dict)
     depends_on: list[int] = field(default_factory=list)
     upstream_context: str = field(default="")
+    fact_claims: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -59,6 +60,9 @@ class SummaryState:
     report_repair_cycles: int = field(default=0)
     topic_cache_warmup_completed: bool = field(default=False)
     skill_pack_metadata: dict = field(default_factory=dict)
+    fact_ledger: dict[str, Any] = field(default_factory=dict)
+    evidence_index_cards: list[dict[str, Any]] = field(default_factory=list)
+    frozen_prefix_version: int = field(default=0)
 
 
 @dataclass(kw_only=True)

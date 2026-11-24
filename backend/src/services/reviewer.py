@@ -15,8 +15,10 @@ from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import get_current_date
+from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.evidence import extract_citation_ids, format_evidence_sources
 from services.evidence_index import EvidenceRetrievalService
+from services.fact_ledger import FactLedger, render_evidence_index_cards_block
 from services.skill_verifiers import run_skill_verifiers
 from services.text_processing import (
     looks_like_meta_reasoning,
@@ -166,9 +168,14 @@ class ReviewService:
         llm_summary: dict[str, Any] = {}
 
         if self._config.review_agent_enabled and self._agent is not None:
-            prompt = self._build_prompt(state, issues, skill_pack_context=skill_pack_context)
+            envelope = self._build_envelope(state, issues, skill_pack_context=skill_pack_context)
+            prompt = envelope.to_flat_prompt()
+            run_env = getattr(self._agent, "run_envelope", None)
             try:
-                response = self._agent.run(prompt)
+                if callable(run_env):
+                    response = run_env(envelope, config=self._config)
+                else:
+                    response = self._agent.run(prompt)
             except Exception as exc:
                 if observer:
                     observer.record_llm_call(
@@ -176,6 +183,7 @@ class ReviewService:
                         prompt_text=prompt,
                         completion_text="",
                         error=exc,
+                        stage="review",
                     )
             else:
                 if observer:
@@ -184,6 +192,7 @@ class ReviewService:
                         prompt_text=prompt,
                         completion_text=response,
                         usage=extract_llm_usage(self._agent),
+                        stage="review",
                     )
                 llm_issues, llm_summary = self._parse_response(response)
                 issues = self._merge_issues(issues, llm_issues)
@@ -200,13 +209,13 @@ class ReviewService:
         )
         return summary
 
-    def _build_prompt(
+    def _build_envelope(
         self,
         state: SummaryState,
         issues: list[ReviewIssue],
         *,
         skill_pack_context: str | None = None,
-    ) -> str:
+    ) -> PromptEnvelope:
         task_blocks: list[str] = []
         for task in state.todo_items:
             sources = format_evidence_sources(task.evidence_items) or "- 暂无来源"
@@ -253,15 +262,51 @@ class ReviewService:
             else "当前运行模式不启用工具调用，请直接基于下方任务总结、来源目录、修补候选和规则审查结果补充指出证据问题。"
             "历史修补候选只能作为线索，不能直接当作当前 source_id 引用。"
         )
-        return (
-            f"当前日期：{get_current_date()}\n"
-            f"研究主题：{state.research_topic}\n"
+        static_rules = (
             "请基于以下任务结果补充指出仍然存在的证据问题。"
             f"{tool_guidance}"
-            "不要重写报告正文，也不要重复输出规则已明确指出的问题。\n\n"
-            f"{''.join(task_blocks)}"
-            + str(skill_pack_context or "")
+            "不要重写报告正文，也不要重复输出规则已明确指出的问题。"
         )
+
+        frozen_parts: list[str] = []
+        raw_ledger = getattr(state, "fact_ledger", None)
+        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
+            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
+                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
+            )
+            if ledger_md:
+                frozen_parts.append(ledger_md)
+        raw_cards = getattr(state, "evidence_index_cards", None) or []
+        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
+            cards_md = render_evidence_index_cards_block(raw_cards)
+            if cards_md:
+                frozen_parts.append(cards_md)
+
+        volatile_delta = f"当前日期：{get_current_date()}\n\n{''.join(task_blocks)}"
+        builder = ContextPrefixBuilder(self._config)
+        return builder.build_envelope(
+            stage="review",
+            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            static_schema_and_rules=static_rules,
+            research_topic=state.research_topic or "",
+            skill_pack_context=str(skill_pack_context or "").strip(),
+            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            volatile_blocks=[("review_tasks", volatile_delta)],
+            cache_key_scope="request",
+        )
+
+    def _build_prompt(
+        self,
+        state: SummaryState,
+        issues: list[ReviewIssue],
+        *,
+        skill_pack_context: str | None = None,
+    ) -> str:
+        return self._build_envelope(
+            state,
+            issues,
+            skill_pack_context=skill_pack_context,
+        ).to_flat_prompt()
 
     def _tools_enabled(self) -> bool:
         provider = str(getattr(self._config, "llm_provider", "") or "").strip().lower()

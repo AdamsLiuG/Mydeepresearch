@@ -13,6 +13,8 @@ from config import Configuration
 from metrics import extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import get_current_date, request_reflection_instructions
+from services.context_builder import ContextPrefixBuilder, PromptEnvelope
+from services.fact_ledger import FactLedger, render_evidence_index_cards_block
 from utils import strip_thinking_tokens, truncate_text
 
 logger = logging.getLogger(__name__)
@@ -57,11 +59,13 @@ class ReflectionService:
     ) -> ReflectionAssessment:
         """Judge whether the current request needs more research coverage."""
         context = self._build_reflection_context(state, gap_signals=gap_signals)
-        prompt = self._build_prompt(
+        envelope = self._build_envelope(
+            state,
             context,
             strategy_memory_context=strategy_memory_context,
             skill_pack_context=skill_pack_context,
         )
+        prompt = envelope.to_flat_prompt()
         existing_task_titles = {
             str(task.get("title") or "").strip().casefold()
             for task in context.get("task_snapshots", [])
@@ -69,7 +73,7 @@ class ReflectionService:
         }
 
         try:
-            response = self._run_agent_with_strict_json(prompt)
+            response = self._run_agent_with_strict_json(prompt, envelope=envelope)
         except Exception as exc:
             if observer:
                 observer.record_llm_call(
@@ -77,6 +81,7 @@ class ReflectionService:
                     prompt_text=prompt,
                     completion_text="",
                     error=exc,
+                    stage="reflection",
                 )
             raise
         finally:
@@ -88,6 +93,7 @@ class ReflectionService:
                 prompt_text=prompt,
                 completion_text=response,
                 usage=extract_llm_usage(self._agent),
+                stage="reflection",
             )
 
         return self._parse_response(
@@ -97,15 +103,26 @@ class ReflectionService:
             existing_task_titles=existing_task_titles,
         )
 
-    def _run_agent_with_strict_json(self, prompt: str) -> str:
+    def _run_agent_with_strict_json(
+        self,
+        prompt: str,
+        *,
+        envelope: PromptEnvelope | None = None,
+    ) -> str:
         """Prefer provider-level JSON mode and fall back when unsupported."""
+        run_env = getattr(self._agent, "run_envelope", None)
+        use_envelope = envelope is not None and callable(run_env)
         try:
+            if use_envelope:
+                return run_env(envelope, config=self._config, response_format=_STRICT_JSON_RESPONSE_FORMAT)
             return self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
         except Exception as exc:
             if not self._response_format_is_unsupported(exc):
                 raise
 
             logger.info("Reflection JSON mode unsupported; retrying without response_format: %s", exc)
+            if use_envelope:
+                return run_env(envelope, config=self._config)
             return self._agent.run(prompt)
 
     def _build_task_snapshot(self, task: TodoItem) -> dict[str, Any]:
@@ -171,14 +188,14 @@ class ReflectionService:
             },
         }
 
-    def _build_prompt(
+    def _build_envelope(
         self,
+        state: SummaryState | None,
         context: dict[str, Any],
         *,
         strategy_memory_context: str | None = None,
         skill_pack_context: str | None = None,
-    ) -> str:
-        """Render the reflection prompt from a structured context object."""
+    ) -> PromptEnvelope:
         task_counts = context.get("task_counts", {})
         task_count_summary = (
             f"共 {task_counts.get('total', 0)} 个任务，"
@@ -200,7 +217,7 @@ class ReflectionService:
             )
         task_overview = "\n".join(task_overview_lines) or "- 暂无任务结果"
         compact_context_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-        prompt = request_reflection_instructions.format(
+        volatile_body = request_reflection_instructions.format(
             current_date=context.get("current_date"),
             research_topic=context.get("research_topic"),
             task_count_summary=task_count_summary,
@@ -208,7 +225,50 @@ class ReflectionService:
             task_overview=task_overview,
             reflection_context_json=compact_context_json,
         )
-        return prompt + self._strategy_memory_block(strategy_memory_context) + str(skill_pack_context or "")
+
+        frozen_parts: list[str] = []
+        strategy_block = self._strategy_memory_block(strategy_memory_context).strip()
+        if strategy_block:
+            frozen_parts.append(strategy_block)
+        if state is not None:
+            raw_ledger = getattr(state, "fact_ledger", None)
+            if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
+                ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
+                    max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
+                )
+                if ledger_md:
+                    frozen_parts.append(ledger_md)
+            raw_cards = getattr(state, "evidence_index_cards", None) or []
+            if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
+                cards_md = render_evidence_index_cards_block(raw_cards)
+                if cards_md:
+                    frozen_parts.append(cards_md)
+
+        builder = ContextPrefixBuilder(self._config)
+        return builder.build_envelope(
+            stage="reflection",
+            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            research_topic=str(context.get("research_topic") or ""),
+            skill_pack_context=str(skill_pack_context or "").strip(),
+            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            volatile_blocks=[("reflection_delta", volatile_body)],
+            cache_key_scope="request",
+        )
+
+    def _build_prompt(
+        self,
+        context: dict[str, Any],
+        *,
+        strategy_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
+    ) -> str:
+        """Render the reflection prompt from a structured context object."""
+        return self._build_envelope(
+            None,
+            context,
+            strategy_memory_context=strategy_memory_context,
+            skill_pack_context=skill_pack_context,
+        ).to_flat_prompt()
 
     @staticmethod
     def _strategy_memory_block(strategy_memory_context: str | None) -> str:

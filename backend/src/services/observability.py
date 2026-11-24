@@ -128,6 +128,10 @@ class LangfuseTraceAdapter:
                         "token_source": snapshot.get("token_source"),
                         "llm_calls": snapshot.get("llm_calls"),
                         "estimated_cost": snapshot.get("estimated_cost"),
+                        "cached_prompt_tokens": int(snapshot.get("cached_prompt_tokens") or 0),
+                        "cache_creation_tokens": int(snapshot.get("cache_creation_tokens") or 0),
+                        "cache_hit_ratio": float(snapshot.get("cache_hit_ratio") or 0.0),
+                        "kv_cache_by_stage": dict(snapshot.get("kv_cache_by_stage") or {}),
                     },
                 )
 

@@ -277,6 +277,71 @@ class Configuration(BaseModel):
         title="Active Output Format Skill ID",
         description="Request-scoped output format skill id bound during planning/reporting",
     )
+    kv_cache_prefix_optimization_enabled: bool = Field(
+        default=True,
+        title="KV-Cache Prefix Optimization Enabled",
+        description="Whether to use 3-segment stable prefix ordering across research prompts",
+    )
+    kv_cache_provider_mode: str = Field(
+        default="auto",
+        title="KV-Cache Provider Mode",
+        description="Prefix caching payload mode: auto | openai | anthropic | vllm | disabled",
+    )
+    kv_cache_anthropic_breakpoints_enabled: bool = Field(
+        default=True,
+        title="KV-Cache Anthropic Breakpoints Enabled",
+        description="Whether to emit cache_control ephemeral blocks for Anthropic-compatible backends",
+    )
+    kv_cache_min_segment_tokens: int = Field(
+        default=1024,
+        ge=0,
+        title="KV-Cache Minimum Segment Tokens",
+        description="Minimum estimated prefix tokens before emitting explicit cache_control breakpoints",
+    )
+    kv_cache_prompt_cache_key_enabled: bool = Field(
+        default=True,
+        title="KV-Cache Prompt Cache Key Enabled",
+        description="Whether to emit tenant-isolated prompt_cache_key for OpenAI/vLLM requests",
+    )
+    kv_cache_block_alignment_tokens: int = Field(
+        default=16,
+        ge=1,
+        title="KV-Cache Block Alignment Tokens",
+        description="PagedAttention block size hint used when aligning prefix boundaries",
+    )
+    context_compaction_enabled: bool = Field(
+        default=True,
+        title="Context Compaction Enabled",
+        description="Whether to compact cross-wave and downstream task prose into FactLedger",
+    )
+    fact_ledger_llm_compaction_enabled: bool = Field(
+        default=False,
+        title="Fact Ledger LLM Compaction Enabled",
+        description="Whether to invoke Fast LLM when deterministic extraction yields no claims",
+    )
+    fact_ledger_max_entries: int = Field(
+        default=40,
+        ge=4,
+        title="Fact Ledger Max Entries",
+        description="Maximum FactEntry items rendered into frozen downstream checkpoints",
+    )
+    evidence_pointer_disclosure_enabled: bool = Field(
+        default=True,
+        title="Evidence Pointer Disclosure Enabled",
+        description="Whether to use EvidenceIndexCard pointers and lazy source_id chunk loading",
+    )
+    evidence_lazy_load_max_chunks_per_source: int = Field(
+        default=2,
+        ge=1,
+        title="Evidence Lazy Load Max Chunks Per Source",
+        description="Maximum chunks hydrated per source_id during lazy retrieval or pre-hydration",
+    )
+    evidence_lazy_load_char_budget: int = Field(
+        default=1800,
+        ge=200,
+        title="Evidence Lazy Load Char Budget",
+        description="Character ceiling for lazy chunk hydration per call",
+    )
     note_memory_enabled: bool = Field(
         default=False,
         title="Note Memory Enabled",
@@ -1201,6 +1266,18 @@ class Configuration(BaseModel):
             "skill_pack_semantic_routing_enabled": os.getenv("SKILL_PACK_SEMANTIC_ROUTING_ENABLED"),
             "skill_pack_llm_router_enabled": os.getenv("SKILL_PACK_LLM_ROUTER_ENABLED"),
             "default_output_format": os.getenv("DEFAULT_OUTPUT_FORMAT"),
+            "kv_cache_prefix_optimization_enabled": os.getenv("KV_CACHE_PREFIX_OPTIMIZATION_ENABLED"),
+            "kv_cache_provider_mode": os.getenv("KV_CACHE_PROVIDER_MODE"),
+            "kv_cache_anthropic_breakpoints_enabled": os.getenv("KV_CACHE_ANTHROPIC_BREAKPOINTS_ENABLED"),
+            "kv_cache_min_segment_tokens": os.getenv("KV_CACHE_MIN_SEGMENT_TOKENS"),
+            "kv_cache_prompt_cache_key_enabled": os.getenv("KV_CACHE_PROMPT_CACHE_KEY_ENABLED"),
+            "kv_cache_block_alignment_tokens": os.getenv("KV_CACHE_BLOCK_ALIGNMENT_TOKENS"),
+            "context_compaction_enabled": os.getenv("CONTEXT_COMPACTION_ENABLED"),
+            "fact_ledger_llm_compaction_enabled": os.getenv("FACT_LEDGER_LLM_COMPACTION_ENABLED"),
+            "fact_ledger_max_entries": os.getenv("FACT_LEDGER_MAX_ENTRIES"),
+            "evidence_pointer_disclosure_enabled": os.getenv("EVIDENCE_POINTER_DISCLOSURE_ENABLED"),
+            "evidence_lazy_load_max_chunks_per_source": os.getenv("EVIDENCE_LAZY_LOAD_MAX_CHUNKS_PER_SOURCE"),
+            "evidence_lazy_load_char_budget": os.getenv("EVIDENCE_LAZY_LOAD_CHAR_BUDGET"),
             "note_memory_enabled": os.getenv("NOTE_MEMORY_ENABLED"),
             "note_memory_dir": os.getenv("NOTE_MEMORY_DIR"),
             "note_memory_embedding_model": os.getenv("NOTE_MEMORY_EMBEDDING_MODEL"),

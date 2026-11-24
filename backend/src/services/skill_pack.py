@@ -21,6 +21,7 @@ from typing import Any
 import yaml
 
 from services.skill_verifiers import REGISTERED_VERIFIER_IDS
+from services.text_processing import CITATION_PATTERN as _SOURCE_ID_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,6 @@ LAYOUT_KNOBS = {"report_layout_mode", "search_api"}
 
 _FRONTMATTER_DELIMITER = "---"
 _TOOL_CALL_MARKER = "[TOOL_CALL:"
-_SOURCE_ID_PATTERN = re.compile(r"\[T\d+-S\d+\]")
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 # A run of >=4 digits (optionally with %/.,) reads as a concrete finding rather than method text.
 _HARD_NUMBER_PATTERN = re.compile(r"\d[\d.,]{3,}%?")

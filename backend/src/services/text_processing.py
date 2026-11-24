@@ -6,7 +6,8 @@ import json
 import re
 from typing import Any
 
-CITATION_PATTERN = re.compile(r"\[(T\d+-S\d+)\]")
+CITATION_TOKEN_REGEX = r"\[(T\d+-(?:S|M|C)\d+)\]"
+CITATION_PATTERN = re.compile(CITATION_TOKEN_REGEX)
 JSON_TEXT_KEYS = (
     "report_markdown",
     "report",

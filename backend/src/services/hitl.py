@@ -9,6 +9,7 @@ from config import Configuration
 from models import TodoItem
 from services.dag_scheduler import normalize_depends_on, sanitize_task_dependencies
 from services.skill_pack import SkillPackService
+from services.text_processing import CITATION_PATTERN as _CITATION_TOKEN_PATTERN
 
 _BROAD_COMPARISON_MARKERS = (
     "对比",
@@ -46,7 +47,6 @@ _SPECIFIC_SCOPE_MARKERS = (
     "pricing",
     "compliance",
 )
-_CITATION_TOKEN_PATTERN = re.compile(r"\[(T\d+-S\d+)\]")
 
 
 class HitlService:

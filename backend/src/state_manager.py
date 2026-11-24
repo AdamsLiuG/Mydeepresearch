@@ -64,6 +64,9 @@ class StateManagerMixin:
             "report_repair_cycles": int(state.report_repair_cycles or 0),
             "topic_cache_warmup_completed": bool(state.topic_cache_warmup_completed),
             "skill_pack": dict(state.skill_pack_metadata or {}),
+            "fact_ledger": dict(getattr(state, "fact_ledger", None) or {}),
+            "evidence_index_cards": list(getattr(state, "evidence_index_cards", None) or []),
+            "frozen_prefix_version": int(getattr(state, "frozen_prefix_version", 0) or 0),
             "tenant_id": str(getattr(self, "tenant_id", "default") or "default").strip()
             or "default",
             "cache_diagnostics": cache_diagnostics,
@@ -153,6 +156,7 @@ class StateManagerMixin:
             ),
             depends_on=normalize_depends_on(payload.get("depends_on")),
             upstream_context=str(payload.get("upstream_context") or "").strip(),
+            fact_claims=list(payload.get("fact_claims") or []),
         )
 
     def _state_from_snapshot(self, payload: dict[str, Any]) -> tuple[SummaryState, str]:
@@ -182,6 +186,13 @@ class StateManagerMixin:
                 if isinstance(payload.get("skill_pack"), dict)
                 else {}
             ),
+            fact_ledger=(
+                dict(payload.get("fact_ledger") or {})
+                if isinstance(payload.get("fact_ledger"), dict)
+                else {}
+            ),
+            evidence_index_cards=list(payload.get("evidence_index_cards") or []),
+            frozen_prefix_version=int(payload.get("frozen_prefix_version") or 0),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
         for task in state.todo_items:

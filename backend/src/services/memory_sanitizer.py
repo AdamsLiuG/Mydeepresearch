@@ -17,13 +17,14 @@ import json
 import re
 from typing import Any
 
+from services.text_processing import CITATION_PATTERN as _SOURCE_ID_PATTERN
+
 # ``[TOOL_CALL:note:{...}]`` directives are how agents invoke tools. If such a string
 # survives into an injected memory block the downstream model may execute it.
 _TOOL_CALL_START_PATTERN = re.compile(r"\[TOOL_CALL:", re.IGNORECASE)
 
-# Evidence ids are scoped to the request that produced them (``T1-S1`` = task 1 source 1).
+# Evidence ids are scoped to the request that produced them (``T1-S1``, ``T1-M1``, ``T1-C1``).
 # Injected verbatim they let a new report cite sources it never retrieved.
-_SOURCE_ID_PATTERN = re.compile(r"\[T\d+-S\d+\]")
 
 # Prompt wrapper boundary tags that untrusted memory text must never forge or close.
 _BOUNDARY_TAG_PATTERN = re.compile(

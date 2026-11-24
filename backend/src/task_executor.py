@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterator
 
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
+from services.context_builder import ContextPrefixBuilder
 from services.evidence import (
     EvidenceStore,
     build_task_context,
@@ -20,6 +21,7 @@ from services.evidence import (
     format_evidence_sources,
 )
 from services.evidence_index import EvidenceRetrievalHit
+from services.fact_ledger import FactLedger, render_evidence_index_cards_block
 from services.policy_controller import PolicyStateFeatures, build_policy_controller
 from services.reviewer import ReviewService
 from services.search import classify_search_query_bucket, dispatch_search
@@ -924,8 +926,7 @@ class TaskExecutorMixin:
             }
             for hit in repair_hits[:3]
         ]
-        prompt = (
-            f"研究主题：{state.research_topic}\n"
+        volatile_delta = (
             f"任务标题：{task.title}\n"
             f"任务目标：{task.intent}\n"
             f"当前查询：{task.query}\n"
@@ -939,9 +940,35 @@ class TaskExecutorMixin:
             f"最相关来源：{json.dumps({'source_id': top_item.get('source_id'), 'title': top_item.get('title'), 'url': top_item.get('url')}, ensure_ascii=False)}\n"
             f"建议基线动作：{json.dumps({'action': fallback.action, 'query': fallback.query, 'source_id': fallback.source_id, 'url': fallback.url, 'reason': fallback.reason}, ensure_ascii=False)}"
         )
+        frozen_parts: list[str] = []
+        raw_ledger = getattr(state, "fact_ledger", None)
+        if getattr(self.config, "context_compaction_enabled", True) and raw_ledger:
+            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
+                max_entries=int(getattr(self.config, "fact_ledger_max_entries", 40) or 40),
+            )
+            if ledger_md:
+                frozen_parts.append(ledger_md)
+        raw_cards = getattr(state, "evidence_index_cards", None) or []
+        if getattr(self.config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
+            cards_md = render_evidence_index_cards_block(raw_cards)
+            if cards_md:
+                frozen_parts.append(cards_md)
+        envelope = ContextPrefixBuilder(self.config).build_envelope(
+            stage="task_react",
+            system_role=str(getattr(self.task_react_agent, "system_prompt", "") or ""),
+            research_topic=state.research_topic or "",
+            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            volatile_blocks=[("task_react_delta", volatile_delta)],
+            cache_key_scope="request",
+        )
+        prompt = envelope.to_flat_prompt()
+        run_env = getattr(self.task_react_agent, "run_envelope", None)
 
         try:
-            response = self.task_react_agent.run(prompt)
+            if callable(run_env):
+                response = run_env(envelope, config=self.config)
+            else:
+                response = self.task_react_agent.run(prompt)
         except Exception as exc:
             if observer:
                 observer.record_llm_call(
@@ -949,6 +976,7 @@ class TaskExecutorMixin:
                     prompt_text=prompt,
                     completion_text="",
                     error=exc,
+                    stage="task_react",
                 )
             return fallback
         finally:
@@ -960,6 +988,7 @@ class TaskExecutorMixin:
                 prompt_text=prompt,
                 completion_text=response,
                 usage=extract_llm_usage(self.task_react_agent),
+                stage="task_react",
             )
 
         cleaned = str(response or "").strip()

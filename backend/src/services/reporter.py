@@ -12,13 +12,15 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState
+from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.evidence import (
     derive_grounded_findings_from_evidence,
     extract_citation_ids,
     looks_like_source_label_text,
     render_references,
 )
-from services.text_processing import normalize_agent_markdown
+from services.fact_ledger import FactLedger, render_evidence_index_cards_block
+from services.text_processing import CITATION_PATTERN, normalize_agent_markdown
 from utils import strip_thinking_tokens, truncate_text
 
 _STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
@@ -89,15 +91,28 @@ class ReportingService:
         skill_pack_context: str | None = None,
     ) -> str:
         """Generate a structured report based on completed tasks."""
-        prompt = self._build_prompt(state) + str(skill_pack_context or "")
+        envelope = self._build_envelope(state, skill_pack_context=skill_pack_context)
+        prompt = envelope.to_flat_prompt()
+        run_env = getattr(self._agent, "run_envelope", None)
+        use_envelope = callable(run_env)
 
         try:
             try:
-                response = self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
+                if use_envelope:
+                    response = run_env(
+                        envelope,
+                        config=self._config,
+                        response_format=_STRICT_JSON_RESPONSE_FORMAT,
+                    )
+                else:
+                    response = self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
             except Exception as exc:
                 if not self._response_format_is_unsupported(exc):
                     raise
-                response = self._agent.run(prompt)
+                if use_envelope:
+                    response = run_env(envelope, config=self._config)
+                else:
+                    response = self._agent.run(prompt)
         except Exception as exc:
             if observer:
                 observer.record_llm_call(
@@ -105,6 +120,7 @@ class ReportingService:
                     prompt_text=prompt,
                     completion_text="",
                     error=exc,
+                    stage="report",
                 )
             raise
         finally:
@@ -116,6 +132,7 @@ class ReportingService:
                 prompt_text=prompt,
                 completion_text=response,
                 usage=extract_llm_usage(self._agent),
+                stage="report",
             )
 
         cleaned = response.strip()
@@ -217,7 +234,7 @@ class ReportingService:
             token = match.group(1)
             return match.group(0) if token in valid_source_ids else ""
 
-        cleaned = re.sub(r"\[(T\d+-S\d+)\]", _replace, text)
+        cleaned = CITATION_PATTERN.sub(_replace, text)
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
         return cleaned
 
@@ -240,7 +257,12 @@ class ReportingService:
             chunks.append(buffer)
         return chunks
 
-    def _build_prompt(self, state: SummaryState) -> str:
+    def _build_envelope(
+        self,
+        state: SummaryState,
+        *,
+        skill_pack_context: str | None = None,
+    ) -> PromptEnvelope:
         task_blocks: list[str] = []
         for task in state.todo_items:
             summary_block = truncate_text(
@@ -262,17 +284,56 @@ class ReportingService:
             )
 
         tools_enabled = self._tools_enabled()
-        if self._config.resolved_report_layout_mode() == self._FIXED_LAYOUT_MODE:
-            return self._build_fixed_prompt(
+        layout_mode = self._config.resolved_report_layout_mode()
+        if layout_mode == self._FIXED_LAYOUT_MODE:
+            static_contract = self._build_fixed_prompt(
                 research_topic=state.research_topic,
-                task_blocks=task_blocks,
+                task_blocks=[],
                 tools_enabled=tools_enabled,
             )
-        return self._build_flexible_prompt(
-            research_topic=state.research_topic,
-            task_blocks=task_blocks,
-            tools_enabled=tools_enabled,
+        else:
+            static_contract = self._build_flexible_prompt(
+                research_topic=state.research_topic,
+                task_blocks=[],
+                tools_enabled=tools_enabled,
+            )
+
+        # Strip variable topic & empty placeholder from static schema so prefix remains maximally stable
+        static_schema = re.sub(
+            r"研究主题：[^\n]*\n任务概览：\n\n",
+            "",
+            static_contract,
+            count=1,
         )
+
+        frozen_parts: list[str] = []
+        raw_ledger = getattr(state, "fact_ledger", None)
+        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
+            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
+                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
+            )
+            if ledger_md:
+                frozen_parts.append(ledger_md)
+        raw_cards = getattr(state, "evidence_index_cards", None) or []
+        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
+            cards_md = render_evidence_index_cards_block(raw_cards)
+            if cards_md:
+                frozen_parts.append(cards_md)
+
+        builder = ContextPrefixBuilder(self._config)
+        return builder.build_envelope(
+            stage="report",
+            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            static_schema_and_rules=static_schema,
+            research_topic=state.research_topic or "",
+            skill_pack_context=str(skill_pack_context or "").strip(),
+            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            volatile_blocks=[("report_tasks", f"任务概览：\n{''.join(task_blocks)}")],
+            cache_key_scope="request",
+        )
+
+    def _build_prompt(self, state: SummaryState) -> str:
+        return self._build_envelope(state).to_flat_prompt()
 
     def _tools_enabled(self) -> bool:
         provider = str(getattr(self._config, "llm_provider", "") or "").strip().lower()

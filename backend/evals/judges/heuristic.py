@@ -9,7 +9,7 @@ from evals.judges.base import Judge
 from evals.schema import BenchmarkCase
 
 _CITATION_PATTERN = re.compile(r"https?://[^\s)\]>]+", re.IGNORECASE)
-_SOURCE_ID_PATTERN = re.compile(r"\[(T\d+-S\d+)\]")
+_SOURCE_ID_PATTERN = re.compile(r"\[(T\d+-(?:S|M|C)\d+)\]")
 _HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 
 

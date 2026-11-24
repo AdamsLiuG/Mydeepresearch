@@ -131,12 +131,40 @@ def build_upstream_context(
     all_tasks: Sequence[TodoItem],
     *,
     max_chars: int = 800,
+    fact_ledger: dict[str, Any] | Any | None = None,
+    compact_enabled: bool = True,
 ) -> str:
     """Build concise upstream dependency findings injected into downstream wave execution."""
 
     dep_ids = normalize_depends_on(getattr(task, "depends_on", None))
     if not dep_ids:
         return ""
+
+    entries_by_task: dict[int, list[str]] = {}
+    if compact_enabled and fact_ledger:
+        raw_entries = (
+            fact_ledger.get("entries")
+            if isinstance(fact_ledger, dict)
+            else getattr(fact_ledger, "entries", None)
+        )
+        for item in raw_entries or ():
+            if isinstance(item, dict):
+                tid = int(item.get("task_id") or 0)
+                cid = str(item.get("claim_id") or "").strip()
+                stmt = str(item.get("statement") or "").strip()
+                cites = ",".join(str(s) for s in (item.get("source_ids") or []) if s)
+                conflict = str(item.get("conflict_group_id") or "").strip()
+            else:
+                tid = int(getattr(item, "task_id", 0) or 0)
+                cid = str(getattr(item, "claim_id", "") or "").strip()
+                stmt = str(getattr(item, "statement", "") or "").strip()
+                cites = ",".join(str(s) for s in (getattr(item, "source_ids", ()) or ()) if s)
+                conflict = str(getattr(item, "conflict_group_id", "") or "").strip()
+            if tid and stmt:
+                tag = f" [CONFLICT:{conflict}]" if conflict else ""
+                entries_by_task.setdefault(tid, []).append(
+                    f"  - {cid}{tag} ({cites}): {truncate_text(stmt, 140)}"
+                )
 
     by_id = {int(item.id): item for item in all_tasks}
     blocks: list[str] = []
@@ -147,11 +175,18 @@ def build_upstream_context(
         summary_text = str(upstream.summary or "").strip()
         if not summary_text and isinstance(upstream.summary_payload, dict):
             summary_text = str(upstream.summary_payload.get("executive_summary") or "").strip()
-        if not summary_text:
+        ledger_lines = entries_by_task.get(int(upstream.id), [])
+        if not summary_text and not ledger_lines:
             continue
-        blocks.append(
-            f"- 前置任务 {upstream.id}（{upstream.title}）结论：{truncate_text(summary_text, 280)}"
-        )
+        if summary_text:
+            summary_cap = 180 if ledger_lines else 280
+            blocks.append(
+                f"- 前置任务 {upstream.id}（{upstream.title}）结论：{truncate_text(summary_text, summary_cap)}"
+            )
+        else:
+            blocks.append(f"- 前置任务 {upstream.id}（{upstream.title}）结构化事实：")
+        if ledger_lines:
+            blocks.extend(ledger_lines[:4])
 
     if not blocks:
         return ""

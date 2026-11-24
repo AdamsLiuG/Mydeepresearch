@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -80,6 +81,57 @@ class EvidenceChunk:
     published_at: str | None = None
     archive_doc_key: str | None = None
     archive_version_id: str | None = None
+    page_no: int | None = None
+    bbox: list[float] | None = None
+    anchor_id: str | None = None
+
+
+@dataclass(frozen=True)
+class EvidenceIndexCard:
+    """Lightweight evidence directory pointer for progressive disclosure."""
+
+    source_id: str
+    task_id: int
+    title: str
+    domain: str
+    source_type: str
+    quality_label: str
+    freshness_label: str
+    published_at: str | None
+    has_full_content: bool
+    chunk_count: int
+    char_len: int
+    one_line_gist: str
+    source_origin: str = "web"
+    modality: str = "text"
+    page_no: int | None = None
+
+    def to_compact_line(self) -> str:
+        pub = self.published_at or "unknown"
+        origin_tag = "" if self.source_origin == "web" else f"|{self.source_origin}"
+        return (
+            f"[{self.source_id}{origin_tag}] {self.title} | {self.domain} | "
+            f"{self.quality_label}/{self.freshness_label}/{pub} | "
+            f"chunks={self.chunk_count} | {self.one_line_gist}"
+        )
+
+
+@dataclass
+class ChunkLazyLoadResult:
+    """Chunks fetched lazily by source_id while keeping provenance."""
+
+    source_id: str
+    chunks: list[dict[str, Any]]
+    truncated: bool = False
+    total_available_chunks: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_id": self.source_id,
+            "chunks": list(self.chunks),
+            "truncated": bool(self.truncated),
+            "total_available_chunks": int(self.total_available_chunks),
+        }
 
 
 @dataclass
@@ -431,11 +483,22 @@ def _chunk_text(
 
 
 def _record_text(record: Any) -> str:
+    parts: list[str] = []
     for key in ("full_content", "raw_content", "snippet"):
         value = _clean_structured_text(getattr(record, key, ""))
         if value:
-            return value
-    return ""
+            parts.append(value)
+            break
+
+    blocks = getattr(record, "multimodal_blocks", None) or []
+    for block in blocks:
+        if isinstance(block, dict):
+            btext = _clean_structured_text(block.get("text_representation") or block.get("key_takeaway") or "")
+        else:
+            btext = _clean_structured_text(getattr(block, "text_representation", "") or getattr(block, "key_takeaway", ""))
+        if btext and btext not in "\n".join(parts):
+            parts.append(btext)
+    return "\n\n".join(parts).strip()
 
 
 def _record_has_full_content(record: Any) -> bool:
@@ -480,7 +543,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         request_id: str | None = None,
     ) -> None:
         del request_id
-        if not self.enabled or reason not in {"search", "fetch", "hydrate"}:
+        if not self.enabled or reason not in {"search", "fetch", "hydrate", "mcp", "compute"}:
             return
 
         source_chunks: dict[str, list[EvidenceChunk]] = {}
@@ -582,9 +645,104 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                     published_at=_normalize_text(getattr(record, "published_at", "")) or None,
                     archive_doc_key=_record_archive_doc_key(record),
                     archive_version_id=archive_version_id,
+                    page_no=(
+                        int(getattr(record, "page_no"))
+                        if isinstance(getattr(record, "page_no", None), int)
+                        and not isinstance(getattr(record, "page_no", None), bool)
+                        else None
+                    ),
+                    bbox=(
+                        list(getattr(record, "bbox"))
+                        if isinstance(getattr(record, "bbox", None), list)
+                        else None
+                    ),
+                    anchor_id=_normalize_text(getattr(record, "anchor_id", "")) or None,
                 )
             )
         return chunks
+
+    def chunk_counts_by_source(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with self._lock:
+            for chunk_list in self._chunks_by_task.values():
+                for chunk in chunk_list:
+                    counts[chunk.source_id] = counts.get(chunk.source_id, 0) + 1
+        return counts
+
+    def get_source_chunks(
+        self,
+        *,
+        source_ids: Sequence[str],
+        chunk_indices: Sequence[int] | None = None,
+        max_chunks_per_source: int = 2,
+        char_budget: int = 1800,
+    ) -> list[ChunkLazyLoadResult]:
+        """Lazily hydrate ordered chunks for requested source_ids within a character budget."""
+
+        ordered_ids = [str(sid).strip() for sid in (source_ids or ()) if str(sid).strip()]
+        if not ordered_ids:
+            return []
+        remaining_chars = max(200, int(char_budget or 1800))
+        with self._lock:
+            all_chunks = [c for chunk_list in self._chunks_by_task.values() for c in chunk_list]
+
+        by_source: dict[str, list[EvidenceChunk]] = {}
+        target_set = set(ordered_ids)
+        for chunk in all_chunks:
+            if chunk.source_id in target_set:
+                by_source.setdefault(chunk.source_id, []).append(chunk)
+
+        requested_indices = [int(i) for i in (chunk_indices or ()) if int(i) >= 1]
+        results: list[ChunkLazyLoadResult] = []
+        for sid in ordered_ids:
+            candidates = sorted(by_source.get(sid, []), key=lambda c: c.start_char)
+            if requested_indices:
+                selected = [candidates[idx - 1] for idx in requested_indices if idx <= len(candidates)]
+            else:
+                selected = candidates[: max(1, int(max_chunks_per_source or 1))]
+            packed: list[dict[str, Any]] = []
+            truncated = False
+            for ch in selected:
+                if remaining_chars <= 0:
+                    truncated = True
+                    break
+                if len(ch.text) > remaining_chars:
+                    if remaining_chars >= 120:
+                        entry: dict[str, Any] = {
+                            "chunk_id": ch.chunk_id,
+                            "start_char": ch.start_char,
+                            "end_char": ch.end_char,
+                            "text": ch.text[:remaining_chars],
+                            "has_full_content": ch.has_full_content,
+                        }
+                        if ch.page_no is not None:
+                            entry["page_no"] = ch.page_no
+                        packed.append(entry)
+                    remaining_chars = 0
+                    truncated = True
+                    break
+                entry = {
+                    "chunk_id": ch.chunk_id,
+                    "start_char": ch.start_char,
+                    "end_char": ch.end_char,
+                    "text": ch.text,
+                    "has_full_content": ch.has_full_content,
+                }
+                if ch.page_no is not None:
+                    entry["page_no"] = ch.page_no
+                if ch.anchor_id:
+                    entry["anchor_id"] = ch.anchor_id
+                packed.append(entry)
+                remaining_chars -= len(ch.text)
+            results.append(
+                ChunkLazyLoadResult(
+                    source_id=sid,
+                    chunks=packed,
+                    truncated=truncated,
+                    total_available_chunks=len(candidates),
+                )
+            )
+        return results
 
     def query(
         self,
@@ -594,16 +752,34 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         top_k: int,
         per_source_limit: int = 2,
         max_sources: int = 4,
+        allowed_source_ids: Sequence[str] | None = None,
     ) -> list[EvidenceRetrievalHit]:
         if not self.enabled:
             return []
 
         normalized_query = _clean_text(text)
-        if not normalized_query or task_id <= 0:
+        allowed_set = (
+            {str(sid).strip() for sid in allowed_source_ids if str(sid).strip()}
+            if allowed_source_ids is not None
+            else None
+        )
+        if not normalized_query or (task_id <= 0 and not allowed_set):
+            return []
+        if allowed_set is not None and not allowed_set:
             return []
 
         with self._lock:
-            chunks = list(self._chunks_by_task.get(task_id, []))
+            if allowed_set is not None and task_id <= 0:
+                raw_chunks = [c for chunk_list in self._chunks_by_task.values() for c in chunk_list]
+            else:
+                raw_chunks = list(self._chunks_by_task.get(task_id, []))
+                if allowed_set is not None and not any(c.source_id in allowed_set for c in raw_chunks):
+                    raw_chunks = [c for chunk_list in self._chunks_by_task.values() for c in chunk_list]
+            chunks = (
+                [c for c in raw_chunks if c.source_id in allowed_set]
+                if allowed_set is not None
+                else raw_chunks
+            )
             embeddings = {
                 chunk.chunk_id: self._chunk_embeddings.get(chunk.chunk_id)
                 for chunk in chunks
@@ -821,11 +997,19 @@ class EvidenceMemoryService(EvidenceStoreListener):
         if not self.enabled or reason not in {"search", "fetch"}:
             return
 
+        eligible_records = [
+            record
+            for record in records
+            if str(getattr(record, "source_origin", "web") or "web").strip().lower() not in {"mcp", "sandbox"}
+        ]
+        if not eligible_records:
+            return
+
         with self._lock:
             manifest = self._load_manifest()
             collection = self._get_collection()
             changed = False
-            for record in records:
+            for record in eligible_records:
                 if self._ingest_record_locked(
                     record,
                     manifest=manifest,
@@ -1402,6 +1586,23 @@ class EvidenceRetrievalService:
         self._memory_service = memory_service
         self._config = config
 
+    def get_source_chunks(
+        self,
+        *,
+        source_ids: Sequence[str],
+        chunk_indices: Sequence[int] | None = None,
+        max_chunks_per_source: int = 2,
+        char_budget: int = 1800,
+    ) -> list[ChunkLazyLoadResult]:
+        if self._runtime_index is None:
+            return []
+        return self._runtime_index.get_source_chunks(
+            source_ids=source_ids,
+            chunk_indices=chunk_indices,
+            max_chunks_per_source=max_chunks_per_source,
+            char_budget=char_budget,
+        )
+
     def query(
         self,
         text: str,
@@ -1412,6 +1613,7 @@ class EvidenceRetrievalService:
         top_k: int | None = None,
         request_id: str | None = None,
         observer: RequestTrace | None = None,
+        allowed_source_ids: Sequence[str] | None = None,
     ) -> EvidenceQueryResult:
         normalized_scope = str(scope or "current").strip().lower() or "current"
         if normalized_scope not in {"current", "history", "hybrid"}:
@@ -1432,11 +1634,16 @@ class EvidenceRetrievalService:
         )
         hits: list[EvidenceRetrievalHit] = []
 
-        if normalized_scope in {"current", "hybrid"} and task_id is not None and self._runtime_index is not None:
+        if (
+            normalized_scope in {"current", "hybrid"}
+            and self._runtime_index is not None
+            and (task_id is not None or allowed_source_ids is not None)
+        ):
             current_hits = self._runtime_index.query(
                 text=text,
-                task_id=task_id,
+                task_id=int(task_id or 0),
                 top_k=requested_top_k,
+                allowed_source_ids=allowed_source_ids,
             )
             hits.extend(current_hits)
 

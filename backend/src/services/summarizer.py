@@ -13,11 +13,17 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
+from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.evidence import (
     derive_grounded_findings_from_evidence,
     extract_citation_ids,
     format_evidence_sources,
     looks_like_source_label_text,
+)
+from services.fact_ledger import (
+    FactLedger,
+    FactLedgerCompactor,
+    render_evidence_index_cards_block,
 )
 from services.notes import build_note_guidance
 from services.text_processing import (
@@ -95,23 +101,52 @@ class SummarizationService:
             )
         )
 
-    def _run_with_json_fallback(self, agent: Any, prompt: str) -> str:
+    def _run_with_json_fallback(
+        self,
+        agent: Any,
+        prompt: str,
+        *,
+        envelope: PromptEnvelope | None = None,
+    ) -> str:
+        run_env = getattr(agent, "run_envelope", None)
+        use_envelope = envelope is not None and callable(run_env)
         try:
+            if use_envelope:
+                return run_env(envelope, config=self._config, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
             return agent.run(prompt, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
         except Exception as exc:
             if not self._response_format_is_unsupported(exc):
                 raise
+            if use_envelope:
+                return run_env(envelope, config=self._config)
             return agent.run(prompt)
 
-    def _stream_run_with_json_fallback(self, agent: Any, prompt: str) -> Iterator[str]:
+    def _stream_run_with_json_fallback(
+        self,
+        agent: Any,
+        prompt: str,
+        *,
+        envelope: PromptEnvelope | None = None,
+    ) -> Iterator[str]:
+        stream_env = getattr(agent, "stream_run_envelope", None)
+        use_envelope = envelope is not None and callable(stream_env)
         try:
-            stream = agent.stream_run(prompt, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
+            stream = (
+                stream_env(envelope, config=self._config, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
+                if use_envelope
+                else agent.stream_run(prompt, response_format=self._STRICT_JSON_RESPONSE_FORMAT)
+            )
             for chunk in stream:
                 yield chunk
         except Exception as exc:
             if not self._response_format_is_unsupported(exc):
                 raise
-            for chunk in agent.stream_run(prompt):
+            fallback_stream = (
+                stream_env(envelope, config=self._config)
+                if use_envelope
+                else agent.stream_run(prompt)
+            )
+            for chunk in fallback_stream:
                 yield chunk
 
     @staticmethod
@@ -182,6 +217,7 @@ class SummarizationService:
                     prompt_text=repair_prompt,
                     completion_text="",
                     error=repair_exc,
+                    stage="task_summarization",
                 )
             raise error from repair_exc
 
@@ -191,6 +227,7 @@ class SummarizationService:
                 prompt_text=repair_prompt,
                 completion_text=repair_response,
                 usage=extract_llm_usage(agent),
+                stage="task_summarization",
             )
 
         return self._finalize_summary(repair_response, task, research_topic=state.research_topic)
@@ -206,7 +243,7 @@ class SummarizationService:
     ) -> TaskSummaryResult:
         """Generate a task-specific summary using the summarizer agent."""
         agent = self._agent_factory()
-        prompt = self._build_prompt(
+        envelope = self._build_envelope(
             state,
             task,
             context,
@@ -214,10 +251,11 @@ class SummarizationService:
             skill_pack_context=skill_pack_context,
             tools_enabled=self._tools_enabled(agent),
         )
+        prompt = envelope.to_flat_prompt()
 
         try:
             try:
-                response = self._run_with_json_fallback(agent, prompt)
+                response = self._run_with_json_fallback(agent, prompt, envelope=envelope)
             except Exception as exc:
                 if observer:
                     observer.record_llm_call(
@@ -225,6 +263,7 @@ class SummarizationService:
                         prompt_text=prompt,
                         completion_text="",
                         error=exc,
+                        stage="task_summarization",
                     )
                 raise
 
@@ -234,6 +273,7 @@ class SummarizationService:
                     prompt_text=prompt,
                     completion_text=response,
                     usage=extract_llm_usage(agent),
+                    stage="task_summarization",
                 )
 
             try:
@@ -264,7 +304,7 @@ class SummarizationService:
         """Buffer the raw stream, sanitize it, then emit safe summary chunks."""
 
         agent = self._agent_factory()
-        prompt = self._build_prompt(
+        envelope = self._build_envelope(
             state,
             task,
             context,
@@ -272,6 +312,7 @@ class SummarizationService:
             skill_pack_context=skill_pack_context,
             tools_enabled=self._tools_enabled(agent),
         )
+        prompt = envelope.to_flat_prompt()
         raw_parts: list[str] = []
         result_holder: dict[str, TaskSummaryResult] = {}
         error_holder: dict[str, Exception] = {}
@@ -292,6 +333,7 @@ class SummarizationService:
                     prompt_text=prompt,
                     completion_text=raw_text,
                     usage=extract_llm_usage(agent),
+                    stage="task_summarization",
                 )
                 call_recorded = True
 
@@ -320,7 +362,7 @@ class SummarizationService:
         def generator() -> Iterator[str]:
             nonlocal call_failed, call_recorded
             try:
-                for chunk in self._stream_run_with_json_fallback(agent, prompt):
+                for chunk in self._stream_run_with_json_fallback(agent, prompt, envelope=envelope):
                     if chunk:
                         raw_parts.append(chunk)
                 result = finalize()
@@ -333,6 +375,7 @@ class SummarizationService:
                         prompt_text=prompt,
                         completion_text="".join(raw_parts),
                         error=exc,
+                        stage="task_summarization",
                     )
                     call_recorded = True
                 call_failed = True
@@ -342,7 +385,7 @@ class SummarizationService:
 
         return generator(), finalize
 
-    def _build_prompt(
+    def _build_envelope(
         self,
         state: SummaryState,
         task: TodoItem,
@@ -351,8 +394,7 @@ class SummarizationService:
         historical_memory_context: str | None = None,
         skill_pack_context: str | None = None,
         tools_enabled: bool | None = None,
-    ) -> str:
-        """Construct the summarization prompt shared by both modes."""
+    ) -> PromptEnvelope:
         trimmed_context = truncate_text(
             context,
             self._config.resolved_task_context_char_limit(),
@@ -384,15 +426,7 @@ class SummarizationService:
                 "不要尝试调用任何工具或输出工具调用指令。\n"
             )
 
-        return (
-            f"任务主题：{state.research_topic}\n"
-            f"任务名称：{task.title}\n"
-            f"任务目标：{task.intent}\n"
-            f"检索查询：{task.query}\n"
-            f"可用来源目录：\n{evidence_directory}\n"
-            f"任务上下文：\n{trimmed_context}\n"
-            f"{memory_block}"
-            f"{build_note_guidance(task)}\n"
+        static_rules = (
             f"{tool_guidance}"
             "最终必须只输出 JSON，格式如下：\n"
             "{\n"
@@ -410,8 +444,66 @@ class SummarizationService:
             "5. `evidence_gaps` 仅写证据缺口，不要写工具调用叙述；\n"
             "6. 不允许编造 source_id；\n"
             "7. 最终输出中禁止残留 [TOOL_CALL:...] 指令或自由 Markdown。"
-            + str(skill_pack_context or "")
         )
+
+        frozen_parts: list[str] = []
+        if memory_block.strip():
+            frozen_parts.append(memory_block.strip())
+        raw_ledger = getattr(state, "fact_ledger", None)
+        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
+            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
+                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
+            )
+            if ledger_md:
+                frozen_parts.append(ledger_md)
+        raw_cards = getattr(state, "evidence_index_cards", None) or []
+        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
+            cards_md = render_evidence_index_cards_block(raw_cards)
+            if cards_md:
+                frozen_parts.append(cards_md)
+
+        task_delta = (
+            f"任务主题：{state.research_topic}\n"
+            f"任务名称：{task.title}\n"
+            f"任务目标：{task.intent}\n"
+            f"检索查询：{task.query}\n"
+            f"可用来源目录：\n{evidence_directory}\n"
+            f"任务上下文：\n{trimmed_context}\n"
+            f"{build_note_guidance(task)}"
+        ).strip()
+
+        agent_sys = ""
+        builder = ContextPrefixBuilder(self._config)
+        return builder.build_envelope(
+            stage="task_summarization",
+            system_role=agent_sys,
+            static_schema_and_rules=static_rules,
+            research_topic=state.research_topic or "",
+            skill_pack_context=str(skill_pack_context or "").strip(),
+            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            volatile_blocks=[("task_delta", task_delta)],
+            cache_key_scope="request",
+        )
+
+    def _build_prompt(
+        self,
+        state: SummaryState,
+        task: TodoItem,
+        context: str,
+        *,
+        historical_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
+        tools_enabled: bool | None = None,
+    ) -> str:
+        """Construct the summarization prompt shared by both modes."""
+        return self._build_envelope(
+            state,
+            task,
+            context,
+            historical_memory_context=historical_memory_context,
+            skill_pack_context=skill_pack_context,
+            tools_enabled=tools_enabled,
+        ).to_flat_prompt()
 
     def _finalize_summary(
         self,
@@ -461,6 +553,15 @@ class SummarizationService:
                 "source_ids": list(item["source_ids"]),
                 "support_status": "unreviewed",
             }
+            for item in normalized["key_findings"]
+        ]
+        compactor = FactLedgerCompactor()
+        task.fact_claims = [
+            compactor._structured_from_text(
+                item["text"],
+                list(item["source_ids"]),
+                task,
+            )
             for item in normalized["key_findings"]
         ]
         return TaskSummaryResult(markdown=markdown, payload=normalized, claims=claims)

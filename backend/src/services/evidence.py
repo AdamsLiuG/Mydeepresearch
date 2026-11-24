@@ -48,7 +48,11 @@ from services.evidence_index import (
     EvidenceStoreListener,
 )
 from services.search import dispatch_search
-from services.text_processing import normalize_agent_markdown, strip_citation_markers
+from services.text_processing import (
+    CITATION_PATTERN,
+    normalize_agent_markdown,
+    strip_citation_markers,
+)
 from utils import truncate_text
 
 try:  # pragma: no cover - optional dependency
@@ -75,7 +79,6 @@ TRACKING_QUERY_PARAMS = {
     "ref",
     "ref_src",
 }
-CITATION_PATTERN = re.compile(r"\[(T\d+-S\d+)\]")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 HTML_SCRIPT_PATTERN = re.compile(
     r"<(script|style)\b[^>]*>.*?</\1>",
@@ -172,6 +175,9 @@ SOURCE_TYPE_BONUS = {
     "social_general": -1.0,
     "content_farm_or_aggregator": -2.0,
     "web_general": 0.0,
+    "mcp_filing": 3.5,
+    "mcp_tool": 2.5,
+    "sandbox_computation": 3.5,
 }
 
 PROVIDER_BONUS = {
@@ -1088,9 +1094,19 @@ def is_social_official(ev: Any) -> bool:
 
 
 def detect_source_type(ev: Any) -> str:
+    source_origin = _ev_str(ev, "source_origin").strip().lower()
+    coarse_type = _ev_str(ev, "source_type").strip()
+    if source_origin == "mcp":
+        if coarse_type.startswith("mcp_"):
+            return coarse_type
+        return "mcp_tool"
+    if source_origin == "sandbox":
+        if coarse_type.startswith("sandbox_"):
+            return coarse_type
+        return "sandbox_computation"
+
     domain = extract_domain(_ev_str(ev, "url"))
     url = _ev_str(ev, "url").lower()
-    coarse_type = _ev_str(ev, "source_type")
     if is_aggregator_or_rehosted_copy(ev):
         return "content_farm_or_aggregator"
     if domain.endswith(".gov") or ".gov." in domain:
@@ -1201,7 +1217,7 @@ def _analyze_evidence_quality(ev: Any, now: datetime | None = None) -> dict[str,
 def compute_source_reliability_score(ev: Any) -> float:
     components = _quality_components(ev)
     score = 3.0
-    score += SOURCE_TYPE_BONUS[components["source_type_v2"]]
+    score += SOURCE_TYPE_BONUS.get(components["source_type_v2"], 0.0)
     score += PROVIDER_BONUS[components["provider_count"]]
     if components["official_owner_match"]:
         score += 1.0
@@ -1455,6 +1471,19 @@ class EvidenceRecord:
     archive_doc_key: str | None = None
     archive_version_id: str | None = None
     archive_has_full_content: bool = False
+    source_origin: str = "web"
+    mcp_server_id: str | None = None
+    mcp_tool_name: str | None = None
+    tenant_id: str = "default"
+    provenance_meta: dict[str, Any] = field(default_factory=dict)
+    modality: str = "text"
+    page_no: int | None = None
+    bbox: list[float] | None = None
+    anchor_id: str | None = None
+    multimodal_blocks: list[dict[str, Any]] = field(default_factory=list)
+    derived_from_source_ids: list[str] = field(default_factory=list)
+    computation_artifact: dict[str, Any] | None = None
+    structured_payload: dict[str, Any] | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -1476,6 +1505,8 @@ class EvidenceRecord:
             "backend_sources": list(self.backend_sources or []),
             "provider_count": self.provider_count,
             "source_type": self.source_type,
+            "source_origin": self.source_origin,
+            "modality": self.modality,
             "source_reliability_score": self.source_reliability_score,
             "content_quality_score": self.content_quality_score,
             "quality_score": self.quality_score,
@@ -1491,6 +1522,28 @@ class EvidenceRecord:
             "archive_has_full_content": bool(self.archive_has_full_content),
             "has_full_content": bool(self.full_content),
         }
+        if self.mcp_server_id:
+            payload["mcp_server_id"] = self.mcp_server_id
+        if self.mcp_tool_name:
+            payload["mcp_tool_name"] = self.mcp_tool_name
+        if self.tenant_id and self.tenant_id != "default":
+            payload["tenant_id"] = self.tenant_id
+        if self.provenance_meta:
+            payload["provenance_meta"] = dict(self.provenance_meta)
+        if self.page_no is not None:
+            payload["page_no"] = self.page_no
+        if self.bbox is not None:
+            payload["bbox"] = list(self.bbox)
+        if self.anchor_id:
+            payload["anchor_id"] = self.anchor_id
+        if self.multimodal_blocks:
+            payload["multimodal_blocks"] = list(self.multimodal_blocks)
+        if self.derived_from_source_ids:
+            payload["derived_from_source_ids"] = list(self.derived_from_source_ids)
+        if self.computation_artifact:
+            payload["computation_artifact"] = dict(self.computation_artifact)
+        if self.structured_payload:
+            payload["structured_payload"] = dict(self.structured_payload)
         if include_full_content and self.full_content:
             payload["full_content"] = truncate_text(self.full_content, excerpt_limit * 3)
         return payload
@@ -1690,6 +1743,198 @@ class EvidenceStore:
             self._notify_listeners(task_id=task_id, records=[changed_record], reason="fetch")
         return changed_record.to_dict(include_full_content=True) if changed_record is not None else {}
 
+    def record_mcp_results(
+        self,
+        *,
+        task_id: int,
+        server_id: str,
+        tool_name: str,
+        items: list[dict[str, Any]],
+        query: str = "",
+        tenant_id: str = "default",
+    ) -> list[dict[str, Any]]:
+        """Normalize MCP tool outputs into first-class [Tn-Mm] evidence records."""
+
+        if not items or task_id <= 0:
+            return []
+
+        changed_records: list[EvidenceRecord] = []
+        normalized_tenant = str(tenant_id or "default").strip() or "default"
+        prefix = f"T{task_id}-M"
+        with self._lock:
+            task_ids = self._task_source_ids.setdefault(task_id, [])
+            url_index = self._task_url_index.setdefault(task_id, {})
+            existing_m = [sid for sid in task_ids if sid.startswith(prefix)]
+            next_m = len(existing_m) + 1
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                snippet = str(item.get("snippet") or item.get("content") or item.get("text") or "").strip()
+                raw_content = str(item.get("raw_content") or item.get("full_content") or snippet).strip()
+                if not snippet and not raw_content:
+                    continue
+                if not snippet:
+                    snippet = truncate_text(raw_content, 600)
+                title = str(item.get("title") or f"{server_id}:{tool_name} #{next_m}").strip()
+                url = str(item.get("url") or f"mcp://{server_id}/{tool_name}/{next_m}").strip()
+                dedup_key = _normalize_url(url) or f"mcp::{server_id}::{tool_name}::{title.casefold()}"
+                existing_id = url_index.get(dedup_key)
+                if existing_id and existing_id in self._records_by_id:
+                    rec = self._records_by_id[existing_id]
+                    if len(raw_content) > len(rec.full_content):
+                        rec.full_content = raw_content
+                    if len(snippet) > len(rec.snippet):
+                        rec.snippet = snippet
+                    rec.updated_at = time.time()
+                    _apply_quality_metadata(rec)
+                    changed_records.append(rec)
+                    continue
+
+                source_id = f"{prefix}{next_m}"
+                next_m += 1
+                raw_type = str(item.get("source_type") or "").strip()
+                source_type = raw_type if raw_type.startswith("mcp_") else "mcp_tool"
+                page_no_raw = item.get("page_no")
+                page_no = int(page_no_raw) if isinstance(page_no_raw, int) and not isinstance(page_no_raw, bool) else None
+                rec = EvidenceRecord(
+                    source_id=source_id,
+                    task_id=task_id,
+                    query=query,
+                    title=title,
+                    url=url,
+                    snippet=snippet,
+                    raw_content=raw_content,
+                    full_content=str(item.get("full_content") or "").strip(),
+                    backend=f"mcp:{server_id}",
+                    backend_sources=[f"mcp:{server_id}"],
+                    provider_count=1,
+                    domain=extract_domain(url) or server_id,
+                    source_type=source_type,
+                    source_origin="mcp",
+                    mcp_server_id=server_id,
+                    mcp_tool_name=tool_name,
+                    tenant_id=normalized_tenant,
+                    provenance_meta=dict(item.get("provenance_meta") or {}),
+                    modality=str(item.get("modality") or "text").strip() or "text",
+                    page_no=page_no,
+                    published_at=str(item.get("published_at") or "").strip() or None,
+                    structured_payload=(
+                        dict(item.get("structured_payload"))
+                        if isinstance(item.get("structured_payload"), dict)
+                        else None
+                    ),
+                    created_at=time.time(),
+                    updated_at=time.time(),
+                )
+                _apply_quality_metadata(rec)
+                self._records_by_id[source_id] = rec
+                task_ids.append(source_id)
+                url_index[dedup_key] = source_id
+                changed_records.append(rec)
+
+        if changed_records:
+            self._notify_listeners(task_id=task_id, records=changed_records, reason="mcp")
+        return [rec.to_dict(include_full_content=True) for rec in changed_records]
+
+    def record_computation_evidence(
+        self,
+        *,
+        task_id: int,
+        title: str,
+        summary_text: str,
+        derived_from_source_ids: list[str],
+        computation_artifact: dict[str, Any],
+        structured_payload: dict[str, Any] | None = None,
+        tenant_id: str = "default",
+    ) -> dict[str, Any]:
+        """Record a deterministic sandbox computation result as a [Tn-Cm] citation."""
+
+        if task_id <= 0:
+            raise ValueError("task_id must be positive")
+        prefix = f"T{task_id}-C"
+        normalized_tenant = str(tenant_id or "default").strip() or "default"
+        clean_derived = [str(sid).strip() for sid in (derived_from_source_ids or []) if str(sid).strip()]
+
+        with self._lock:
+            task_ids = self._task_source_ids.setdefault(task_id, [])
+            existing_c = [sid for sid in task_ids if sid.startswith(prefix)]
+            next_c = len(existing_c) + 1
+            source_id = f"{prefix}{next_c}"
+            url = f"sandbox://compute/{task_id}/{next_c}"
+            rec = EvidenceRecord(
+                source_id=source_id,
+                task_id=task_id,
+                query=title,
+                title=title.strip() or f"Sandbox Computation {next_c}",
+                url=url,
+                snippet=truncate_text(summary_text.strip(), 1000),
+                raw_content=summary_text.strip(),
+                full_content=summary_text.strip(),
+                backend="sandbox",
+                backend_sources=["sandbox"],
+                provider_count=1,
+                domain="sandbox.local",
+                source_type="sandbox_computation",
+                source_origin="sandbox",
+                tenant_id=normalized_tenant,
+                modality="computation",
+                derived_from_source_ids=clean_derived,
+                computation_artifact=dict(computation_artifact or {}),
+                structured_payload=dict(structured_payload) if isinstance(structured_payload, dict) else None,
+                created_at=time.time(),
+                updated_at=time.time(),
+            )
+            _apply_quality_metadata(rec)
+            self._records_by_id[source_id] = rec
+            task_ids.append(source_id)
+
+        self._notify_listeners(task_id=task_id, records=[rec], reason="compute")
+        return rec.to_dict(include_full_content=True)
+
+    def list_index_cards(
+        self,
+        *,
+        task_id: int | None = None,
+        max_gist_chars: int = 120,
+    ) -> list[dict[str, Any]]:
+        """Return lightweight pointer cards for progressive disclosure without injecting full text."""
+
+        with self._lock:
+            if task_id is not None:
+                candidate_ids = list(self._task_source_ids.get(task_id, []))
+            else:
+                candidate_ids = [
+                    sid
+                    for tid in sorted(self._task_source_ids.keys())
+                    for sid in self._task_source_ids.get(tid, [])
+                ]
+            cards: list[dict[str, Any]] = []
+            for sid in candidate_ids:
+                rec = self._records_by_id.get(sid)
+                if rec is None:
+                    continue
+                gist_source = (rec.snippet or rec.full_content or rec.raw_content or rec.title).replace("\n", " ").strip()
+                cards.append(
+                    {
+                        "source_id": rec.source_id,
+                        "task_id": rec.task_id,
+                        "source_origin": rec.source_origin,
+                        "modality": rec.modality,
+                        "title": rec.title,
+                        "domain": rec.domain,
+                        "source_type": rec.source_type,
+                        "quality_label": rec.quality_label,
+                        "freshness_label": rec.freshness_label,
+                        "published_at": rec.published_at,
+                        "has_full_content": bool(rec.full_content),
+                        "page_no": rec.page_no,
+                        "char_len": len(rec.full_content or rec.raw_content or rec.snippet or ""),
+                        "one_line_gist": truncate_text(gist_source, max(40, int(max_gist_chars or 120))),
+                    }
+                )
+            return cards
+
     def list_task_evidence(
         self,
         task_id: int,
@@ -1879,6 +2124,43 @@ class EvidenceStore:
                         archive_doc_key=str(item.get("archive_doc_key") or "").strip() or None,
                         archive_version_id=str(item.get("archive_version_id") or "").strip() or None,
                         archive_has_full_content=bool(item.get("archive_has_full_content")),
+                        source_origin=str(item.get("source_origin") or "web").strip() or "web",
+                        mcp_server_id=str(item.get("mcp_server_id") or "").strip() or None,
+                        mcp_tool_name=str(item.get("mcp_tool_name") or "").strip() or None,
+                        tenant_id=str(item.get("tenant_id") or "default").strip() or "default",
+                        provenance_meta=(
+                            dict(item.get("provenance_meta"))
+                            if isinstance(item.get("provenance_meta"), dict)
+                            else {}
+                        ),
+                        modality=str(item.get("modality") or "text").strip() or "text",
+                        page_no=(
+                            int(item.get("page_no"))
+                            if isinstance(item.get("page_no"), int) and not isinstance(item.get("page_no"), bool)
+                            else None
+                        ),
+                        bbox=list(item.get("bbox")) if isinstance(item.get("bbox"), list) else None,
+                        anchor_id=str(item.get("anchor_id") or "").strip() or None,
+                        multimodal_blocks=(
+                            list(item.get("multimodal_blocks"))
+                            if isinstance(item.get("multimodal_blocks"), list)
+                            else []
+                        ),
+                        derived_from_source_ids=[
+                            str(sid).strip()
+                            for sid in (item.get("derived_from_source_ids") or [])
+                            if str(sid).strip()
+                        ],
+                        computation_artifact=(
+                            dict(item.get("computation_artifact"))
+                            if isinstance(item.get("computation_artifact"), dict)
+                            else None
+                        ),
+                        structured_payload=(
+                            dict(item.get("structured_payload"))
+                            if isinstance(item.get("structured_payload"), dict)
+                            else None
+                        ),
                         created_at=time.time(),
                         updated_at=time.time(),
                     )
@@ -2357,8 +2639,11 @@ class EvidenceLookupTool(Tool):
             ToolParameter(name="source_ids", type="string", description="多个来源 ID", required=False),
             ToolParameter(name="query", type="string", description="检索查询", required=False),
             ToolParameter(name="top_k", type="integer", description="返回的 chunk 命中数量", required=False),
+            ToolParameter(name="chunk_indices", type="string", description="可选 chunk 序号列表（1-based），如 1,2", required=False),
+            ToolParameter(name="max_chunks_per_source", type="integer", description="每个来源最多返回 chunk 数", required=False),
+            ToolParameter(name="char_budget", type="integer", description="lazy_chunks 模式总字符上限", required=False),
             ToolParameter(name="scope", type="string", description="current | history | hybrid", required=False),
-            ToolParameter(name="mode", type="string", description="grounding | lead | repair", required=False),
+            ToolParameter(name="mode", type="string", description="grounding | lead | repair | index_cards | lazy_chunks", required=False),
         ]
 
     def run(self, parameters: dict[str, Any]) -> str:
@@ -2382,6 +2667,52 @@ class EvidenceLookupTool(Tool):
         include_full_content = bool(parameters.get("include_full_content", False))
         limit = int(parameters.get("limit") or 0) or None
         query_text = str(parameters.get("query") or "").strip()
+        mode = str(parameters.get("mode") or "grounding").strip().lower() or "grounding"
+
+        if mode == "index_cards":
+            cards = self._evidence_store.list_index_cards(task_id=task_id)
+            if limit is not None:
+                cards = cards[: max(0, limit)]
+            return json.dumps({"mode": "index_cards", "index_cards": cards}, ensure_ascii=False)
+
+        if mode == "lazy_chunks":
+            raw_indices = parameters.get("chunk_indices")
+            parsed_indices: list[int] | None = None
+            if isinstance(raw_indices, list):
+                parsed_indices = [int(i) for i in raw_indices if str(i).strip().isdigit()]
+            elif isinstance(raw_indices, str) and raw_indices.strip():
+                parsed_indices = [
+                    int(tok.strip())
+                    for tok in re.split(r"[\s,]+", raw_indices)
+                    if tok.strip().isdigit()
+                ]
+            target_ids = normalized_source_ids or [
+                card["source_id"]
+                for card in self._evidence_store.list_index_cards(task_id=task_id)[: (limit or 6)]
+            ]
+            max_chunks = max(1, int(parameters.get("max_chunks_per_source") or 2))
+            char_budget = max(200, int(parameters.get("char_budget") or 1800))
+            if self._retrieval_service is not None and hasattr(self._retrieval_service, "get_source_chunks"):
+                lazy_results = self._retrieval_service.get_source_chunks(
+                    source_ids=target_ids,
+                    chunk_indices=parsed_indices,
+                    max_chunks_per_source=max_chunks,
+                    char_budget=char_budget,
+                )
+                return json.dumps(
+                    {
+                        "mode": "lazy_chunks",
+                        "results": [item.to_dict() for item in lazy_results],
+                    },
+                    ensure_ascii=False,
+                )
+            fallback_items = self._evidence_store.lookup(
+                task_id=task_id,
+                source_ids=target_ids or None,
+                include_full_content=True,
+                limit=limit,
+            )
+            return json.dumps({"mode": "lazy_chunks", "evidence": fallback_items}, ensure_ascii=False)
 
         evidence = self._evidence_store.lookup(
             task_id=task_id,
@@ -2394,9 +2725,10 @@ class EvidenceLookupTool(Tool):
                 query_text,
                 task_id=task_id,
                 scope=str(parameters.get("scope") or "current").strip() or "current",
-                mode=str(parameters.get("mode") or "grounding").strip() or "grounding",
+                mode=mode,
                 top_k=int(parameters.get("top_k") or 0) or None,
                 request_id=self._request_id_getter() if self._request_id_getter else None,
+                allowed_source_ids=normalized_source_ids or None,
             )
             return json.dumps(
                 {

@@ -18,7 +18,9 @@ from prompts import (
     supplemental_planner_instructions,
     todo_planner_instructions,
 )
+from services.context_builder import ContextPrefixBuilder, PromptEnvelope
 from services.dag_scheduler import normalize_depends_on, sanitize_task_dependencies
+from services.fact_ledger import FactLedger, render_evidence_index_cards_block
 from utils import strip_thinking_tokens
 
 logger = logging.getLogger(__name__)
@@ -103,14 +105,22 @@ class PlanningService:
         skill_pack_context: str | None = None,
     ) -> List[TodoItem]:
         """Ask the planner agent to break the topic into actionable tasks."""
-        prompt = todo_planner_instructions.format(
+        body_prompt = todo_planner_instructions.format(
             current_date=get_current_date(),
             research_topic=state.research_topic,
         )
-        prompt += self._historical_memory_block(historical_memory_context)
-        prompt += self._strategy_memory_block(strategy_memory_context)
-        prompt += str(skill_pack_context or "")
-        response = self._invoke_planner(prompt, observer=observer)
+        envelope = self._build_planner_envelope(
+            state,
+            body_prompt=body_prompt,
+            historical_memory_context=historical_memory_context,
+            strategy_memory_context=strategy_memory_context,
+            skill_pack_context=skill_pack_context,
+        )
+        response = self._invoke_planner(
+            envelope.to_flat_prompt(),
+            observer=observer,
+            envelope=envelope,
+        )
         logger.info("Planner raw output (truncated): %s", response[:500])
 
         raw_tasks = self._extract_tasks(response)
@@ -122,7 +132,16 @@ class PlanningService:
                 rejected_count,
             )
             repair_prompt = self._build_repair_prompt(state.research_topic, response)
-            repaired_response = self._invoke_planner(repair_prompt, observer=observer)
+            repair_envelope = self._build_planner_envelope(
+                state,
+                body_prompt=repair_prompt,
+                skill_pack_context=skill_pack_context,
+            )
+            repaired_response = self._invoke_planner(
+                repair_envelope.to_flat_prompt(),
+                observer=observer,
+                envelope=repair_envelope,
+            )
             logger.info("Planner repaired output (truncated): %s", repaired_response[:500])
             repaired_tasks, _ = self._sanitize_tasks(
                 self._extract_tasks(repaired_response),
@@ -186,7 +205,7 @@ class PlanningService:
             return []
 
         next_id = max((task.id for task in existing_tasks), default=0) + 1
-        prompt = supplemental_planner_instructions.format(
+        body_prompt = supplemental_planner_instructions.format(
             current_date=get_current_date(),
             research_topic=state.research_topic,
             starting_task_id=next_id,
@@ -199,9 +218,17 @@ class PlanningService:
             or "- 无明确缺失维度",
             max_additional_tasks=max_additional_tasks,
         )
-        prompt += self._historical_memory_block(historical_memory_context)
-        prompt += str(skill_pack_context or "")
-        response = self._invoke_planner(prompt, observer=observer)
+        envelope = self._build_planner_envelope(
+            state,
+            body_prompt=body_prompt,
+            historical_memory_context=historical_memory_context,
+            skill_pack_context=skill_pack_context,
+        )
+        response = self._invoke_planner(
+            envelope.to_flat_prompt(),
+            observer=observer,
+            envelope=envelope,
+        )
         logger.info("Supplemental planner raw output (truncated): %s", response[:500])
 
         raw_tasks = self._extract_tasks(response)
@@ -252,7 +279,7 @@ class PlanningService:
         next_id = max((task.id for task in existing_tasks), default=0) + 1
         next_round = max((task.round for task in existing_tasks), default=1) + 1
         review_summary = state.review_summary or {}
-        prompt = report_repair_task_prompt.format(
+        body_prompt = report_repair_task_prompt.format(
             current_date=get_current_date(),
             research_topic=state.research_topic,
             starting_task_id=next_id,
@@ -279,9 +306,17 @@ class PlanningService:
             or "- 无待修补问题",
             max_additional_tasks=max_additional_tasks,
         )
-        prompt += self._historical_memory_block(historical_memory_context)
-        prompt += str(skill_pack_context or "")
-        response = self._invoke_planner(prompt, observer=observer)
+        envelope = self._build_planner_envelope(
+            state,
+            body_prompt=body_prompt,
+            historical_memory_context=historical_memory_context,
+            skill_pack_context=skill_pack_context,
+        )
+        response = self._invoke_planner(
+            envelope.to_flat_prompt(),
+            observer=observer,
+            envelope=envelope,
+        )
         logger.info("Repair planner raw output (truncated): %s", response[:500])
 
         raw_tasks = self._extract_tasks(response)
@@ -999,20 +1034,75 @@ class PlanningService:
             return line
         return ""
 
+    def _build_planner_envelope(
+        self,
+        state: SummaryState,
+        *,
+        body_prompt: str,
+        historical_memory_context: str | None = None,
+        strategy_memory_context: str | None = None,
+        skill_pack_context: str | None = None,
+    ) -> PromptEnvelope:
+        frozen_parts: list[str] = []
+        hist_block = self._historical_memory_block(historical_memory_context).strip()
+        if hist_block:
+            frozen_parts.append(hist_block)
+        strat_block = self._strategy_memory_block(strategy_memory_context).strip()
+        if strat_block:
+            frozen_parts.append(strat_block)
+
+        raw_ledger = getattr(state, "fact_ledger", None)
+        if getattr(self._config, "context_compaction_enabled", True) and raw_ledger:
+            ledger_md = FactLedger.from_dict(raw_ledger).render_frozen_markdown(
+                max_entries=int(getattr(self._config, "fact_ledger_max_entries", 40) or 40),
+            )
+            if ledger_md:
+                frozen_parts.append(ledger_md)
+
+        raw_cards = getattr(state, "evidence_index_cards", None) or []
+        if getattr(self._config, "evidence_pointer_disclosure_enabled", True) and raw_cards:
+            cards_md = render_evidence_index_cards_block(raw_cards)
+            if cards_md:
+                frozen_parts.append(cards_md)
+
+        builder = ContextPrefixBuilder(self._config)
+        return builder.build_envelope(
+            stage="planning",
+            system_role=str(getattr(self._agent, "system_prompt", "") or ""),
+            research_topic=state.research_topic or "",
+            skill_pack_context=str(skill_pack_context or "").strip(),
+            frozen_index_and_ledger="\n\n".join(frozen_parts),
+            volatile_blocks=[("planning_delta", body_prompt)],
+            cache_key_scope="request",
+        )
+
     def _invoke_planner(
         self,
         prompt: str,
         *,
         observer: RequestTrace | None = None,
+        envelope: PromptEnvelope | None = None,
     ) -> str:
+        run_env = getattr(self._agent, "run_envelope", None)
+        use_envelope = envelope is not None and callable(run_env)
         try:
             try:
-                response = self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
+                if use_envelope:
+                    response = run_env(
+                        envelope,
+                        config=self._config,
+                        response_format=_STRICT_JSON_RESPONSE_FORMAT,
+                    )
+                else:
+                    response = self._agent.run(prompt, response_format=_STRICT_JSON_RESPONSE_FORMAT)
             except Exception as exc:
                 if not self._response_format_is_unsupported(exc):
                     raise
                 logger.info("Planner JSON mode unsupported; retrying without response_format: %s", exc)
-                response = self._agent.run(prompt)
+                if use_envelope:
+                    response = run_env(envelope, config=self._config)
+                else:
+                    response = self._agent.run(prompt)
         except Exception as exc:
             if observer:
                 observer.record_llm_call(
@@ -1020,6 +1110,7 @@ class PlanningService:
                     prompt_text=prompt,
                     completion_text="",
                     error=exc,
+                    stage="planning",
                 )
             raise
         else:
@@ -1029,6 +1120,7 @@ class PlanningService:
                     prompt_text=prompt,
                     completion_text=response,
                     usage=extract_llm_usage(self._agent),
+                    stage="planning",
                 )
             return response
         finally:
