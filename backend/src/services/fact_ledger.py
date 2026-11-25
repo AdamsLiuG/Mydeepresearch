@@ -199,6 +199,7 @@ class FactLedgerCompactor:
         tasks: list[Any],
         *,
         valid_source_ids: set[str] | None = None,
+        evidence_store: Any | None = None,
     ) -> FactLedger:
         ledger = deepcopy(existing_ledger) if existing_ledger is not None else FactLedger()
         before = {entry.claim_id: entry.to_dict() for entry in ledger.entries}
@@ -207,6 +208,26 @@ class FactLedgerCompactor:
             (int(entry.claim_id[2:]) for entry in ledger.entries if re.fullmatch(r"C-[0-9]+", entry.claim_id)),
             default=0,
         ) + 1
+        if getattr(evidence_store, "web_extraction_enabled", False):
+            if valid_source_ids is None:
+                valid_source_ids = {item["source_id"] for item in evidence_store.lookup()}
+            valid_source_ids = {
+                sid for sid in valid_source_ids if evidence_store.is_eligible_for_facts(sid)
+            }
+            # Existing facts cannot keep an unsupported primary or corroborating claim.
+            ledger.entries = [
+                entry for entry in ledger.entries
+                if entry.source_ids and set(entry.source_ids) <= valid_source_ids
+            ]
+            for group_id, claim_ids in list(ledger.conflict_groups.items()):
+                members = [entry for entry in ledger.entries if entry.claim_id in claim_ids]
+                if len(members) > 1:
+                    ledger.conflict_groups[group_id] = [entry.claim_id for entry in members]
+                else:
+                    del ledger.conflict_groups[group_id]
+                    for entry in members:
+                        entry.conflict_group_id = None
+                        entry.stance = "supported"
         for entry in ledger.entries:
             indexed_keys.setdefault(self._fact_key(entry.to_dict()), []).append(entry)
 
@@ -253,7 +274,7 @@ class FactLedgerCompactor:
 
         after = [entry.to_dict() for entry in ledger.entries]
         changed = [row for row in after if before.get(row["claim_id"]) != row]
-        if changed:
+        if changed or len(after) != len(before):
             ledger.prior_revisions.extend(
                 before[row["claim_id"]] for row in changed if row["claim_id"] in before
             )
@@ -414,6 +435,8 @@ def build_evidence_index_cards(
     if evidence_store is None or not hasattr(evidence_store, "list_index_cards"):
         return []
     cards = evidence_store.list_index_cards(task_id=task_id)
+    if getattr(evidence_store, "web_extraction_enabled", False):
+        cards = [card for card in cards if evidence_store.is_eligible_for_facts(card["source_id"])]
     chunk_counts = (
         runtime_index.chunk_counts_by_source()
         if runtime_index is not None and hasattr(runtime_index, "chunk_counts_by_source")

@@ -1,6 +1,9 @@
 import sys
 import unittest
 from pathlib import Path
+from time import monotonic
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
@@ -8,10 +11,59 @@ if str(BACKEND_SRC) not in sys.path:
 
 from config import Configuration
 from models import SummaryState, TodoItem
+from services.evidence import EvidenceStore
 from services.reviewer import ReviewService
+from services.web_extractor import ExtractionContext, WebExtractor
+from services.web_fetch_gateway import FetchedDocument, FetchScope
 
 
 class ReviewerTests(unittest.TestCase):
+    def test_enabled_numeric_fallback_uses_visible_table_rows_and_units(self):
+        store = EvidenceStore(web_extraction_enabled=True)
+        url = "https://example.org/results"
+        store.record_search_results(task_id=1, query="sales", backend="fixture", search_payload={
+            "results": [{"url": url, "content": "Sales reached $91 million in 2025."}],
+        })
+        document = FetchedDocument(
+            url, "text/html",
+            b'<main><table><caption>Units: USD million</caption><tr><th>Year</th><th>Sales</th></tr>'
+            b'<tr><td>2025</td><td>38</td></tr><tr><td>2024</td><td>19</td></tr></table></main>',
+        )
+        extractor = WebExtractor(gateway=SimpleNamespace(fetch=lambda *args, **kwargs: document))
+        artifact = extractor.extract(
+            url, context=ExtractionContext("default", "request", 1, FetchScope(monotonic() + 5)),
+        )
+        saved = store.update_full_content(
+            task_id=1, source_id="T1-S1", url=url, title="", full_content="", web_result=artifact,
+        )
+        self.assertTrue(store.is_eligible_for_facts("T1-S1"))
+        numeric = ReviewService._normalized_numeric_fallback
+        self.assertIsNone(numeric("Sales reached $38 million in 2025.", [saved], web_extraction_enabled=True))
+        self.assertIsNotNone(numeric("Sales reached $19 million in 2025.", [saved], web_extraction_enabled=True))
+        self.assertIsNotNone(numeric("Sales reached $91 million in 2025.", [saved], web_extraction_enabled=True))
+
+    def test_enabled_l0_is_excluded_from_coverage_and_numeric_grounding(self):
+        config = Configuration.from_env(overrides={"review_agent_enabled": False}, load_env_file=False)
+        store = EvidenceStore(web_extraction_enabled=True)
+        items = store.record_search_results(task_id=1, query="measurements", backend="fixture", search_payload={
+            "results": [{"url": "https://example.org", "content": "The device reduced latency by 91%."}],
+        })
+        task = TodoItem(
+            id=1, title="Benchmark", intent="Check latency", query="latency", status="completed",
+            summary="- The device reduced latency by 91% [T1-S1]",
+            evidence_items=[{**items[0], "full_content": "untrusted-state-body"}],
+        )
+        state = SummaryState(research_topic="Measurements", todo_items=[task])
+        numeric = Mock(return_value=(True, ""))
+        reviewer = ReviewService(None, config, evidence_store=store, claim_verifier=numeric)
+        reviewer.review_request(state)
+        numeric.assert_not_called()
+        self.assertEqual(task.claims[0]["support_status"], "invalid_citation")
+        self.assertIn("weak_evidence", {issue["check"] for issue in task.review_issues})
+        prompt = reviewer._build_prompt(state, [])
+        self.assertIn("<WEB_EVIDENCE_DATA", prompt)
+        self.assertNotIn("untrusted-state-body", prompt)
+
     def test_review_service_flags_missing_and_invalid_citations(self):
         config = Configuration.from_env(
             overrides={

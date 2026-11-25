@@ -9,9 +9,129 @@ if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
 import config
+from metrics import MetricsRegistry
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_v4_web_extractor_defaults_disable_dynamic_extraction(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = config.Configuration.from_env(load_env_file=False)
+
+        self.assertFalse(cfg.v4_web_extractor_enabled)
+        self.assertFalse(cfg.v4_browser_use_enabled)
+        self.assertEqual(cfg.v4_web_l2_adapter, "off")
+        self.assertEqual(cfg.v4_web_extractor_tenants, [])
+        self.assertEqual(cfg.v4_web_l2_origin_rules, {})
+        self.assertEqual(cfg.v4_web_l2_max_concurrency, 2)
+        self.assertEqual(cfg.v4_web_l2_per_tenant, 1)
+        self.assertEqual(cfg.v4_web_l2_timeout_seconds, 12)
+        self.assertIsNone(cfg.v4_web_config_reason)
+
+    def test_v4_web_extractor_alias_applies_only_when_canonical_key_is_absent(self):
+        with patch.dict(os.environ, {"V4_WEB_EXTRACTION_ENABLED": "true"}, clear=True):
+            legacy = config.Configuration.from_env(load_env_file=False)
+            matching = config.Configuration.from_env(
+                overrides={"v4_web_extractor_enabled": True}, load_env_file=False,
+            )
+            with self.assertLogs("config", level="WARNING") as logs:
+                conflict = config.Configuration.from_env(
+                    overrides={"v4_web_extractor_enabled": False}, load_env_file=False,
+                )
+
+        self.assertTrue(legacy.v4_web_extractor_enabled)
+        self.assertTrue(matching.v4_web_extractor_enabled)
+        self.assertFalse(conflict.v4_web_extractor_enabled)
+        self.assertEqual(conflict.v4_web_config_reason, "web_extractor_alias_conflict")
+        self.assertIn("web_extractor_alias_conflict", logs.output[0])
+
+        with patch.dict(
+            os.environ,
+            {"V4_WEB_EXTRACTOR_ENABLED": "true", "V4_WEB_EXTRACTION_ENABLED": "false"},
+            clear=True,
+        ), self.assertLogs("config", level="WARNING"):
+            conflict = config.Configuration.from_env(load_env_file=False)
+        self.assertFalse(conflict.v4_web_extractor_enabled)
+        self.assertEqual(conflict.v4_web_config_reason, "web_extractor_alias_conflict")
+
+    def test_v4_web_extractor_accepts_trusted_reader_settings_and_keeps_them_private(self):
+        env = {
+            "V4_WEB_EXTRACTOR_ENABLED": "true",
+            "V4_WEB_L2_ADAPTER": "reader_http",
+            "V4_WEB_EXTRACTOR_TENANTS": '["private-tenant"]',
+            "V4_WEB_L2_ORIGIN_RULES": '{"private-tenant":[{"origin":"https://document.example.org"}]}',
+            "V4_WEB_READER_URL": "https://reader.example.org/read",
+            "V4_WEB_READER_TOKEN": "secret-reader-token",
+            "V4_WEB_L2_MAX_CONCURRENCY": "1",
+            "V4_WEB_L2_TIMEOUT_SECONDS": "0.5",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = config.Configuration.from_env(load_env_file=False)
+
+        self.assertTrue(cfg.v4_web_extractor_enabled)
+        self.assertEqual(cfg.v4_web_l2_adapter, "reader_http")
+        self.assertFalse(cfg.v4_browser_use_enabled)
+        self.assertEqual(cfg.v4_web_extractor_tenants, ["private-tenant"])
+        self.assertEqual(cfg.v4_web_l2_origin_rules["private-tenant"][0]["origin"], "https://document.example.org")
+        self.assertEqual(cfg.v4_web_reader_url, "https://reader.example.org/read")
+        self.assertEqual(cfg.v4_web_reader_token, "secret-reader-token")
+        self.assertEqual(cfg.v4_web_l2_max_concurrency, 1)
+        self.assertEqual(cfg.v4_web_l2_timeout_seconds, 0.5)
+        self.assertIsNone(cfg.v4_web_config_reason)
+        for output in (str(cfg), repr(cfg), str(cfg.model_dump()), cfg.model_dump_json()):
+            for value in ("private-tenant", "document.example.org", "reader.example.org", "secret-reader-token"):
+                self.assertNotIn(value, output)
+
+    def test_invalid_v4_web_extractor_settings_fail_closed(self):
+        for field, value, reason in (
+            ("v4_web_extractor_enabled", "", "invalid_web_extractor_enabled"),
+            ("v4_web_extractor_enabled", None, "invalid_web_extractor_enabled"),
+            ("v4_web_extractor_tenants", ["default", 7], "invalid_web_extractor_tenants"),
+            ("v4_web_extractor_tenants", ["*"], "invalid_web_extractor_tenants"),
+        ):
+            with self.subTest(field=field, value=value), self.assertLogs("config", level="WARNING"):
+                cfg = config.Configuration.model_validate({"v4_web_extractor_enabled": True, field: value})
+                self.assertFalse(cfg.v4_web_extractor_enabled)
+                self.assertEqual(cfg.v4_web_l2_adapter, "off")
+                self.assertEqual(cfg.v4_web_config_reason, reason)
+
+    def test_invalid_v4_dynamic_settings_preserve_static_extraction(self):
+        settings = {
+            "v4_web_extractor_enabled": True,
+            "v4_web_extractor_tenants": ["default"],
+            "v4_web_l2_origin_rules": {"default": [{"origin": "https://example.org"}]},
+            "v4_web_l2_adapter": "reader_http",
+            "v4_web_reader_url": "https://reader.example.org/read",
+            "v4_web_reader_token": "valid-secret-token",
+        }
+        for field, value, reason in (
+            ("v4_web_l2_adapter", "", "invalid_web_l2_adapter"),
+            ("v4_web_l2_adapter", 123, "invalid_web_l2_adapter"),
+            ("v4_browser_use_enabled", "sometimes", "invalid_browser_use_enabled"),
+            ("v4_web_l2_origin_rules", "", "invalid_web_l2_origin_rules"),
+            ("v4_web_l2_origin_rules", {"default": [{"origin": "https://*.example.org"}]}, "invalid_web_l2_origin_rules"),
+            ("v4_web_l2_origin_rules", {"default": [{"origin": "https://example.org", "path_prefix": "/a/%2Fb"}]}, "invalid_web_l2_origin_rules"),
+            ("v4_web_reader_url", "http://reader.example.org/read", "invalid_web_reader_url"),
+            ("v4_web_reader_url", "", "invalid_web_reader_url"),
+            ("v4_web_reader_token", "", "invalid_web_reader_token"),
+            ("v4_web_reader_token", "secret\r\nHeader", "invalid_web_reader_token"),
+            ("v4_web_l2_max_concurrency", 0, "invalid_web_l2_limits"),
+            ("v4_web_l2_max_concurrency", "3", "invalid_web_l2_limits"),
+            ("v4_web_l2_per_tenant", True, "invalid_web_l2_limits"),
+            ("v4_web_l2_per_tenant", 2, "invalid_web_l2_limits"),
+            ("v4_web_l2_timeout_seconds", "nan", "invalid_web_l2_limits"),
+            ("v4_web_l2_timeout_seconds", 12.1, "invalid_web_l2_limits"),
+            ("v4_web_l2_timeout_seconds", "", "invalid_web_l2_limits"),
+        ):
+            with self.subTest(field=field, value=value), self.assertLogs("config", level="WARNING") as logs:
+                with patch.dict(os.environ, {}, clear=True):
+                    cfg = config.Configuration.from_env(
+                        overrides={**settings, field: value}, load_env_file=False,
+                    )
+                self.assertTrue(cfg.v4_web_extractor_enabled)
+                self.assertEqual(cfg.v4_web_l2_adapter, "off")
+                self.assertEqual(cfg.v4_web_config_reason, reason)
+                self.assertNotIn("secret", logs.output[0])
+
     def test_relative_notes_workspace_resolves_under_backend_root(self):
         with patch.dict(os.environ, {}, clear=True):
             cfg = config.Configuration.from_env(
@@ -318,6 +438,43 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(cfg_tiered.fast_llm_provider, "vllm")
             self.assertEqual(cfg_tiered.fast_llm_base_url, "http://localhost:8002/v1")
             self.assertAlmostEqual(cfg_tiered.fast_llm_temperature, 0.1)
+
+
+class WebExtractionMetricsTests(unittest.TestCase):
+    def test_web_extraction_metrics_only_publish_observed_finite_labels(self):
+        registry = MetricsRegistry()
+        original = registry.snapshot()
+        registry.record_web_extraction("result", tier="L1", adapter="static", outcome="degraded")
+        registry.record_web_extraction("http_attempt", adapter="reader_http", kind="reader_service")
+        registry.record_web_extraction("degraded", reason="timeout")
+        registry.record_web_extraction("sanitizer_dropped_text", amount=4)
+        registry.record_web_extraction("elapsed", adapter="static", elapsed_ms=10.5)
+        registry.record_web_extraction("elapsed", adapter="static", elapsed_ms=2.5)
+        registry.record_web_extraction("l2_inflight", amount=1)
+        registry.record_web_extraction("result", tier="L1", adapter="https://private.example.org", outcome="success")
+        registry.record_web_extraction("egress_denied", reason="private-tenant")
+        registry.record_web_extraction("queue", adapter="static", elapsed_ms=float("nan"))
+
+        updated = registry.snapshot()
+        self.assertNotIn("web_extraction", original)
+        self.assertEqual(updated["counters"]["web_extraction_result_total"], 1)
+        self.assertEqual(updated["counters"]["web_extraction_http_attempt_total"], 1)
+        self.assertEqual(updated["counters"]["web_extraction_degraded_total"], 1)
+        self.assertEqual(updated["counters"]["web_extraction_sanitizer_dropped_text_total"], 4)
+        self.assertNotIn("web_extraction_egress_denied_total", updated["counters"])
+        self.assertNotIn("web_extraction_queue_ms", updated["latencies_ms"])
+        self.assertEqual(updated["latencies_ms"]["web_extraction_elapsed_ms"]["avg_ms"], 6.5)
+        self.assertEqual(updated["web_extraction"]["web_extraction_result_total"], [
+            {"tier": "L1", "adapter": "static", "outcome": "degraded", "count": 1},
+        ])
+        self.assertEqual(updated["web_extraction"]["web_extraction_l2_inflight"], 1)
+        self.assertNotIn("private", str(updated))
+
+        registry.record_web_extraction("l2_inflight", amount=-1)
+        self.assertEqual(registry.snapshot()["web_extraction"]["web_extraction_l2_inflight"], 0)
+        registry.reset()
+        self.assertNotIn("web_extraction", registry.snapshot())
+        self.assertEqual(registry.snapshot()["counters"], original["counters"])
 
 
 if __name__ == "__main__":

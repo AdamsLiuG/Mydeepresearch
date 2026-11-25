@@ -1,16 +1,91 @@
 import json
+import logging
 import os
+import re
+from copy import deepcopy
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _DOTENV_PATH = _BACKEND_ROOT / ".env"
 _DOTENV_LOADED = False
+_LOGGER = logging.getLogger(__name__)
+_BOOLEAN_ADAPTER = TypeAdapter(bool)
+_WEB_EXTRACTOR_ALIAS = "v4_web_extraction_enabled"
+_WEB_L2_LIMITS: dict[str, tuple[type[int] | type[float], int]] = {
+    "v4_web_l2_max_concurrency": (int, 2),
+    "v4_web_l2_per_tenant": (int, 1),
+    "v4_web_l2_timeout_seconds": (float, 12),
+}
+_WEB_BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/\-]+={0,2}")
+WebConfigReason = Literal[
+    "invalid_web_extractor_enabled",
+    "web_extractor_alias_conflict",
+    "invalid_web_extractor_tenants",
+    "invalid_web_l2_adapter",
+    "invalid_browser_use_enabled",
+    "invalid_web_l2_origin_rules",
+    "invalid_web_reader_url",
+    "invalid_web_reader_token",
+    "invalid_web_l2_limits",
+]
+
+
+def _web_bool(value: Any) -> bool:
+    if type(value) not in (bool, str):
+        raise ValueError("invalid web extraction switch")
+    return _BOOLEAN_ADAPTER.validate_python(value.strip() if isinstance(value, str) else value)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate web extraction configuration key")
+    return result
+
+
+def _web_structured(value: Any, expected: type[list] | type[dict]) -> Any:
+    if isinstance(value, str):
+        value = json.loads(value, object_pairs_hook=_unique_json_object)
+    if not isinstance(value, expected):
+        raise ValueError("invalid web extraction configuration shape")
+    return value
+
+
+def _web_tenants(value: Any) -> list[str]:
+    tenants = _web_structured(value, list)
+    if any(
+        not isinstance(tenant, str)
+        or not tenant
+        or tenant != tenant.strip()
+        or not tenant.isprintable()
+        or "*" in tenant
+        for tenant in tenants
+    ):
+        raise ValueError("invalid web extraction tenant")
+    return list(dict.fromkeys(tenants))
+
+
+def _web_limit(value: Any, numeric_type: type[int] | type[float], maximum: int) -> int | float:
+    allowed_types = (str, int) if numeric_type is int else (str, int, float)
+    if type(value) not in allowed_types:
+        raise ValueError("invalid web extraction limit type")
+    normalized = numeric_type(value)
+    if not 0 < normalized <= maximum:
+        raise ValueError("web extraction limit is outside its bounds")
+    return normalized
+
+
+def validate_reader_token(value: str) -> str:
+    """Validate deployment bearer credentials before they reach HTTP headers."""
+    if not isinstance(value, str) or not _WEB_BEARER_TOKEN.fullmatch(value):
+        raise ValueError("invalid reader bearer token")
+    return value
 
 
 def _append_unique(items: list[str], value: str) -> None:
@@ -1208,6 +1283,32 @@ class Configuration(BaseModel):
         title="V4 Replan Enabled",
         description="Enable the v4 Wave 1 research tree replanner",
     )
+    v4_web_extractor_enabled: bool = False
+    v4_web_extractor_tenants: list[str] = Field(default_factory=list, repr=False, exclude=True)
+    v4_web_l2_adapter: Literal["off", "reader_http", "playwright"] = "off"
+    v4_browser_use_enabled: bool = False
+    v4_web_l2_origin_rules: dict[str, list[dict[str, Any]]] = Field(
+        default_factory=dict, repr=False, exclude=True,
+    )
+    v4_web_reader_url: str | None = Field(default=None, repr=False, exclude=True)
+    v4_web_reader_token: str | None = Field(default=None, repr=False, exclude=True)
+    v4_web_l2_max_concurrency: int = Field(default=2, gt=0, le=2)
+    v4_web_l2_per_tenant: int = Field(default=1, gt=0, le=1)
+    v4_web_l2_timeout_seconds: float = Field(default=12, gt=0, le=12)
+    v4_web_config_reason: WebConfigReason | None = None
+
+    def web_extraction_enabled_for(self, tenant_id: str) -> bool:
+        return self.v4_web_extractor_enabled and tenant_id in self.v4_web_extractor_tenants
+
+    def request_config_values(self) -> dict[str, Any]:
+        """Copy validated settings for server-side request overrides."""
+        values = self.model_dump()
+        for key in (
+            "v4_web_extractor_tenants", "v4_web_l2_origin_rules",
+            "v4_web_reader_url", "v4_web_reader_token",
+        ):
+            values[key] = deepcopy(getattr(self, key))
+        return values
     v4_default_research_depth: str = Field(
         default="standard",
         title="V4 Default Research Depth",
@@ -1588,6 +1689,144 @@ class Configuration(BaseModel):
             raise ValueError("v4 budget limits must be a JSON object")
         return value
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_web_extraction_settings(cls, raw_values: Any) -> Any:
+        if not isinstance(raw_values, dict):
+            return raw_values
+        values = raw_values.copy()
+        reason = cls._normalize_web_extractor_gate(values)
+        dynamic_reason = cls._normalize_web_dynamic_settings(values)
+        reason = reason or dynamic_reason
+        if reason:
+            values["v4_web_l2_adapter"] = "off"
+            values["v4_browser_use_enabled"] = False
+            values["v4_web_config_reason"] = reason
+            _LOGGER.warning("Web extraction configuration rejected (%s)", reason)
+        return values
+
+    @staticmethod
+    def _normalize_web_extractor_gate(values: dict[str, Any]) -> WebConfigReason | None:
+        enabled_key = "v4_web_extractor_enabled"
+        reason = None
+        try:
+            enabled = _web_bool(values.get(enabled_key, values.get(_WEB_EXTRACTOR_ALIAS, False)))
+            if enabled_key in values and _WEB_EXTRACTOR_ALIAS in values:
+                if enabled is not _web_bool(values[_WEB_EXTRACTOR_ALIAS]):
+                    reason = "web_extractor_alias_conflict"
+        except ValueError:
+            enabled = False
+            reason = "invalid_web_extractor_enabled"
+
+        tenants_key = "v4_web_extractor_tenants"
+        if tenants_key in values:
+            try:
+                values[tenants_key] = _web_tenants(values[tenants_key])
+            except (ValueError, RecursionError):
+                values[tenants_key] = []
+                reason = reason or "invalid_web_extractor_tenants"
+        if enabled_key in values or _WEB_EXTRACTOR_ALIAS in values or reason:
+            values[enabled_key] = enabled and reason is None
+        values.pop(_WEB_EXTRACTOR_ALIAS, None)
+        return reason
+
+    @staticmethod
+    def _normalize_web_dynamic_settings(values: dict[str, Any]) -> WebConfigReason | None:
+        adapter_key = "v4_web_l2_adapter"
+        adapter = values.get(adapter_key, "off")
+        if isinstance(adapter, str):
+            adapter = adapter.strip().lower()
+        reason = None
+        if adapter not in ("off", "reader_http", "playwright"):
+            reason = "invalid_web_l2_adapter"
+            adapter = "off"
+        if adapter_key in values:
+            values[adapter_key] = adapter
+
+        browser_key = "v4_browser_use_enabled"
+        if browser_key in values:
+            try:
+                values[browser_key] = _web_bool(values[browser_key])
+            except ValueError:
+                reason = reason or "invalid_browser_use_enabled"
+
+        reader_url_key = "v4_web_reader_url"
+        reader_url = values.get(reader_url_key)
+        if reader_url == "":
+            reader_url = None
+        if reader_url is not None and not isinstance(reader_url, str):
+            reason = reason or "invalid_web_reader_url"
+            reader_url = None
+        if reader_url_key in values:
+            values[reader_url_key] = reader_url
+
+        reader_token_key = "v4_web_reader_token"
+        token = values.get(reader_token_key)
+        if reader_token_key in values:
+            try:
+                values[reader_token_key] = None if token in (None, "") else validate_reader_token(token)
+            except ValueError:
+                values[reader_token_key] = None
+                reason = reason or "invalid_web_reader_token"
+
+        for key, (numeric_type, maximum) in _WEB_L2_LIMITS.items():
+            if key not in values:
+                continue
+            try:
+                values[key] = _web_limit(values[key], numeric_type, maximum)
+            except (ValueError, OverflowError):
+                values[key] = maximum
+                reason = reason or "invalid_web_l2_limits"
+
+        rules_key = "v4_web_l2_origin_rules"
+        rules = values.get(rules_key, {})
+        try:
+            rules = _web_structured(rules, dict)
+            if any(
+                not isinstance(tenant, str)
+                or not isinstance(items, list)
+                or any(
+                    not isinstance(rule, dict) or any(not isinstance(key, str) for key in rule)
+                    for rule in items
+                )
+                for tenant, items in rules.items()
+            ):
+                raise ValueError("invalid web extraction origin rules")
+        except (ValueError, RecursionError):
+            reason = reason or "invalid_web_l2_origin_rules"
+            rules = {}
+        if rules_key in values:
+            values[rules_key] = rules
+
+        if (
+            reason
+            or not values.get("v4_web_extractor_enabled")
+            or adapter == "off"
+            or (adapter == "playwright" and not values.get(browser_key))
+        ):
+            return reason
+
+        from services.web_dynamic_adapter import (
+            DynamicTargetPolicy,
+            validate_reader_endpoint,
+        )
+
+        if rules:
+            try:
+                DynamicTargetPolicy.from_config(rules)
+            except ValueError:
+                values[rules_key] = {}
+                return "invalid_web_l2_origin_rules"
+        if adapter == "reader_http":
+            try:
+                values[reader_url_key] = validate_reader_endpoint(reader_url)
+            except ValueError:
+                values[reader_url_key] = None
+                return "invalid_web_reader_url"
+            if token is None or token == "":
+                return "invalid_web_reader_token"
+        return None
+
     @field_validator("v4_default_research_depth", mode="before")
     @classmethod
     def _normalize_v4_research_depth(cls, value: Any) -> str:
@@ -1767,8 +2006,11 @@ class Configuration(BaseModel):
         # Load values from environment variables based on field names
         for field_name in cls.model_fields.keys():
             env_key = field_name.upper()
-            if env_key in os.environ:
+            if field_name != "v4_web_config_reason" and env_key in os.environ:
                 raw_values[field_name] = os.environ[env_key]
+        old_web_flag = os.getenv(_WEB_EXTRACTOR_ALIAS.upper())
+        if old_web_flag is not None:
+            raw_values[_WEB_EXTRACTOR_ALIAS] = old_web_flag
 
         # Additional mappings for explicit env names
         env_aliases = {
@@ -2017,7 +2259,8 @@ class Configuration(BaseModel):
 
         if overrides:
             for key, value in overrides.items():
-                if value is not None:
+                web_setting = key.startswith(("v4_web_", "v4_browser_use_"))
+                if key != "v4_web_config_reason" and (value is not None or web_setting):
                     raw_values[key] = value
 
         return cls(**raw_values)

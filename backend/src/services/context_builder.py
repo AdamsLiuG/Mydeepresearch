@@ -5,10 +5,80 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _evidence_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace(
+        "<", r"\u003C"
+    ).replace(">", r"\u003E")
+
+
+def _web_evidence_frame(items: list[str]) -> str:
+    body = "[" + ",".join(items) + "]"
+    return f'<WEB_EVIDENCE_DATA chars="{len(body)}">\n{body}\n</WEB_EVIDENCE_DATA>'
+
+
+def render_web_evidence_data(
+    records: Sequence[dict[str, Any]], evidence_store: Any, *, max_chars: int = 6000,
+) -> str:
+    """Render bounded Store data, retaining a whole table and its anchor or omitting it."""
+    if not getattr(evidence_store, "web_extraction_enabled", False):
+        return ""
+    source_ids = list(dict.fromkeys(
+        str(item["source_id"]) for item in records if isinstance(item, dict) and item.get("source_id")
+    ))
+    if not source_ids:
+        return ""
+    items: list[str] = []
+    for record in evidence_store.lookup(source_ids=source_ids, include_full_content=True):
+        sid = record["source_id"]
+        eligible = evidence_store.is_eligible_for_facts(sid)
+        metadata = record.get("provenance_meta", {}).get("web_extraction", {})
+        item = {
+            "source_id": sid,
+            "tier": metadata.get("tier") if eligible else "L0",
+            "fact_eligible": eligible,
+            "title": record.get("title", ""),
+            "url": record.get("url", ""),
+        }
+        if not eligible:
+            item["snippet"] = record.get("snippet", "")
+        rendered = _evidence_json(item)
+        if len(_web_evidence_frame([*items, rendered])) > max_chars:
+            continue
+        if eligible:
+            if type(metadata.get("artifact_version")) is int:
+                item["artifact_version"] = metadata["artifact_version"]
+            for block in record.get("multimodal_blocks") or ():
+                if block.get("modality") != "table":
+                    continue
+                table = {"anchor_id": block.get("anchor_id"), **(block.get("structured_payload") or {})}
+                candidate = {**item, "tables": [*item.get("tables", []), table]}
+                encoded = _evidence_json(candidate)
+                if len(_web_evidence_frame([*items, encoded])) <= max_chars:
+                    item, rendered = candidate, encoded
+            full_text = record.get("full_content", "")
+            if metadata.get("tier") in {"L1", "L2"}:
+                passages = [
+                    {"anchor_id": anchor["anchor_id"], "text": full_text[anchor["start"]:anchor["end"]]}
+                    for anchor in metadata.get("text_anchors", [])
+                ]
+            else:
+                passages = [{"text": full_text or record.get("snippet", "")}]
+            for passage in passages:
+                if not passage["text"]:
+                    continue
+                candidate = {**item, "passages": [*item.get("passages", []), passage]}
+                encoded = _evidence_json(candidate)
+                if len(_web_evidence_frame([*items, encoded])) <= max_chars:
+                    item, rendered = candidate, encoded
+        items.append(rendered)
+    return _web_evidence_frame(items) if items else ""
 
 
 def estimate_tokens_fast(text: str) -> int:

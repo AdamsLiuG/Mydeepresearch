@@ -12,6 +12,127 @@ from services.request_state import RequestStateStore
 
 
 class RequestStateStoreTests(unittest.TestCase):
+    def test_web_evidence_write_updates_only_unfinished_task_under_snapshot_cas(self):
+        from models import SummaryState
+        from services.request_state import SnapshotConflictError
+        from state_manager import StateManagerMixin
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = StateManagerMixin()
+            manager._request_state_store = RequestStateStore(temp_dir)
+            manager.request_id = "web-evidence"
+            manager._web_budget = object()
+            manager._is_cancelled = lambda: False
+            existing = {"source_id": "T1-S1", "full_content": "Published content"}
+            current = manager._request_state_store.save(manager.request_id, {"todo_items": [
+                {"id": 1, "status": "completed", "evidence_items": [existing]},
+                {"id": 2, "status": "in_progress", "title": "Second"},
+            ]})
+            state = SummaryState(state_version=current["state_version"])
+            manager._persist_web_evidence(state, 1, [])
+            record = {"source_id": "T2-S1", "full_content": "Sanitized content"}
+            manager._persist_web_evidence(state, 2, [record])
+            saved = manager._request_state_store.load(manager.request_id)
+            self.assertEqual(saved["todo_items"][0]["evidence_items"], [existing])
+            self.assertEqual(saved["todo_items"][1]["title"], "Second")
+            self.assertEqual(saved["todo_items"][1]["evidence_items"], [record])
+            stale = SummaryState(state_version=current["state_version"])
+            with self.assertRaises(SnapshotConflictError):
+                manager._persist_web_evidence(stale, 2, [])
+
+    def test_dynamic_marker_and_dispatch_are_absent_when_dispatch_cas_fails(self):
+        from config import Configuration
+        from models import SummaryState
+        from services.budget import BudgetGovernor, build_request_budget
+        from services.request_state import SnapshotConflictError
+        from state_manager import (
+            RequestBudgetController,
+            StateManagerMixin,
+            freeze_web_extraction,
+        )
+
+        class FailDispatchStore(RequestStateStore):
+            def save(self, request_id, payload, **kwargs):
+                ledger = payload.get("v4", {}).get("budget", {}).get("ledger", {})
+                if any(record["state"] == "dispatched" for record in ledger.get("active", {}).values()):
+                    raise SnapshotConflictError("dispatch commit rejected")
+                return super().save(request_id, payload, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = StateManagerMixin()
+            manager._request_state_store = FailDispatchStore(temp_dir)
+            manager.request_id = "web-cas"
+            manager._is_cancelled = lambda: False
+            config = Configuration(v4_web_extractor_enabled=True, v4_web_extractor_tenants=["default"])
+            v4 = {"schema_version": 1, "web_extraction": freeze_web_extraction(config, "default")}
+            initial = manager._request_state_store.save(manager.request_id, {"v4": v4})
+            state = SummaryState(v4=initial["v4"], state_version=initial["state_version"])
+            budget = build_request_budget("quick")
+            governor = BudgetGovernor(budget, request_id=manager.request_id)
+            controller = RequestBudgetController(manager, state, governor)
+
+            with self.assertRaisesRegex(SnapshotConflictError, "dispatch commit rejected"):
+                with controller.attempt(
+                    {"dynamic_fetches": 1}, required=False, dynamic_urls=("https://example.org/doc",),
+                ):
+                    self.fail("A rejected dispatch cannot open a transport")
+            self.assertEqual(governor.external_attempt_count, 0)
+            persisted = manager._request_state_store.load(manager.request_id)["v4"]
+            self.assertEqual(persisted["web_extraction"]["dynamic_targets"], {})
+            recovered = BudgetGovernor(budget, request_id=manager.request_id)
+            recovered.restore_ledger(persisted["budget"]["ledger"])
+            self.assertEqual(recovered.snapshot().remaining["dynamic_fetches"], 1)
+
+    def test_dynamic_dispatch_and_alias_survive_recovery(self):
+        from config import Configuration
+        from models import SummaryState
+        from services.budget import BudgetGovernor, build_request_budget
+        from state_manager import (
+            BudgetDispatchDenied,
+            RequestBudgetController,
+            StateManagerMixin,
+            freeze_web_extraction,
+        )
+
+        config = Configuration(v4_web_extractor_enabled=True, v4_web_extractor_tenants=["default"])
+        budget = build_request_budget("quick")
+        url = "https://example.org/web"
+        redirected = "https://example.org/redirect"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = StateManagerMixin()
+            manager._request_state_store = RequestStateStore(temp_dir)
+            manager.request_id = "web-budget"
+            manager._is_cancelled = lambda: False
+            v4 = {"schema_version": 1, "web_extraction": freeze_web_extraction(config, "default")}
+            saved = manager._request_state_store.save(manager.request_id, {"v4": v4})
+            state = SummaryState(v4=saved["v4"], state_version=saved["state_version"])
+            governor = BudgetGovernor(budget, request_id=manager.request_id)
+            controller = RequestBudgetController(manager, state, governor)
+            operation = controller.attempt(
+                {"web_fetches": 1, "dynamic_fetches": 1, "cost_microusd": 10},
+                required=False, dynamic_urls=(url,),
+            )
+            attempt = operation.__enter__()
+            try:
+                self.assertTrue(attempt.associate_dynamic_url(redirected))
+                committed = manager._request_state_store.load(manager.request_id)
+                self.assertNotIn(url, str(committed))
+                self.assertNotIn(redirected, str(committed))
+                recovered_governor = BudgetGovernor(budget, request_id=manager.request_id)
+                recovered_governor.restore_ledger(committed["v4"]["budget"]["ledger"])
+                recovered_state = SummaryState(v4=committed["v4"], state_version=committed["state_version"])
+                recovered = RequestBudgetController(manager, recovered_state, recovered_governor)
+                spent = recovered.snapshot().spent
+                self.assertEqual((spent["web_fetches"], spent["dynamic_fetches"], spent["cost_microusd"]), (1, 1, 10))
+                self.assertEqual(recovered.snapshot().external_attempts, 2)
+                for target in (url, redirected):
+                    with self.assertRaisesRegex(BudgetDispatchDenied, "not_eligible"):
+                        with recovered.attempt({"dynamic_fetches": 1}, required=False, dynamic_urls=(target,)):
+                            self.fail("Recovered target was dispatched twice")
+            finally:
+                operation.__exit__(None, None, None)
+
     def test_budget_write_cannot_revert_newer_graph_and_preserves_other_v4_fields(self):
         from types import SimpleNamespace
 

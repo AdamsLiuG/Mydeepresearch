@@ -105,7 +105,11 @@ class WorkflowCheckpoint:
         research_depth: str | None = None,
         output_format: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        from state_manager import freeze_web_extraction
+
         budget_enabled = getattr(config, "v4_research_budget_enabled", False)
+        web = freeze_web_extraction(config, self.tenant_id)
+        downstream_only = web is not None and not budget_enabled
         requested_depth = research_depth
         if budget_enabled and requested_depth is None:
             requested_depth = config.v4_default_research_depth
@@ -132,10 +136,14 @@ class WorkflowCheckpoint:
                 topic=topic, phase="queued", status="queued", runner_backend=self.backend,
                 workflow_run_id=self.run_id, workflow_plan_first=plan_first,
             )
-            if budget_enabled:
-                budget = build_request_budget_for_config(config, self.tenant_id, depth=requested_depth)
+            if budget_enabled or downstream_only:
+                budget = build_request_budget_for_config(
+                    config, self.tenant_id, depth="quick" if downstream_only else requested_depth,
+                )
                 governor = BudgetGovernor(budget, tenant_id=self.tenant_id, request_id=self.request_id)
-                snapshot["workflow_request_options"] = {**options, "research_depth": budget.depth}
+                snapshot["workflow_request_options"] = {
+                    **options, "research_depth": budget.depth if budget_enabled else None,
+                }
                 snapshot["v4"] = {
                     "schema_version": 1,
                     "budget": {
@@ -147,6 +155,10 @@ class WorkflowCheckpoint:
                         "plan_locked": False, "slots_allocated": False,
                     },
                 }
+                if web is not None:
+                    snapshot["v4"]["web_extraction"] = web
+                if downstream_only:
+                    snapshot["v4"]["web_downstream_only"] = True
             return True
 
         return self._update(change)
@@ -189,6 +201,14 @@ class WorkflowCheckpoint:
     def check_owner(self, snapshot: dict[str, Any]) -> None:
         if self.lost.is_set() or not self._owns(snapshot):
             raise WorkflowLeaseLost(f"Execution lease expired for {self.request_id}")
+
+    def web_owner_is_current(self) -> bool:
+        snapshot = self.load() or {}
+        return (
+            not self.lost.is_set() and self._owns(snapshot)
+            and not snapshot.get("workflow_cancel_requested")
+            and snapshot.get("status") not in _FINISHED_STATUSES
+        )
 
     def persist(
         self,
@@ -260,8 +280,23 @@ class WorkflowCheckpoint:
         snapshot, _ = self._update(change)
         return snapshot
 
-    def persist_budget(self, budget: dict[str, Any]) -> dict[str, Any]:
-        return self.persist({"v4": {"budget": budget}})
+    def persist_budget(
+        self, budget: dict[str, Any], *, web_extraction: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        v4 = {"budget": budget}
+        if web_extraction is not None:
+            v4["web_extraction"] = web_extraction
+        return self.persist({"v4": v4})
+
+    def persist_web_evidence(self, task_id: int, records: list[dict]) -> dict[str, Any]:
+        from state_manager import replace_unfinished_task_evidence
+
+        def change(snapshot: dict[str, Any]) -> bool:
+            self.check_owner(snapshot)
+            return replace_unfinished_task_evidence(snapshot, task_id, records)
+
+        snapshot, _ = self._update(change)
+        return snapshot
 
     def acknowledge_event(self, event_key: str) -> None:
         def change(snapshot: dict[str, Any]) -> bool:
@@ -335,14 +370,15 @@ class WorkflowCheckpoint:
                 elif snapshot.get("workflow_plan_pending_revision") is not None:
                     valid_revisions.add(str(snapshot["workflow_plan_pending_revision"]))
                 v4 = snapshot.get("v4")
-                if isinstance(v4, dict) and v4.get("budget"):
+                budgeted_plan = isinstance(v4, dict) and v4.get("budget") and not v4.get("web_downstream_only")
+                if budgeted_plan:
                     revision = edited_revision or snapshot.get("workflow_plan_pending_revision") or revision
                     valid_revisions = {str(revision)}
                 if supplied is not None and str(supplied) not in valid_revisions:
                     return False
                 accepted = True
                 snapshot["workflow_plan_revision"] = supplied if supplied is not None else edited_revision or revision
-                if isinstance(v4, dict) and v4.get("budget"):
+                if budgeted_plan:
                     snapshot["v4"] = {**v4, "replan": {**(v4.get("replan") or {}), "plan_locked": True}}
                 return True
             if name in {"approve_tool", "approve_tool_call"}:
@@ -1047,7 +1083,7 @@ def _output_format_value(config: Any, output_format: str | None) -> str | None:
 def _apply_workflow_request_options(config: Any, options: dict[str, Any] | None) -> Any:
     if not options:
         return config
-    values = config.model_dump()
+    values = config.request_config_values()
     if "policy_model_mode" not in config.model_fields_set:
         values.pop("policy_model_mode", None)
     overrides = {
@@ -1057,7 +1093,7 @@ def _apply_workflow_request_options(config: Any, options: dict[str, Any] | None)
             ("default_output_format", "default_output_format"),
             ("v4_default_research_depth", "research_depth"),
         )
-        if option_key in options
+        if options.get(option_key) is not None
     }
     return type(config).model_validate({**values, **overrides})
 

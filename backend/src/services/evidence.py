@@ -10,7 +10,8 @@ import socket
 import time
 from collections.abc import Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Callable, Iterator
@@ -43,7 +44,7 @@ except Exception:  # pragma: no cover - test stubs may only expose a partial mod
             self.description = description
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import WEB_EXTRACTION_REASONS, RequestTrace
 from services.evidence_index import (
     ChunkLazyLoadResult,
     EvidenceChunk,
@@ -52,14 +53,26 @@ from services.evidence_index import (
     EvidenceStoreListener,
     pack_lazy_chunks,
 )
-from services.memory_sanitizer import sanitize_injection_text
-from services.search import dispatch_search
+from services.memory_sanitizer import WEB_SANITIZER_VERSION, sanitize_injection_text
+from services.search import dispatch_search, projected_search_snippet
 from services.text_processing import (
     CITATION_PATTERN,
     normalize_agent_markdown,
     strip_citation_markers,
     truncate_cited_text,
 )
+from services.web_extractor import (
+    POLICY_VERSION,
+    QUALITY_VERSION,
+    ExtractionContext,
+    WebExtractionResult,
+    WebExtractor,
+    is_produced_result,
+    normalize_snippet,
+    sanitize_web_snippet,
+)
+from services.web_fetch_gateway import FetchScope, GatewayError
+from services.web_fetch_gateway import normalize_url as normalize_web_url
 from utils import truncate_text
 
 try:  # pragma: no cover - optional dependency
@@ -586,14 +599,20 @@ def _extract_structured_html_text(html: str) -> str:
     return _clean_structured_text(without_tags)
 
 
-def _extract_pdf_text(raw_bytes: bytes) -> str:
+def _extract_pdf_text(
+    raw_bytes: bytes, *, max_pages: int | None = None, check: Callable[[], object] | None = None,
+) -> str:
     """Extract structured text from PDF bytes when PyMuPDF is available."""
     if pymupdf is None or not raw_bytes:
         return ""
     doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
     try:
         pages: list[str] = []
-        for page in doc:
+        for index, page in enumerate(doc):
+            if max_pages is not None and index >= max_pages:
+                break
+            if check is not None:
+                check()
             page_text = _clean_structured_text(page.get_text("text") or "")
             if page_text:
                 pages.append(page_text)
@@ -1627,6 +1646,9 @@ class EvidenceRecord:
     mcp_tool_name: str | None = None
     tenant_id: str = "default"
     provenance_meta: dict[str, Any] = field(default_factory=dict)
+    _web_managed: bool = field(default=False, init=False, repr=False)
+    _web_verified: bool = field(default=False, init=False, repr=False)
+    _web_published: bool = field(default=False, init=False, repr=False)
     modality: str = "text"
     page_no: int | None = None
     bbox: list[float] | None = None
@@ -1680,7 +1702,7 @@ class EvidenceRecord:
         if self.tenant_id and self.tenant_id != "default":
             payload["tenant_id"] = self.tenant_id
         if self.provenance_meta:
-            payload["provenance_meta"] = dict(self.provenance_meta)
+            payload["provenance_meta"] = deepcopy(self.provenance_meta)
         if self.page_no is not None:
             payload["page_no"] = self.page_no
         if self.bbox is not None:
@@ -1688,7 +1710,7 @@ class EvidenceRecord:
         if self.anchor_id:
             payload["anchor_id"] = self.anchor_id
         if self.multimodal_blocks:
-            payload["multimodal_blocks"] = list(self.multimodal_blocks)
+            payload["multimodal_blocks"] = deepcopy(self.multimodal_blocks)
         if self.derived_from_source_ids:
             payload["derived_from_source_ids"] = list(self.derived_from_source_ids)
         if self.computation_artifact:
@@ -1696,7 +1718,9 @@ class EvidenceRecord:
         if self.structured_payload:
             payload["structured_payload"] = dict(self.structured_payload)
         if include_full_content and self.full_content:
-            payload["full_content"] = truncate_text(self.full_content, excerpt_limit * 3)
+            payload["full_content"] = (
+                self.full_content if self._web_verified else truncate_text(self.full_content, excerpt_limit * 3)
+            )
         return payload
 
 
@@ -1713,6 +1737,122 @@ def _apply_quality_metadata(record: EvidenceRecord) -> None:
     record.freshness_label = str(scored["freshness_label"])
     record.quality_reasons = list(scored["quality_reasons"])
     record.quality_flags = list(scored["quality_flags"])
+
+
+def _is_compatible_web_artifact(record: EvidenceRecord) -> bool:
+    meta = record.provenance_meta.get("web_extraction")
+    if not isinstance(meta, dict) or not (record.full_content.strip() or record.multimodal_blocks):
+        return False
+    if (meta.get("tier"), meta.get("adapter")) not in (
+        ("L1", "static"), ("L2", "reader_http"), ("L2", "playwright"),
+    ):
+        return False
+    versions = (
+        ("sanitizer_version", WEB_SANITIZER_VERSION),
+        ("quality_version", QUALITY_VERSION),
+        ("policy_version", POLICY_VERSION),
+    )
+    if any(type(meta.get(key)) is not int or meta[key] != version for key, version in versions):
+        return False
+    artifact_version = meta.get("artifact_version")
+    if type(artifact_version) is not int or artifact_version <= 0:
+        return False
+    try:
+        normalize_web_url(record.url)
+    except GatewayError:
+        return False
+    return True
+
+
+_WEB_PUBLIC_TIERS = {"L0": {"snippet"}, "L1": {"static"}, "L2": {"reader_http", "playwright"}}
+_WEB_PUBLIC_FLAGS = frozenset({
+    "js_shell", "low_snr", "has_table", "structure_truncated", "visibility_uncertain",
+    "snippet_only", "link_only",
+})
+_WEB_CREDENTIAL_PARAMETER = re.compile(
+    r"(?:^|[-_])(?:token|key|secret|password|auth|authorization|credential|signature|session)(?:$|[-_])"
+    r"|^(?:sig|code|accesskey|apikey|accesstoken|sessionid|x-amz-.+|x-goog-.+)$", re.I,
+)
+
+
+def public_web_url(url: str) -> str:
+    try:
+        safe = normalize_web_url(url)
+    except GatewayError:
+        return ""
+    parts = urlsplit(safe)
+    # Keep query segment encoding and ordering for URLs without credential fields.
+    segments = []
+    for segment in parts.query.split("&"):
+        pairs = parse_qsl(segment, keep_blank_values=True)
+        if all(not _WEB_CREDENTIAL_PARAMETER.search(key) for key, _ in pairs):
+            segments.append(segment)
+    query = "&".join(segments)
+    return safe if query == parts.query else parts._replace(query=query).geturl()
+
+
+def public_web_evidence_projection(value: Any, *, web_enabled: bool = False) -> Any:
+    """Project nested evidence the same way in synchronous, saved, and streamed responses."""
+    if isinstance(value, list):
+        return [public_web_evidence_projection(item, web_enabled=web_enabled) for item in value]
+    if not isinstance(value, dict):
+        return value
+    provenance = value.get("provenance_meta")
+    web = provenance.get("web_extraction") if isinstance(provenance, dict) else None
+    v4 = value.get("v4")
+    mode = web_enabled or (isinstance(v4, dict) and isinstance(v4.get("web_extraction"), dict))
+    if web is None and not (
+        mode and "source_id" in value and value.get("source_origin", "web") == "web"
+    ):
+        return {key: public_web_evidence_projection(item, web_enabled=mode) for key, item in value.items()}
+    projected = {
+        key: public_web_evidence_projection(item, web_enabled=mode)
+        for key, item in value.items()
+        if key not in {
+            "provenance_meta", "raw_content", "raw_html", "final_url", "redirect_chain",
+            "resolved_ip", "connected_ip", "credentials", "headers",
+        }
+    }
+    if "url" in projected:
+        projected["url"] = public_web_url(str(projected["url"] or ""))
+    if not isinstance(web, dict):
+        projected.pop("full_content", None)
+        projected.pop("multimodal_blocks", None)
+        if "has_full_content" in projected:
+            projected["has_full_content"] = False
+        for field_name in ("title", "snippet"):
+            if field_name in projected:
+                projected[field_name] = sanitize_web_snippet(str(projected[field_name] or ""))
+        return projected
+    bounded: dict[str, Any] = {}
+    tier, adapter = web.get("tier"), web.get("adapter")
+    if isinstance(tier, str) and isinstance(adapter, str) and adapter in _WEB_PUBLIC_TIERS.get(tier, ()):
+        bounded.update(tier=tier, adapter=adapter)
+    for key in ("sanitizer_version", "quality_version", "policy_version", "artifact_version", "dropped_nodes"):
+        count = web.get(key)
+        if type(count) is int and 0 <= count <= 2**31 - 1:
+            bounded[key] = count
+    flags = web.get("quality_flags")
+    if isinstance(flags, list):
+        bounded["quality_flags"] = list(dict.fromkeys(
+            flag for flag in flags[:32] if isinstance(flag, str) and flag in _WEB_PUBLIC_FLAGS
+        ))
+    reason = web.get("degraded_reason")
+    if "degraded_reason" in web and (reason is None or isinstance(reason, str) and reason in WEB_EXTRACTION_REASONS):
+        bounded["degraded_reason"] = reason
+    anchors = web.get("text_anchors")
+    if isinstance(anchors, list):
+        bounded["text_anchors"] = [
+            {key: anchor[key] for key in ("anchor_id", "start", "end")}
+            for anchor in anchors[:4096]
+            if isinstance(anchor, dict)
+            and isinstance(anchor.get("anchor_id"), str)
+            and re.fullmatch(r"(?:html-p|text-p|pdf-p)[0-9]{1,6}", anchor["anchor_id"])
+            and type(anchor.get("start")) is int and type(anchor.get("end")) is int
+            and 0 <= anchor["start"] < anchor["end"] <= 50_000
+        ]
+    projected["provenance_meta"] = {"web_extraction": bounded}
+    return projected
 
 
 def _next_source_sequence(source_ids: list[str], prefix: str) -> int:
@@ -1732,6 +1872,7 @@ class EvidenceStore:
         freshness_reference_days: int = 365,
         listeners: list[EvidenceStoreListener] | None = None,
         request_id_getter: Callable[[], str | None] | None = None,
+        web_extraction_enabled: bool = False,
     ) -> None:
         self._lock = Lock()
         self._freshness_reference_days = max(1, int(freshness_reference_days or 365))
@@ -1740,6 +1881,27 @@ class EvidenceStore:
         self._task_url_index: dict[int, dict[str, str]] = {}
         self._listeners = list(listeners or [])
         self._request_id_getter = request_id_getter
+        self.web_extraction_enabled = web_extraction_enabled
+
+    def is_eligible_for_facts(self, source_id: str) -> bool:
+        with self._lock:
+            record = self._records_by_id.get(source_id)
+            return record is not None and (
+                not self.web_extraction_enabled or record.source_origin != "web" or record._web_verified
+            )
+
+    def web_snippet_for_fetch(self, source_id: str, url: str) -> WebExtractionResult | None:
+        with self._lock:
+            record = self._records_by_id.get(source_id)
+            if record is None or record.source_origin != "web" or _normalize_url(record.url) != _normalize_url(url):
+                return None
+            return normalize_snippet(url, record.title, record.snippet, projected=True)
+
+    def publish_web_artifact(self, source_id: str) -> None:
+        """Freeze the current artifact after publication."""
+        with self._lock:
+            if (record := self._records_by_id.get(source_id)) is not None and record._web_verified:
+                record._web_published = True
 
     def _notify_listeners(
         self,
@@ -1755,7 +1917,7 @@ class EvidenceStore:
             try:
                 listener.on_records_changed(
                     task_id=task_id,
-                    records=list(records),
+                    records=deepcopy(records) if self.web_extraction_enabled else list(records),
                     reason=reason,
                     request_id=request_id,
                 )
@@ -1790,6 +1952,16 @@ class EvidenceStore:
                 title = str(result.get("title") or url or f"Source {next_index}").strip()
                 snippet = str(result.get("content") or "").strip()
                 raw_content = str(result.get("raw_content") or "").strip()
+                projection = None
+                if self.web_extraction_enabled:
+                    projection = projected_search_snippet(result)
+                    if projection is None:
+                        projection = normalize_snippet(url, str(result.get("title") or ""), snippet)
+                    if projection is None:
+                        continue
+                    title = projection.title
+                    snippet = projection.visible_text
+                    raw_content = ""
                 published_at = _extract_published_at(result)
                 source_updated_at = _extract_source_updated_at(result)
                 source_type = _classify_source_type(url, title)
@@ -1797,7 +1969,7 @@ class EvidenceStore:
                 existing_id = url_index.get(dedup_key)
                 if existing_id:
                     record = self._records_by_id[existing_id]
-                    if len(snippet) > len(record.snippet):
+                    if (not record.snippet if projection else len(snippet) > len(record.snippet)):
                         record.snippet = snippet
                     if len(raw_content) > len(record.raw_content):
                         record.raw_content = raw_content
@@ -1809,7 +1981,7 @@ class EvidenceStore:
                     record.source_updated_at = source_updated_at or record.source_updated_at
                     _apply_quality_metadata(record)
                     record.updated_at = time.time()
-                    changed_records.append(record)
+                    changed_records.append(deepcopy(record) if projection else record)
                     continue
 
                 source_id = f"T{task_id}-S{next_index}"
@@ -1832,11 +2004,14 @@ class EvidenceStore:
                     created_at=time.time(),
                     updated_at=time.time(),
                 )
+                if projection is not None:
+                    record.provenance_meta = {"web_extraction": projection.provenance()}
+                    record._web_managed = True
                 _apply_quality_metadata(record)
                 self._records_by_id[source_id] = record
                 task_ids.append(source_id)
                 url_index[dedup_key] = source_id
-                changed_records.append(record)
+                changed_records.append(deepcopy(record) if projection else record)
 
         self._notify_listeners(task_id=task_id, records=changed_records, reason="search")
         return self.list_task_evidence(task_id)
@@ -1850,12 +2025,29 @@ class EvidenceStore:
         title: str,
         full_content: str,
         multimodal_blocks: list[dict[str, Any]] | None = None,
+        web_result: WebExtractionResult | None = None,
+        check_owner: Callable[[], object] | None = None,
     ) -> dict[str, Any]:
         """Attach fetched page content to an existing or new evidence record."""
 
+        if self.web_extraction_enabled:
+            if web_result is None:
+                return {}
+            try:
+                if not is_produced_result(web_result, url):
+                    return {}
+            except GatewayError:
+                return {}
+            title = web_result.title
+            full_content = web_result.visible_text if web_result.supports_facts else ""
+            multimodal_blocks = list(web_result.multimodal_blocks)
+        elif web_result is not None:
+            return {}
         normalized_url = _normalize_url(url)
         changed_record: EvidenceRecord | None = None
         with self._lock:
+            if check_owner is not None:
+                check_owner()
             task_ids = self._task_source_ids.setdefault(task_id, [])
             url_index = self._task_url_index.setdefault(task_id, {})
 
@@ -1872,6 +2064,21 @@ class EvidenceStore:
                 if existing_id:
                     record = self._records_by_id.get(existing_id)
 
+            if record is not None and record.source_origin != "web" and web_result is not None:
+                return {}
+            if record is not None and web_result is not None:
+                previous_meta = record.provenance_meta.get("web_extraction", {})
+                if record._web_verified and (
+                    record._web_published or web_result.tier == "L0"
+                    or (previous_meta.get("tier") == "L2" and web_result.tier == "L1")
+                ):
+                    if web_result.tier != "L0" or record.snippet or not web_result.visible_text:
+                        return record.to_dict(include_full_content=True)
+                    record.snippet = web_result.visible_text
+                    _apply_quality_metadata(record)
+                    record.updated_at = time.time()
+                    changed_record = deepcopy(record)
+
             if record is None:
                 prefix = f"T{task_id}-S"
                 source_id = f"{prefix}{_next_source_sequence(task_ids, prefix)}"
@@ -1879,9 +2086,12 @@ class EvidenceStore:
                     source_id=source_id,
                     task_id=task_id,
                     query="",
-                    title=title or url,
+                    title=title if web_result is not None else title or url,
                     url=url,
-                    snippet=truncate_text(full_content, 600),
+                    snippet=(
+                        web_result.visible_text if web_result is not None and web_result.tier == "L0"
+                        else ("" if web_result is not None else truncate_text(full_content, 600))
+                    ),
                     domain=_domain(url),
                     source_type=_classify_source_type(url, title or url),
                     created_at=time.time(),
@@ -1893,21 +2103,49 @@ class EvidenceStore:
                 if normalized_url:
                     url_index[normalized_url] = source_id
 
-            if title and len(title) > len(record.title):
-                record.title = title
-            if full_content:
+            if web_result is not None and changed_record is None:
+                previous = record.provenance_meta.get("web_extraction", {})
+                version = int(previous.get("artifact_version") or 0)
+                metadata = web_result.provenance(artifact_version=max(1, version))
+                if (
+                    previous == metadata and record.full_content == full_content
+                    and record.multimodal_blocks == multimodal_blocks
+                    and (not title or record.title == title)
+                ):
+                    return record.to_dict(include_full_content=True)
+                if record._web_verified and (
+                    record.full_content != full_content or record.multimodal_blocks != multimodal_blocks
+                    or record.title != title or previous.get("tier") != web_result.tier
+                ):
+                    metadata["artifact_version"] += 1
+                record.title = title or record.title
+                if web_result.tier == "L0" and not record.snippet:
+                    record.snippet = web_result.visible_text
                 record.full_content = full_content
-                if not record.snippet:
-                    record.snippet = truncate_text(full_content, 600)
-            if multimodal_blocks is not None:
-                record.multimodal_blocks = [
-                    dict(block) for block in multimodal_blocks if isinstance(block, dict)
-                ]
-            if not record.source_type or record.source_type == "web":
-                record.source_type = _classify_source_type(url, record.title)
-            _apply_quality_metadata(record)
-            record.updated_at = time.time()
-            changed_record = record
+                record.raw_content = ""
+                record.multimodal_blocks = deepcopy(multimodal_blocks)
+                record.provenance_meta["web_extraction"] = metadata
+                record._web_managed = True
+                record._web_verified = web_result.supports_facts
+                _apply_quality_metadata(record)
+                record.updated_at = time.time()
+                changed_record = deepcopy(record)
+            elif web_result is None:
+                if title and len(title) > len(record.title):
+                    record.title = title
+                if full_content:
+                    record.full_content = full_content
+                    if not record.snippet:
+                        record.snippet = truncate_text(full_content, 600)
+                if multimodal_blocks is not None:
+                    record.multimodal_blocks = [
+                        dict(block) for block in multimodal_blocks if isinstance(block, dict)
+                    ]
+                if not record.source_type or record.source_type == "web":
+                    record.source_type = _classify_source_type(url, record.title)
+                _apply_quality_metadata(record)
+                record.updated_at = time.time()
+                changed_record = record
 
         if changed_record is not None:
             self._notify_listeners(task_id=task_id, records=[changed_record], reason="fetch")
@@ -2250,8 +2488,8 @@ class EvidenceStore:
             references.append(ref_entry)
         return references
 
-    def hydrate_from_tasks(self, tasks: list[Any]) -> None:
-        """Rebuild the in-memory indices from persisted task evidence payloads."""
+    def hydrate_from_tasks(self, tasks: list[Any], *, trusted_web_snapshot: bool = False) -> None:
+        """Rebuild evidence indices. Opt in to web artifact reuse for published internal snapshots."""
 
         hydrated_by_task: dict[int, list[EvidenceRecord]] = {}
         for listener in self._listeners:
@@ -2394,6 +2632,31 @@ class EvidenceStore:
                         created_at=time.time(),
                         updated_at=time.time(),
                     )
+                    if self.web_extraction_enabled and record.source_origin == "web":
+                        record._web_managed = True
+                        record.raw_content = ""
+                        snapshot_title = str(item.get("title") or "")
+                        if trusted_web_snapshot is True and _is_compatible_web_artifact(record):
+                            record.title = snapshot_title
+                            record.provenance_meta = deepcopy(record.provenance_meta)
+                            record.multimodal_blocks = deepcopy(record.multimodal_blocks)
+                            record._web_verified = True
+                            record._web_published = True
+                        else:
+                            projection = normalize_snippet(url, snapshot_title, record.snippet)
+                            if projection is None:
+                                continue
+                            record.title = projection.title
+                            record.snippet = projection.visible_text
+                            record.full_content = ""
+                            record.multimodal_blocks = []
+                            record.archive_doc_key = record.archive_version_id = record.anchor_id = None
+                            record.archive_has_full_content = False
+                            record.modality = "text"
+                            record.page_no = record.bbox = None
+                            record.structured_payload = record.computation_artifact = None
+                            record.derived_from_source_ids = []
+                            record.provenance_meta = {"web_extraction": projection.provenance()}
                     _apply_quality_metadata(record)
                     self._records_by_id[source_id] = record
                     task_ids.append(source_id)
@@ -2755,6 +3018,7 @@ class SearchWebTool(Tool):
         config: Configuration,
         evidence_store: EvidenceStore,
         observer_getter: Callable[[], RequestTrace | None],
+        scope_provider: Callable[[int], tuple[str, str] | None] | None = None,
     ) -> None:
         super().__init__(
             name="search_web",
@@ -2766,6 +3030,7 @@ class SearchWebTool(Tool):
         self._config = config
         self._evidence_store = evidence_store
         self._observer_getter = observer_getter
+        self._scope_provider = scope_provider
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
@@ -2791,7 +3056,22 @@ class SearchWebTool(Tool):
         if "fetch_full_page" in parameters:
             overrides["fetch_full_page"] = bool(parameters.get("fetch_full_page"))
         budget = self.budget_provider() if self.budget_provider else None
-        config = self._config.model_copy(update=overrides) if overrides and budget is None else self._config
+        web_enabled = self._evidence_store.web_extraction_enabled
+        config = self._config.model_copy(update=overrides) if overrides and budget is None and not web_enabled else self._config
+        dispatch_options = {"budget": budget} if budget is not None else {}
+        scope = self._scope_provider(task_id) if self._scope_provider else None
+        if web_enabled:
+            if self._scope_provider is not None and scope is None:
+                return json.dumps({
+                    "task_id": task_id, "query": query, "backend": "", "cache_hit": False,
+                    "cache_strategy": "miss", "answer": None, "notices": [],
+                    "evidence": self._evidence_store.list_task_evidence(task_id),
+                }, ensure_ascii=False)
+            dispatch_options["web_extraction_enabled"] = True
+        elif self._scope_provider is not None and self._config.web_extraction_enabled_for(
+            scope[0] if scope else self._config.default_tenant_id
+        ):
+            dispatch_options["web_extraction_enabled"] = False
 
         payload, notices, answer_text, backend_label, cache_hit, cache_strategy = dispatch_search(
             query,
@@ -2802,10 +3082,11 @@ class SearchWebTool(Tool):
                 "research_topic": parameters.get("research_topic"),
                 "task_title": parameters.get("task_title"),
                 "task_intent": parameters.get("task_intent"),
+                **({"tenant_id": scope[0], "request_id": scope[1], "task_id": str(task_id)} if scope else {}),
                 **({"tenant_id": budget.governor.tenant_id} if budget is not None else {}),
             },
             max_results=int(parameters.get("max_results") or 5),
-            **({"budget": budget} if budget is not None else {}),
+            **dispatch_options,
         )
         evidence_items = self._evidence_store.record_search_results(
             task_id=task_id,
@@ -2823,7 +3104,7 @@ class SearchWebTool(Tool):
                 "cache_strategy": cache_strategy,
                 "answer": answer_text,
                 "notices": notices,
-                "evidence": evidence_items,
+                "evidence": public_web_evidence_projection(evidence_items) if web_enabled else evidence_items,
             },
             ensure_ascii=False,
         )
@@ -2840,6 +3121,10 @@ class FetchPageTool(Tool):
         evidence_store: EvidenceStore,
         timeout_seconds: float = 10.0,
         multimodal_parser: Any | None = None,
+        web_extractor: WebExtractor | None = None,
+        extraction_context_provider: Callable[..., ExtractionContext | None] | None = None,
+        commit_lock: Any = None,
+        persist_web_evidence: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__(
             name="fetch_page",
@@ -2850,6 +3135,24 @@ class FetchPageTool(Tool):
         self._evidence_store = evidence_store
         self._timeout_seconds = timeout_seconds
         self._multimodal_parser = multimodal_parser
+        self._extraction_context_provider = extraction_context_provider
+        self._web_extractor = web_extractor
+        self._commit_lock = commit_lock
+        self._persist_web_evidence = persist_web_evidence
+        if self._web_extractor is None and evidence_store.web_extraction_enabled:
+            self._web_extractor = self.build_web_extractor()
+
+    def build_web_extractor(self) -> WebExtractor:
+        parser = self._multimodal_parser
+        return WebExtractor(
+            pdf_parser=lambda data, check: _extract_pdf_text(
+                data, max_pages=min(20, getattr(parser, "max_pdf_pages", 20)), check=check,
+            ),
+            pdf_limit=getattr(parser, "max_pdf_bytes", 2 * 1024 * 1024),
+        )
+
+    def set_web_extractor(self, extractor: WebExtractor) -> None:
+        self._web_extractor = extractor
 
     def get_parameters(self) -> list[ToolParameter]:
         return [
@@ -2876,6 +3179,9 @@ class FetchPageTool(Tool):
 
         parser = getattr(self, "_multimodal_parser", None)
         budget = self.budget_provider() if self.budget_provider else None
+        if self._evidence_store.web_extraction_enabled:
+            return self.fetch_tiered(task_id, source_id, url, budget=budget)[0]
+
         if budget is not None:
             artifact = _fetch_page_artifact(url, timeout_seconds=self._timeout_seconds, budget=budget)
             title, content, multimodal_blocks = artifact.title, artifact.content, None
@@ -2902,6 +3208,63 @@ class FetchPageTool(Tool):
             multimodal_blocks=multimodal_blocks,
         )
         return json.dumps(item, ensure_ascii=False)
+
+
+    def fetch_tiered(
+        self, task_id: int, source_id: str | None, url: str, *, budget: Any = None,
+        context: ExtractionContext | None = None,
+    ) -> tuple[str, str | None]:
+        extractor = self._web_extractor
+        if extractor is None:
+            return "{}", "adapter_unavailable"
+        if context is None and self._extraction_context_provider:
+            context = self._extraction_context_provider(task_id)
+            if context is None:
+                return "{}", "not_eligible"
+        if context is None:
+            if budget is None:
+                return "{}", "budget_denied"
+            remaining = budget.governor.remaining_timeout(self._timeout_seconds, stage=budget.stage)
+            context = ExtractionContext(
+                budget.governor.tenant_id, budget.governor.request_id, task_id,
+                FetchScope(
+                    time.monotonic() + remaining,
+                    check_owner=lambda: not budget.blocked,
+                    cancelled=budget.agent._is_cancelled,
+                    attempt=lambda demand: budget.attempt(demand, required=False),
+                ),
+                can_dispatch=budget.can_dispatch,
+            )
+        if context.task_id != task_id or (context.source_id is not None and context.source_id != source_id):
+            return "{}", "not_eligible"
+        context = replace(context, static_timeout=min(context.static_timeout, self._timeout_seconds))
+        snippet = self._evidence_store.web_snippet_for_fetch(source_id, url) if source_id else None
+        observed_reason = None
+        record_result = getattr(context, "on_result", None)
+
+        def on_result(tier: str | None, reason: str | None) -> None:
+            nonlocal observed_reason
+            observed_reason = reason
+            if record_result is not None:
+                record_result(tier, reason)
+
+        if hasattr(context, "on_result"):
+            context = replace(context, on_result=on_result)
+        try:
+            result = extractor.extract(url, context=context, snippet=snippet)
+            if result is None:
+                return "{}", observed_reason or "quality_insufficient"
+            with self._commit_lock or nullcontext():
+                context.scope.check()
+                payload = self._evidence_store.update_full_content(
+                    task_id=task_id, source_id=source_id, url=url, title="", full_content="",
+                    web_result=result, check_owner=context.scope.check,
+                )
+                if payload and self._persist_web_evidence is not None:
+                    self._persist_web_evidence(task_id)
+            return json.dumps(public_web_evidence_projection(payload), ensure_ascii=False), result.degraded_reason
+        except GatewayError as error:
+            return "{}", error.reason
 
 
 class EvidenceLookupTool(Tool):

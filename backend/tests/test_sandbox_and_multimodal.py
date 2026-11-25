@@ -921,3 +921,16 @@ class TestDirection02PipelineIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebBlockSerializationTests(unittest.TestCase):
+    def test_versioned_table_block_does_not_share_nested_payload(self):
+        from services.multimodal_parser import MultimodalEvidenceBlock
+
+        block = MultimodalEvidenceBlock(
+            "html-t1", "table", structured_payload={"schema_version": 1, "cells": [{"text": "42"}]},
+        )
+        export = block.to_dict()
+        self.assertEqual(export["kind"], "table")
+        export["structured_payload"]["cells"][0]["text"] = "changed"
+        self.assertEqual(block.to_dict()["structured_payload"]["cells"][0]["text"], "42")

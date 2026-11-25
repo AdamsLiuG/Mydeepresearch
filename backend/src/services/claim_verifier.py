@@ -724,6 +724,42 @@ _CURRENCY_UNITS = {
     "jpy": "jpy", "日元": "jpy", "hkd": "hkd", "hk$": "hkd", "港元": "hkd",
 }
 _RATE_CONTEXT = re.compile(r"%|率|份额|占比|margin|rate|share|percent|cagr|yoy", re.IGNORECASE)
+_YEAR_COLUMN = re.compile(r"\b(?:year|date|period|quarter|fy)\b|年度|年份|期间|日期|季度", re.I)
+
+
+def web_fact_excerpts(record: dict[str, Any]) -> list[str] | None:
+    """Return verified web prose and independent table rows for numeric grounding."""
+    if record.get("provenance_meta", {}).get("web_extraction", {}).get("tier") not in {"L1", "L2"}:
+        return None
+    excerpts = [record["full_content"]] if record.get("full_content") else []
+    for block in record.get("multimodal_blocks") or ():
+        if block.get("modality") != "table":
+            if text := block.get("text"):
+                excerpts.append(text)
+            continue
+        payload = block.get("structured_payload") or {}
+        if payload.get("schema_version") != 1:
+            if text := block.get("text") or block.get("markdown"):
+                excerpts.append(text)
+            continue
+        unit = str(payload.get("unit_text") or "").strip()
+        currency_scale = re.fullmatch(rf"({_CURRENCY})\s+({_SCALE})", unit, re.I)
+        if currency_scale:
+            unit = f"{currency_scale[2]} {currency_scale[1]}"
+        if not _QUANTITY.fullmatch(f"1 {unit}"):
+            unit = ""
+        headers = payload.get("headers") or []
+        for row in payload.get("rows") or []:
+            cells = []
+            for col, value in enumerate(row):
+                label = headers[col] if col < len(headers) else ""
+                if unit and not _YEAR_COLUMN.search(label) and re.fullmatch(
+                    r"[+\-−]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", value,
+                ):
+                    value = f"{value} {unit}"
+                cells.append(value)
+            excerpts.append(" | ".join(cells))
+    return excerpts
 
 
 def _normalize_quantity(value: float, unit: str) -> tuple[float, str]:
@@ -1146,6 +1182,7 @@ def _inline_chunk_and_bm25_top_k(
     query: str,
     records: list[dict[str, Any]],
     top_k_per_source: int,
+    web_extraction_enabled: bool = False,
 ) -> list[EvidenceRetrievalHit]:
     query_tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}|\d+(?:\.\d+)?", query.lower()))
     hits: list[EvidenceRetrievalHit] = []
@@ -1154,7 +1191,10 @@ def _inline_chunk_and_bm25_top_k(
         if not sid:
             continue
         texts: list[tuple[str, str]] = []
-        full = str(rec.get("full_content") or rec.get("raw_content") or rec.get("snippet") or "").strip()
+        body = rec.get("full_content")
+        if not (web_extraction_enabled and rec.get("source_origin") == "web"):
+            body = body or rec.get("raw_content") or rec.get("snippet")
+        full = str(body or "").strip()
         if full:
             for idx in range(0, min(len(full), 6000), 600):
                 window = full[idx : idx + 680].strip()
@@ -1209,6 +1249,9 @@ class ScopedEvidenceRetriever:
         top_k_per_source: int = 3,
     ) -> list[EvidenceRetrievalHit]:
         allowed_list = list(dict.fromkeys(sid.strip() for sid in atomic_claim.source_ids if sid.strip()))
+        web_enabled = getattr(evidence_store, "web_extraction_enabled", False)
+        if web_enabled:
+            allowed_list = [sid for sid in allowed_list if evidence_store.is_eligible_for_facts(sid)]
         if not allowed_list:
             return []
         allowed_set = set(allowed_list)
@@ -1238,7 +1281,7 @@ class ScopedEvidenceRetriever:
         if missing:
             records = {
                 rec["source_id"]: rec for rec in cited_records_fallback
-                if isinstance(rec, dict) and rec.get("source_id") in missing
+                if not web_enabled and isinstance(rec, dict) and rec.get("source_id") in missing
             }
             if evidence_store is not None:
                 records.update({
@@ -1251,6 +1294,7 @@ class ScopedEvidenceRetriever:
                 query=atomic_claim.text,
                 records=list(records.values()),
                 top_k_per_source=top_k_per_source,
+                web_extraction_enabled=web_enabled,
             ):
                 by_source[hit.source_id].append(hit)
         return [hit for sid in allowed_list for hit in by_source[sid]]
@@ -1561,6 +1605,12 @@ class ClaimVerificationOrchestrator:
         self._conflict_builder = conflict_builder or ConflictGraphBuilder(config)
 
     def _collect_evidence_map(self, state: Any) -> dict[str, dict[str, Any]]:
+        store = self._evidence_store
+        if getattr(store, "web_extraction_enabled", False):
+            return {
+                item["source_id"]: item for item in store.lookup()
+                if store.is_eligible_for_facts(item["source_id"])
+            }
         by_id: dict[str, dict[str, Any]] = {}
         for task in getattr(state, "todo_items", []) or []:
             for item in getattr(task, "evidence_items", None) or []:
@@ -1589,6 +1639,7 @@ class ClaimVerificationOrchestrator:
         budget_sec = float(getattr(self._config, "nli_stage_budget_seconds", 8.0))
         deadline = time.monotonic() + budget_sec
         evidence_by_id = self._collect_evidence_map(state)
+        web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
         request_valid_ids = set(evidence_by_id.keys())
         max_atomics = int(getattr(self._config, "nli_max_atomic_claims_per_task", 12) or 12)
         top_k = int(getattr(self._config, "nli_top_k_chunks_per_source", 3) or 3)
@@ -1606,6 +1657,7 @@ class ClaimVerificationOrchestrator:
                 for idx, claim in enumerate(task_claims)
                 if str(claim.get("support_status") or "") not in {"missing_citation", "invalid_citation"}
                 and bool(claim.get("source_ids"))
+                and (not web_enabled or set(claim["source_ids"]) <= request_valid_ids)
             ]
             if not verifiable_pairs:
                 continue
@@ -1888,6 +1940,9 @@ class ClaimVerificationOrchestrator:
             if not bool(getattr(self._config, "nli_verifier_enabled", False)):
                 return None
             valid_ids = {str(r.get("source_id") or "").strip() for r in cited_records if r.get("source_id")}
+            web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
+            if web_enabled:
+                valid_ids = {sid for sid in valid_ids if self._evidence_store.is_eligible_for_facts(sid)}
             if not valid_ids:
                 return None
             atomics = self._decomposer.decompose(
@@ -1907,7 +1962,7 @@ class ClaimVerificationOrchestrator:
                 hits = self._retriever.fetch_for_claim(
                     atomic,
                     retrieval_service=None,
-                    evidence_store=None,
+                    evidence_store=self._evidence_store if web_enabled else None,
                     cited_records_fallback=cited_records,
                     top_k_per_source=int(getattr(self._config, "nli_top_k_chunks_per_source", 3) or 3),
                 )

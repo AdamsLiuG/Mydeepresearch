@@ -15,6 +15,32 @@ from typing import Any
 CHARS_PER_TOKEN = 4
 _CJK_TOKEN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
 
+WEB_EXTRACTION_REASONS = frozenset({
+    "not_eligible", "adapter_unavailable", "origin_not_allowed", "url_denied",
+    "dns_denied", "redirect_denied", "access_denied", "download_blocked",
+    "content_type_denied", "size_limit", "queue_full", "timeout", "network_error",
+    "budget_denied", "lease_lost", "cancelled", "response_invalid",
+    "visibility_uncertain", "quality_insufficient",
+})
+_WEB_LABEL_VALUES = {
+    "tier": {"L0", "L1", "L2", "none"},
+    "adapter": {"snippet", "static", "reader_http", "playwright", "none"},
+    "outcome": {"success", "degraded", "empty", "cancelled"},
+    "kind": {"static", "reader_service", "document", "subresource"},
+    "reason": WEB_EXTRACTION_REASONS,
+}
+_WEB_COUNTER_LABELS = {
+    "result": ("tier", "adapter", "outcome"),
+    "l2_selected": ("adapter",),
+    "http_attempt": ("adapter", "kind"),
+    "degraded": ("reason",),
+    "egress_denied": ("reason",),
+    "sanitizer_dropped_nodes": (),
+    "sanitizer_dropped_text": (),
+    "cache_hit": ("adapter",),
+}
+_WEB_LATENCY_EVENTS = {"queue", "elapsed", "http_elapsed", "render"}
+
 DEFAULT_PRICING_CATALOG: dict[str, dict[str, dict[str, float]]] = {
     "default": {
         "default": {
@@ -316,6 +342,9 @@ class MetricsRegistry:
         self._task_react_stop_reason_counts: dict[str, int] = {}
         self._budget_denial_reason_counts: dict[str, int] = {}
         self._replan_reason_counts: dict[str, int] = {}
+        self._web_counters: dict[str, dict[tuple[str, ...], int]] = {}
+        self._web_latencies: dict[str, dict[str, LatencyStats]] = {}
+        self._web_l2_inflight: int | None = None
         self._kv_cache_by_stage: dict[str, dict[str, Any]] = {}
         self._estimated_cost = 0.0
         self._latencies: dict[str, LatencyStats] = {
@@ -346,6 +375,9 @@ class MetricsRegistry:
             self._task_react_stop_reason_counts = {}
             self._budget_denial_reason_counts = {}
             self._replan_reason_counts = {}
+            self._web_counters.clear()
+            self._web_latencies.clear()
+            self._web_l2_inflight = None
             self._kv_cache_by_stage.clear()
             self._estimated_cost = 0.0
             self._latencies = {
@@ -490,6 +522,77 @@ class MetricsRegistry:
                 } else "other"
                 self._replan_reason_counts[normalized] = self._replan_reason_counts.get(normalized, 0) + 1
 
+    def record_web_extraction(
+        self,
+        event: str,
+        *,
+        tier: str | None = None,
+        adapter: str | None = None,
+        outcome: str | None = None,
+        kind: str | None = None,
+        reason: str | None = None,
+        amount: int = 1,
+        elapsed_ms: float | None = None,
+    ) -> None:
+        """Aggregate an observation using only the dimensions defined for its event."""
+        if event == "l2_inflight":
+            if type(amount) is int and amount in (-1, 1):
+                with self._lock:
+                    self._web_l2_inflight = max(0, (self._web_l2_inflight or 0) + amount)
+            return
+
+        if isinstance(event, str) and event in _WEB_LATENCY_EVENTS:
+            if (
+                isinstance(adapter, str)
+                and adapter in _WEB_LABEL_VALUES["adapter"]
+                and type(elapsed_ms) in (int, float)
+                and 0 <= elapsed_ms < math.inf
+            ):
+                with self._lock:
+                    latencies = self._web_latencies.setdefault(event, {})
+                    latencies.setdefault(adapter, LatencyStats()).add(elapsed_ms)
+            return
+
+        label_names = _WEB_COUNTER_LABELS.get(event) if isinstance(event, str) else None
+        if label_names is None or type(amount) is not int or amount <= 0:
+            return
+        labels = {"tier": tier, "adapter": adapter, "outcome": outcome, "kind": kind, "reason": reason}
+        values = tuple(labels[name] for name in label_names)
+        if any(
+            not isinstance(value, str) or value not in _WEB_LABEL_VALUES[name]
+            for name, value in zip(label_names, values)
+        ):
+            return
+        with self._lock:
+            counter = self._web_counters.setdefault(event, {})
+            counter[values] = counter.get(values, 0) + amount
+
+    def _web_extraction_snapshot(
+        self, counters: dict[str, int], latencies: dict[str, Any],
+    ) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {}
+        for event, observations in self._web_counters.items():
+            name = f"web_extraction_{event}_total"
+            counters[name] = sum(observations.values())
+            label_names = _WEB_COUNTER_LABELS[event]
+            snapshot[name] = (
+                [dict(zip(label_names, labels), count=count) for labels, count in sorted(observations.items())]
+                if label_names else counters[name]
+            )
+        for event, adapters in self._web_latencies.items():
+            name = f"web_extraction_{event}_ms"
+            aggregate = LatencyStats(
+                count=sum(stats.count for stats in adapters.values()),
+                total_ms=sum(stats.total_ms for stats in adapters.values()),
+                min_ms=min(stats.min_ms for stats in adapters.values()),
+                max_ms=max(stats.max_ms for stats in adapters.values()),
+            )
+            latencies[name] = aggregate.to_dict()
+            snapshot[name] = {adapter: stats.to_dict() for adapter, stats in sorted(adapters.items())}
+        if self._web_l2_inflight is not None:
+            snapshot["web_extraction_l2_inflight"] = self._web_l2_inflight
+        return snapshot
+
     def store_request(self, payload: dict[str, Any]) -> None:
         with self._lock:
             self._recent_requests.appendleft(_clone_dict(payload))
@@ -500,6 +603,7 @@ class MetricsRegistry:
         with self._lock:
             counters = dict(self._counters)
             latencies = {name: stats.to_dict() for name, stats in self._latencies.items()}
+            web_extraction = self._web_extraction_snapshot(counters, latencies)
             estimated_cost = round(self._estimated_cost, 6)
             recent_requests = [
                 _clone_dict(request)
@@ -564,6 +668,7 @@ class MetricsRegistry:
             if task_react_stop_total
             else 0.0,
             "recent_requests": recent_requests,
+            **({"web_extraction": web_extraction} if web_extraction else {}),
         }
 
 

@@ -581,6 +581,8 @@ def _chunk_text(
 
 
 def _record_text(record: Any) -> str:
+    if getattr(record, "_web_verified", False):
+        return str(getattr(record, "full_content", "") or "")
     parts: list[str] = []
     for key in ("full_content", "raw_content", "snippet"):
         value = _clean_structured_text(getattr(record, key, ""))
@@ -600,7 +602,17 @@ def _record_text(record: Any) -> str:
 
 
 def _record_has_full_content(record: Any) -> bool:
+    if getattr(record, "_web_verified", False):
+        return bool(getattr(record, "full_content", "") or getattr(record, "multimodal_blocks", None))
     return bool(_clean_structured_text(getattr(record, "full_content", "")))
+
+
+def _web_passages(record: Any, text: str) -> list[tuple[int, int, str, str]]:
+    anchors = record.provenance_meta["web_extraction"]["text_anchors"]
+    return [
+        (anchor["start"], anchor["end"], text[anchor["start"]:anchor["end"]], anchor["anchor_id"])
+        for anchor in anchors
+    ]
 
 
 def _layout_fields(block: dict[str, Any]) -> dict[str, Any]:
@@ -763,9 +775,12 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         *,
         reason: str,
     ) -> list[EvidenceChunk]:
+        web_managed = getattr(record, "_web_managed", False)
+        if web_managed and not record._web_verified:
+            return []
         archive_version_id = _record_archive_version_id(record)
         if (
-            reason == "hydrate" and archive_version_id and self._archive_loader is not None
+            not web_managed and reason == "hydrate" and archive_version_id and self._archive_loader is not None
             and _normalize_text(getattr(record, "source_origin", "web")) == "web"
         ):
             restored = self._archive_loader.load_runtime_chunks(
@@ -786,17 +801,18 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
 
         has_full_content = _record_has_full_content(record)
         windows = (
-            _chunk_text(
+            _web_passages(record, text)[:self._config.evidence_runtime_max_chunks]
+            if web_managed else [
+                (start, end, window, None) for start, end, window in _chunk_text(
                 text,
                 max_chars=self._config.evidence_chunk_chars,
                 overlap=self._config.evidence_chunk_overlap,
                 max_chunks=self._config.evidence_runtime_max_chunks,
-            )
-            if text
-            else []
+                )
+            ] if text else []
         )
         chunks: list[EvidenceChunk] = []
-        for index, (start, end, window) in enumerate(windows, start=1):
+        for index, (start, end, window, anchor) in enumerate(windows, start=1):
             chunks.append(
                 EvidenceChunk(
                     chunk_id=f"{source_id}::chunk::{index}",
@@ -810,7 +826,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                     title=_normalize_text(getattr(record, "title", "")),
                     url=_normalize_text(getattr(record, "url", "")),
                     domain=_normalize_text(getattr(record, "domain", "")),
-                    snippet=_clean_text(getattr(record, "snippet", "")),
+                    snippet=window if web_managed else _clean_text(getattr(record, "snippet", "")),
                     quality_label=_normalize_text(getattr(record, "quality_label", "")) or "medium",
                     freshness_label=_normalize_text(getattr(record, "freshness_label", "")) or "unknown",
                     published_at=_normalize_text(getattr(record, "published_at", "")) or None,
@@ -827,7 +843,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                         if isinstance(getattr(record, "bbox", None), list)
                         else None
                     ),
-                    anchor_id=_normalize_text(getattr(record, "anchor_id", "")) or None,
+                    anchor_id=anchor or _normalize_text(getattr(record, "anchor_id", "")) or None,
                     modality=_normalize_text(getattr(record, "modality", "")) or "text",
                     structured_payload=(
                         dict(getattr(record, "structured_payload"))
@@ -1209,13 +1225,17 @@ class EvidenceMemoryService(EvidenceStoreListener):
     ) -> bool:
         normalized_url = _normalize_url(getattr(record, "url", ""))
         text = _record_text(record)
-        if not normalized_url or not text:
+        blocks = getattr(record, "multimodal_blocks", None) or []
+        web_managed = getattr(record, "_web_managed", False)
+        if not normalized_url or not (text or (web_managed and blocks)):
             return False
 
         canonical_doc_key = _sha256_text(normalized_url)
-        blocks = getattr(record, "multimodal_blocks", None) or []
+        material = [text, blocks, record.provenance_meta["web_extraction"]] if web_managed else None
         content_hash = _sha256_text(
-            f"{text}\n{json.dumps(blocks, sort_keys=True, ensure_ascii=False)}" if blocks else text,
+            json.dumps(material, sort_keys=True, ensure_ascii=False) if web_managed else (
+                f"{text}\n{json.dumps(blocks, sort_keys=True, ensure_ascii=False)}" if blocks else text
+            ),
         )
         doc_version_id = _sha256_text(f"{normalized_url}\n{content_hash}")
         has_full_content = _record_has_full_content(record)
@@ -1261,11 +1281,16 @@ class EvidenceMemoryService(EvidenceStoreListener):
             return True
 
         metrics_registry.increment("evidence_archive_ingest_total")
-        windows = _chunk_text(
-            text,
-            max_chars=self._config.evidence_chunk_chars,
-            overlap=self._config.evidence_chunk_overlap,
-            max_chunks=self._config.evidence_runtime_max_chunks,
+        windows = (
+            _web_passages(record, text)[:self._config.evidence_runtime_max_chunks]
+            if web_managed and record._web_verified else [
+                (start, end, window, None) for start, end, window in _chunk_text(
+                    text,
+                    max_chars=self._config.evidence_chunk_chars,
+                    overlap=self._config.evidence_chunk_overlap,
+                    max_chunks=self._config.evidence_runtime_max_chunks,
+                )
+            ]
         )
         archive_chunks = [
             EvidenceChunk(
@@ -1286,8 +1311,9 @@ class EvidenceMemoryService(EvidenceStoreListener):
                 published_at=_normalize_text(getattr(record, "published_at", "")) or None,
                 archive_doc_key=canonical_doc_key,
                 archive_version_id=doc_version_id,
+                anchor_id=anchor,
             )
-            for index, (start, end, window) in enumerate(windows, start=1)
+            for index, (start, end, window, anchor) in enumerate(windows, start=1)
         ]
         archive_chunks.extend(_multimodal_chunks(
             record, task_id=int(getattr(record, "task_id", 0) or 0), source_id=doc_version_id, origin="history",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from threading import Semaphore, Thread
 from time import sleep
@@ -13,16 +13,20 @@ from typing import Any, Callable, Iterator
 
 from metrics import RequestTrace, extract_llm_usage, metrics_registry
 from models import SummaryState, TodoItem
-from services.context_builder import ContextPrefixBuilder
+from prompts import web_evidence_prompt_rules
+from services.context_builder import ContextPrefixBuilder, render_web_evidence_data
 from services.evidence import (
     EvidenceStore,
     build_task_context,
     build_task_context_from_hits,
     format_evidence_sources,
+    public_web_evidence_projection,
+    public_web_url,
 )
 from services.evidence_index import EvidenceRetrievalHit
 from services.fact_ledger import render_context_checkpoint, render_context_delta
 from services.mcp_bridge import MCPHitlApprovalRequired, _scope_allows_tool
+from services.memory_sanitizer import sanitize_web_text
 from services.policy_controller import (
     ModelPolicyController,
     PolicyDecision,
@@ -130,6 +134,14 @@ class TaskReactDecision:
 
 
 class TaskExecutorMixin:
+    def _web_search_options(self) -> tuple[Any, dict[str, Any]]:
+        store = getattr(self, "_evidence_store", None)
+        web_enabled = bool(getattr(store, "web_extraction_enabled", False))
+        tenant = getattr(self, "tenant_id", "default")
+        if web_enabled:
+            return getattr(self, "_web_budget", None), {"web_extraction_enabled": True}
+        opts = {"web_extraction_enabled": False} if self.config.web_extraction_enabled_for(tenant) else {}
+        return getattr(self, "_research_budget", None), opts
     """Run planned task batches and task-level evidence repair loops."""
 
     def _execute_task_batch_sync(
@@ -193,7 +205,7 @@ class TaskExecutorMixin:
         retry_backoff_seconds = max(float(self.config.search_tool_retry_backoff_seconds or 0.0), 0.0)
         timeout_seconds = self.config.search_tool_timeout_seconds
         operation_name = f"搜索工具调用[{candidate}]"
-        budget = getattr(self, "_research_budget", None)
+        budget, web_options = self._web_search_options()
         cache_context = {
             "research_topic": state.research_topic,
             "task_title": task.title,
@@ -202,15 +214,15 @@ class TaskExecutorMixin:
             "task_id": str(task.id),
         }
         tenant = str(getattr(self, "tenant_id", "") or "").strip()
-        if tenant not in {"", "default"}:
-            cache_context["tenant_id"] = tenant
+        if tenant not in {"", "default"} or web_options.get("web_extraction_enabled"):
+            cache_context["tenant_id"] = tenant or "default"
 
         for retry_index in range(retry_attempts + 1):
             try:
                 if budget is not None:
                     return dispatch_search(
                         candidate, self.config, state.research_loop_count,
-                        observer=observer, cache_context=cache_context, budget=budget,
+                        observer=observer, cache_context=cache_context, budget=budget, **web_options,
                     )
                 return self._run_with_timeout(
                     lambda: dispatch_search(
@@ -219,6 +231,7 @@ class TaskExecutorMixin:
                         state.research_loop_count,
                         observer=observer,
                         cache_context=cache_context,
+                        **web_options,
                     ),
                     timeout_seconds=timeout_seconds,
                     operation_name=operation_name,
@@ -326,12 +339,13 @@ class TaskExecutorMixin:
             },
         )
         try:
-            budget = getattr(self, "_research_budget", None)
+            budget, web_options = self._web_search_options()
             if budget is not None:
                 result = dispatch_search(
                     topic_query, self.config, state.research_loop_count, observer=observer,
                     cache_context={"research_topic": state.research_topic, "tenant_id": self.tenant_id},
                     budget=budget, required=False,
+                    **web_options,
                 )
             else:
                 result = self._run_with_timeout(
@@ -340,7 +354,11 @@ class TaskExecutorMixin:
                         self.config,
                         state.research_loop_count,
                         observer=observer,
-                        cache_context={"research_topic": state.research_topic},
+                        cache_context={
+                            "research_topic": state.research_topic,
+                            **({"tenant_id": self.tenant_id} if web_options.get("web_extraction_enabled") else {}),
+                        },
+                        **web_options,
                     ),
                     timeout_seconds=self.config.search_tool_timeout_seconds,
                     operation_name=f"主题缓存预热[{topic_query}]",
@@ -455,6 +473,9 @@ class TaskExecutorMixin:
             request_id=self.request_id,
             observer=observer,
         )
+        store = getattr(self, "_evidence_store", None)
+        if getattr(store, "web_extraction_enabled", False):
+            return [hit for hit in result.hits if store.is_eligible_for_facts(hit.source_id)]
         return list(result.hits)
 
     def _repair_hits_for_task(
@@ -475,6 +496,12 @@ class TaskExecutorMixin:
             request_id=self.request_id,
             observer=observer,
         )
+        if getattr(getattr(self, "_evidence_store", None), "web_extraction_enabled", False):
+            return [
+                replace(hit, title=sanitize_web_text(hit.title, max_chars=500), text="", snippet="")
+                if hit.origin == "history" else hit
+                for hit in result.hits if hit.origin != "history" or public_web_url(hit.url)
+            ]
         return list(result.hits)
 
     def _query_signal_tokens(self, value: str) -> set[str]:
@@ -610,9 +637,14 @@ class TaskExecutorMixin:
         evidence_items: list[dict[str, Any]],
     ) -> TaskReactObservation:
         source_count = len(evidence_items)
+        store = getattr(self, "_evidence_store", None)
+        web_enabled = bool(getattr(store, "web_extraction_enabled", False))
+        supporting_items = [
+            item for item in evidence_items if store.is_eligible_for_facts(item.get("source_id"))
+        ] if web_enabled else evidence_items
         unique_domains = {
             str(item.get("domain") or "").strip().lower()
-            for item in evidence_items
+            for item in supporting_items
             if str(item.get("domain") or "").strip()
         }
         source_diversity = len(unique_domains)
@@ -621,16 +653,16 @@ class TaskExecutorMixin:
             not freshness_sensitive
             or any(
                 str(item.get("freshness_label") or "").strip() in {"fresh", "recent", "current"}
-                for item in evidence_items
+                for item in supporting_items
             )
         )
         high_quality_count = sum(
             1
-            for item in evidence_items
+            for item in supporting_items
             if str(item.get("quality_label") or "").strip() == "high"
         )
         high_quality_source = high_quality_count > 0
-        full_content_available = any(
+        full_content_available = bool(supporting_items) if web_enabled else any(
             bool(str(item.get("full_content") or "").strip())
             or len(str(item.get("snippet") or "").strip()) >= 240
             for item in evidence_items
@@ -652,7 +684,7 @@ class TaskExecutorMixin:
                 gap_signals.append("thin_content")
 
         evidence_sufficiency = (
-            source_count >= max(int(self.config.review_min_sources_per_task or 1), 1)
+            len(supporting_items) >= max(int(self.config.review_min_sources_per_task or 1), 1)
             and source_diversity >= max(int(self.config.review_min_domains_per_task or 1), 1)
             and freshness_ok
         )
@@ -728,7 +760,11 @@ class TaskExecutorMixin:
         fetch_budget_left = (
             task.react_fetch_count < max(int(self.config.task_react_max_fetches_per_task or 0), 0)
         )
-        top_item = self._top_evidence_item(evidence_items)
+        store = getattr(self, "_evidence_store", None)
+        top_item = self._top_evidence_item([
+            item for item in evidence_items if item.get("source_origin", "web") == "web"
+            and not store.is_eligible_for_facts(item.get("source_id"))
+        ] if getattr(store, "web_extraction_enabled", False) else evidence_items)
         current_urls = {
             str(item.get("url") or "").strip()
             for item in evidence_items
@@ -1037,6 +1073,7 @@ class TaskExecutorMixin:
             ("context_delta", render_context_delta(state, self.config)),
         ]
         role = str(getattr(self.task_react_agent, "system_prompt", "") or "")
+        role += web_evidence_prompt_rules(bool(getattr(getattr(self, "_evidence_store", None), "web_extraction_enabled", False)))
         if builder.enabled():
             envelope = builder.build_envelope(
                 stage="task_react",
@@ -1318,29 +1355,54 @@ class TaskExecutorMixin:
                 if target_url:
                     task.react_fetch_count += 1
                     try:
-                        response = self.fetch_page_tool.run(
-                            {
-                                "task_id": task.id,
-                                "source_id": target_source_id,
-                                "url": target_url,
-                            }
-                        )
+                        fetch_reason = None
+                        if evidence_store.web_extraction_enabled:
+                            # Coverage comes from the previous server-side observation and selected task.
+                            context = self._web_fetch_context(
+                                task.id, state=state, task=task, source_id=target_source_id,
+                                needs_coverage=bool(task.react_gap_signals),
+                            )
+                            if context is None:
+                                response, fetch_reason = "{}", "not_eligible"
+                            else:
+                                response, fetch_reason = self.fetch_page_tool.fetch_tiered(
+                                    task.id, target_source_id, target_url, context=context,
+                                )
+                        else:
+                            response = self.fetch_page_tool.run({
+                                "task_id": task.id, "source_id": target_source_id, "url": target_url,
+                            })
                         payload = self._extract_json_payload(str(response or "").strip()) or {}
-                        if payload:
+                        if evidence_store.web_extraction_enabled:
+                            meta = payload.get("provenance_meta", {}).get("web_extraction", {})
+                            tier = meta.get("tier")
+                            if tier in {"L1", "L2"}:
+                                fetch_notice = f"已取得净化正文（{tier}）：{payload.get('source_id') or target_source_id}"
+                            elif tier == "L0":
+                                fetch_notice = f"保留网页摘要（L0，{fetch_reason or 'not_eligible'}）"
+                            else:
+                                fetch_notice = f"未取得可用网页内容（{fetch_reason or 'quality_insufficient'}）"
+                            notices = self._merge_notices(notices, [fetch_notice])
+                        elif payload:
                             fetch_notice = (
                                 f"已抓取来源全文：{payload.get('source_id') or target_source_id or target_url}"
                             )
                             notices = self._merge_notices(notices, [fetch_notice])
                     except Exception as exc:
+                        if evidence_store.web_extraction_enabled:
+                            if type(exc).__name__ in {"SnapshotConflictError", "WorkflowLeaseLost"}:
+                                raise
+                            notices = self._merge_notices(notices, ["未取得可用网页内容（response_invalid）"])
+                        else:
+                            notices = self._merge_notices(notices, [f"抓取来源正文失败：{exc}"])
                         logger.warning(
                             "Task fetch-page action failed task_id=%s title=%s error=%s",
                             task.id,
                             task.title,
-                            exc,
+                            type(exc).__name__ if evidence_store.web_extraction_enabled else exc,
                         )
                         if observer:
                             observer.record_degraded(f"task_fetch_failed:{task.id}")
-                        notices = self._merge_notices(notices, [f"抓取来源正文失败：{exc}"])
                 else:
                     notices = self._merge_notices(notices, ["未找到可抓取的来源正文，结束补证据。"])
             else:
@@ -1494,7 +1556,9 @@ class TaskExecutorMixin:
                 self._drain_tool_events(state)
 
             task.evidence_items = evidence_store.list_task_evidence(task.id, include_full_content=True)
-            task.sources_summary = format_evidence_sources(task.evidence_items)
+            task.sources_summary = format_evidence_sources(
+                public_web_evidence_projection(task.evidence_items) if evidence_store.web_extraction_enabled else task.evidence_items,
+            )
             task.react_rounds = round_index
             observation = self._observe_task_evidence(state, task, task.evidence_items)
             task.react_gap_signals = list(observation.gap_signals)
@@ -1643,20 +1707,14 @@ class TaskExecutorMixin:
             self._persist_request_state(state, phase="task_execution", status="in_progress")
             return
 
-        grounding_hits = self._grounding_hits_for_task(state, task, observer=observer)
-        context = (
-            build_task_context_from_hits(
-                grounding_hits,
-                answer_text=answer_text,
-                config=self.config,
-            )
-            if grounding_hits
-            else build_task_context(
-                task.evidence_items,
-                answer_text=answer_text,
-                config=self.config,
-            )
-        )
+        if evidence_store.web_extraction_enabled:
+            context = web_evidence_prompt_rules(True) + render_web_evidence_data(task.evidence_items, evidence_store)
+            if answer_text:
+                context += "\n" + json.dumps({"web_search_answer_lead": answer_text}, ensure_ascii=False)
+        else:
+            grounding_hits = self._grounding_hits_for_task(state, task, observer=observer)
+            build_context = build_task_context_from_hits if grounding_hits else build_task_context
+            context = build_context(grounding_hits or task.evidence_items, answer_text=answer_text, config=self.config)
         historical_memory_context = self._task_memory_context(state, task, observer)
         upstream_context = str(getattr(task, "upstream_context", "") or "").strip()
         if upstream_context:
@@ -1838,7 +1896,9 @@ class TaskExecutorMixin:
             )
 
         task.evidence_items = evidence_store.list_task_evidence(task.id)
-        task.sources_summary = format_evidence_sources(task.evidence_items)
+        task.sources_summary = format_evidence_sources(
+            public_web_evidence_projection(task.evidence_items) if evidence_store.web_extraction_enabled else task.evidence_items,
+        )
         task.summary = (summary_result.markdown or "").strip() if summary_result else "暂无可用信息"
         task.summary_payload = dict(summary_result.payload or {}) if summary_result else None
         task.claims = list(summary_result.claims or []) if summary_result else []
@@ -1899,7 +1959,9 @@ class TaskExecutorMixin:
         valid_ids = {
             str(item.get("source_id") or "").strip()
             for item in evidence_store.list_task_evidence(task.id)
-            if item.get("source_id")
+            if item.get("source_id") and (
+                not evidence_store.web_extraction_enabled or evidence_store.is_eligible_for_facts(item["source_id"])
+            )
         }
         max_reqs = max(1, int(getattr(self.config, "sandbox_max_executions_per_task", 4) or 4))
         extra_findings: list[dict[str, Any]] = []

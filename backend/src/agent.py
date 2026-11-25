@@ -63,6 +63,7 @@ from services.evidence import (
     EvidenceStore,
     FetchPageTool,
     SearchWebTool,
+    public_web_evidence_projection,
     render_references,
 )
 from services.evidence_index import (
@@ -108,6 +109,8 @@ from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService
 from services.tool_events import ToolCallTracker
+from services.web_extractor import ExtractionContext
+from services.web_fetch_gateway import FetchScope
 from state_manager import (
     BudgetDispatchDenied,
     RequestBudgetController,
@@ -897,6 +900,7 @@ class DeepResearchAgent(
         request_id: str | None = None,
         tenant_id: str | None = None,
         mcp_bridge: MCPBridgeManager | None = None,
+        web_deployment_provider: Callable[[str, str], Any] | None = None,
     ) -> None:
         """Initialise the coordinator with configuration and shared tools."""
         self.config = config or Configuration.from_env()
@@ -914,6 +918,8 @@ class DeepResearchAgent(
         self._owns_mcp_bridge = mcp_bridge is None
         self._active_state: SummaryState | None = None
         self._research_budget: RequestBudgetController | None = None
+        self._web_budget: RequestBudgetController | None = None
+        self._web_deployment_provider = web_deployment_provider
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
         self.fast_llm = self._init_fast_llm(allow_reasoning_fallback=True)
@@ -971,6 +977,7 @@ class DeepResearchAgent(
             config=self.config,
             evidence_store=self._evidence_store,
             observer_getter=lambda: self._request_trace,
+            scope_provider=self._web_search_tool_scope,
         )
         self._multimodal_parser = MultimodalEvidenceParser(
             enabled=bool(getattr(self.config, "multimodal_evidence_enabled", False)),
@@ -1009,9 +1016,13 @@ class DeepResearchAgent(
             evidence_store=self._evidence_store,
             timeout_seconds=float(self.config.search_tool_timeout_seconds or 10.0),
             multimodal_parser=self._multimodal_parser,
+            extraction_context_provider=self._web_fetch_context,
+            commit_lock=self._request_snapshot_lock,
+            persist_web_evidence=self._commit_web_evidence,
         )
-        for tool in (self.search_web_tool, self.fetch_page_tool, self._sandbox_service):
+        for tool in (self.fetch_page_tool, self._sandbox_service):
             tool.budget_provider = lambda: self._research_budget
+        self.search_web_tool.budget_provider = lambda: self._web_budget or self._research_budget
         self.evidence_lookup_tool = EvidenceLookupTool(
             evidence_store=self._evidence_store,
             retrieval_service=self._evidence_retrieval,
@@ -1565,6 +1576,7 @@ class DeepResearchAgent(
                 existing = FactLedger.from_dict(state.fact_ledger)
                 updated = FactLedgerCompactor().update_ledger(
                     existing, state.todo_items, valid_source_ids=valid_ids,
+                    evidence_store=evidence_store,
                 )
                 if updated.version != existing.version:
                     state.fact_ledger = updated.to_dict()
@@ -1763,6 +1775,117 @@ class DeepResearchAgent(
     def _is_cancelled(self) -> bool:
         cancel_event = getattr(self, "_cancel_event", None)
         return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _web_search_tool_scope(self, task_id: int) -> tuple[str, str] | None:
+        state = getattr(self, "_active_state", None)
+        if state is not None and any(task.id == task_id for task in state.todo_items):
+            return self.tenant_id, self.request_id
+        return None
+
+    def _commit_web_evidence(self, task_id: int) -> None:
+        state = self._active_state
+        if state is not None:
+            self._persist_web_evidence(
+                state, task_id, self._evidence_store.list_task_evidence(task_id, include_full_content=True),
+            )
+
+    def _configure_web_extraction(self, state: SummaryState) -> None:
+        from state_manager import web_extraction_adapter
+
+        frozen = (state.v4 or {}).get("web_extraction")
+        store = getattr(self, "_evidence_store", None)
+        if not isinstance(store, EvidenceStore):
+            return
+        store.web_extraction_enabled = isinstance(frozen, dict)
+        tool = getattr(self, "fetch_page_tool", None)
+        if not store.web_extraction_enabled or not isinstance(tool, FetchPageTool):
+            return
+        extractor = tool.build_web_extractor()
+        adapter_name = web_extraction_adapter(frozen, self.config, self.tenant_id)
+        provider = getattr(self, "_web_deployment_provider", None)
+        if adapter_name != "off" and provider is not None:
+            from services.web_dynamic_adapter import (
+                DynamicTargetPolicy,
+                PlaywrightAdapter,
+                ReaderEndpoint,
+                ReaderHttpAdapter,
+            )
+
+            try:
+                deployment = provider(adapter_name, self.tenant_id)
+                settings = {
+                    "deployment": deployment,
+                    "max_concurrency": self.config.v4_web_l2_max_concurrency,
+                    "per_tenant": self.config.v4_web_l2_per_tenant,
+                    "timeout_seconds": self.config.v4_web_l2_timeout_seconds,
+                }
+                rules = DynamicTargetPolicy.from_config(self.config.v4_web_l2_origin_rules)
+                if adapter_name == "reader_http":
+                    endpoint = ReaderEndpoint(
+                        self.config.v4_web_reader_url, self.config.v4_web_reader_token,
+                        getattr(deployment, "cost_microusd", 0),
+                    )
+                    extractor.adapter = ReaderHttpAdapter(extractor.gateway, rules, endpoint, **settings)
+                else:
+                    extractor.adapter = PlaywrightAdapter(extractor.gateway, rules, enabled=True, **settings)
+            except Exception:
+                logger.warning("Web extraction adapter unavailable (deployment)")
+        tool.set_web_extractor(extractor)
+
+    def _web_fetch_context(
+        self, task_id: int, *, state: SummaryState | None = None, task: TodoItem | None = None,
+        source_id: str | None = None, needs_coverage: bool = False,
+    ) -> ExtractionContext | None:
+        from state_manager import (
+            record_web_extraction_result,
+            supported_web_extraction,
+            web_extraction_adapter,
+        )
+
+        state = state or getattr(self, "_active_state", None)
+        if state is None:
+            return None
+        task = next((item for item in state.todo_items if item.id == task_id), None) if task is None else task
+        if task is None or task.id != task_id or task.status in {"completed", "skipped", "failed"}:
+            return None
+        frozen = (state.v4 or {}).get("web_extraction")
+        budget = getattr(self, "_web_budget", None)
+        stage = budget.stage if budget is not None and not (state.v4 or {}).get("web_downstream_only") else "research"
+        allow_network = (
+            budget is not None and not budget.blocked and supported_web_extraction(frozen)
+            and self.config.web_extraction_enabled_for(self.tenant_id)
+        )
+        remaining = budget.governor.remaining_timeout(stage=stage, work_class="optional") if allow_network else 0
+        def static_attempt(demand: dict[str, int]):
+            return budget.attempt(demand, required=False, stage=stage)
+
+        def record_result(tier: str | None, reason: str | None) -> None:
+            with self._request_snapshot_lock:
+                current = (state.v4 or {}).get("web_extraction")
+                if isinstance(current, dict) and (budget is None or budget.web_owner_is_current()):
+                    record_web_extraction_result(current, tier=tier, reason=reason)
+
+        selected_adapter = web_extraction_adapter(frozen, self.config, self.tenant_id)
+        return ExtractionContext(
+            self.tenant_id, self.request_id, task.id,
+            FetchScope(
+                monotonic() + (remaining if remaining > 0 else 1.0),
+                check_owner=budget.web_owner_is_current if budget is not None and not budget.blocked else lambda: True,
+                cancelled=self._is_cancelled,
+                attempt=static_attempt,
+            ),
+            task_terms=f"{task.title} {task.query}", needs_coverage=needs_coverage,
+            source_id=source_id, allow_network=allow_network and remaining > 0,
+            network_allowed=lambda: self.config.web_extraction_enabled_for(self.tenant_id),
+            can_dispatch=(lambda demand: budget.can_dispatch(demand, required=False, stage=stage)) if allow_network else None,
+            dynamic_attempt=(
+                lambda demand, urls: budget.attempt(demand, required=False, stage=stage, dynamic_urls=urls)
+            ) if allow_network else None,
+            dynamic_allowed=lambda: selected_adapter != "off" and selected_adapter == web_extraction_adapter(
+                frozen, self.config, self.tenant_id,
+            ),
+            on_result=record_result,
+        )
 
     def bind_workflow_checkpoint(self, checkpoint: Any) -> None:
         previous_store = self._request_state_store
@@ -2126,7 +2249,9 @@ class DeepResearchAgent(
         sources = [record for record in records if (
             (task_ids is None or record.get("task_id") in task_ids)
             and record.get("source_id")
-            and (record.get("raw_content") or record.get("full_content") or record.get("source_origin") in {"mcp", "sandbox"})
+            and self._evidence_store.is_eligible_for_facts(record["source_id"])
+            and (record.get("raw_content") or record.get("full_content") or record.get("source_origin") in {"mcp", "sandbox"}
+                 or self._evidence_store.web_extraction_enabled and record.get("multimodal_blocks"))
             and record.get("quality_label") != "low"
         )]
         ids = {source["source_id"] for source in sources}
@@ -2306,7 +2431,10 @@ class DeepResearchAgent(
         report = ReportingService(None, self.config, evidence_store=self._evidence_store)
         # A local report is restricted to claims verified against registered evidence.
         safe_state = deepcopy(state)
-        valid_ids = {item["source_id"] for item in self._evidence_store.lookup() if item.get("source_id")}
+        valid_ids = {
+            item["source_id"] for item in self._evidence_store.lookup()
+            if item.get("source_id") and self._evidence_store.is_eligible_for_facts(item["source_id"])
+        }
         for task in safe_state.todo_items:
             task.claims = []
             task.fact_claims = []
@@ -2348,6 +2476,7 @@ class DeepResearchAgent(
         request_completed = False
         try:
             budget = self._init_request_budget(state, resumed=resumed)
+            self._configure_web_extraction(state)
             if budget is not None and resume_phase != "completed":
                 report = ""
             if budget is not None and not resumed:
@@ -2355,6 +2484,8 @@ class DeepResearchAgent(
                     state, phase="planning", v4_expected=self._graph_expectation(budget.replan) if not budget.blocked else None,
                     v4_events=[self._budget_event(budget, "initialized")] if not budget.blocked else None,
                 )
+            elif not resumed and (state.v4 or {}).get("web_extraction"):
+                self._persist_request_state(state, phase="planning")
             self._select_skill_pack(state.research_topic or topic, observer, state=state)
             if emit_stream:
                 logger.debug("Starting streaming research: topic=%s", topic)
@@ -3054,6 +3185,7 @@ class DeepResearchAgent(
             raise
         finally:
             self._research_budget = None
+            self._web_budget = None
             self._active_state = None
             self._cancel_event = None
             self._restore_request_config()
@@ -3125,11 +3257,14 @@ class DeepResearchAgent(
         self._active_state = state
         try:
             budget = self._init_request_budget(state, resumed=False)
+            self._configure_web_extraction(state)
             if budget is not None and not budget.blocked:
                 self._persist_request_state(
                     state, phase="planning", v4_expected=self._graph_expectation(budget.replan),
                     v4_events=[self._budget_event(budget, "initialized")],
                 )
+            elif (state.v4 or {}).get("web_extraction"):
+                self._persist_request_state(state, phase="planning")
             self._select_skill_pack(topic, observer, state=state)
             planning_span = observer.start_stage("planning", scope="request", metadata={"topic": topic})
             try:
@@ -3164,7 +3299,7 @@ class DeepResearchAgent(
             observer.set_task_totals(total_tasks=len(state.todo_items))
             observer.complete_request(status="awaiting_approval")
             self._persist_request_state(state, phase="awaiting_approval", status="awaiting_approval", **persist_kwargs)
-            return {
+            result = {
                 "request_id": self.request_id,
                 "topic": topic,
                 "status": "awaiting_approval",
@@ -3172,13 +3307,15 @@ class DeepResearchAgent(
                 "skill_pack": dict(state.skill_pack_metadata or {}),
                 "todo_items": [self._serialize_task(task) for task in state.todo_items],
                 **({"v4": projection} if (projection := public_v4_projection(state.v4)) is not None else {}),
-                **({"plan_revision": 0} if budget is not None and getattr(self, "_workflow_checkpoint", None) is None else {}),
+                **({"plan_revision": 0} if state.v4 and getattr(self, "_workflow_checkpoint", None) is None else {}),
                 "estimated_duration_seconds": HitlService.estimate_duration_seconds(
                     len(state.todo_items), self.config
                 ),
             }
+            return public_web_evidence_projection(result) if (state.v4 or {}).get("web_extraction") else result
         finally:
             self._research_budget = None
+            self._web_budget = None
             self._active_state = None
             self._restore_request_config()
 

@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 from hello_agents import ToolAwareSimpleAgent
@@ -14,9 +15,13 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
-from prompts import get_current_date
-from services.claim_verifier import numeric_grounding_mismatch
-from services.context_builder import ContextPrefixBuilder, PromptEnvelope
+from prompts import get_current_date, web_evidence_prompt_rules
+from services.claim_verifier import numeric_grounding_mismatch, web_fact_excerpts
+from services.context_builder import (
+    ContextPrefixBuilder,
+    PromptEnvelope,
+    render_web_evidence_data,
+)
 from services.evidence import extract_citation_ids, format_evidence_sources
 from services.evidence_index import (
     EvidenceRetrievalService,
@@ -175,7 +180,7 @@ class ReviewService:
             else list(getattr(self._config, "active_skill_verifiers", []) or [])
         )
         verifier_issue_dicts, executed_verifiers = run_skill_verifiers(
-            state,
+            self._skill_verifier_state(state, claims_by_task) if resolved_verifiers else state,
             self._config,
             resolved_verifiers,
         )
@@ -201,7 +206,10 @@ class ReviewService:
                 state,
                 claims_by_task=claims_by_task,
                 observer=observer,
-                fallback_claim_verifier=self._normalized_numeric_fallback,
+                fallback_claim_verifier=partial(
+                    self._normalized_numeric_fallback,
+                    web_extraction_enabled=getattr(self._evidence_store, "web_extraction_enabled", False),
+                ),
             )
             claim_verification_summary = dict(nli_out.get("summary") or {})
             conflicts = nli_out.get("conflicts") or []
@@ -282,6 +290,7 @@ class ReviewService:
         skill_pack_context: str | None = None,
     ) -> PromptEnvelope:
         builder = ContextPrefixBuilder(self._config)
+        web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
         covered_task_ids = context_covered_task_ids(state, self._config)
         task_blocks: list[str] = []
         for task in state.todo_items:
@@ -299,9 +308,9 @@ class ReviewService:
                 task_blocks.append(f"{task_header}- 规则审查结果：\n{issue_text}\n")
                 continue
 
-            sources = format_evidence_sources(task.evidence_items) or "- 暂无来源"
+            sources = "" if web_enabled else format_evidence_sources(task.evidence_items)
             excerpt_lines: list[str] = []
-            for item in (task.evidence_items or [])[:6]:
+            for item in ([] if web_enabled else task.evidence_items or [])[:6]:
                 sid = str(item.get("source_id") or "").strip()
                 snippet = str(
                     item.get("snippet")
@@ -312,7 +321,10 @@ class ReviewService:
                 ).strip()
                 if sid and snippet:
                     excerpt_lines.append(f"  - [{sid}] {truncate_cited_text(snippet, 240)}")
-            excerpt_text = "\n".join(excerpt_lines) or "  - 暂无正文摘录"
+            excerpt_text = (
+                render_web_evidence_data(task.evidence_items, self._evidence_store, max_chars=3000)
+                if web_enabled else "\n".join(excerpt_lines)
+            ) or "  - 暂无正文摘录"
             repair_hits = self._repair_hits_for_task(state, task)
             repair_text = "\n".join(
                 f"  - [{hit['origin']}] {hit['title']} ({hit['quality_label']}/{hit['freshness_label']}) {hit['url']}"
@@ -321,7 +333,7 @@ class ReviewService:
             task_blocks.append(
                 f"{task_header}"
                 f"- 总结：\n{truncate_cited_text(task.summary or '暂无可用信息', 1200)}\n"
-                f"- 来源目录：\n{truncate_cited_text(sources, 1200)}\n"
+                f"- 来源目录：\n{truncate_cited_text(sources, 1200) or '- 暂无来源'}\n"
                 f"- 关键证据摘录：\n{excerpt_text}\n"
                 f"- 修补候选：\n{repair_text}\n"
                 f"- 规则审查结果：\n{issue_text}\n"
@@ -341,7 +353,7 @@ class ReviewService:
             "请基于以下任务结果补充指出仍然存在的证据问题。"
             f"{tool_guidance}"
             "不要重写报告正文，也不要重复输出规则已明确指出的问题。"
-        )
+        ) + web_evidence_prompt_rules(web_enabled)
 
         frozen = render_context_checkpoint(state, self._config)
         volatile_delta = f"当前日期：{get_current_date()}\n\n{''.join(task_blocks)}"
@@ -358,7 +370,7 @@ class ReviewService:
                 valid_ids.update(item["source_id"] for item in self._evidence_store.lookup() if item.get("source_id"))
             flagged_ids = sorted({
                 sid for issue in issues if issue.check in flagged_checks for sid in issue.source_ids
-                if sid in valid_ids
+                if sid in valid_ids and (not web_enabled or self._evidence_store.is_eligible_for_facts(sid))
             })
             volatile_blocks.append(("disputed_chunks", render_disputed_source_chunks(self._retrieval_service, flagged_ids)))
 
@@ -416,10 +428,15 @@ class ReviewService:
                 if isinstance(item, dict) and item.get("source_id"):
                     request_evidence_by_id[str(item["source_id"]).strip()] = item
         evidence_store = getattr(self, "_evidence_store", None)
+        web_enabled = getattr(evidence_store, "web_extraction_enabled", False)
+        if web_enabled:
+            request_evidence_by_id.clear()
         if evidence_store is not None and hasattr(evidence_store, "lookup"):
             for item in evidence_store.lookup(include_full_content=True) or []:
                 if isinstance(item, dict) and item.get("source_id"):
-                    request_evidence_by_id[str(item["source_id"]).strip()] = item
+                    sid = str(item["source_id"]).strip()
+                    if not web_enabled or evidence_store.is_eligible_for_facts(sid):
+                        request_evidence_by_id[sid] = item
         lineage_errors = self._computation_lineage_errors(request_evidence_by_id)
         request_valid_ids = request_evidence_by_id.keys() - lineage_errors.keys()
 
@@ -435,6 +452,25 @@ class ReviewService:
             claims_by_task[task.id] = task_claims
 
         return issues, claims_by_task
+
+    def _skill_verifier_state(
+        self, state: SummaryState, claims_by_task: dict[int, list[dict[str, Any]]],
+    ) -> SummaryState:
+        store = self._evidence_store
+        if not getattr(store, "web_extraction_enabled", False):
+            return state
+        tasks: list[TodoItem] = []
+        for task in state.todo_items:
+            claims = [
+                claim for claim in claims_by_task.get(task.id, [])
+                if claim.get("support_status") == "supported"
+            ]
+            evidence = [
+                item for item in store.list_task_evidence(task.id, include_full_content=True)
+                if store.is_eligible_for_facts(item["source_id"])
+            ]
+            tasks.append(replace(task, summary="", claims=claims, evidence_items=evidence))
+        return replace(state, todo_items=tasks)
 
     def _repair_hits_for_task(
         self,
@@ -470,7 +506,14 @@ class ReviewService:
         issues: list[ReviewIssue] = []
         claims: list[dict[str, Any]] = []
 
-        evidence_items = [item for item in task.evidence_items or [] if isinstance(item, dict)]
+        store = getattr(self, "_evidence_store", None)
+        if getattr(store, "web_extraction_enabled", False):
+            evidence_items = [
+                item for item in store.list_task_evidence(task.id, include_full_content=True)
+                if store.is_eligible_for_facts(item["source_id"])
+            ]
+        else:
+            evidence_items = [item for item in task.evidence_items or [] if isinstance(item, dict)]
         local_by_id = {
             sid: item for item in evidence_items if (sid := str(item.get("source_id") or "").strip())
         }
@@ -809,6 +852,8 @@ class ReviewService:
                 if not supported:
                     return reason or truncate_text(claim_text, 120)
 
+        if getattr(self._evidence_store, "web_extraction_enabled", False):
+            return self._normalized_numeric_fallback(claim_text, cited_records, web_extraction_enabled=True)
         return self._numeric_fallback_only(claim_text, cited_records)
 
     @staticmethod
@@ -846,15 +891,21 @@ class ReviewService:
         return None
 
     @staticmethod
-    def _normalized_numeric_fallback(claim_text: str, cited_records: list[dict[str, Any]]) -> str | None:
-        bodies = [
-            next(
-                (body for key in ("full_content", "raw_content", "snippet", "content")
-                 if (body := str(rec.get(key) or "").strip())),
-                "",
+    def _normalized_numeric_fallback(
+        claim_text: str, cited_records: list[dict[str, Any]], *, web_extraction_enabled: bool = False,
+    ) -> str | None:
+        bodies = []
+        for rec in cited_records:
+            if web_extraction_enabled and (excerpts := web_fact_excerpts(rec)) is not None:
+                bodies.extend(excerpts)
+                continue
+            bodies.append(
+                next(
+                    (body for key in ("full_content", "raw_content", "snippet", "content")
+                     if (body := str(rec.get(key) or "").strip())),
+                    "",
+                )
             )
-            for rec in cited_records
-        ]
         return numeric_grounding_mismatch(claim_text, [body for body in bodies if body])
 
     def _computation_lineage_errors(self, evidence_by_id: dict[str, dict[str, Any]]) -> dict[str, str]:

@@ -11,6 +11,7 @@ import re
 import struct
 import threading
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
@@ -143,7 +144,9 @@ class MultimodalEvidenceBlock:
             "text": self.markdown or self.summary or self.title,
         }
         if self.structured_payload is not None:
-            payload["structured_payload"] = dict(self.structured_payload)
+            payload["structured_payload"] = deepcopy(self.structured_payload)
+            if self.modality == "table" and self.structured_payload.get("schema_version") == 1:
+                payload["kind"] = "table"
         if self.image_url:
             payload["image_url"] = self.image_url
         if self.source_hint:

@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,6 +17,7 @@ from config import Configuration
 from evals.judges.heuristic import HeuristicJudge
 from metrics import RequestTrace, build_token_usage, metrics_registry
 from models import SummaryState, TodoItem
+from services import context_builder
 from services.context_builder import (
     ContextPrefixBuilder,
     ProviderCacheAdapter,
@@ -46,6 +48,8 @@ from services.memory_sanitizer import neutralize_source_ids
 from services.reporter import ReportingService
 from services.skill_pack import _validate_fragment_safety
 from services.text_processing import strip_citation_markers
+from services.web_extractor import ExtractionContext, WebExtractor
+from services.web_fetch_gateway import FetchedDocument, FetchScope
 from state_manager import StateManagerMixin
 
 
@@ -53,6 +57,79 @@ class UnifiedEvidenceAndContextTests(unittest.TestCase):
     def setUp(self) -> None:
         metrics_registry.reset()
         self.config = Configuration.from_env(load_env_file=False)
+
+    def test_enabled_runtime_index_excludes_l0_after_upgrade_and_legacy_hydrate(self):
+        index = EvidenceRuntimeIndex(self.config)
+        store = EvidenceStore(web_extraction_enabled=True, listeners=[index])
+        url = "https://example.org/result"
+        lead, = store.record_search_results(task_id=1, query="latency", backend="fixture", search_payload={
+            "results": [{"url": url, "content": "l0-sentinel says all speeds are faster."}],
+        })
+        self.assertEqual(index.chunk_counts_by_source(), {})
+        document = FetchedDocument(
+            url, "text/html",
+            b"<main><table><tr><th>Stage</th><th>Speed</th></tr><tr><td>Run</td><td>38</td></tr></table></main>",
+        )
+        extractor = WebExtractor(gateway=SimpleNamespace(fetch=lambda *args, **kwargs: document))
+        artifact = extractor.extract(
+            url, context=ExtractionContext("default", "request", 1, FetchScope(time.monotonic() + 5)),
+        )
+        store.update_full_content(
+            task_id=1, source_id=lead["source_id"], url=url, title="", full_content="", web_result=artifact,
+        )
+        hits = index.query(text="Run speed", task_id=1, top_k=3)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].anchor_id, "html-t1")
+        self.assertNotIn("l0-sentinel", hits[0].text)
+        store.hydrate_from_tasks([{"id": 1, "evidence_items": [lead]}])
+        self.assertEqual(index.chunk_counts_by_source(), {})
+
+    def test_enabled_ledger_excludes_l0_and_unverified_state_source_ids(self):
+        store = EvidenceStore(web_extraction_enabled=True)
+        task = self._fact_task(1, "10 ms")
+        store.record_search_results(task_id=1, query="latency", backend="fixture", search_payload={
+            "results": [{"url": "https://example.org", "content": "Measured 10 ms"}],
+        })
+        compactor = FactLedgerCompactor()
+        legacy = compactor.update_ledger(None, [task])
+        self.assertEqual(len(legacy.entries), 1)
+        active = compactor.update_ledger(legacy, [task], evidence_store=store)
+        self.assertEqual(active.entries, [])
+
+    def test_web_prompt_serializes_complete_table_blocks_under_budget(self):
+        store = EvidenceStore(web_extraction_enabled=True)
+        url = "https://example.org/table"
+        first, = store.record_search_results(task_id=1, query="measurements", backend="fixture", search_payload={
+            "results": [{"url": "https://example.org/lead", "content": "Candidate lead"}],
+        })
+        document = FetchedDocument(
+            url, "text/html",
+            b'<main><p hidden>hidden-sentinel</p><table><caption>Units: USD million</caption>'
+            b'<tr><th>Year</th><th>Sales</th></tr><tr><td>2025</td><td>38</td></tr></table></main>',
+        )
+        extractor = WebExtractor(gateway=SimpleNamespace(fetch=lambda *args, **kwargs: document))
+        artifact = extractor.extract(
+            url, context=ExtractionContext("default", "request", 1, FetchScope(time.monotonic() + 5)),
+        )
+        fetched = store.update_full_content(
+            task_id=1, source_id=None, url=url, title="", full_content="", web_result=artifact,
+        )
+        records = [first, {**fetched, "full_content": "forged-state-text"}]
+        rendered = context_builder.render_web_evidence_data(records, store)
+        opening, body, closing = rendered.splitlines()
+        self.assertEqual(opening, f'<WEB_EVIDENCE_DATA chars="{len(body)}">')
+        self.assertEqual(closing, "</WEB_EVIDENCE_DATA>")
+        lead, document = json.loads(body)
+        self.assertEqual(lead["tier"], "L0")
+        self.assertFalse(lead["fact_eligible"])
+        self.assertEqual(lead["snippet"], "Candidate lead")
+        self.assertTrue(document["fact_eligible"])
+        self.assertEqual(document["tables"][0]["rows"], [["2025", "38"]])
+        self.assertNotIn("hidden-sentinel", rendered)
+        self.assertNotIn("forged-state-text", rendered)
+        limited = context_builder.render_web_evidence_data(records, store, max_chars=250)
+        self.assertLessEqual(len(limited), 250)
+        self.assertEqual(len(json.loads(limited.splitlines()[1])), 1)
 
     @staticmethod
     def _fact_task(task_id, value, *, source_kind="S", metric="latency", **extra):

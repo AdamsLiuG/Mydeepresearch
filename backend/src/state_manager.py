@@ -5,18 +5,101 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from inspect import Parameter, signature
+from json import dumps
 from threading import RLock
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from uuid import uuid4
 
-from metrics import RequestTrace, metrics_registry
+from metrics import WEB_EXTRACTION_REASONS, RequestTrace, metrics_registry
 from models import BudgetDenial, RequestBudget, SummaryState, TodoItem
 from services.budget import BudgetGovernor, build_request_budget_for_config
 from services.dag_scheduler import normalize_depends_on
 from services.evidence import EvidenceStore, format_evidence_sources
 from services.mcp_bridge import tool_approval_expired
 from services.request_state import SnapshotConflictError
+from services.web_extractor import (
+    POLICY_VERSION,
+    QUALITY_VERSION,
+    WEB_SANITIZER_VERSION,
+)
+from services.web_fetch_gateway import GatewayError, normalize_url
+
+_WEB_VERSIONS = {
+    "schema_version": 1,
+    "policy_version": POLICY_VERSION,
+    "quality_version": QUALITY_VERSION,
+    "sanitizer_version": WEB_SANITIZER_VERSION,
+}
+_WEB_TIERS = frozenset({"L0", "L1", "L2"})
+_DYNAMIC_ADAPTERS = frozenset({"reader_http", "playwright"})
+_MAX_DYNAMIC_TARGETS_PER_ATTEMPT = 5  # Requested URL, L1 final URL and three L2 redirects.
+_WEB_TERMINAL_STATUSES = frozenset({
+    "success", "partial_success", "completed", "cancelled", "failed", "workflow_failed", "rejected", "expired",
+})
+
+
+def freeze_web_extraction(config: Any, tenant_id: str) -> dict[str, Any] | None:
+    if not getattr(config, "web_extraction_enabled_for", lambda _: False)(tenant_id):
+        return None
+    adapter = config.v4_web_l2_adapter
+    rules = config.v4_web_l2_origin_rules.get(tenant_id, [])
+    if not rules or (adapter == "playwright" and not config.v4_browser_use_enabled):
+        adapter = "off"
+    policy = {"tenant_id": tenant_id, "adapter": adapter, "rules": rules}
+    if adapter == "reader_http":
+        policy["reader_url"] = config.v4_web_reader_url
+    return {
+        **_WEB_VERSIONS, "enabled": True, "adapter": adapter,
+        "policy_id": sha256(dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        "dynamic_targets": {}, "tier_counts": {}, "degraded_counts": {},
+    }
+
+
+def supported_web_extraction(frozen: Any) -> bool:
+    return isinstance(frozen, dict) and frozen.get("enabled") is True and all(
+        type(frozen.get(key)) is int and frozen[key] == version for key, version in _WEB_VERSIONS.items()
+    )
+
+
+def web_extraction_adapter(frozen: Any, config: Any, tenant_id: str) -> str:
+    if not supported_web_extraction(frozen) or frozen.get("adapter") not in ("reader_http", "playwright"):
+        return "off"
+    current = freeze_web_extraction(config, tenant_id)
+    if current is None or current["policy_id"] != frozen.get("policy_id"):
+        return "off"
+    return current["adapter"]
+
+
+def record_web_extraction_result(frozen: dict[str, Any], *, tier: str | None, reason: str | None) -> None:
+    for field, value, allowed in (
+        ("tier_counts", tier, _WEB_TIERS), ("degraded_counts", reason, WEB_EXTRACTION_REASONS),
+    ):
+        if value in allowed:
+            counts = _public_web_counts(frozen.get(field), allowed)
+            counts[value] = counts.get(value, 0) + 1
+            frozen[field] = counts
+
+
+def _public_web_counts(value: Any, allowed: frozenset[str]) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: count for key, count in value.items() if key in allowed and type(count) is int and count >= 0}
+
+
+def replace_unfinished_task_evidence(snapshot: dict[str, Any], task_id: int, records: list[dict]) -> bool:
+    if snapshot.get("status") in _WEB_TERMINAL_STATUSES or snapshot.get("workflow_cancel_requested"):
+        return False
+    for task in snapshot.get("todo_items") or ():
+        if (
+            isinstance(task, dict) and task.get("id") == task_id
+            and task.get("status") not in {"completed", "skipped", "failed"}
+            and task.get("evidence_items") != records
+        ):
+            task["evidence_items"] = deepcopy(records)
+            return True
+    return False
 
 
 def public_v4_projection(v4: Any) -> dict[str, Any] | None:
@@ -41,10 +124,17 @@ def public_v4_projection(v4: Any) -> dict[str, Any] | None:
                 ) if key in limit
             }
     replan = v4.get("replan")
-    if isinstance(replan, dict):
+    if isinstance(replan, dict) and not v4.get("web_downstream_only"):
         result["replan"] = {
             key: deepcopy(replan[key]) for key in ("dag_revision", "decision_id", "pruned_task_ids")
             if key in replan and replan[key] is not None
+        }
+    web = v4.get("web_extraction")
+    if supported_web_extraction(web):
+        result["web_extraction"] = {
+            "schema_version": web["schema_version"],
+            "tier_counts": _public_web_counts(web.get("tier_counts"), _WEB_TIERS),
+            "degraded_counts": _public_web_counts(web.get("degraded_counts"), WEB_EXTRACTION_REASONS),
         }
     return result
 
@@ -59,6 +149,7 @@ class BudgetDispatchDenied(RuntimeError):
 class BudgetAttempt:
     timeout: float
     usage: dict[str, int] | None = None
+    associate_dynamic_url: Callable[[str], bool] | None = None
 
 
 class RequestBudgetController:
@@ -105,12 +196,61 @@ class RequestBudgetController:
             self.degrade(reason)
         raise BudgetDispatchDenied(reason)
 
-    def can_dispatch(self, demand: dict[str, int]) -> bool:
+    def can_dispatch(
+        self, demand: dict[str, int], *, required: bool = True, stage: str | None = None,
+    ) -> bool:
+        work_class = "required" if required else "optional"
+        stage = stage or self.stage
         return (
             not self.blocked
-            and self.governor.remaining_timeout(stage=self.stage, work_class="required") > 0
-            and self.governor.snapshot(minimum_demand=demand, stage=self.stage, work_class="required").pressure != "exhausted"
+            and self.governor.remaining_timeout(stage=stage, work_class=work_class) > 0
+            and self.governor.snapshot(minimum_demand=demand, stage=stage, work_class=work_class).pressure
+            in ({"normal", "high"} if required else {"normal"})
         )
+
+    def web_owner_is_current(self) -> bool:
+        with self.lock:
+            checkpoint = getattr(self.agent, "_workflow_checkpoint", None)
+            if checkpoint is not None:
+                return checkpoint.web_owner_is_current()
+            store = self.agent._request_state_store
+            if store is None:
+                return False
+            current = store.load(self.agent.request_id, tenant_id=self.governor.tenant_id) or {}
+            return (
+                current.get("state_version") == self.state.state_version
+                and current.get("status") not in _WEB_TERMINAL_STATUSES
+            )
+
+    @staticmethod
+    def _target_key(url: str) -> str:
+        return sha256(normalize_url(url).encode()).hexdigest()
+
+    def _dynamic_targets(self) -> dict[str, str]:
+        web = self.state.v4.get("web_extraction")
+        targets = web.get("dynamic_targets") if supported_web_extraction(web) else None
+        if not isinstance(targets, dict):
+            self.refuse("dispatch_unbounded", required=False)
+        return targets
+
+    def _associate_dynamic_url(self, url: str, *, operation_id: str) -> bool:
+        with self.lock:
+            if self.agent._is_cancelled() or not self.web_owner_is_current():
+                return False
+            key = self._target_key(url)
+            targets = self._dynamic_targets()
+            if key in targets:
+                return targets[key] == operation_id
+            if sum(owner == operation_id for owner in targets.values()) >= _MAX_DYNAMIC_TARGETS_PER_ATTEMPT:
+                return False
+            if operation_id not in targets.values():
+                return False
+            self._persist_web_dispatch({**targets, key: operation_id})
+            return True
+
+    def _persist_web_dispatch(self, targets: dict[str, str]) -> None:
+        web = {**self.state.v4["web_extraction"], "dynamic_targets": targets}
+        self.agent._persist_v4_budget(self.state, self.payload(), web_extraction=web)
 
     def charge_tasks(self, count: int) -> None:
         # Graph and this balance must be committed in the same CAS.
@@ -124,13 +264,30 @@ class RequestBudgetController:
         self.governor.settle(lease, {"tasks": count})
 
     @contextmanager
-    def attempt(self, demand: dict[str, int], *, llm=None, required: bool = True) -> Iterator[BudgetAttempt]:
+    def attempt(
+        self, demand: dict[str, int], *, llm=None, required: bool = True,
+        stage: str | None = None, dynamic_urls: tuple[str, ...] | None = None,
+    ) -> Iterator[BudgetAttempt]:
         work_class = "required" if required else "optional"
-        stage = self.stage
+        stage = stage or self.stage
         with self.lock:
             if self.blocked or self.agent._is_cancelled():
                 self.refuse("dispatch_unbounded" if self.blocked else "lease_lost", required=required)
             operation_id = self._operation_id()
+            dynamic_targets = None
+            if dynamic_urls is not None:
+                targets = self._dynamic_targets()
+                try:
+                    keys = {self._target_key(url) for url in dynamic_urls}
+                except GatewayError:
+                    self.refuse("url_denied", required=False)
+                if not keys or len(keys) > 2 or keys.intersection(targets):
+                    self.refuse("not_eligible", required=False)
+                if demand.get("dynamic_fetches") != 1 or llm is not None or required:
+                    self.refuse("dispatch_unbounded", required=False)
+                if self.governor.snapshot(minimum_demand=demand, stage=stage, work_class=work_class).pressure == "high":
+                    self.refuse("optional_pressure", required=False)
+                dynamic_targets = {**targets, **dict.fromkeys(keys, operation_id)}
             if llm is None:
                 lease = self.governor.reserve(operation_id, demand, work_class, stage=stage)
             else:
@@ -150,11 +307,27 @@ class RequestBudgetController:
                 self.governor.release(lease)
                 self.agent._persist_v4_budget(self.state, self.payload())
                 self.refuse("deadline_exceeded" if timeout <= 0 else "lease_lost", required=required)
-            if not self.governor.dispatch(lease):
+            def commit() -> None:
+                if dynamic_targets is None:
+                    self.agent._persist_v4_budget(self.state, self.payload())
+                else:
+                    self._persist_web_dispatch(dynamic_targets)
+
+            try:
+                dispatched = self.governor.dispatch(lease, commit=commit)
+            except BaseException:
+                self.blocked = True
+                raise
+            if not dispatched:
                 self.agent._persist_v4_budget(self.state, self.payload())
                 self.refuse("deadline_exceeded", required=required)
-            self.agent._persist_v4_budget(self.state, self.payload())
+            if dynamic_targets is not None:
+                adapter = self.state.v4["web_extraction"].get("adapter")
+                if adapter in _DYNAMIC_ADAPTERS:
+                    metrics_registry.record_web_extraction("l2_selected", adapter=adapter)
             attempt = BudgetAttempt(self.governor.remaining_timeout(stage=stage, work_class=work_class))
+            if dynamic_targets is not None:
+                attempt.associate_dynamic_url = lambda url: self._associate_dynamic_url(url, operation_id=operation_id)
         try:
             if attempt.timeout <= 0 or self.agent._is_cancelled():
                 self.refuse("deadline_exceeded" if attempt.timeout <= 0 else "lease_lost", required=required)
@@ -175,12 +348,7 @@ class StateManagerMixin:
 
     def _init_request_budget(self, state: SummaryState, *, resumed: bool) -> RequestBudgetController | None:
         self._research_budget = None
-        store = self._request_state_store
-        if store is not None and not (
-            self._store_supports_tenant_id("load") and self._store_supports_tenant_id("save")
-            and self._callable_accepts_kwarg(store.save, "expected_version")
-        ):
-            return None
+        self._web_budget = None
         if not hasattr(self, "_request_snapshot_lock"):
             self._request_snapshot_lock = RLock()
         checkpoint = getattr(self, "_workflow_checkpoint", None)
@@ -189,16 +357,34 @@ class StateManagerMixin:
             checkpoint.check_owner(frozen)
             state.state_version = frozen["state_version"]
             state.v4 = deepcopy(frozen.get("v4"))
-        v4 = state.v4
-        if v4 is None and (resumed or frozen or not getattr(self.config, "v4_research_budget_enabled", False)):
-            return None
-        if isinstance(v4, dict) and "budget" not in v4:
-            return None
         tenant_id = getattr(self, "tenant_id", "default")
+        research_budget_enabled = getattr(self.config, "v4_research_budget_enabled", False)
+        if state.v4 is None and not (resumed or frozen):
+            web = freeze_web_extraction(self.config, tenant_id)
+            if web is not None:
+                state.v4 = {"schema_version": 1, "web_extraction": web, "replan": {}}
+                if not research_budget_enabled:
+                    state.v4["web_downstream_only"] = True
+        v4 = state.v4
+        if v4 is None and (resumed or frozen or not research_budget_enabled):
+            return None
+        store = self._request_state_store
+        if store is not None and not (
+            self._store_supports_tenant_id("load") and self._store_supports_tenant_id("save")
+            and self._callable_accepts_kwarg(store.save, "expected_version")
+        ):
+            return None
+        downstream_only = isinstance(v4, dict) and v4.get("web_downstream_only") is True
+        web = v4.get("web_extraction") if isinstance(v4, dict) else None
+        new_web_request = web is not None and not (resumed or frozen)
+        if isinstance(v4, dict) and "budget" not in v4 and not new_web_request:
+            return None
         blocked = False
         try:
-            if v4 is None:
-                budget = build_request_budget_for_config(self.config, tenant_id=tenant_id)
+            if v4 is None or (new_web_request and "budget" not in v4):
+                budget = build_request_budget_for_config(
+                    self.config, tenant_id=tenant_id, depth="quick" if downstream_only else None,
+                )
             else:
                 if not isinstance(v4, dict) or v4.get("schema_version") != 1:
                     raise ValueError("Unsupported budget snapshot version")
@@ -206,7 +392,7 @@ class StateManagerMixin:
                 if budget.profile_version != 1:
                     raise ValueError("Unsupported budget profile version")
             governor = BudgetGovernor(budget, tenant_id=tenant_id, request_id=self.request_id)
-            if v4 is not None:
+            if v4 is not None and "budget" in v4:
                 if "ledger" in v4["budget"]:
                     governor.restore_ledger(v4["budget"]["ledger"])
                 elif not frozen or frozen.get("phase") not in {"queued", "planning"}:
@@ -215,7 +401,7 @@ class StateManagerMixin:
                     raise ValueError("Missing budget execution checkpoint")
         except (TypeError, ValueError, KeyError, AttributeError):
             governor = BudgetGovernor(
-                build_request_budget_for_config(self.config, tenant_id=tenant_id),
+                build_request_budget_for_config(self.config, tenant_id=tenant_id, depth="quick" if downstream_only else None),
                 tenant_id=tenant_id, request_id=self.request_id,
             )
             blocked = True
@@ -229,19 +415,30 @@ class StateManagerMixin:
                 "plan_locked": False, "slots_allocated": False,
             }.items():
                 state.v4["replan"].setdefault(key, value)
-        self._research_budget = RequestBudgetController(self, state, governor, blocked=blocked)
+        controller = RequestBudgetController(self, state, governor, blocked=blocked)
+        if supported_web_extraction(web) and store is not None and not blocked:
+            self._web_budget = controller
+        if not downstream_only:
+            self._research_budget = controller
         return self._research_budget
 
-    def _persist_v4_budget(self, state: SummaryState, budget: dict[str, Any]) -> None:
+    def _persist_v4_budget(
+        self, state: SummaryState, budget: dict[str, Any], *, web_extraction: dict[str, Any] | None = None,
+    ) -> None:
         """Write the ledger without changing committed plan, approvals or outbox."""
         checkpoint = getattr(self, "_workflow_checkpoint", None)
         if checkpoint is not None:
-            saved = checkpoint.persist_budget(budget)
+            saved = (
+                checkpoint.persist_budget(budget, web_extraction=web_extraction)
+                if web_extraction is not None else checkpoint.persist_budget(budget)
+            )
         elif self._request_state_store is not None:
             current = self._load_resume_snapshot(self.request_id)
             if current.get("state_version") != state.state_version:
                 raise SnapshotConflictError("Request budget ownership changed")
             current["v4"] = {**current.get("v4", {}), "budget": budget}
+            if web_extraction is not None:
+                current["v4"]["web_extraction"] = web_extraction
             saved = self._request_state_store.save(
                 self.request_id, current, tenant_id=getattr(self, "tenant_id", "default"),
                 expected_version=state.state_version,
@@ -249,7 +446,29 @@ class StateManagerMixin:
         else:
             saved = None
         state.v4["budget"] = budget
+        if web_extraction is not None:
+            state.v4["web_extraction"] = web_extraction
         if saved:
+            state.state_version = saved["state_version"]
+
+    def _persist_web_evidence(self, state: SummaryState, task_id: int, records: list[dict]) -> None:
+        """Commit a tool result to its current task before returning it to a caller."""
+        if getattr(self, "_web_budget", None) is None or self._is_cancelled():
+            return
+        with getattr(self, "_request_snapshot_lock", nullcontext()):
+            checkpoint = getattr(self, "_workflow_checkpoint", None)
+            if checkpoint is not None:
+                saved = checkpoint.persist_web_evidence(task_id, records)
+            else:
+                current = self._load_resume_snapshot(self.request_id)
+                if current.get("state_version") != state.state_version:
+                    raise SnapshotConflictError("Request evidence ownership changed")
+                if not replace_unfinished_task_evidence(current, task_id, records):
+                    return
+                saved = self._request_state_store.save(
+                    self.request_id, current, tenant_id=getattr(self, "tenant_id", "default"),
+                    expected_version=state.state_version,
+                )
             state.state_version = saved["state_version"]
 
     def _restore_task_counters(self, observer: RequestTrace, state: SummaryState) -> None:
@@ -275,7 +494,9 @@ class StateManagerMixin:
     ) -> list[dict[str, Any]]:
         """Persist the latest request snapshot for history and resume."""
 
-        controller = getattr(self, "_research_budget", None)
+        research_controller = getattr(self, "_research_budget", None)
+        controller = research_controller or getattr(self, "_web_budget", None)
+        web_enabled = isinstance(state.v4, dict) and "web_extraction" in state.v4
         if self._request_state_store is None:
             if controller is not None and not controller.blocked:
                 state.v4["budget"] = controller.payload()
@@ -339,6 +560,7 @@ class StateManagerMixin:
             if isinstance(self._evidence_store, EvidenceStore) and (
                 getattr(self.config, "evidence_pointer_disclosure_enabled", True)
                 or getattr(self.config, "resolved_sandbox_effective_enabled", lambda: False)()
+                or web_enabled
             ):
                 for task in serialized_tasks:
                     evidence = self._evidence_store.list_task_evidence(task["id"], include_full_content=True)
@@ -360,7 +582,7 @@ class StateManagerMixin:
                 if checkpoint is not None and v4_expected is None:
                     # The coordinator sends the graph explicitly when it advances.
                     payload["v4"].pop("replan", None)
-            elif state.v4 is not None and checkpoint is None:
+            elif state.v4 is not None and (checkpoint is None or web_enabled):
                 payload["v4"] = deepcopy(state.v4)
             if checkpoint is not None:
                 payload["runner_backend"] = checkpoint.backend
@@ -386,7 +608,7 @@ class StateManagerMixin:
                 saved = self._request_state_store.save(self.request_id, payload)
             if isinstance(saved, dict) and "state_version" in saved:
                 state.state_version = int(saved.get("state_version") or state.state_version or 0)
-        if controller is None:
+        if research_controller is None:
             self._refresh_note_memory_for_state(state, observer=self._request_trace)
         return [{**event, "state_version": state.state_version} for event in v4_events or []]
 
@@ -589,14 +811,20 @@ class StateManagerMixin:
             workflow_run_id=str(payload.get("workflow_run_id") or "").strip() or None,
             v4=deepcopy(payload.get("v4")),
         )
-        self._evidence_store.hydrate_from_tasks(state.todo_items)
+        web = state.v4.get("web_extraction") if isinstance(state.v4, dict) else None
+        web_enabled = web is not None
+        self._evidence_store.web_extraction_enabled = web_enabled
+        if web_enabled:
+            self._evidence_store.hydrate_from_tasks(state.todo_items, trusted_web_snapshot=supported_web_extraction(web))
+        else:
+            self._evidence_store.hydrate_from_tasks(state.todo_items)
         sandbox = getattr(self, "_sandbox_service", None)
         if sandbox is not None:
             sandbox.restore_task_counts(state.todo_items)
         for task in state.todo_items:
-            if not task.sources_summary and task.id > 0:
+            if (web_enabled or not task.sources_summary) and task.id > 0:
                 evidence_items = self._evidence_store.list_task_evidence(task.id)
-                if evidence_items:
+                if evidence_items or web_enabled:
                     task.evidence_items = evidence_items
                     task.sources_summary = format_evidence_sources(evidence_items)
         phase = str(payload.get("phase") or "planning").strip() or "planning"

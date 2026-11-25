@@ -500,7 +500,7 @@ class BudgetGovernor:
             stage=stage,
         )
 
-    def dispatch(self, lease: BudgetLease) -> bool:
+    def dispatch(self, lease: BudgetLease, *, commit: Callable[[], None] | None = None) -> bool:
         with self._lock:
             record = self._records.get(lease.operation_id)
             if record is None or record.lease != lease or record.state != "reserved":
@@ -516,8 +516,15 @@ class BudgetGovernor:
                 return False
             record.state = "dispatched"
             attempts = sum(record.lease.reserved.get(name, 0) for name in EXTERNAL_RESOURCES)
+            self._external_attempt_count += attempts
+            if commit is not None:
+                try:
+                    commit()
+                except BaseException:
+                    self._external_attempt_count -= attempts
+                    record.state = "reserved"
+                    raise
             if attempts:
-                self._external_attempt_count += attempts
                 metrics_registry.increment("budget_external_attempt_total", attempts)
             metrics_registry.record_budget_event("dispatch")
             return True

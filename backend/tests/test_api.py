@@ -240,6 +240,19 @@ class CapturingAgent(StubAgent):
 
 
 class ApiTests(unittest.TestCase):
+    def test_request_options_preserve_server_owned_web_policy(self):
+        config = main.Configuration(
+            v4_web_extractor_enabled=True, v4_web_extractor_tenants=["default"],
+            v4_web_l2_adapter="reader_http", v4_web_reader_url="https://reader.example.org/read",
+            v4_web_reader_token="private", v4_web_l2_origin_rules={"default": [{"origin": "https://example.org"}]},
+        )
+        request = main.ResearchRequest(topic="Study", search_api="searxng")
+        effective = main._build_config(request, base_config=config)
+        self.assertEqual(effective.v4_web_extractor_tenants, ["default"])
+        self.assertEqual(effective.v4_web_l2_adapter, "reader_http")
+        self.assertEqual(effective.v4_web_l2_origin_rules, config.v4_web_l2_origin_rules)
+        self.assertEqual(effective.v4_web_reader_token, "private")
+
     def setUp(self) -> None:
         metrics_registry.reset()
 

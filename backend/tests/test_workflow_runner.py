@@ -445,6 +445,29 @@ def test_worker_reclaims_expired_lease_and_reuses_completed_tasks(tmp_path: Path
     assert executed == [3]
 
 
+def test_web_only_durable_reservation_keeps_frozen_policy_and_quick_deadline(tmp_path: Path) -> None:
+    from config import Configuration
+    from services.workflow_runner import WorkflowCheckpoint
+    from state_manager import public_v4_projection
+
+    store = RequestStateStore(str(tmp_path))
+    checkpoint = WorkflowCheckpoint(store, "default", "web-only", "local", "web-run")
+    config = Configuration(
+        v4_web_extractor_enabled=True, v4_web_extractor_tenants=["default"],
+        v4_default_research_depth="deep", v4_tenant_budget_limits={"default": {"web_fetches": 2}},
+    )
+    first, _ = checkpoint.reserve("example", config=config, plan_first=True)
+    assert first["v4"]["web_downstream_only"]
+    limit = first["v4"]["budget"]["limit"]
+    assert limit["depth"] == "quick"
+    assert limit["limits"]["web_fetches"] == 2
+    assert public_v4_projection(first["v4"])["web_extraction"] == {
+        "schema_version": 1, "tier_counts": {}, "degraded_counts": {},
+    }
+    second, _ = checkpoint.reserve("example", config=Configuration(), plan_first=True)
+    assert second["v4"] == first["v4"]
+
+
 def test_v4_durable_reservation_freezes_budget_and_options(tmp_path: Path) -> None:
     from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
 

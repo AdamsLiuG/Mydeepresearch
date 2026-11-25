@@ -32,6 +32,27 @@ class DummyAgent:
 
 
 class ReportingServiceTests(unittest.TestCase):
+    def test_enabled_report_rejects_l0_facts_and_keeps_workbench_link(self):
+        config = Configuration.from_env(load_env_file=False)
+        store = EvidenceStore(web_extraction_enabled=True)
+        url = "https://example.org/lead"
+        evidence = store.record_search_results(task_id=1, query="measurements", backend="fixture", search_payload={
+            "results": [{"url": url, "content": "The device reduced latency by 91%."}],
+        })
+        task = TodoItem(
+            id=1, title="Benchmark", query="latency", intent="Check latency", status="completed",
+            summary="- The device reduced latency by 91% [T1-S1]", evidence_items=evidence,
+            claims=[{"text": "The device reduced latency by 91%", "source_ids": ["T1-S1"]}],
+        )
+        state = SummaryState(research_topic="Measurements", todo_items=[task])
+        agent = DummyAgent('{"key_findings":[{"text":"The device reduced latency by 91%","source_ids":["T1-S1"]}]}')
+        reporter = ReportingService(agent, config, evidence_store=store)
+        self.assertEqual(reporter._collect_valid_source_ids(state), set())
+        self.assertNotIn("[T1-S1]", reporter.generate_report(state))
+        workbench = reporter.build_workbench_payload(state, "- The device reduced latency by 91% [T1-S1]")
+        self.assertEqual(workbench["citation_index"]["T1-S1"]["url"], url)
+        self.assertEqual(workbench["paragraph_bindings"], [])
+
     def test_generate_report_renders_grounded_markdown_from_structured_json(self):
         store = EvidenceStore()
         store.record_search_results(

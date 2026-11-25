@@ -133,6 +133,22 @@ class AgentExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         metrics_registry.reset()
 
+    def test_web_leads_cannot_close_react_coverage_or_drive_wave_one(self):
+        instance = self._build_agent()
+        instance._evidence_store = EvidenceStore(web_extraction_enabled=True)
+        task = TodoItem(id=1, title="Report", intent="Find measurements", query="measurements")
+        state = SummaryState(research_topic="Measurements", todo_items=[task])
+        leads = instance._evidence_store.record_search_results(
+            task_id=1, query=task.query, backend="searxng",
+            search_payload={"results": [{
+                "url": "https://example.org/research", "title": "Report",
+                "content": "Provider lead " * 40, "raw_content": "UNTRUSTED",
+            }]},
+        )
+        self.assertIn("thin_content", instance._observe_task_evidence(state, task, leads).gap_signals)
+        self.assertFalse(instance._observe_task_evidence(state, task, leads).evidence_sufficiency)
+        self.assertEqual(instance._wave_material(state), {"facts": [], "sources": []})
+
     def _build_agent(self):
         instance = agent_module.DeepResearchAgent.__new__(agent_module.DeepResearchAgent)
         instance.config = Configuration.from_env(

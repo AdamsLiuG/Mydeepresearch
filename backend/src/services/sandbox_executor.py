@@ -882,7 +882,10 @@ class RunPythonSandboxTool(Tool):
             valid_task_sources = {
                 str(item.get("source_id") or "").strip()
                 for item in items
-                if item.get("source_id")
+                if item.get("source_id") and (
+                    not getattr(self._evidence_store, "web_extraction_enabled", False)
+                    or self._evidence_store.is_eligible_for_facts(item["source_id"])
+                )
             }
 
         exec_result = self._sandbox_service.execute(req, valid_source_ids=valid_task_sources)

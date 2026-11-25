@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -24,11 +24,17 @@ import requests
 from hello_agents.tools import SearchTool
 
 from config import Configuration
-from metrics import RequestTrace
+from metrics import RequestTrace, metrics_registry
 from services.embeddings import (
     embeddings_available,
     encode_text,
     load_sentence_transformer,
+)
+from services.memory_sanitizer import WEB_SANITIZER_VERSION
+from services.web_extractor import (
+    WebExtractionResult,
+    normalize_snippet,
+    sanitize_web_snippet,
 )
 from utils import (
     deduplicate_and_format_sources,
@@ -68,6 +74,9 @@ _STANDALONE_VERSION_PATTERN = re.compile(r"\bv(\d+(?:\.\d+)?)\b")
 _SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 _SEMANTIC_SCHOLAR_USER_AGENT = "helloagents-deepresearch/1.0"
 _SEMANTIC_CACHE_COLLECTION_NAME = "semantic_search_cache_v1"
+_BOUNDED_SEARCH_BACKENDS = frozenset({"semanticscholar", "searxng"})
+_SNIPPET_ONLY = "snippet_only"
+_MAX_SNIPPET_RESULTS = 50
 _FRESH_SIGNAL_WORDS = {
     "latest",
     "current",
@@ -588,6 +597,36 @@ def _resolved_search_fetch_full_page(search_api: str, config: Configuration) -> 
     return bool(config.fetch_full_page)
 
 
+def _bounded_search_backends(search_api: str, config: Configuration) -> list[str]:
+    backends = config.resolved_advanced_search_backends() if search_api == "advanced" else [search_api]
+    return [backend for backend in backends if backend in _BOUNDED_SEARCH_BACKENDS]
+
+
+def _search_cache_options(
+    search_api: str, config: Configuration, *, web_extraction_enabled: bool = False,
+) -> tuple[bool, dict[str, Any]]:
+    if not web_extraction_enabled:
+        return _resolved_search_fetch_full_page(search_api, config), config.resolved_search_cache_signature(search_api)
+    return False, {
+        "mode": _SNIPPET_ONLY,
+        "sanitizer_version": WEB_SANITIZER_VERSION,
+        "provider": next(iter(_bounded_search_backends(search_api, config)), None),
+    }
+
+
+def _matches_snippet_scope(
+    entry: SearchCacheEntry, tenant_id: str, search_api: str, signature: dict[str, Any],
+) -> bool:
+    return (
+        not entry.fetch_full_page
+        and entry.tenant_id == tenant_id
+        and entry.search_api == search_api
+        and entry.cache_signature == signature
+        and entry.backend_label in _BOUNDED_SEARCH_BACKENDS
+        and entry.backend_label == signature["provider"]
+    )
+
+
 def _normalized_tenant_namespace(tenant_id: str | None) -> str:
     cleaned = str(tenant_id or "").strip()
     if not cleaned or cleaned == "default":
@@ -606,7 +645,11 @@ def _build_scope_key(
     """Return the namespace key used to group semantically comparable entries."""
 
     base = f"scope::{search_api}::{int(fetch_full_page)}"
-    tenant_ns = _normalized_tenant_namespace(tenant_id)
+    tenant_ns = (
+        tenant_id or "default"
+        if (cache_signature or {}).get("mode") == _SNIPPET_ONLY
+        else _normalized_tenant_namespace(tenant_id)
+    )
     if tenant_ns:
         tenant_digest = hashlib.sha256(tenant_ns.encode("utf-8")).hexdigest()[:16]
         base = f"{base}::t={tenant_digest}"
@@ -630,17 +673,20 @@ def _build_cache_key(
     config: Configuration,
     *,
     tenant_id: str = "",
+    web_extraction_enabled: bool = False,
 ) -> str:
     """Return the persistent key for an exact query match."""
 
-    fetch_full_page = _resolved_search_fetch_full_page(search_api, config)
+    fetch_full_page, cache_signature = _search_cache_options(
+        search_api, config, web_extraction_enabled=web_extraction_enabled,
+    )
     payload: dict[str, Any] = {
         "query": _normalize_query(query),
         "search_api": search_api,
         "fetch_full_page": fetch_full_page,
-        "cache_signature": config.resolved_search_cache_signature(search_api),
+        "cache_signature": cache_signature,
     }
-    tenant_ns = _normalized_tenant_namespace(tenant_id)
+    tenant_ns = (tenant_id or "default") if web_extraction_enabled else _normalized_tenant_namespace(tenant_id)
     if tenant_ns:
         payload["tenant_id"] = tenant_ns
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
@@ -1148,6 +1194,7 @@ def _select_best_approximate_match(
     raw_query: str = "",
     request_id: str = "",
     task_id: str = "",
+    snippet_scope: tuple[str, str, dict[str, Any]] | None = None,
 ) -> ApproximateCacheMatchResult:
     best_match = ApproximateCacheMatchResult()
     live_keys: list[str] = []
@@ -1165,6 +1212,8 @@ def _select_best_approximate_match(
             continue
 
         live_keys.append(candidate_key)
+        if snippet_scope and not _matches_snippet_scope(entry, *snippet_scope):
+            continue
         if (
             request_id
             and task_id
@@ -1264,6 +1313,7 @@ def _read_approximate_cache(
     request_id: str = "",
     task_id: str = "",
     tenant_id: str = "",
+    web_extraction_enabled: bool = False,
 ) -> ApproximateCacheMatchResult:
     """Read the best approximate cache match using dense and sparse candidate union."""
 
@@ -1276,13 +1326,10 @@ def _read_approximate_cache(
     ):
         return ApproximateCacheMatchResult()
 
-    scope_key = _build_scope_key(
-        search_api,
-        _resolved_search_fetch_full_page(search_api, config),
-        config.resolved_search_cache_signature(search_api),
-        topic_scope,
-        tenant_id=tenant_id,
+    fetch_full_page, cache_signature = _search_cache_options(
+        search_api, config, web_extraction_enabled=web_extraction_enabled,
     )
+    scope_key = _build_scope_key(search_api, fetch_full_page, cache_signature, topic_scope, tenant_id=tenant_id)
     dense_candidate_keys: list[str] = []
     if query_embedding is not None and config.resolved_approximate_cache_dense_enabled():
         dense_candidate_keys, _ = _query_vector_candidate_keys(
@@ -1315,6 +1362,7 @@ def _read_approximate_cache(
         raw_query=raw_query,
         request_id=request_id,
         task_id=task_id,
+        snippet_scope=(tenant_id, search_api, cache_signature) if web_extraction_enabled else None,
     )
 
 
@@ -1378,6 +1426,62 @@ def _normalize_search_payload(
     backend_label = str(payload.get("backend") or requested_backend)
     answer_text = payload.get("answer")
     return payload, notices, answer_text, backend_label
+
+
+class _ProjectedSearchSnippet(dict[str, Any]):
+    """Dict-shaped L0 result with an in-process projection for EvidenceStore."""
+
+    def __init__(self, projection: WebExtractionResult, backend: str) -> None:
+        super().__init__(
+            title=projection.title, url=projection.final_url, content=projection.visible_text,
+            backend_sources=[backend], provider_count=1,
+            provenance_meta={"web_extraction": projection.provenance()},
+        )
+        self.projection = projection
+
+
+def projected_search_snippet(result: dict[str, Any]) -> WebExtractionResult | None:
+    if isinstance(result, _ProjectedSearchSnippet):
+        return result.projection
+    return None
+
+
+def _project_search_snippets(
+    payload: dict[str, Any],
+    answer_text: str | None,
+    *,
+    backend: str,
+    max_results: int,
+    cached: bool = False,
+) -> tuple[dict[str, Any], str | None]:
+    cleaned = []
+    results = payload.get("results")
+    if isinstance(results, list):
+        for item in results[:max_results]:
+            if not isinstance(item, dict):
+                continue
+            projection = projected_search_snippet(item)
+            if projection is None:
+                projection = normalize_snippet(item.get("url"), item.get("title"), item.get("content"))
+            if projection is None:
+                continue
+            if cached:
+                provenance = item.get("provenance_meta")
+                web_meta = provenance.get("web_extraction") if isinstance(provenance, dict) else None
+                dropped_nodes = web_meta.get("dropped_nodes") if isinstance(web_meta, dict) else None
+                if type(dropped_nodes) is int and 0 <= dropped_nodes <= 20_000:
+                    projection = replace(projection, dropped_nodes=dropped_nodes)
+            record = _ProjectedSearchSnippet(projection, backend)
+            published_at = item.get("published_at")
+            if isinstance(published_at, str) and len(published_at) <= 10:
+                try:
+                    record["published_at"] = datetime.strptime(published_at, "%Y-%m-%d").date().isoformat()
+                except ValueError:
+                    pass
+            cleaned.append(record)
+
+    answer = sanitize_web_snippet(answer_text) or None
+    return {"results": cleaned, "backend": backend, "answer": answer, "notices": []}, answer
 
 
 def _semantic_scholar_timeout_seconds(config: Configuration) -> float:
@@ -1552,6 +1656,7 @@ def _execute_semantic_scholar_backend(
     *,
     max_results: int,
     timeout: float | None = None,
+    snippet_only: bool = False,
 ) -> tuple[dict[str, Any], list[str], str | None, str]:
     """Execute the local Semantic Scholar provider without relying on hello-agents."""
 
@@ -1560,7 +1665,7 @@ def _execute_semantic_scholar_backend(
             _SEMANTIC_SCHOLAR_SEARCH_URL,
             params={
                 "query": query,
-                "fields": _SEMANTIC_SCHOLAR_FIELDS,
+                "fields": "title,url,abstract,year,publicationDate" if snippet_only else _SEMANTIC_SCHOLAR_FIELDS,
                 "limit": max(1, int(max_results or 1)),
             },
             headers=_semantic_scholar_headers(config),
@@ -1568,7 +1673,11 @@ def _execute_semantic_scholar_backend(
             **({"allow_redirects": False} if timeout is not None else {}),
         )
     except requests.RequestException as exc:
+        if snippet_only:
+            raise RuntimeError("search_provider_error") from None
         raise RuntimeError(f"Semantic Scholar 请求失败: {exc}") from exc
+    if snippet_only and response.status_code != 200:
+        raise RuntimeError("search_provider_error")
 
     if response.status_code == 401:
         raise RuntimeError("Semantic Scholar 认证失败（401），请检查 SEMANTIC_SCHOLAR_API_KEY 是否有效。")
@@ -1592,11 +1701,20 @@ def _execute_semantic_scholar_backend(
     except ValueError as exc:
         raise RuntimeError("Semantic Scholar 返回了无法解析的 JSON 响应。") from exc
 
-    results = [
-        _normalize_semantic_scholar_result(item)
-        for item in list(payload.get("data") or [])
-        if isinstance(item, dict)
-    ]
+    rows = list(payload.get("data") or [])
+    if snippet_only:
+        results = [
+            {
+                "url": _semantic_scholar_paper_url(item),
+                "title": item.get("title"),
+                "content": item.get("abstract"),
+                "published_at": _semantic_scholar_published_at(item),
+            }
+            for item in rows[:max_results]
+            if isinstance(item, dict)
+        ]
+    else:
+        results = [_normalize_semantic_scholar_result(item) for item in rows if isinstance(item, dict)]
     normalized_payload = {
         "results": results,
         "backend": "semanticscholar",
@@ -1608,21 +1726,21 @@ def _execute_semantic_scholar_backend(
 
 def _execute_bounded_search(
     query: str, search_api: str, config: Configuration, *, max_results: int,
-    budget: Any, required: bool,
+    budget: Any, required: bool, snippet_only: bool = False,
 ) -> tuple[dict[str, Any], list[str], str | None, str]:
-    backends = config.resolved_advanced_search_backends() if search_api == "advanced" else [search_api]
-    bounded_backends = [backend for backend in backends if backend in {"semanticscholar", "searxng"}]
+    bounded_backends = _bounded_search_backends(search_api, config)
     if not bounded_backends:
         budget.refuse("dispatch_unbounded", required=required)
 
     result = None
-    for backend in bounded_backends:
+    for backend in bounded_backends[:1] if snippet_only else bounded_backends:
         with budget.attempt({"search_calls": 1}, required=required) as attempt:
             timeout = min(attempt.timeout, float(config.search_tool_timeout_seconds or 10.0))
             if backend == "semanticscholar":
                 result = _execute_semantic_scholar_backend(
                     query, config, max_results=max_results,
                     timeout=min(timeout, _semantic_scholar_timeout_seconds(config)),
+                    **({"snippet_only": True} if snippet_only else {}),
                 )
             else:
                 endpoint = f"{os.getenv('SEARXNG_URL', 'http://localhost:8888').rstrip('/')}/search"
@@ -1631,14 +1749,18 @@ def _execute_bounded_search(
                                       "categories": "general"},
                     timeout=timeout, allow_redirects=False,
                 )
+                if snippet_only and response.status_code != 200:
+                    raise RuntimeError("search_provider_error")
                 response.raise_for_status()
+                provider_payload = response.json()
                 results = [
                     {"title": item.get("title") or item["url"], "url": item["url"],
                      "content": item.get("content") or item.get("snippet") or ""}
-                    for item in response.json().get("results", [])[:max_results]
+                    for item in provider_payload.get("results", [])[:max_results]
                     if isinstance(item, dict) and item.get("url")
                 ]
-                result = ({"results": results, "backend": backend}, [], None, backend)
+                answer = provider_payload.get("answer") if snippet_only else None
+                result = ({"results": results, "backend": backend}, [], answer, backend)
         if result[0].get("results"):
             return result
     assert result is not None
@@ -2613,6 +2735,18 @@ def _build_cache_observer_metadata(
     return metadata
 
 
+def _cached_search_result(
+    entry: SearchCacheEntry, strategy: str, *, web_extraction_enabled: bool, max_results: int,
+) -> tuple[dict[str, Any], list[str], str | None, str, bool, str]:
+    if web_extraction_enabled:
+        payload, answer = _project_search_snippets(
+            entry.payload, entry.answer_text, backend=entry.backend_label, max_results=max_results, cached=True,
+        )
+        metrics_registry.record_web_extraction("cache_hit", adapter="snippet")
+        return payload, [], answer, entry.backend_label, True, strategy
+    return entry.payload, entry.notices, entry.answer_text, entry.backend_label, True, strategy
+
+
 def dispatch_search(
     query: str,
     config: Configuration,
@@ -2623,15 +2757,25 @@ def dispatch_search(
     *,
     budget: Any = None,
     required: bool = True,
+    web_extraction_enabled: bool | None = None,
 ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool, str]:
     """Execute configured search backend and normalise response payload."""
 
     search_api = get_config_value(config.search_api)
-    effective_fetch_full_page = _resolved_search_fetch_full_page(search_api, config)
-    cache_signature = config.resolved_search_cache_signature(search_api)
     normalized_cache_context = _normalize_cache_context(cache_context)
     context_tenant_id = normalized_cache_context.get("tenant_id", "")
-    cache_key = _build_cache_key(query, search_api, config, tenant_id=context_tenant_id)
+    if web_extraction_enabled is None:
+        web_extraction_enabled = config.web_extraction_enabled_for(context_tenant_id or "default")
+    if web_extraction_enabled:
+        context_tenant_id = context_tenant_id or "default"
+        max_results = min(max(1, max_results), _MAX_SNIPPET_RESULTS)
+    effective_fetch_full_page, cache_signature = _search_cache_options(
+        search_api, config, web_extraction_enabled=web_extraction_enabled,
+    )
+    cache_key = _build_cache_key(
+        query, search_api, config, tenant_id=context_tenant_id,
+        web_extraction_enabled=web_extraction_enabled,
+    )
     topic_scope = _build_topic_scope(normalized_cache_context)
     context_request_id = normalized_cache_context.get("request_id") or (
         str(getattr(observer, "request_id", "") or "").strip() if observer else ""
@@ -2643,6 +2787,10 @@ def dispatch_search(
     approximate_match = ApproximateCacheMatchResult()
     if config.search_cache_enabled:
         exact_cached = _read_exact_cache(cache_key, config)
+        if web_extraction_enabled and exact_cached and not _matches_snippet_scope(
+            exact_cached, context_tenant_id, search_api, cache_signature,
+        ):
+            exact_cached = None
         if exact_cached:
             if observer:
                 observer.record_search_attempt(
@@ -2664,13 +2812,8 @@ def dispatch_search(
                 exact_cached.ttl_bucket or ttl_bucket,
                 exact_cached.resolved_expires_at(fallback_ttl_seconds=ttl_seconds),
             )
-            return (
-                exact_cached.payload,
-                exact_cached.notices,
-                exact_cached.answer_text,
-                exact_cached.backend_label,
-                True,
-                "exact",
+            return _cached_search_result(
+                exact_cached, "exact", web_extraction_enabled=web_extraction_enabled, max_results=max_results,
             )
 
         approximate_cache_allowed = config.resolved_approximate_cache_enabled() and _approximate_cache_reuse_allowed(
@@ -2678,7 +2821,7 @@ def dispatch_search(
             topic_scope=topic_scope,
         )
         if approximate_cache_allowed:
-            if budget is None and config.resolved_approximate_cache_dense_enabled():
+            if budget is None and not web_extraction_enabled and config.resolved_approximate_cache_dense_enabled():
                 approximate_embedding = _embed_query(approximate_text or query, config)
             approximate_match = _read_approximate_cache(
                 approximate_embedding,
@@ -2690,6 +2833,7 @@ def dispatch_search(
                 request_id=context_request_id,
                 task_id=context_task_id,
                 tenant_id=context_tenant_id,
+                **({"web_extraction_enabled": True} if web_extraction_enabled else {}),
             )
             if approximate_match.entry:
                 if observer:
@@ -2724,13 +2868,9 @@ def dispatch_search(
                     approximate_match.hit_mode,
                     approximate_match.entry.ttl_bucket or ttl_bucket,
                 )
-                return (
-                    approximate_match.entry.payload,
-                    approximate_match.entry.notices,
-                    approximate_match.entry.answer_text,
-                    approximate_match.entry.backend_label,
-                    True,
-                    approximate_match.hit_mode,
+                return _cached_search_result(
+                    approximate_match.entry, approximate_match.hit_mode,
+                    web_extraction_enabled=web_extraction_enabled, max_results=max_results,
                 )
         elif config.resolved_approximate_cache_enabled():
             logger.info(
@@ -2741,10 +2881,14 @@ def dispatch_search(
                 topic_scope or "<global>",
             )
 
+    if web_extraction_enabled and budget is None:
+        return {"results": [], "backend": search_api, "answer": None, "notices": []}, [], None, search_api, False, "miss"
+
     try:
         if budget is not None:
             payload, notices, answer_text, backend_label = _execute_bounded_search(
                 query, search_api, config, max_results=max_results, budget=budget, required=required,
+                **({"snippet_only": True} if web_extraction_enabled else {}),
             )
         elif search_api == "advanced":
             payload, notices, answer_text, backend_label = _fuse_advanced_search_results(
@@ -2764,6 +2908,10 @@ def dispatch_search(
     except Exception as exc:  # pragma: no cover - defensive logging
         if getattr(exc, "budget_denied", False):
             raise
+        if web_extraction_enabled:
+            if observer:
+                observer.record_search_attempt(cache_hit=False, success=False, cache_strategy="miss")
+            raise RuntimeError("search_provider_error") from None
         if observer:
             observer.record_search_attempt(
                 cache_hit=False,
@@ -2778,6 +2926,11 @@ def dispatch_search(
             )
         logger.exception("Search backend %s failed: %s", search_api, exc)
         raise
+    if web_extraction_enabled:
+        payload, answer_text = _project_search_snippets(
+            payload, answer_text, backend=backend_label, max_results=max_results,
+        )
+        notices = []
     results = payload.get("results", [])
 
     if notices:
@@ -2806,7 +2959,10 @@ def dispatch_search(
             ),
         )
 
-    if config.search_cache_enabled and (budget is None or (search_api != "advanced" and not effective_fetch_full_page)):
+    cache_allowed = (
+        web_extraction_enabled or budget is None or (search_api != "advanced" and not effective_fetch_full_page)
+    )
+    if config.search_cache_enabled and cache_allowed:
         created_at = time.time()
         cache_entry = SearchCacheEntry(
             query=query.strip(),
@@ -2816,7 +2972,7 @@ def dispatch_search(
             search_api=search_api,
             fetch_full_page=effective_fetch_full_page,
             cache_signature=cache_signature or None,
-            payload=payload,
+            payload={**payload, "results": [dict(result) for result in results]} if web_extraction_enabled else payload,
             notices=notices,
             answer_text=answer_text,
             backend_label=backend_label,

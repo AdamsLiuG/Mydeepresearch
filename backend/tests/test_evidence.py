@@ -800,3 +800,121 @@ class EvidenceStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebEvidenceTests(unittest.TestCase):
+    def test_enabled_fetch_keeps_stable_id_and_commits_only_visible_artifact(self):
+        import time
+
+        from services.web_extractor import ExtractionContext, WebExtractor
+        from services.web_fetch_gateway import FetchedDocument, FetchScope
+
+        class Gateway:
+            def fetch(self, url, **kwargs):
+                content = b'<main><p>The analysis confirms a substantial improvement across all periods of the study and includes detailed results.</p><p hidden>hidden-sentinel</p></main>'
+                return FetchedDocument(url, "text/html", content)
+
+        context = ExtractionContext("default", "request", 1, FetchScope(time.monotonic() + 5))
+        store = EvidenceStore(web_extraction_enabled=True)
+        tool = FetchPageTool(evidence_store=store, web_extractor=WebExtractor(gateway=Gateway()),
+                             extraction_context_provider=lambda task_id: context)
+        url = "https://example.org/paper"
+        first, = store.record_search_results(
+            task_id=1, query="research", backend="fixture", search_payload={"results": [{
+                "url": url, "content": "short summary", "raw_content": "raw-sentinel",
+                "provenance_meta": {"web_extraction": {"tier": "L2"}}
+            }]},
+        )
+        self.assertFalse(store.is_eligible_for_facts(first["source_id"]))
+        fetched = json.loads(tool.run({"task_id": 1, "url": url, "source_id": first["source_id"]}))
+        self.assertEqual(first["source_id"], fetched["source_id"])
+        self.assertTrue(store.is_eligible_for_facts(first["source_id"]))
+        self.assertNotIn("sentinel", json.dumps(fetched))
+        fetched["provenance_meta"]["web_extraction"]["text_anchors"][0]["end"] = 1
+        saved = store.get_evidence(first["source_id"])
+        self.assertGreater(saved["provenance_meta"]["web_extraction"]["text_anchors"][0]["end"], 1)
+
+    def test_trusted_snapshot_restores_published_artifact_and_untrusted_falls_back(self):
+        import time
+
+        from services.web_extractor import ExtractionContext, WebExtractor
+        from services.web_fetch_gateway import FetchedDocument, FetchScope
+
+        class Gateway:
+            content = (
+                b'<main><p>The study measured the number of participants in each group.</p>'
+                b'<table><caption>Results</caption><tr><th>Group</th><th>Count</th></tr>'
+                b'<tr><td>A</td><td>24</td></tr></table></main>'
+            )
+
+            def fetch(self, url, **kwargs):
+                return FetchedDocument(url, "text/html", self.content)
+
+        context = ExtractionContext("default", "request", 1, FetchScope(time.monotonic() + 5))
+        url = "https://example.org/study"
+        artifact = WebExtractor(gateway=Gateway()).extract(url, context=context)
+        store = EvidenceStore(web_extraction_enabled=True)
+        item = store.update_full_content(
+            task_id=1, source_id=None, url=url, title="", full_content="", web_result=artifact,
+        )
+        source_id = item["source_id"]
+        task = {"id": 1, "evidence_items": [item]}
+        trusted = EvidenceStore(web_extraction_enabled=True)
+        trusted.hydrate_from_tasks([task], trusted_web_snapshot=True)
+        self.assertTrue(trusted.is_eligible_for_facts(source_id))
+        restored = trusted.get_evidence(source_id, include_full_content=True)
+        self.assertEqual(restored["title"], item["title"])
+        self.assertEqual(restored["full_content"], item["full_content"])
+        self.assertEqual(restored["multimodal_blocks"], item["multimodal_blocks"])
+        self.assertEqual(restored["provenance_meta"], item["provenance_meta"])
+
+        gateway = Gateway()
+        gateway.content = gateway.content.replace(b"24", b"48")
+        late_artifact = WebExtractor(gateway=gateway).extract(url, context=context)
+        self.assertNotEqual(late_artifact.multimodal_blocks, artifact.multimodal_blocks)
+        late_update = trusted.update_full_content(
+            task_id=1, source_id=source_id, url=url, title="", full_content="", web_result=late_artifact,
+        )
+        self.assertEqual(late_update, restored)
+
+        untrusted = EvidenceStore(web_extraction_enabled=True)
+        untrusted.hydrate_from_tasks([task])
+        self.assertFalse(untrusted.is_eligible_for_facts(source_id))
+        fallback = untrusted.get_evidence(source_id, include_full_content=True)
+        self.assertNotIn("full_content", fallback)
+        self.assertNotIn("multimodal_blocks", fallback)
+        self.assertEqual(fallback["provenance_meta"]["web_extraction"]["tier"], "L0")
+
+        item["provenance_meta"]["web_extraction"]["text_anchors"][0]["end"] = 1
+        item["multimodal_blocks"][0]["text"] = "changed snapshot"
+        self.assertEqual(trusted.get_evidence(source_id, include_full_content=True), restored)
+
+    def test_trusted_snapshot_with_mismatched_versions_falls_back_to_sanitized_snippet(self):
+        source_id = "T1-S1"
+        item = {
+            "source_id": source_id,
+            "url": "https://example.org/study",
+            "title": "Study <span hidden>hidden-title</span>",
+            "snippet": "Visible summary <span hidden>hidden-snippet</span>",
+            "full_content": "obsolete full text",
+            "multimodal_blocks": [{"kind": "table", "text": "obsolete table"}],
+            "archive_version_id": "obsolete-version",
+            "archive_has_full_content": True,
+            "computation_artifact": {"result": "obsolete computation"},
+            "provenance_meta": {"web_extraction": {
+                "tier": "L2", "adapter": "reader_http", "artifact_version": 1,
+                "sanitizer_version": 0, "quality_version": 0, "policy_version": 0,
+            }},
+        }
+        store = EvidenceStore(web_extraction_enabled=True)
+        store.hydrate_from_tasks([{"id": 1, "evidence_items": [item]}], trusted_web_snapshot=True)
+
+        restored = store.get_evidence(source_id, include_full_content=True)
+        self.assertFalse(store.is_eligible_for_facts(source_id))
+        self.assertEqual(restored["title"], "Study")
+        self.assertEqual(restored["snippet"], "Visible summary")
+        self.assertEqual(restored["provenance_meta"]["web_extraction"]["tier"], "L0")
+        self.assertIsNone(restored["archive_version_id"])
+        self.assertFalse(restored["archive_has_full_content"])
+        for key in ("full_content", "multimodal_blocks", "computation_artifact"):
+            self.assertNotIn(key, restored)

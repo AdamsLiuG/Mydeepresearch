@@ -6,6 +6,7 @@ import tempfile
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -177,6 +178,20 @@ class MockHTTPResponse:
             raise ValueError("missing json payload")
         return deepcopy(self._payload)
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError("HTTP error")
+
+
+class SnippetSearchBudget:
+    def __init__(self):
+        self.calls = []
+
+    @contextmanager
+    def attempt(self, demand, *, required=True):
+        self.calls.append((demand, required))
+        yield types.SimpleNamespace(timeout=0.5)
+
 
 def rerank_completion_payload(ranked_ids):
     return {
@@ -251,6 +266,143 @@ class SearchCacheTests(unittest.TestCase):
         services_search.clear_search_cache()
         self.temp_dir.cleanup()
         self.env_patcher.stop()
+
+    def _web_search_config(self, **overrides):
+        return Configuration.from_env(
+            overrides={
+                "search_api": "advanced",
+                "advanced_search_backends": ["searxng", "semanticscholar", "tavily"],
+                "search_cache_enabled": True,
+                "search_cache_dir": self.temp_dir.name,
+                "search_cache_vector_dir": self.temp_dir.name,
+                "semantic_cache_enabled": False,
+                "fetch_full_page": True,
+                "advanced_search_fetch_full_page_override": True,
+                "advanced_rerank_enabled": True,
+                "v4_web_extractor_enabled": True,
+                "v4_web_extractor_tenants": ["default", "tenant-a", "tenant-b"],
+                **overrides,
+            },
+            load_env_file=False,
+        )
+
+    def test_web_search_projects_only_snippets_and_uses_one_bounded_provider(self):
+        config = self._web_search_config()
+        provider_result = {
+            "results": [
+                {
+                    "url": "https://example.com/results#old",
+                    "title": "<p>Public title</p><p hidden>hidden title</p>",
+                    "content": "<p>Visible excerpt</p><p hidden>hidden snippet</p>",
+                    "raw_content": "provider full text",
+                    "provenance_meta": {"web_extraction": {"tier": "L2", "internal_ip": "10.0.0.1"}},
+                },
+                {"url": "https://example.org/link", "raw_content": "not a snippet"},
+                {"url": "https://user:secret@example.com/"},
+            ],
+            "backend": "searxng",
+            "answer": "<p>Research lead</p><p hidden>hidden answer</p>",
+        }
+        response = MockHTTPResponse(payload=provider_result)
+        budget = SnippetSearchBudget()
+
+        with (
+            patch.object(services_search.requests, "get", return_value=response) as transport,
+            patch.object(services_search, "_invoke_advanced_reranker") as rerank,
+        ):
+            first = services_search.dispatch_search("isolated L0 search", config, 0, budget=budget)
+            second = services_search.dispatch_search("isolated L0 search", config, 1)
+
+        self.assertEqual(DummySearchTool.call_count, 0)
+        transport.assert_called_once()
+        self.assertEqual(budget.calls, [({"search_calls": 1}, True)])
+        self.assertFalse(transport.call_args.kwargs["allow_redirects"])
+        rerank.assert_not_called()
+        self.assertFalse(first[4])
+        self.assertTrue(second[4])
+        self.assertEqual(first[:4], second[:4])
+        self.assertEqual(first[2], "Research lead")
+        results = first[0]["results"]
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["url"], "https://example.com/results")
+        self.assertEqual(results[0]["title"], "Public title")
+        self.assertEqual(results[0]["content"], "Visible excerpt")
+        self.assertEqual(results[0]["provenance_meta"]["web_extraction"]["tier"], "L0")
+        self.assertNotIn("raw_content", results[0])
+        self.assertNotIn("internal_ip", json.dumps(results))
+        self.assertEqual(results[1]["content"], "")
+        self.assertIn("link_only", results[1]["provenance_meta"]["web_extraction"]["quality_flags"])
+
+    def test_web_search_exact_cache_isolated_from_unversioned_and_other_tenant_entries(self):
+        config = self._web_search_config(
+            search_api="searxng",
+            fetch_full_page=False,
+            advanced_search_fetch_full_page_override=False,
+        )
+        query = "web cache scope"
+        services_search.dispatch_search(query, config, 0, web_extraction_enabled=False)
+
+        response = MockHTTPResponse(payload={
+            "results": [{"url": "https://example.com/", "content": "safe snippet"}],
+        })
+        budget = SnippetSearchBudget()
+        with patch.object(services_search.requests, "get", return_value=response) as transport:
+            first = services_search.dispatch_search(query, config, 0, budget=budget)
+            tenant_a = services_search.dispatch_search(
+                query, config, 0, budget=budget, cache_context={"tenant_id": "tenant-a"},
+            )
+            tenant_b = services_search.dispatch_search(
+                query, config, 0, budget=budget, cache_context={"tenant_id": "tenant-b"},
+            )
+            default_hit = services_search.dispatch_search(query, config, 0, cache_context={"tenant_id": "default"})
+            tenant_a_hit = services_search.dispatch_search(query, config, 0, cache_context={"tenant_id": "tenant-a"})
+
+        self.assertEqual(transport.call_count, 3)
+        self.assertFalse(any(result[4] for result in (first, tenant_a, tenant_b)))
+        self.assertTrue(default_hit[4])
+        self.assertTrue(tenant_a_hit[4])
+
+    def test_web_search_approximate_cache_scopes_l0_by_tenant_and_stays_local(self):
+        config = self._web_search_config(
+            search_api="searxng",
+            approximate_cache_enabled=True,
+            approximate_cache_sparse_threshold=0.3,
+        )
+        topic = "renewable power history"
+        query = "renewable power history offshore turbine overview"
+        related_query = "renewable power history offshore turbine introduction"
+        response = MockHTTPResponse(payload={
+            "results": [{"url": "https://example.com/", "content": "bounded source snippet"}],
+        })
+        budget = SnippetSearchBudget()
+
+        with (
+            patch.object(services_search.requests, "get", return_value=response) as transport,
+            patch.object(services_search, "_embed_query") as embed,
+        ):
+            first = services_search.dispatch_search(
+                query, config, 0, budget=budget,
+                cache_context={"research_topic": topic, "tenant_id": "tenant-a"},
+            )
+            same_tenant = services_search.dispatch_search(
+                related_query, config, 0,
+                cache_context={"research_topic": topic, "tenant_id": "tenant-a"},
+            )
+            other_tenant = services_search.dispatch_search(
+                related_query, config, 0,
+                cache_context={"research_topic": topic, "tenant_id": "tenant-b"},
+            )
+
+        self.assertFalse(first[4])
+        self.assertEqual(same_tenant[5], "approximate_sparse")
+        self.assertEqual(same_tenant[0]["results"], first[0]["results"])
+        self.assertIsNotNone(services_search.projected_search_snippet(same_tenant[0]["results"][0]))
+        self.assertIsNone(services_search.projected_search_snippet(dict(same_tenant[0]["results"][0])))
+        self.assertEqual(other_tenant[0]["results"], [])
+        self.assertFalse(other_tenant[4])
+        transport.assert_called_once()
+        embed.assert_not_called()
+        self.assertEqual(budget.calls, [({"search_calls": 1}, True)])
 
     def test_dispatch_search_uses_cache_and_updates_metrics(self):
         observer = RequestTrace(

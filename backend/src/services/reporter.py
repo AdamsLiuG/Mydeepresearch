@@ -14,7 +14,12 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState
-from services.context_builder import ContextPrefixBuilder, PromptEnvelope
+from prompts import web_evidence_prompt_rules
+from services.context_builder import (
+    ContextPrefixBuilder,
+    PromptEnvelope,
+    render_web_evidence_data,
+)
 from services.evidence import (
     derive_grounded_findings_from_evidence,
     extract_citation_ids,
@@ -247,6 +252,8 @@ class ReportingService:
                     sid = str(item.get("source_id") or "").strip()
                     if sid:
                         valid.add(sid)
+        if getattr(self._evidence_store, "web_extraction_enabled", False):
+            valid = {sid for sid in valid if self._evidence_store.is_eligible_for_facts(sid)}
         return valid - self._rejected_computation_ids(state)
 
     @staticmethod
@@ -331,21 +338,26 @@ class ReportingService:
         skill_pack_context: str | None = None,
     ) -> PromptEnvelope:
         builder = ContextPrefixBuilder(self._config)
+        web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
+        valid_ids = self._collect_valid_source_ids(state)
         covered_task_ids = context_covered_task_ids(state, self._config)
         task_blocks: list[str] = []
         for task in state.todo_items:
             if task.id in covered_task_ids:
                 task_blocks.append(f"### 任务 {task.id}: {task.title}\n- 任务目标：{task.intent}\n")
                 continue
+            summary = self._task_prompt_summary(task) if not web_enabled else self._render_bullets(
+                self._task_grounded_findings(task, valid_source_ids=valid_ids),
+            )
             summary_block = truncate_cited_text(
-                self._task_prompt_summary(task),
+                self._sanitize_chunk_citations(summary, valid_ids) if web_enabled else summary,
                 self._config.resolved_report_summary_char_limit(),
             )
             citations = ", ".join(sorted(extract_citation_ids(summary_block))) or "无"
             source_ids = sorted(extract_citation_ids(summary_block))
-            sources_block = self._task_prompt_references(
-                task,
-                cited_source_ids=source_ids,
+            sources_block = (
+                render_web_evidence_data(task.evidence_items, self._evidence_store, max_chars=3000)
+                if web_enabled else self._task_prompt_references(task, cited_source_ids=source_ids)
             )
             task_blocks.append(
                 f"### 任务 {task.id}: {task.title}\n"
@@ -358,14 +370,13 @@ class ReportingService:
         tools_enabled = self._tools_enabled()
         layout_mode = self._config.resolved_report_layout_mode()
         build_contract = self._build_fixed_prompt if layout_mode == self._FIXED_LAYOUT_MODE else self._build_flexible_prompt
-        static_schema = build_contract(tools_enabled=tools_enabled)
+        static_schema = build_contract(tools_enabled=tools_enabled) + web_evidence_prompt_rules(web_enabled)
 
         frozen = render_context_checkpoint(state, self._config)
         volatile_blocks: list[tuple[str, str]] = [
             ("report_tasks", f"任务概览：\n{''.join(task_blocks)}"),
             ("context_delta", render_context_delta(state, self._config)),
         ]
-        valid_ids = self._collect_valid_source_ids(state)
         raw_conflicts = self._filtered_conflicts(state, valid_ids)
         if raw_conflicts:
             disputed_ids: list[str] = []
@@ -877,6 +888,15 @@ class ReportingService:
         findings: list[dict[str, Any]] = []
         seen: set[tuple[str, tuple[str, ...]]] = set()
         rejected = self._rejected_claim_texts([task])
+        web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
+        evidence = list(getattr(task, "evidence_items", None) or [])
+        if web_enabled:
+            evidence = []
+            for item in self._evidence_store.list_task_evidence(task.id, include_full_content=True):
+                if item["source_id"] in valid_source_ids:
+                    if item.get("provenance_meta", {}).get("web_extraction"):
+                        item["snippet"] = ""
+                    evidence.append(item)
 
         def append_items(items: Any) -> None:
             if not isinstance(items, list):
@@ -894,9 +914,14 @@ class ReportingService:
                         break
                 if not raw_text or self._has_rejected_claim(raw_text, rejected):
                     continue
+                raw_source_ids = item.get("source_ids") or extract_citation_ids(raw_text)
+                if web_enabled and not (
+                    raw_source_ids and set(raw_source_ids) | set(extract_citation_ids(raw_text)) <= valid_source_ids
+                ):
+                    continue
                 if looks_like_source_label_text(raw_text):
                     replacements = derive_grounded_findings_from_evidence(
-                        list(getattr(task, "evidence_items", None) or []),
+                        evidence,
                         query_text=self._task_query_text(task),
                         allowed_source_ids=list(item.get("source_ids") or extract_citation_ids(raw_text)),
                         limit=1,
@@ -936,7 +961,7 @@ class ReportingService:
         append_items(getattr(task, "claims", None))
         if len(findings) < 2:
             supplements = derive_grounded_findings_from_evidence(
-                list(getattr(task, "evidence_items", None) or []),
+                evidence,
                 query_text=self._task_query_text(task),
                 limit=4,
             )
@@ -1760,6 +1785,7 @@ def build_report_workbench_payload(
     citation_index: dict[str, dict[str, Any]] = {}
     claims_by_source: dict[str, list[dict[str, Any]]] = {}
     rejected_ids = ReportingService._rejected_computation_ids(state)
+    web_enabled = getattr(evidence_store, "web_extraction_enabled", False)
 
     def _ingest_record(rec: dict[str, Any], default_task_id: int | None = None) -> None:
         sid = str(rec.get("source_id") or "").strip()
@@ -1767,6 +1793,10 @@ def build_report_workbench_payload(
             return
         existing = citation_index.get(sid) or {}
         anchors: list[str] = []
+        web_meta = rec.get("provenance_meta", {}).get("web_extraction", {}) if web_enabled else {}
+        anchors.extend(
+            anchor["anchor_id"] for anchor in web_meta.get("text_anchors", []) if anchor.get("anchor_id")
+        )
         modality = str(rec.get("modality") or existing.get("modality") or "text")
         if rec.get("computation_artifact") or "-C" in sid:
             modality = "computed"
@@ -1810,11 +1840,12 @@ def build_report_workbench_payload(
                if isinstance(rec.get("computation_artifact"), dict) else {}),
             **({"derived_from_source_ids": list(rec["derived_from_source_ids"])}
                if isinstance(rec.get("derived_from_source_ids"), list) else {}),
+            **({"provenance_meta": {"web_extraction": web_meta}} if web_meta else {}),
         }
 
     for task in getattr(state, "todo_items", []) or []:
         tid = getattr(task, "id", None)
-        for item in getattr(task, "evidence_items", None) or []:
+        for item in [] if web_enabled else getattr(task, "evidence_items", None) or []:
             if isinstance(item, dict):
                 _ingest_record(item, default_task_id=tid)
         for claim in getattr(task, "atomic_claims", None) or []:
@@ -1824,7 +1855,7 @@ def build_report_workbench_payload(
                 key: claim[key] for key in ("text", "nli_label", "calibrated_confidence") if key in claim
             }
             for sid in claim.get("source_ids") or []:
-                if not isinstance(sid, str):
+                if not isinstance(sid, str) or (web_enabled and not evidence_store.is_eligible_for_facts(sid)):
                     continue
                 claims = claims_by_source.setdefault(sid, [])
                 if linked_claim not in claims:
@@ -1835,7 +1866,10 @@ def build_report_workbench_payload(
             if isinstance(item, dict):
                 _ingest_record(item)
 
-    conflicts = ReportingService._filtered_conflicts(state, set(citation_index))
+    fact_source_ids = {
+        sid for sid in citation_index if not web_enabled or evidence_store.is_eligible_for_facts(sid)
+    }
+    conflicts = ReportingService._filtered_conflicts(state, fact_source_ids)
     for cluster in conflicts:
         for side in cluster["sides"]:
             side["url"] = _safe_workbench_url(side.get("url"))
@@ -1851,7 +1885,7 @@ def build_report_workbench_payload(
         for side in cluster.get("sides") or []:
             if isinstance(side, dict):
                 sid = str(side.get("source_id") or "").strip()
-                if sid in citation_index:
+                if sid in fact_source_ids:
                     conflicts_by_source.setdefault(sid, [])
                     if cid not in conflicts_by_source[sid]:
                         conflicts_by_source[sid].append(cid)
@@ -1879,9 +1913,11 @@ def build_report_workbench_payload(
         ordered_sids: list[str] = []
         seen_sids: set[str] = set()
         for sid in raw_sids:
-            if sid in citation_index and sid not in seen_sids:
+            if sid in fact_source_ids and sid not in seen_sids:
                 ordered_sids.append(sid)
                 seen_sids.add(sid)
+        if web_enabled and not ordered_sids:
+            continue
         matched_conflicts: list[str] = []
         for sid in ordered_sids:
             for cid in conflicts_by_source.get(sid, []):
@@ -1932,7 +1968,7 @@ def build_report_workbench_payload(
     charts = [
         sanitized for chart in getattr(state, "report_charts", None) or []
         if isinstance(chart, dict)
-        if (sanitized := sanitize_chart_spec(chart, valid_source_ids=set(citation_index))) is not None
+        if (sanitized := sanitize_chart_spec(chart, valid_source_ids=fact_source_ids)) is not None
     ]
 
     return {

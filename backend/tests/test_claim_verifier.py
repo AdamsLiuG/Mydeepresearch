@@ -42,6 +42,7 @@ from services.claim_verifier import (
     load_nli_model,
 )
 from services.event_bus import RedisStreamEventBus
+from services.evidence import EvidenceStore
 from services.evidence_index import EvidenceRetrievalService, EvidenceRuntimeIndex
 from services.reporter import ReportingService
 from services.request_state import RequestStateStore, SnapshotConflictError
@@ -87,6 +88,33 @@ class _FakeEvidenceStore:
 
     def list_task_evidence(self, task_id: int) -> list[dict[str, Any]]:
         return [r for r in self._records if int(r.get("task_id") or 0) == int(task_id)]
+
+
+def test_enabled_claim_verification_omits_l0_with_forged_state_body():
+    from unittest.mock import Mock
+
+    config = Configuration.from_env(overrides={"nli_verifier_enabled": True}, load_env_file=False)
+    store = EvidenceStore(web_extraction_enabled=True)
+    evidence = store.record_search_results(task_id=1, query="test", backend="fixture", search_payload={
+        "results": [{"url": "https://example.org", "content": "Processing time improved by 91%."}],
+    })
+    task = TodoItem(
+        id=1, title="Benchmark", intent="Check latency", query="latency", status="completed",
+        evidence_items=[{**evidence[0], "full_content": "Processing time improved by 91%."}],
+    )
+    state = SummaryState(research_topic="Benchmark", todo_items=[task])
+    scorer = Mock()
+    scorer.score_pairs_batched.return_value = None
+    fallback = Mock()
+    fallback.return_value = None
+    orchestrator = ClaimVerificationOrchestrator(config, evidence_store=store, scorer=scorer)
+    finding = {"text": "Processing time improved by 91%.", "source_ids": ["T1-S1"]}
+    orchestrator.verify_request(state, claims_by_task={1: [finding]}, fallback_claim_verifier=fallback)
+    scorer.score_pairs_batched.assert_not_called()
+    fallback.assert_not_called()
+    self_check = orchestrator.as_review_callback()(finding["text"], task.evidence_items)
+    assert self_check is None
+    scorer.score_pairs_batched.assert_not_called()
 
 
 class _PersistedStateHost(StateManagerMixin):

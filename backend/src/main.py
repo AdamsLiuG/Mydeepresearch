@@ -234,7 +234,7 @@ def _build_config(payload: ResearchRequest | AsyncResearchRequest, *, base_confi
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail="research_depth must be quick, standard, or deep") from exc
 
-    values = base_config.model_dump()
+    values = base_config.request_config_values()
     if "policy_model_mode" not in base_config.model_fields_set:
         values.pop("policy_model_mode", None)
     return Configuration.model_validate({**values, **overrides})
@@ -409,6 +409,7 @@ def create_app(
     *,
     base_config: Configuration | None = None,
     agent_factory: Callable[..., Any] | None = None,
+    web_deployment_provider: Callable[[str, str], Any] | None = None,
 ) -> FastAPI:
     base_config = base_config or Configuration.from_env()
     resolved_agent_factory = _resolve_agent_factory(base_config, agent_factory)
@@ -642,6 +643,8 @@ def create_app(
             kwargs["tenant_id"] = tenant_id
         if _accepts_kwarg(factory, "mcp_bridge") and getattr(app.state, "mcp_bridge", None) is not None:
             kwargs["mcp_bridge"] = app.state.mcp_bridge
+        if web_deployment_provider is not None and _accepts_kwarg(factory, "web_deployment_provider"):
+            kwargs["web_deployment_provider"] = web_deployment_provider
         agent = factory(**kwargs)
         if not hasattr(agent, "tenant_id"):
             try:
@@ -755,11 +758,18 @@ def create_app(
         workbench = getattr(result, "report_workbench", None)
         if not workbench:
             return {}
-        return {
+        from services.evidence import public_web_evidence_projection
+
+        return public_web_evidence_projection({
             "workbench": workbench,
             "citation_drawer_map": workbench.get("citation_index"),
             "verifier_badges": workbench.get("verifier_badges"),
-        }
+        }, web_enabled=bool((getattr(result, "v4", None) or {}).get("web_extraction")))
+
+    def _public_tasks(tasks: list[dict[str, Any]], v4: Any) -> list[dict[str, Any]]:
+        from services.evidence import public_web_evidence_projection
+
+        return public_web_evidence_projection(tasks, web_enabled=bool((v4 or {}).get("web_extraction")))
 
     @app.get("/healthz")
     async def health_check() -> Dict[str, str]:
@@ -849,7 +859,7 @@ def create_app(
         raw_summary = dict(getattr(result, "claim_verification_summary", {}) or {})
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
-            todo_items=todo_payload,
+            todo_items=_public_tasks(todo_payload, getattr(result, "v4", None)),
             charts_spec=list(getattr(result, "report_charts", []) or []) or None,
             **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
             **({"claim_verification_summary": raw_summary} if raw_summary else {}),
@@ -935,8 +945,9 @@ def create_app(
         if snapshot.get("pending_tool_approval") or snapshot.get("approved_tool_calls"):
             raise HTTPException(status_code=409, detail="Request has a tool approval record")
         raw_v4 = snapshot.get("v4")
-        budgeted_plan = isinstance(raw_v4, dict) and "budget" in raw_v4
-        if (snapshot.get("workflow_run_id") or budgeted_plan) and (
+        web_plan = isinstance(raw_v4, dict) and isinstance(raw_v4.get("web_extraction"), dict)
+        budgeted_plan = isinstance(raw_v4, dict) and "budget" in raw_v4 and not raw_v4.get("web_downstream_only")
+        if (snapshot.get("workflow_run_id") or budgeted_plan or web_plan) and (
             snapshot.get("phase") != "awaiting_approval"
             or snapshot.get("status") != "awaiting_approval"
             or snapshot.get("workflow_plan_revision") is not None
@@ -949,7 +960,7 @@ def create_app(
         config = app.state.base_config
         max_tasks = config.resolved_max_total_tasks()
         projection = None
-        if budgeted_plan:
+        if budgeted_plan or web_plan:
             if not _accepts_kwarg(store.save, "expected_version") or "state_version" not in snapshot:
                 raise HTTPException(status_code=409, detail="Budgeted plan edits require a versioned request snapshot")
             from state_manager import public_v4_projection
@@ -958,7 +969,8 @@ def create_app(
             try:
                 if projection is None:
                     raise ValueError("Unsupported v4 snapshot")
-                max_tasks = RequestBudget(**raw_v4["budget"]["limit"]).limits["tasks"]
+                if budgeted_plan:
+                    max_tasks = RequestBudget(**raw_v4["budget"]["limit"]).limits["tasks"]
             except (KeyError, TypeError, ValueError) as exc:
                 raise HTTPException(status_code=409, detail="Request has an invalid frozen research budget") from exc
             if len(payload.tasks) > max_tasks:
@@ -1096,6 +1108,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
         if "v4" not in payload:
             return payload
+        from services.evidence import public_web_evidence_projection
         from state_manager import public_v4_projection
 
         public_payload = dict(payload)
@@ -1104,11 +1117,14 @@ def create_app(
         public_payload.pop("workflow_request_options", None)
         if projection is not None:
             public_payload["v4"] = projection
-        return public_payload
+        return public_web_evidence_projection(public_payload, web_enabled=isinstance(payload["v4"], dict)
+                                              and isinstance(payload["v4"].get("web_extraction"), dict))
 
     def _sse_frame(payload: dict[str, Any], event_id: str = "") -> str:
+        from services.evidence import public_web_evidence_projection
+
         prefix = f"id: {event_id}\n" if event_id else ""
-        return f"{prefix}data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return f"{prefix}data: {json.dumps(public_web_evidence_projection(payload), ensure_ascii=False)}\n\n"
 
     def _stream_response(iterator: AsyncIterator[str], request_id: str, backend: str | None = None) -> StreamingResponse:
         headers = {
@@ -1438,7 +1454,7 @@ def create_app(
         raw_summary = dict(getattr(result, "claim_verification_summary", {}) or {})
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
-            todo_items=todo_payload,
+            todo_items=_public_tasks(todo_payload, getattr(result, "v4", None)),
             charts_spec=list(getattr(result, "report_charts", []) or []) or None,
             **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
             **({"claim_verification_summary": raw_summary} if raw_summary else {}),
