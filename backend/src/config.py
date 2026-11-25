@@ -1352,6 +1352,20 @@ class Configuration(BaseModel):
             and tenant_id in self.v4_knowledge_graph_tenants
         )
 
+    # Direction v4-05 cascade model router, OpenTelemetry GenAI tracing & Prometheus SLI
+    v4_model_router_enabled: bool = False
+    v4_model_router_mode: Literal["off", "shadow", "active"] = "off"
+    v4_model_router_fast_model: str = ""
+    v4_model_router_standard_model: str = ""
+    v4_model_router_frontier_model: str = ""
+    v4_model_router_max_escalations_per_stage: int = Field(default=1, ge=0, le=2)
+    v4_model_router_confidence_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
+    v4_otel_enabled: bool = False
+    v4_otel_service_name: str = "deepresearch-backend"
+    v4_otel_otlp_endpoint: str = Field(default="", repr=False, exclude=True)
+    v4_otel_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    v4_prometheus_metrics_enabled: bool = False
+
     def web_extraction_enabled_for(self, tenant_id: str) -> bool:
         return self.v4_web_extractor_enabled and tenant_id in self.v4_web_extractor_tenants
 

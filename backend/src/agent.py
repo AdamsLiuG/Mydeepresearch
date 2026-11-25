@@ -102,10 +102,15 @@ from services.mcp_bridge import (
 )
 from services.memory_sanitizer import sanitize_web_text
 from services.memory_scope import MemoryPolicy, valid_internal_id
+from services.model_router import CascadeModelRouter, RouteDecision, RouteFeatures
 from services.multimodal_parser import MultimodalEvidenceParser
 from services.note_memory import NoteMemoryService
 from services.notes import ScopedNoteTool, ScopedNoteWorkspace
-from services.observability import LangfuseTraceAdapter
+from services.observability import (
+    LangfuseTraceAdapter,
+    OTelTraceAdapter,
+    parse_traceparent,
+)
 from services.planner import PlanningService
 from services.policy_controller import build_policy_controller
 from services.reflection import ReflectionAssessment, ReflectionService
@@ -938,10 +943,14 @@ class DeepResearchAgent(
         tenant_id: str | None = None,
         mcp_bridge: MCPBridgeManager | None = None,
         web_deployment_provider: Callable[[str, str], Any] | None = None,
+        traceparent: str | None = None,
     ) -> None:
         """Initialise the coordinator with configuration and shared tools."""
         self.config = config or Configuration.from_env()
         self.request_id = request_id or "local-request"
+        self.traceparent: str | None = (
+            traceparent.strip().lower() if parse_traceparent(traceparent) else None
+        )
         self.tenant_id = (
             str(
                 tenant_id
@@ -1003,6 +1012,8 @@ class DeepResearchAgent(
         self._skill_pack = SkillPackService(self.config)
         self._skill_selection: SkillSelection | None = None
         self._observability = LangfuseTraceAdapter(self.config)
+        self._otel = OTelTraceAdapter(self.config, metrics=metrics_registry)
+        self._model_router = CascadeModelRouter(self.config)
 
         self.note_tool = (
             NoteTool(workspace=self.config.notes_workspace)
@@ -1325,6 +1336,8 @@ class DeepResearchAgent(
             pricing_catalog=self.config.llm_pricing_json,
         )
         self._request_trace.memory_shadow_mode = bool(self.config.memory_shadow_mode)
+        if getattr(self, "traceparent", None):
+            self._request_trace.traceparent = self.traceparent
         return self._request_trace
 
     def _request_status(self, state: SummaryState, report: str | None = None) -> str:
@@ -2242,9 +2255,56 @@ class DeepResearchAgent(
 
     def _export_observability_trace(self, snapshot: dict[str, Any] | None) -> None:
         adapter = getattr(self, "_observability", None)
-        if adapter is None or not snapshot:
-            return
-        adapter.export_request_trace(snapshot)
+        if adapter is not None and snapshot:
+            adapter.export_request_trace(snapshot)
+        otel = getattr(self, "_otel", None)
+        if otel is not None and snapshot:
+            otel.export_request_trace(snapshot, traceparent=getattr(self, "traceparent", None))
+
+    def _select_stage_route(
+        self,
+        *,
+        stage: str,
+        topic: str = "",
+        state: SummaryState | None = None,
+        observer: RequestTrace | None = None,
+        retry_index: int = 0,
+    ) -> RouteDecision | None:
+        router = getattr(self, "_model_router", None)
+        if router is None:
+            return None
+        todo_items = getattr(state, "todo_items", ()) if state is not None else ()
+        conflicts = getattr(state, "evidence_conflicts", ()) if state is not None else ()
+        budget = getattr(self, "_research_budget", None)
+        pressure = 0.0
+        if budget is not None:
+            try:
+                snap = budget.governor.snapshot()
+                llm_used = float(getattr(snap, "llm_calls_used", 0) or 0)
+                llm_limit = float(budget.governor.budget.limits.get("llm_calls") or 1)
+                if llm_limit > 0:
+                    pressure = min(1.0, llm_used / llm_limit)
+            except Exception:
+                pressure = 0.0
+        selection = getattr(self, "_skill_selection", None)
+        domain = str(getattr(selection, "domain", "") or "general") if selection else "general"
+        features = RouteFeatures(
+            stage=stage,
+            topic=topic or (getattr(state, "research_topic", "") or ""),
+            task_count=len(todo_items),
+            conflict_count=len(conflicts),
+            budget_pressure=pressure,
+            retry_index=retry_index,
+            domain=domain,
+        )
+        decision = router.select_tier(features)
+        router.record_decision(
+            decision,
+            metrics=metrics_registry,
+            observer=observer,
+            tenant_id=getattr(self, "tenant_id", "default"),
+        )
+        return decision
 
     def _flush_strategy_memory_usage(self, *, observer: RequestTrace | None) -> None:
         """Persist which strategy cards this request actually used, then decay unused drafts.
@@ -2462,6 +2522,7 @@ class DeepResearchAgent(
         }
         if active_verifiers and self._callable_accepts_kwarg(self.reviewer.review_request, "active_verifiers"):
             review_kwargs["active_verifiers"] = active_verifiers
+        self._select_stage_route(stage="review", state=state, observer=observer)
         review_graph = self._query_graph_context(
             state, purpose="task", seed_text=state.research_topic or "", max_bytes=256,
         )
@@ -2988,6 +3049,7 @@ class DeepResearchAgent(
                 try:
                     if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
                         budget.refuse("limit_exceeded")
+                    self._select_stage_route(stage="planning", topic=topic, state=state, observer=observer)
                     historical_memory_context = self._planning_memory_context(state, observer)
                     plan_graph = self._query_graph_context(
                         state, purpose="plan", seed_text=state.research_topic or topic, max_bytes=256,
@@ -3485,10 +3547,12 @@ class DeepResearchAgent(
                     yield report_started
                 try:
                     if versioned_report:
+                        self._select_stage_route(stage="report", topic=topic, state=state, observer=observer)
                         report, report_checkpoint = yield from self._run_versioned_report(
                             state, budget, observer, final_step, emit_stream,
                         )
                     else:
+                        self._select_stage_route(stage="report", topic=topic, state=state, observer=observer)
                         if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
                             budget.refuse("limit_exceeded")
                         report_graph = self._query_graph_context(

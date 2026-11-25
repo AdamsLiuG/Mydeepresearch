@@ -1170,8 +1170,14 @@ class MCPBridgeManager:
 
     def _request_identity(
         self, cfg: MCPServerConfig, tenant_id: str, request_id: str, scope: str,
+        *, traceparent: str | None = None,
     ) -> tuple[dict[str, str], dict[str, str]]:
+        from services.observability import parse_traceparent
+
+        valid_tp = traceparent.strip() if parse_traceparent(traceparent) else None
         if not cfg.tenant_scoped:
+            if valid_tp:
+                return {"traceparent": valid_tp}, {"traceparent": valid_tp}
             return {}, {}
         token = mint_scoped_tenant_token(
             secret=getattr(self._config, "mcp_tenant_token_secret", None),
@@ -1179,6 +1185,9 @@ class MCPBridgeManager:
         )
         headers = {"X-Tenant-ID": tenant_id, "X-Request-ID": request_id}
         meta = {"tenant_id": tenant_id, "request_id": request_id}
+        if valid_tp:
+            headers["traceparent"] = valid_tp
+            meta["traceparent"] = valid_tp
         if token:
             headers["Authorization"] = f"Bearer {token}"
             meta["scoped_token"] = token
@@ -1200,6 +1209,7 @@ class MCPBridgeManager:
         readonly_required: bool = False,
         observer: RequestTrace | None = None,
         budget: Any = None,
+        traceparent: str | None = None,
     ) -> MCPCallResult:
         started = time.perf_counter()
 
@@ -1296,7 +1306,10 @@ class MCPBridgeManager:
                 return fail("approval_closed", "MCP tool approval is no longer available")
 
         scope = "mcp:read" if spec.is_readonly else "mcp:write_approved"
-        headers, meta = self._request_identity(cfg, tenant_id, request_id, scope)
+        effective_traceparent = traceparent or getattr(observer, "traceparent", None)
+        headers, meta = self._request_identity(
+            cfg, tenant_id, request_id, scope, traceparent=effective_traceparent,
+        )
         timeout = min(cfg.tool_timeout_seconds, getattr(self._config, "mcp_tool_timeout_seconds", 10.0))
         deadline = time.monotonic() + timeout
         attempts = 1

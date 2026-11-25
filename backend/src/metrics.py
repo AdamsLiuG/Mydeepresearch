@@ -729,6 +729,121 @@ class MetricsRegistry:
             "v4_graph_pending_batches", count, tenant_id, gauge=True, status=status, oldest_age=oldest_age,
         )
 
+    def record_v4_model_route(
+        self,
+        stage: str,
+        tier: str,
+        outcome: str,
+        *,
+        escalated: bool = False,
+        tenant_id: str | None = None,
+    ) -> None:
+        """Record cascade model router tier decisions and bounded escalations."""
+        if tier not in {"fast", "standard", "frontier"}:
+            return
+        safe_stage = str(stage or "unknown").strip()[:32] or "unknown"
+        safe_outcome = str(outcome or "selected").strip()[:24] or "selected"
+        self._record_v4_metric(
+            "v4_model_route_total",
+            1,
+            tenant_id,
+            stage=safe_stage,
+            tier=tier,
+            outcome=safe_outcome,
+            escalated="true" if escalated else "false",
+        )
+
+    def record_v4_otel_span(self, kind: str, status: str) -> None:
+        """Record OpenTelemetry GenAI span emissions and statuses."""
+        safe_kind = str(kind or "span").strip()[:32] or "span"
+        safe_status = "error" if status == "error" else "ok"
+        self._record_v4_metric("v4_otel_spans_total", 1, None, kind=safe_kind, status=safe_status)
+
+    @staticmethod
+    def _prom_escape(value: Any) -> str:
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+        )
+
+    def render_prometheus(self, *, tenant_id: str | None = None) -> str:
+        """Render Prometheus Exposition Format 0.0.4 RED + GenAI SLI metrics."""
+        snap = self.snapshot(include_recent_requests=False, tenant_id=tenant_id)
+        counters = snap.get("counters") or {}
+        latencies = snap.get("latencies_ms") or {}
+        v4_metrics = snap.get("v4_memory_graph") or {}
+        lines: list[str] = []
+
+        def add_counter(name: str, help_text: str, value: int | float) -> None:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} counter")
+            lines.append(f"{name} {value}")
+
+        def add_gauge(name: str, help_text: str, value: int | float) -> None:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"{name} {value}")
+
+        add_counter("deepresearch_requests_total", "Total processed deep research requests.", counters.get("request_total", 0))
+        lines.append("# HELP deepresearch_request_status_total Completed requests by terminal outcome.")
+        lines.append("# TYPE deepresearch_request_status_total counter")
+        for status_name, key in (
+            ("success", "request_success_total"),
+            ("partial_success", "request_partial_success_total"),
+            ("failed", "request_failed_total"),
+        ):
+            lines.append(f'deepresearch_request_status_total{{status="{status_name}"}} {counters.get(key, 0)}')
+
+        lines.append("# HELP deepresearch_llm_calls_total LLM invocations by outcome.")
+        lines.append("# TYPE deepresearch_llm_calls_total counter")
+        for out_name, key in (("success", "llm_success_total"), ("failed", "llm_failed_total")):
+            lines.append(f'deepresearch_llm_calls_total{{outcome="{out_name}"}} {counters.get(key, 0)}')
+
+        lines.append("# HELP deepresearch_llm_tokens_total Token consumption split by token type.")
+        lines.append("# TYPE deepresearch_llm_tokens_total counter")
+        for kind, key in (
+            ("prompt", "prompt_tokens"),
+            ("completion", "completion_tokens"),
+            ("cached_prompt", "cached_prompt_tokens"),
+        ):
+            lines.append(f'deepresearch_llm_tokens_total{{kind="{kind}"}} {counters.get(key, 0)}')
+
+        add_gauge("deepresearch_estimated_cost_usd", "Accumulated estimated LLM USD cost.", snap.get("estimated_cost", 0.0))
+        add_gauge("deepresearch_cache_hit_rate", "Current search/prefix cache hit ratio.", snap.get("cache_hit_rate", 0.0))
+        add_counter("deepresearch_budget_denied_total", "Total requests or operations denied by budget governor.", counters.get("budget_denied_total", 0))
+
+        lines.append("# HELP deepresearch_stage_latency_ms Stage latency statistics in milliseconds.")
+        lines.append("# TYPE deepresearch_stage_latency_ms gauge")
+        for stage_name, stats in sorted(latencies.items()):
+            if not isinstance(stats, dict):
+                continue
+            lines.append(
+                f'deepresearch_stage_latency_ms{{metric="{self._prom_escape(stage_name)}",stat="p95"}} {stats.get("p95", 0.0)}'
+            )
+            lines.append(
+                f'deepresearch_stage_latency_ms{{metric="{self._prom_escape(stage_name)}",stat="avg"}} {stats.get("avg", 0.0)}'
+            )
+
+        for metric_name, rows in sorted(v4_metrics.items()):
+            if not rows:
+                continue
+            prom_name = f"deepresearch_{metric_name}"
+            lines.append(f"# HELP {prom_name} DeepResearch v4 telemetry series for {metric_name}.")
+            lines.append(f"# TYPE {prom_name} gauge")
+            for row in rows:
+                count_val = row.get("count", 0)
+                label_pairs = ",".join(
+                    f'{k}="{self._prom_escape(v)}"'
+                    for k, v in sorted(row.items())
+                    if k != "count"
+                )
+                suffix = f"{{{label_pairs}}}" if label_pairs else ""
+                lines.append(f"{prom_name}{suffix} {count_val}")
+
+        return "\n".join(lines) + "\n"
+
     def _v4_snapshot(self, tenant_id: str | None) -> dict[str, list[dict[str, Any]]]:
         source = self._v4_metrics if tenant_id is None else self._v4_tenant_metrics.get(tenant_id, {})
         result: dict[str, list[dict[str, Any]]] = {}
@@ -1076,7 +1191,14 @@ class RequestTrace:
         self.uncached_prompt_tokens = 0
         self.kv_cache_by_stage: dict[str, dict[str, Any]] = {}
         self.claim_verification_summary: dict[str, Any] = {}
+        self.traceparent: str | None = None
+        self.model_routes: list[dict[str, Any]] = []
         metrics_registry.increment("request_total")
+
+    def record_model_route(self, decision: dict[str, Any]) -> None:
+        with self._lock:
+            if len(self.model_routes) < 128:
+                self.model_routes.append(_clone_dict(decision))
 
     def record_policy_decision(self, decision: dict[str, Any]) -> None:
         with self._lock:
@@ -1689,6 +1811,12 @@ class RequestTrace:
                 "report_note_id": self.report_note_id,
                 "report_note_path": self.report_note_path,
                 "stages": [stage.to_dict() for stage in self.stages],
+                **({"traceparent": self.traceparent} if self.traceparent else {}),
+                **(
+                    {"model_routes": _clone_dict({"items": self.model_routes}).get("items", [])}
+                    if self.model_routes
+                    else {}
+                ),
             }
 
     def metrics_event(self) -> dict[str, Any]:

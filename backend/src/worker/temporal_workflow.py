@@ -23,6 +23,7 @@ class DeepResearchWorkflowSpec:
     search_api: str | None = None
     output_format: str | None = None
     workflow_run_id: str | None = None
+    traceparent: str | None = None
 
 
 def execute_durable_research_activity(
@@ -75,10 +76,14 @@ def execute_durable_research_activity(
         def agent_factory(*, workflow_request_options: dict[str, Any] | None = None) -> DeepResearchAgent:
             if failure is not None:
                 raise RuntimeError(failure)
-            return DeepResearchAgent(
-                config=_apply_workflow_request_options(config, workflow_request_options),
-                request_id=spec.request_id, tenant_id=spec.tenant_id,
-            )
+            kwargs: dict[str, Any] = {
+                "config": _apply_workflow_request_options(config, workflow_request_options),
+                "request_id": spec.request_id,
+                "tenant_id": spec.tenant_id,
+            }
+            if spec.traceparent:
+                kwargs["traceparent"] = spec.traceparent
+            return DeepResearchAgent(**kwargs)
 
         return run_durable_attempt(
             checkpoint, agent_factory, event_bus, Event(),
@@ -95,12 +100,15 @@ def execute_durable_research_activity(
 async def run_research_arq_job(
     ctx: Any, *, topic: str, request_id: str, tenant_id: str = "default",
     search_api: str | None = None, output_format: str | None = None, workflow_run_id: str | None = None,
+    traceparent: str | None = None,
 ) -> dict[str, Any]:
     """Resume a queued request and yield to ARQ while waiting for human approval."""
 
     from arq import Retry
 
-    spec = DeepResearchWorkflowSpec(topic, request_id, tenant_id, search_api, output_format, workflow_run_id)
+    spec = DeepResearchWorkflowSpec(
+        topic, request_id, tenant_id, search_api, output_format, workflow_run_id, traceparent,
+    )
     stop_event = Event()
     while True:
         task = asyncio.create_task(asyncio.to_thread(

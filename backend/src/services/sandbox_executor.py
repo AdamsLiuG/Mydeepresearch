@@ -154,6 +154,7 @@ class SandboxExecutionRequest(BaseModel):
     purpose: str = ""
     emit_chart: bool = False
     chart_library: str | None = None
+    traceparent: str | None = None
 
     @field_validator("chart_library")
     @classmethod

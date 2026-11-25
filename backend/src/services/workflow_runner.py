@@ -104,6 +104,7 @@ class WorkflowCheckpoint:
         config: Any = None,
         research_depth: str | None = None,
         output_format: str | None = None,
+        traceparent: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         from state_manager import freeze_report, freeze_web_extraction
 
@@ -137,6 +138,11 @@ class WorkflowCheckpoint:
                 topic=topic, phase="queued", status="queued", runner_backend=self.backend,
                 workflow_run_id=self.run_id, workflow_plan_first=plan_first,
             )
+            if traceparent:
+                from services.observability import parse_traceparent
+
+                if parse_traceparent(traceparent):
+                    snapshot["traceparent"] = traceparent.strip().lower()
             if budget_enabled or downstream_only:
                 budget = build_request_budget_for_config(
                     config, self.tenant_id, depth="quick" if downstream_only else requested_depth,
@@ -745,6 +751,7 @@ class WorkflowRunner(Protocol):
         output_format: str | None = None,
         plan_first: bool = False,
         lease_id: str | None = None,
+        traceparent: str | None = None,
     ) -> WorkflowRunHandle:
         """Schedule a research workflow run asynchronously (or inline handle)."""
 
@@ -788,12 +795,15 @@ def _instantiate_with_supported_kwargs(
     config: Any,
     request_id: str,
     tenant_id: str,
+    traceparent: str | None = None,
 ) -> Any:
     kwargs: dict[str, Any] = {}
     if _accepts_kwarg(agent_factory, "request_id"):
         kwargs["request_id"] = request_id
     if _accepts_kwarg(agent_factory, "tenant_id"):
         kwargs["tenant_id"] = tenant_id
+    if traceparent and _accepts_kwarg(agent_factory, "traceparent"):
+        kwargs["traceparent"] = traceparent
     if _accepts_kwarg(agent_factory, "config"):
         return agent_factory(config=config, **kwargs)
     return agent_factory(config, **kwargs)
@@ -817,11 +827,13 @@ class InlineWorkflowRunner:
         output_format: str | None = None,
         plan_first: bool = False,
         lease_id: str | None = None,
+        traceparent: str | None = None,
     ) -> WorkflowRunHandle:
         if self._background is not None:
             return self._background.submit(
                 topic, request_id=request_id, tenant_id=tenant_id, config=config,
                 output_format=output_format, plan_first=plan_first, lease_id=lease_id,
+                traceparent=traceparent,
             )
         return WorkflowRunHandle(
             request_id=request_id,
@@ -903,6 +915,7 @@ class LocalDurableWorkflowRunner:
         output_format: str | None = None,
         plan_first: bool = False,
         lease_id: str | None = None,
+        traceparent: str | None = None,
     ) -> WorkflowRunHandle:
         tenant_id = str(tenant_id or "default").strip() or "default"
         workflow_run_id = _workflow_run_id(self.backend_name, tenant_id, request_id)
@@ -928,7 +941,7 @@ class LocalDurableWorkflowRunner:
             return _instantiate_with_supported_kwargs(
                 self._agent_factory,
                 config=_apply_workflow_request_options(config, workflow_request_options),
-                request_id=request_id, tenant_id=tenant_id,
+                request_id=request_id, tenant_id=tenant_id, traceparent=traceparent,
             )
 
         def _worker() -> None:
@@ -974,6 +987,7 @@ class LocalDurableWorkflowRunner:
             self._state_store = store
             snapshot, created = checkpoint.reserve(
                 topic, plan_first=plan_first, config=config, output_format=output_format,
+                traceparent=traceparent,
             )
             existing = self._runs.get(key)
             if existing and existing.thread and existing.thread.is_alive():
@@ -1149,6 +1163,7 @@ class ArqWorkflowRunner(_ExternalWorkflowRunner):
         output_format: str | None = None,
         plan_first: bool = False,
         lease_id: str | None = None,
+        traceparent: str | None = None,
     ) -> WorkflowRunHandle:
         del lease_id
         create_pool, RedisSettings = self._ensure_arq()
@@ -1175,6 +1190,7 @@ class ArqWorkflowRunner(_ExternalWorkflowRunner):
                     search_api=_search_api_value(config),
                     output_format=output_format or getattr(config, "default_output_format", None),
                     workflow_run_id=checkpoint.run_id,
+                    **({"traceparent": traceparent} if traceparent else {}),
                     _job_id=checkpoint.run_id,
                 )
                 return snapshot["status"], not created or job is None
@@ -1242,6 +1258,7 @@ class TemporalWorkflowRunner(_ExternalWorkflowRunner):
         output_format: str | None = None,
         plan_first: bool = False,
         lease_id: str | None = None,
+        traceparent: str | None = None,
     ) -> WorkflowRunHandle:
         if self._fallback is not None and self._fallback.status(request_id, tenant_id=tenant_id):
             return self._submit_fallback(topic, request_id, tenant_id, config, output_format, plan_first, lease_id)
@@ -1255,6 +1272,7 @@ class TemporalWorkflowRunner(_ExternalWorkflowRunner):
             checkpoint = self._checkpoint(tenant_id, request_id)
             snapshot, created = checkpoint.reserve(
                 topic, plan_first=plan_first, config=config, output_format=output_format,
+                traceparent=traceparent,
             )
             if snapshot["status"] in _FINISHED_STATUSES:
                 await asyncio.to_thread(_repair_terminal_submission, checkpoint, self._event_bus, snapshot)
@@ -1268,6 +1286,7 @@ class TemporalWorkflowRunner(_ExternalWorkflowRunner):
                         "search_api": _search_api_value(config),
                         "output_format": output_format or getattr(config, "default_output_format", None),
                         "heartbeat_seconds": getattr(config, "temporal_activity_heartbeat_seconds", 15),
+                        **({"traceparent": traceparent} if traceparent else {}),
                     },
                     id=checkpoint.run_id,
                     task_queue=self._task_queue,

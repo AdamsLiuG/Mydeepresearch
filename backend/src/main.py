@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from config import Configuration, SearchAPI, backend_root
@@ -34,6 +34,7 @@ from services.mcp_bridge import (
     compute_arguments_digest,
     tool_approval_expired,
 )
+from services.observability import new_traceparent, parse_traceparent
 from services.request_state import SnapshotConflictError
 from services.skill_pack import SkillPackService
 from services.storage_backends import build_request_state_store
@@ -535,8 +536,9 @@ def create_app(
             "X-API-Key",
             "Last-Event-ID",
             "Accept",
+            "traceparent",
         ],
-        expose_headers=["X-Request-ID", "X-Workflow-Runner"],
+        expose_headers=["X-Request-ID", "X-Workflow-Runner", "traceparent"],
     )
 
     @app.middleware("http")
@@ -548,6 +550,11 @@ def create_app(
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
             return JSONResponse({"detail": "Invalid X-Request-ID"}, status_code=400)
         request.state.request_id = request_id
+        incoming_tp = request.headers.get("traceparent")
+        valid_tp = incoming_tp.strip().lower() if parse_traceparent(incoming_tp) else None
+        if valid_tp is None and getattr(app.state.base_config, "v4_otel_enabled", False):
+            valid_tp = new_traceparent()
+        request.state.traceparent = valid_tp
         start_time = time.perf_counter()
 
         logger.info(
@@ -571,6 +578,8 @@ def create_app(
 
         duration_ms = (time.perf_counter() - start_time) * 1000
         response.headers["X-Request-ID"] = request_id
+        if getattr(app.state.base_config, "v4_otel_enabled", False) and getattr(request.state, "traceparent", None):
+            response.headers["traceparent"] = request.state.traceparent
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -636,6 +645,7 @@ def create_app(
         config: Configuration,
         request_id: str,
         tenant_id: str,
+        traceparent: str | None = None,
     ) -> Any:
         factory = app.state.agent_factory
         kwargs: dict[str, Any] = {"config": config, "request_id": request_id}
@@ -645,6 +655,8 @@ def create_app(
             kwargs["mcp_bridge"] = app.state.mcp_bridge
         if web_deployment_provider is not None and _accepts_kwarg(factory, "web_deployment_provider"):
             kwargs["web_deployment_provider"] = web_deployment_provider
+        if traceparent and _accepts_kwarg(factory, "traceparent"):
+            kwargs["traceparent"] = traceparent
         agent = factory(**kwargs)
         if not hasattr(agent, "tenant_id"):
             try:
@@ -780,6 +792,16 @@ def create_app(
         tenant = _resolve_tenant(request)
         return metrics_registry.snapshot(tenant_id=tenant.tenant_id)
 
+    @app.get("/metrics/prometheus")
+    async def metrics_prometheus(request: Request) -> Response:
+        if not getattr(app.state.base_config, "v4_prometheus_metrics_enabled", False):
+            raise HTTPException(status_code=404, detail="Prometheus metrics are disabled")
+        tenant = _resolve_tenant(request)
+        return Response(
+            content=metrics_registry.render_prometheus(tenant_id=tenant.tenant_id),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     @app.get("/skills")
     async def list_skills_catalog(request: Request) -> Dict[str, Any]:
         _resolve_tenant(request)
@@ -802,6 +824,7 @@ def create_app(
                 config=config,
                 request_id=request_id,
                 tenant_id=tenant.tenant_id,
+                traceparent=getattr(request.state, "traceparent", None),
             )
             result = agent.run(payload.topic)
         except HTTPException:
@@ -901,6 +924,7 @@ def create_app(
                 config=config,
                 request_id=request_id,
                 tenant_id=tenant.tenant_id,
+                traceparent=getattr(request.state, "traceparent", None),
             )
             return agent.plan_only(payload.topic)
         except HTTPException:
@@ -1307,6 +1331,7 @@ def create_app(
         tenant: TenantContext,
         *,
         plan_first: bool = False,
+        traceparent: str | None = None,
     ) -> WorkflowRunHandle:
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
 
@@ -1315,14 +1340,19 @@ def create_app(
             retain_lease = False
             try:
                 config = _build_config(payload, base_config=app.state.base_config)
+                submit_kwargs: dict[str, Any] = {
+                    "request_id": request_id,
+                    "tenant_id": tenant.tenant_id,
+                    "config": config,
+                    "output_format": payload.output_format,
+                    "plan_first": plan_first,
+                    "lease_id": lease_id,
+                }
+                if traceparent and _accepts_kwarg(app.state.workflow_runner.submit, "traceparent"):
+                    submit_kwargs["traceparent"] = traceparent
                 handle = app.state.workflow_runner.submit(
                     payload.topic,
-                    request_id=request_id,
-                    tenant_id=tenant.tenant_id,
-                    config=config,
-                    output_format=payload.output_format,
-                    plan_first=plan_first,
-                    lease_id=lease_id,
+                    **submit_kwargs,
                 )
                 retain_lease = handle.runner_backend == "local_durable" and not handle.metadata.get("duplicate")
                 return handle
@@ -1346,7 +1376,10 @@ def create_app(
     async def submit_async_research(payload: AsyncResearchRequest, request: Request) -> Dict[str, Any]:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
-        handle = await _submit_workflow(payload, request_id, tenant, plan_first=payload.mode == "plan_first")
+        handle = await _submit_workflow(
+            payload, request_id, tenant, plan_first=payload.mode == "plan_first",
+            traceparent=getattr(request.state, "traceparent", None),
+        )
         events_url = f"/requests/{request_id}/events?follow=1"
         return {
             **handle.to_dict(),
@@ -1442,6 +1475,7 @@ def create_app(
                 config=config,
                 request_id=request_id,
                 tenant_id=tenant.tenant_id,
+                traceparent=getattr(request.state, "traceparent", None),
             )
             result = agent.run_resume(request_id)
         except HTTPException:
@@ -1606,7 +1640,9 @@ def create_app(
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
         if app.state.workflow_runner.backend_name != "inline":
-            handle = await _submit_workflow(payload, request_id, tenant)
+            handle = await _submit_workflow(
+                payload, request_id, tenant, traceparent=getattr(request.state, "traceparent", None),
+            )
             return _follow_events(request, request_id, tenant, None, handle.runner_backend)
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant, inline_mutation=True)
         lease_id = _acquire_rate_limit(tenant)
@@ -1616,6 +1652,7 @@ def create_app(
                 config=config,
                 request_id=request_id,
                 tenant_id=tenant.tenant_id,
+                traceparent=getattr(request.state, "traceparent", None),
             )
         except HTTPException:
             _release_rate_limit(tenant, lease_id)
@@ -1691,6 +1728,7 @@ def create_app(
                 config=config,
                 request_id=request_id,
                 tenant_id=tenant.tenant_id,
+                traceparent=getattr(request.state, "traceparent", None),
             )
         except HTTPException:
             _release_rate_limit(tenant, lease_id)
