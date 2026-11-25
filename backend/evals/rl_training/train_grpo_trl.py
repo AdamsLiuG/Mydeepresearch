@@ -15,7 +15,10 @@ for entry in (_BACKEND_DIR, _BACKEND_DIR / "src"):
         sys.path.insert(0, str(entry))
 
 from evals.export_rl_trajectories import features_from_record  # noqa: E402
-from evals.rl_training.reward_functions import verifiable_policy_reward_fn  # noqa: E402
+from evals.rl_training.reward_functions import (  # noqa: E402
+    multiturn_trajectory_reward_fn,
+    verifiable_policy_reward_fn,
+)
 from services.policy_controller import (  # noqa: E402
     format_policy_messages,
     is_budget_legal_action,
@@ -66,7 +69,7 @@ def _validated_item(row: dict[str, Any]) -> dict[str, Any]:
     advantage = row.get("step_advantage", row.get("group_advantage"))
     if not _finite_number(advantage):
         raise ValueError("expected a finite replay advantage")
-    return {
+    item: dict[str, Any] = {
         "prompt": prompt,
         "state_features": state,
         "reference_completion": reference,
@@ -76,6 +79,13 @@ def _validated_item(row: dict[str, Any]) -> dict[str, Any]:
             "high_severity_issues_after_step": high,
         },
     }
+    if isinstance(row.get("turns"), list):
+        item["turns"] = row["turns"]
+    if row.get("sample_source") in {"domain_multiturn", "generic_replay"}:
+        item["sample_source"] = row["sample_source"]
+    if row.get("mix_bucket") in {"domain", "generic"}:
+        item["mix_bucket"] = row["mix_bucket"]
+    return item
 
 
 def load_grpo_dataset(path: Path) -> list[dict[str, Any]]:
@@ -125,21 +135,47 @@ def verl_dataset_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def run_dry_validation(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def run_dry_validation(
+    rows: list[dict[str, Any]],
+    *,
+    mode: str = "grpo",
+    generic_mix_ratio: float | None = None,
+) -> dict[str, Any]:
     if not rows:
         raise ValueError("No GRPO training rows")
+    if generic_mix_ratio is not None and not 0.0 <= float(generic_mix_ratio) <= 0.5:
+        raise ValueError("generic_mix_ratio must lie in [0.0, 0.5]")
+
+    domain_records = 0
+    generic_records = 0
     for row in rows:
+        is_generic = row.get("sample_source") == "generic_replay" or row.get("mix_bucket") == "generic"
+        if is_generic:
+            generic_records += 1
+        else:
+            domain_records += 1
+        use_multiturn = mode == "grpo-multiturn" or isinstance(row.get("turns"), list)
+        reward_fn = multiturn_trajectory_reward_fn if use_multiturn else verifiable_policy_reward_fn
         if "candidate_responses" in row:
             completions = row["candidate_responses"]
             features = row.get("state_features")
-            scores = verifiable_policy_reward_fn(completions, state_features=[features] * len(completions))
+            scores = reward_fn(completions, state_features=[features] * len(completions))
         else:
             item = _validated_item(row)
             kwargs = {key: [value] for key, value in item.items() if key != "prompt"}
-            scores = verifiable_policy_reward_fn([item["reference_completion"]], **kwargs)
+            scores = reward_fn([item["reference_completion"]], **kwargs)
         if not scores or any(not math.isfinite(score) for score in scores):
             raise ValueError("Replay reward validation failed")
-    return {"dry_run": True, "dataset_records": len(rows), "scored_groups": len(rows), "status": "ok"}
+    return {
+        "dry_run": True,
+        "mode": mode,
+        "dataset_records": len(rows),
+        "domain_records": domain_records,
+        "generic_records": generic_records,
+        "actual_generic_mix_ratio": round(generic_records / len(rows), 4),
+        "scored_groups": len(rows),
+        "status": "ok",
+    }
 
 
 def run_training(
@@ -154,10 +190,12 @@ def run_training(
     warm_start_model: str | None = None,
     sft_warmup: bool = False,
     use_vllm: bool = False,
+    mode: str = "grpo",
+    generic_mix_ratio: float = 0.15,
 ) -> dict[str, Any]:
     rows = load_grpo_dataset(dataset_path)
     if dry_run:
-        return run_dry_validation(rows)
+        return run_dry_validation(rows, mode=mode, generic_mix_ratio=generic_mix_ratio)
 
     if not _finite_number(learning_rate) or learning_rate <= 0:
         raise ValueError("learning_rate must be positive and finite")
@@ -222,8 +260,9 @@ def run_training(
         bf16=True, optim="adamw_torch_fused", remove_unused_columns=False,
         use_vllm=use_vllm, vllm_mode="colocate", logging_steps=5, save_steps=50,
     )
+    reward_fn = multiturn_trajectory_reward_fn if mode == "grpo-multiturn" else verifiable_policy_reward_fn
     trainer = GRPOTrainer(
-        model=warm_start_model or model_name, reward_funcs=verifiable_policy_reward_fn,
+        model=warm_start_model or model_name, reward_funcs=reward_fn,
         args=grpo_cfg, train_dataset=Dataset.from_list(items), peft_config=peft_config,
         processing_class=tokenizer,
     )
@@ -251,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     warmup.add_argument("--warm-start-model", help="Full SFT model checkpoint to anchor GRPO")
     warmup.add_argument("--sft-warmup", action="store_true", help="Warm up for one epoch using high-reward references")
     parser.add_argument("--use-vllm", action="store_true", help="Enable colocated vLLM generation during training")
+    parser.add_argument("--mode", choices=["grpo", "grpo-multiturn"], default="grpo", help="GRPO training trajectory mode")
+    parser.add_argument("--generic-mix-ratio", type=float, default=0.15, help="Target generic replay mix ratio")
     args = parser.parse_args(argv)
 
     if args.export_verl_parquet is not None:
@@ -267,7 +308,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset_path=args.dataset_path, model_name=args.model_name, output_dir=args.output_dir,
             learning_rate=args.learning_rate, num_generations=args.num_generations, max_steps=args.max_steps,
             dry_run=args.dry_run, warm_start_model=args.warm_start_model, sft_warmup=args.sft_warmup,
-            use_vllm=args.use_vllm,
+            use_vllm=args.use_vllm, mode=args.mode, generic_mix_ratio=args.generic_mix_ratio,
         )
     sys.stdout.write(json.dumps(summary, ensure_ascii=False) + "\n")
     return 0

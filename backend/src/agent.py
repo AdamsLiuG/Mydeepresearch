@@ -123,6 +123,7 @@ from services.request_state import SnapshotConflictError
 from services.reviewer import ReviewService
 from services.sandbox_executor import (
     DockerSandboxBackend,
+    HttpSandboxBackend,
     PyodideSandboxBackend,
     RunPythonSandboxTool,
     SandboxExecutorService,
@@ -1044,6 +1045,16 @@ class DeepResearchAgent(
             max_image_pixels=int(getattr(self.config, "multimodal_image_max_pixels", 16_000_000) or 16_000_000),
             metrics=metrics_registry,
         )
+        sidecar_url = str(getattr(self.config, "v4_sandbox_sidecar_url", "") or "").strip()
+        sidecar_backend = (
+            HttpSandboxBackend(
+                base_url=sidecar_url,
+                auth_secret=str(getattr(self.config, "v4_sandbox_sidecar_auth_secret", "") or ""),
+                timeout_seconds=float(getattr(self.config, "v4_sandbox_sidecar_timeout_seconds", 12.0) or 12.0),
+            )
+            if bool(getattr(self.config, "v4_sandbox_sidecar_enabled", False)) and sidecar_url
+            else None
+        )
         self._sandbox_service = SandboxExecutorService(
             enabled=self.config.resolved_sandbox_effective_enabled(),
             backend_preference=str(getattr(self.config, "sandbox_backend", "auto") or "auto"),
@@ -1058,6 +1069,7 @@ class DeepResearchAgent(
                 pyodide_cache_dir=str(getattr(self.config, "sandbox_pyodide_cache_dir", "") or ""),
                 node_bin=self.config.sandbox_pyodide_node_bin,
             ),
+            sidecar_backend=sidecar_backend,
             metrics=metrics_registry,
         )
         self.fetch_page_tool = FetchPageTool(

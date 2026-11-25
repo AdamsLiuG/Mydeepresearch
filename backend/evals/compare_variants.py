@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from pathlib import Path
 from statistics import mean
@@ -242,6 +243,136 @@ def _mean(values: Sequence[float]) -> float:
     return mean(values) if values else 0.0
 
 
+def _quantile(sorted_values: Sequence[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    pos = max(0.0, min(1.0, q)) * (len(sorted_values) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(sorted_values[lo])
+    frac = pos - lo
+    return float(sorted_values[lo]) * (1.0 - frac) + float(sorted_values[hi]) * frac
+
+
+def paired_bootstrap_ci(
+    deltas: Sequence[float],
+    *,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Compute a deterministic paired bootstrap confidence interval over case deltas."""
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be >= 1")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must lie strictly in (0, 1)")
+
+    clean = [
+        float(val)
+        for val in deltas
+        if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(float(val))
+    ]
+    n = len(clean)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean_delta": 0.0,
+            "ci_low": 0.0,
+            "ci_high": 0.0,
+            "confidence": confidence,
+            "n_bootstrap": n_bootstrap,
+            "seed": seed,
+            "significant": False,
+        }
+
+    observed_mean = round(math.fsum(clean) / n, 6)
+    if n == 1 or all(math.isclose(val, clean[0], abs_tol=1e-12) for val in clean):
+        return {
+            "n": n,
+            "mean_delta": observed_mean,
+            "ci_low": observed_mean,
+            "ci_high": observed_mean,
+            "confidence": confidence,
+            "n_bootstrap": n_bootstrap,
+            "seed": seed,
+            "significant": not math.isclose(observed_mean, 0.0, abs_tol=1e-12),
+        }
+
+    rng = random.Random(seed)
+    boot_means = [
+        math.fsum(clean[rng.randrange(n)] for _ in range(n)) / n
+        for _ in range(n_bootstrap)
+    ]
+    boot_means.sort()
+    alpha = 1.0 - confidence
+    ci_low = round(_quantile(boot_means, alpha / 2.0), 6)
+    ci_high = round(_quantile(boot_means, 1.0 - alpha / 2.0), 6)
+    return {
+        "n": n,
+        "mean_delta": observed_mean,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "confidence": confidence,
+        "n_bootstrap": n_bootstrap,
+        "seed": seed,
+        "significant": bool(ci_low > 1e-12 or ci_high < -1e-12),
+    }
+
+
+def compute_paired_metric_stats(
+    baseline_index: Mapping[str, Mapping[str, Any]],
+    candidate_index: Mapping[str, Mapping[str, Any]],
+    metric_names: Iterable[str],
+    *,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> dict[str, dict[str, Any]]:
+    """Compute paired mean deltas, win/loss/tie counts, and bootstrap CIs across shared cases."""
+    shared_ids = sorted(set(baseline_index) & set(candidate_index))
+    stats: dict[str, dict[str, Any]] = {}
+    for name in metric_names:
+        direction = (
+            "lower_is_better"
+            if name in LOWER_IS_BETTER
+            else "informational"
+            if name in INFORMATIONAL
+            else "higher_is_better"
+        )
+        deltas = [_metric_delta(baseline_index[cid], candidate_index[cid], name) for cid in shared_ids]
+        wins = 0
+        losses = 0
+        ties = 0
+        for delta in deltas:
+            if abs(delta) <= 1e-9:
+                ties += 1
+            elif direction == "lower_is_better":
+                if delta < 0:
+                    wins += 1
+                else:
+                    losses += 1
+            else:
+                if delta > 0:
+                    wins += 1
+                else:
+                    losses += 1
+        bootstrap = paired_bootstrap_ci(
+            deltas, n_bootstrap=n_bootstrap, confidence=confidence, seed=seed,
+        )
+        stats[name] = {
+            "direction": direction,
+            "paired_delta": bootstrap["mean_delta"],
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "bootstrap_ci": bootstrap,
+        }
+    return stats
+
+
 def _regression_ratio(
     baseline_values: Sequence[float],
     candidate_values: Sequence[float],
@@ -309,6 +440,9 @@ def build_comparison(
     max_adversarial_regression: float = DEFAULT_MAX_ADVERSARIAL_REGRESSION,
     required_metrics: Iterable[str] = (),
     expected_case_ids: Iterable[str] | None = None,
+    bootstrap_samples: int = 1000,
+    confidence: float = 0.95,
+    bootstrap_seed: int = 42,
 ) -> dict[str, Any]:
     """Build the full comparison payload, including normalized quality & cost guardrails."""
     baseline_index, baseline_errors = _index_results(baseline)
@@ -395,6 +529,15 @@ def build_comparison(
     else:
         verdict = "inconclusive"
 
+    paired_stats = compute_paired_metric_stats(
+        baseline_index,
+        candidate_index,
+        metric_names,
+        n_bootstrap=bootstrap_samples,
+        confidence=confidence,
+        seed=bootstrap_seed,
+    )
+
     return {
         "baseline_label": _variant_label(baseline, baseline_label, "baseline"),
         "candidate_label": _variant_label(candidate, candidate_label, "candidate"),
@@ -409,6 +552,7 @@ def build_comparison(
         "comparison_data_errors": comparison_errors,
         "verdict": verdict,
         "aggregate_deltas": aggregate,
+        "paired_stats": paired_stats,
         "cases": comparisons,
         **regression_ratios,
     }
@@ -479,6 +623,26 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
         lines.extend(["", "## Regression guardrails", ""])
         lines.extend(f"- `{reason}`" for reason in guardrails)
         lines.extend(f"- `{error}`" for error in comparison.get("comparison_data_errors") or [])
+
+    paired_stats = comparison.get("paired_stats") or {}
+    if isinstance(paired_stats, Mapping) and paired_stats:
+        lines.extend(
+            [
+                "",
+                "## Paired Bootstrap Confidence Intervals",
+                "",
+                "| Metric | Mean Delta | 95% CI | Wins/Losses/Ties | Significant |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for name, entry in paired_stats.items():
+            ci = entry.get("bootstrap_ci") or {}
+            lines.append(
+                f"| {name} | {_format_delta(float(entry.get('paired_delta', 0.0)))} | "
+                f"[{ci.get('ci_low', 0.0)}, {ci.get('ci_high', 0.0)}] | "
+                f"{entry.get('wins', 0)}/{entry.get('losses', 0)}/{entry.get('ties', 0)} | "
+                f"{bool(ci.get('significant', False))} |"
+            )
     return "\n".join(lines) + "\n"
 
 

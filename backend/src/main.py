@@ -15,7 +15,7 @@ from threading import Event, Thread
 from typing import Any, Callable, Dict, Iterator, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
@@ -35,6 +35,15 @@ from services.mcp_bridge import (
     tool_approval_expired,
 )
 from services.observability import new_traceparent, parse_traceparent
+from services.report_revisions import (
+    ReportAnnotationCreate,
+    ReverifyRequest,
+    append_annotation,
+    compute_revision_diff,
+    ensure_revisions,
+    list_annotations,
+    reverify_claim_or_section,
+)
 from services.request_state import SnapshotConflictError
 from services.skill_pack import SkillPackService
 from services.storage_backends import build_request_state_store
@@ -1098,6 +1107,144 @@ def create_app(
             ) from exc
         finally:
             _release_rate_limit(tenant, lease_id)
+
+    def _require_workbench_annotations_enabled() -> None:
+        if not bool(getattr(app.state.base_config, "v4_workbench_annotations_enabled", False)):
+            raise HTTPException(status_code=404, detail="Not found")
+
+    def _load_owned_snapshot_or_404(request_id: str, tenant: TenantContext) -> tuple[Any, dict[str, Any]]:
+        store = app.state.request_state_store
+        if store is None:
+            raise HTTPException(status_code=404, detail="request state store is disabled")
+        snapshot = _store_load(store, request_id, tenant_id=tenant.tenant_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
+        return store, snapshot
+
+    def _save_snapshot_with_cas(
+        store: Any,
+        request_id: str,
+        snapshot: dict[str, Any],
+        *,
+        tenant_id: str,
+        expected_state_version: int | None,
+    ) -> dict[str, Any]:
+        current_version = int(snapshot.get("state_version") or 0)
+        if expected_state_version is not None and int(expected_state_version) != current_version:
+            raise HTTPException(status_code=409, detail="Snapshot state_version conflict")
+        try:
+            if _accepts_kwarg(store.save, "expected_version"):
+                return store.save(
+                    request_id,
+                    snapshot,
+                    tenant_id=tenant_id,
+                    expected_version=current_version,
+                )
+            return _store_save(store, request_id, snapshot, tenant_id=tenant_id)
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Snapshot state_version conflict") from exc
+
+    @app.get("/requests/{request_id}/annotations")
+    async def get_request_annotations(request_id: str, request: Request) -> Dict[str, Any]:
+        _require_workbench_annotations_enabled()
+        tenant = _resolve_tenant(request)
+        _, snapshot = await asyncio.to_thread(_load_owned_snapshot_or_404, request_id, tenant)
+        revisions = ensure_revisions(snapshot)
+        return {
+            "request_id": request_id,
+            "state_version": int(snapshot.get("state_version") or 0),
+            "current_revision_id": int(revisions[-1].get("revision_id") or 1),
+            "annotations": list_annotations(snapshot),
+        }
+
+    @app.post("/requests/{request_id}/annotations")
+    async def create_request_annotation(
+        request_id: str,
+        payload: ReportAnnotationCreate,
+        request: Request,
+    ) -> Dict[str, Any]:
+        _require_workbench_annotations_enabled()
+        tenant = _resolve_tenant(request)
+
+        def _apply() -> Dict[str, Any]:
+            store, snapshot = _load_owned_snapshot_or_404(request_id, tenant)
+            updated, annotation = append_annotation(snapshot, payload, tenant_id=tenant.tenant_id)
+            saved = _save_snapshot_with_cas(
+                store,
+                request_id,
+                updated,
+                tenant_id=tenant.tenant_id,
+                expected_state_version=payload.expected_state_version,
+            )
+            return {
+                "request_id": request_id,
+                "state_version": int(saved.get("state_version") or 0),
+                "annotation": annotation,
+            }
+
+        return await asyncio.to_thread(_apply)
+
+    @app.post("/requests/{request_id}/reverify")
+    async def trigger_request_reverify(
+        request_id: str,
+        payload: ReverifyRequest,
+        request: Request,
+    ) -> Dict[str, Any]:
+        _require_workbench_annotations_enabled()
+        tenant = _resolve_tenant(request)
+
+        def _apply() -> Dict[str, Any]:
+            store, snapshot = _load_owned_snapshot_or_404(request_id, tenant)
+            try:
+                updated, new_revision, summary = reverify_claim_or_section(
+                    snapshot, payload, tenant_id=tenant.tenant_id,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            saved = _save_snapshot_with_cas(
+                store,
+                request_id,
+                updated,
+                tenant_id=tenant.tenant_id,
+                expected_state_version=payload.expected_state_version,
+            )
+            return {
+                "request_id": request_id,
+                "state_version": int(saved.get("state_version") or 0),
+                "revision": new_revision,
+                "summary": summary,
+                "report_markdown": saved.get("report_markdown") or new_revision["report_markdown"],
+            }
+
+        return await asyncio.to_thread(_apply)
+
+    @app.get("/requests/{request_id}/revisions")
+    async def list_request_revisions(request_id: str, request: Request) -> Dict[str, Any]:
+        _require_workbench_annotations_enabled()
+        tenant = _resolve_tenant(request)
+        _, snapshot = await asyncio.to_thread(_load_owned_snapshot_or_404, request_id, tenant)
+        return {
+            "request_id": request_id,
+            "state_version": int(snapshot.get("state_version") or 0),
+            "revisions": ensure_revisions(snapshot),
+        }
+
+    @app.get("/requests/{request_id}/revisions/diff")
+    async def diff_request_revisions(
+        request_id: str,
+        request: Request,
+        base: int = Query(..., ge=1),
+        target: int = Query(..., ge=1),
+    ) -> Dict[str, Any]:
+        _require_workbench_annotations_enabled()
+        tenant = _resolve_tenant(request)
+        _, snapshot = await asyncio.to_thread(_load_owned_snapshot_or_404, request_id, tenant)
+        revisions = {int(rev.get("revision_id") or 0): rev for rev in ensure_revisions(snapshot)}
+        base_rev = revisions.get(int(base))
+        target_rev = revisions.get(int(target))
+        if base_rev is None or target_rev is None:
+            raise HTTPException(status_code=404, detail="requested report revision not found")
+        return compute_revision_diff(request_id, base_rev, target_rev).model_dump()
 
     @app.get("/requests")
     async def list_persisted_requests(

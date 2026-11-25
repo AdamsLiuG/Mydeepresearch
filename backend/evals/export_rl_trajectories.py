@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import random
 import sys
 from collections import defaultdict
 from collections.abc import Callable
@@ -631,6 +632,286 @@ def export_grpo_records(
     return records
 
 
+def _default_generic_mix_templates() -> list[tuple[PolicyStateFeatures, str, dict[str, Any]]]:
+    """Deterministic general-capability anti-forgetting templates valid under policy verifier."""
+    templates = [
+        (
+            PolicyStateFeatures(
+                task_id=1, round_index=1, max_rounds=3, evidence_count=1,
+                distinct_domains=1, high_quality_sources=0, has_gap_signals=True,
+                searches_left=2, fetches_left=1, remaining_budget_ratio=0.8,
+                task_title="Cross-domain synthesis baseline",
+                task_intent="Expand diverse primary evidence",
+                gap_signals=("low_source_diversity",),
+                can_fetch=False,
+            ),
+            json.dumps(
+                {
+                    "action": "search",
+                    "confidence": 0.86,
+                    "reason": "increase independent source diversity",
+                    "query_override": None,
+                    "target_url": None,
+                },
+                ensure_ascii=False, sort_keys=True,
+            ),
+            {
+                "final_citation_faithfulness": 0.9,
+                "final_hybrid_score": 0.86,
+                "final_verifier_clean_rate": 1.0,
+                "high_severity_issues_after_step": 0,
+            },
+        ),
+        (
+            PolicyStateFeatures(
+                task_id=2, round_index=2, max_rounds=3, evidence_count=4,
+                distinct_domains=3, high_quality_sources=2, has_gap_signals=False,
+                searches_left=1, fetches_left=1, remaining_budget_ratio=0.6,
+                task_title="General evidence sufficiency gate",
+                task_intent="Confirm factual sufficiency and stop cleanly",
+                gap_signals=(),
+                can_fetch=True,
+            ),
+            json.dumps(
+                {
+                    "action": "stop",
+                    "confidence": 0.91,
+                    "reason": "sufficient multi-domain grounded evidence",
+                    "query_override": None,
+                    "target_url": None,
+                },
+                ensure_ascii=False, sort_keys=True,
+            ),
+            {
+                "final_citation_faithfulness": 0.94,
+                "final_hybrid_score": 0.88,
+                "final_verifier_clean_rate": 1.0,
+                "high_severity_issues_after_step": 0,
+            },
+        ),
+        (
+            PolicyStateFeatures(
+                task_id=3, round_index=1, max_rounds=3, evidence_count=2,
+                distinct_domains=2, high_quality_sources=1, has_gap_signals=True,
+                searches_left=1, fetches_left=2, remaining_budget_ratio=0.75,
+                task_title="Primary document full-text drilldown",
+                task_intent="Resolve thin snippet ambiguity via fetch",
+                gap_signals=("thin_content",),
+                can_fetch=True,
+            ),
+            json.dumps(
+                {
+                    "action": "fetch",
+                    "confidence": 0.84,
+                    "reason": "thin content requires full primary fetch",
+                    "query_override": None,
+                    "target_url": "https://example.org/report",
+                },
+                ensure_ascii=False, sort_keys=True,
+            ),
+            {
+                "final_citation_faithfulness": 0.89,
+                "final_hybrid_score": 0.84,
+                "final_verifier_clean_rate": 1.0,
+                "high_severity_issues_after_step": 0,
+            },
+        ),
+    ]
+    return templates
+
+
+def _build_generic_mix_rows(
+    count: int,
+    *,
+    generic_mix_records: list[dict[str, Any]] | None,
+    generic_mix_ratio: float,
+    discount_gamma: float,
+    prompt_version: str,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if count <= 0:
+        return []
+    rng = random.Random(seed)
+    pool: list[dict[str, Any]] = []
+    if generic_mix_records:
+        for idx, raw in enumerate(generic_mix_records):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            item["sample_source"] = "generic_replay"
+            item["mix_bucket"] = "generic"
+            item["mix_ratio_applied"] = round(float(generic_mix_ratio), 4)
+            item.setdefault("discount_gamma", discount_gamma)
+            item.setdefault("group_id", f"grp_generic_{idx}")
+            pool.append(item)
+
+    if not pool:
+        for idx, (features, completion, oracle_rates) in enumerate(_default_generic_mix_templates()):
+            prompt = format_policy_messages(features, prompt_version=prompt_version)
+            decision = parse_policy_decision(completion)
+            action = decision.action if decision is not None else "stop"
+            shaping = round(step_shaping(features, action, clean_rate=1.0, high_issues=0), 6)
+            state_dict = features.to_dict()
+            pool.append({
+                "group_id": f"grp_generic_builtin_{idx}",
+                "case_id": f"generic_replay_{idx}",
+                "rollout_id": f"generic_rollout_{idx}",
+                "request_id": f"generic_req_{idx}",
+                "skill_pack_id": "_neutral",
+                "task_id": features.task_id,
+                "step_index": 0,
+                "prompt": prompt,
+                "state_features": state_dict,
+                "reference_completion": completion,
+                "trajectory_reward": 0.85,
+                "group_mean_reward": 0.72,
+                "group_std_reward": 0.08,
+                "group_advantage": 0.6,
+                "step_shaping": shaping,
+                "step_advantage": round(0.6 + shaping, 6),
+                "verifiable_oracle": {**state_dict, **oracle_rates},
+                "turns": [
+                    {
+                        "turn_index": 0,
+                        "task_id": features.task_id,
+                        "round_index": features.round_index,
+                        "prompt": prompt,
+                        "state_features": state_dict,
+                        "completion": completion,
+                        "action": action,
+                        "step_shaping": shaping,
+                        "discounted_return": round(0.85 + 0.2 * shaping, 6),
+                        "turn_advantage": round(0.6 + shaping, 6),
+                    }
+                ],
+                "turn_count": 1,
+                "discount_gamma": discount_gamma,
+                "discounted_return": round(0.85 + 0.2 * shaping, 6),
+                "sample_source": "generic_replay",
+                "mix_bucket": "generic",
+                "mix_ratio_applied": round(float(generic_mix_ratio), 4),
+            })
+
+    selected: list[dict[str, Any]] = []
+    for idx in range(count):
+        base = dict(pool[idx % len(pool)] if idx < len(pool) else rng.choice(pool))
+        base["rollout_id"] = f"{base.get('rollout_id', 'generic')}_mix_{idx}"
+        selected.append(base)
+    return selected
+
+
+def export_grpo_multiturn_records(
+    snapshots: list[dict[str, Any]],
+    *,
+    generic_mix_records: list[dict[str, Any]] | None = None,
+    generic_mix_ratio: float = 0.15,
+    discount_gamma: float = 0.9,
+    prompt_version: str = "policy_prompt_v2",
+    min_group_size: int = 4,
+    min_reward_std: float = 0.03,
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """Export multi-turn GRPO trajectories with discounted turn credit and generic replay mix."""
+    _checked_group_limits(min_group_size, min_reward_std)
+    ratio = float(generic_mix_ratio)
+    if not 0.0 <= ratio <= 0.5 or not math.isfinite(ratio):
+        raise ValueError("generic_mix_ratio must lie in [0.0, 0.5]")
+    gamma = float(discount_gamma)
+    if not 0.0 < gamma <= 1.0 or not math.isfinite(gamma):
+        raise ValueError("discount_gamma must lie in (0.0, 1.0]")
+
+    domain_records: list[dict[str, Any]] = []
+    for identity, rollouts in sorted(_rollout_groups(snapshots).items()):
+        if len(rollouts) < min_group_size:
+            continue
+        rewards = [item["outcome"]["reward"] for item in rollouts]
+        mean, std = _reward_stats(rewards)
+        if std <= 0 or std < min_reward_std:
+            continue
+        group_id = "grp_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+        for rollout in rollouts:
+            outcome = rollout["outcome"]
+            advantage = (outcome["reward"] - mean) / std
+            steps = rollout["steps"]
+            if not steps:
+                continue
+            running_return = 0.0
+            turns_rev: list[dict[str, Any]] = []
+            total_turns = len(steps)
+            for rev_offset, (features, completion, action) in enumerate(reversed(steps)):
+                turn_index = total_turns - 1 - rev_offset
+                shaping = step_shaping(
+                    features, action, clean_rate=outcome["verifier_clean_rate"],
+                    high_issues=outcome["high_severity_issues"],
+                )
+                step_reward = 0.2 * shaping + (outcome["reward"] if turn_index == total_turns - 1 else 0.0)
+                running_return = step_reward + gamma * running_return
+                discount_weight = gamma ** (total_turns - 1 - turn_index)
+                turn_adv = advantage * discount_weight + shaping
+                turns_rev.append({
+                    "turn_index": turn_index,
+                    "task_id": features.task_id,
+                    "round_index": features.round_index,
+                    "prompt": format_policy_messages(features, prompt_version=prompt_version),
+                    "state_features": features.to_dict(),
+                    "completion": completion,
+                    "action": action,
+                    "step_shaping": round(shaping, 6),
+                    "discounted_return": round(running_return, 6),
+                    "turn_advantage": round(turn_adv, 6),
+                })
+            turns = list(reversed(turns_rev))
+            anchor_features, anchor_completion, _ = steps[-1]
+            anchor_state = anchor_features.to_dict()
+            anchor_turn = turns[-1]
+            domain_records.append({
+                "group_id": group_id,
+                "case_id": rollout["case_id"],
+                "rollout_id": rollout["rollout_id"],
+                "request_id": rollout["request_id"],
+                "skill_pack_id": anchor_features.skill_pack_id,
+                "task_id": anchor_features.task_id,
+                "step_index": anchor_turn["turn_index"],
+                "prompt": anchor_turn["prompt"],
+                "state_features": anchor_state,
+                "reference_completion": anchor_completion,
+                "trajectory_reward": outcome["reward"],
+                "group_mean_reward": round(mean, 6),
+                "group_std_reward": round(std, 6),
+                "group_advantage": round(advantage, 6),
+                "step_shaping": anchor_turn["step_shaping"],
+                "step_advantage": anchor_turn["turn_advantage"],
+                "verifiable_oracle": {
+                    **anchor_state,
+                    "final_verifier_clean_rate": outcome["verifier_clean_rate"],
+                    "final_citation_faithfulness": outcome["citation_faithfulness"],
+                    "final_hybrid_score": outcome["hybrid_judge_score"],
+                    "high_severity_issues_after_step": outcome["high_severity_issues"],
+                },
+                "turns": turns,
+                "turn_count": len(turns),
+                "discount_gamma": gamma,
+                "discounted_return": turns[0]["discounted_return"],
+                "sample_source": "domain_multiturn",
+                "mix_bucket": "domain",
+                "mix_ratio_applied": round(ratio, 4),
+            })
+
+    if not domain_records or ratio <= 0.0:
+        return domain_records
+
+    target_generic = max(1, round(len(domain_records) * ratio / (1.0 - ratio)))
+    generic_rows = _build_generic_mix_rows(
+        target_generic,
+        generic_mix_records=generic_mix_records,
+        generic_mix_ratio=ratio,
+        discount_gamma=gamma,
+        prompt_version=prompt_version,
+        seed=seed,
+    )
+    return domain_records + generic_rows
+
+
 def load_snapshots_from_dir(input_dir: Path) -> list[dict[str, Any]]:
     """Load persisted JSON snapshots from a directory tree (recursively)."""
 
@@ -659,17 +940,53 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Export RL SFT/DPO/GRPO datasets from DeepResearch snapshots.")
     parser.add_argument("--input-dir", default=str(_BACKEND_DIR / ".state" / "requests"), help="Directory containing JSON request snapshots")
     parser.add_argument("--output-dir", default=str(_BACKEND_DIR / "evals" / "rl_exports"), help="Destination directory for JSONL exports")
-    parser.add_argument("--mode", choices=["sft-dpo", "grpo-group"], default="sft-dpo", help="Export format mode")
+    parser.add_argument("--mode", choices=["sft-dpo", "grpo-group", "grpo-multiturn"], default="sft-dpo", help="Export format mode")
     parser.add_argument("--min-reward", type=float, default=0.5, help="Minimum composite reward for SFT export")
     parser.add_argument("--min-margin", type=float, default=0.15, help="Minimum reward margin for DPO pairing")
     parser.add_argument("--min-group-size", type=int, default=4, help="Minimum group size for GRPO export")
     parser.add_argument("--min-reward-std", type=float, default=0.03, help="Minimum reward std-dev for GRPO export")
     parser.add_argument("--prompt-version", default="policy_prompt_v2", help="Prompt template version for GRPO export")
+    parser.add_argument("--generic-mix-ratio", type=float, default=0.15, help="Target generic replay mix ratio for grpo-multiturn")
+    parser.add_argument("--generic-mix-path", default=None, help="Optional JSONL path of generic replay rows for mixing")
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     snapshots = load_snapshots_from_dir(input_dir)
+
+    if args.mode == "grpo-multiturn":
+        custom_generic: list[dict[str, Any]] | None = None
+        if args.generic_mix_path:
+            mix_file = Path(args.generic_mix_path)
+            if mix_file.exists() and mix_file.is_file():
+                custom_generic = [
+                    json.loads(line)
+                    for line in mix_file.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+        records = export_grpo_multiturn_records(
+            snapshots,
+            generic_mix_records=custom_generic,
+            generic_mix_ratio=args.generic_mix_ratio,
+            prompt_version=args.prompt_version,
+            min_group_size=args.min_group_size,
+            min_reward_std=args.min_reward_std,
+        )
+        out_path = output_dir / "grpo_multiturn_records.jsonl"
+        _write_jsonl(out_path, records)
+        generic_count = sum(1 for row in records if row.get("sample_source") == "generic_replay")
+        domain_count = len(records) - generic_count
+        summary = {
+            "mode": "grpo-multiturn",
+            "input_snapshots": len(snapshots),
+            "domain_records": domain_count,
+            "generic_records": generic_count,
+            "total_records": len(records),
+            "actual_generic_ratio": round(generic_count / len(records), 4) if records else 0.0,
+            "output_path": str(out_path),
+        }
+        sys.stdout.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        return 0
 
     if args.mode == "grpo-group":
         grpo_records = export_grpo_records(

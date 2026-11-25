@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { EvidenceConflictCluster, TodoTaskView } from "../types/research";
 import {
   buildFallbackWorkbenchPayload,
+  computeLocalLineDiff,
   conflictsForCitation,
   enhanceReportCitations,
   enhanceReportTables,
@@ -10,7 +11,8 @@ import {
   getChartSeries,
   normalizeReportWorkbench,
   safeEvidenceUrl,
-  sanitizeChartSpec
+  sanitizeChartSpec,
+  summarizeRevisionLabel
 } from "../utils/workbench";
 
 const runtime = globalThis as typeof globalThis & { process?: { features?: { require_module?: boolean } } };
@@ -230,4 +232,29 @@ it("keeps stable report bindings and deduplicates replayed chunks and statuses",
   expect(normalizeReportWorkbench({ workbench: { section_bindings: [binding, binding] } }).section_bindings)
     .toEqual([binding]);
   expect(normalizeReportWorkbench({})).not.toHaveProperty("section_bindings");
+
+  const diff = computeLocalLineDiff("## 结论\n旧内容", "## 结论\n新内容\n> 定向复核");
+  expect(diff.changed).toBe(true);
+  expect(diff.removed_lines).toEqual(["旧内容"]);
+  expect(diff.added_lines).toEqual(["新内容", "> 定向复核"]);
+  expect(
+    summarizeRevisionLabel({
+      revision_id: 2,
+      reason: "targeted_reverify",
+      created_at: "2026-11-25T00:00:00Z"
+    })
+  ).toBe("v2 · 定向复核");
+
+  const fsSpecifier = "node:fs";
+  const fsMod = (await import(/* @vite-ignore */ fsSpecifier)) as {
+    readFileSync: (path: URL, encoding: string) => string;
+  };
+  const viewerUrl = new URL("../components/ReportViewer.vue", import.meta.url);
+  const viewerSource = fsMod.readFileSync(viewerUrl, "utf-8");
+  const panelStart = viewerSource.indexOf('<div v-if="showAnnotations');
+  expect(panelStart).toBeGreaterThan(-1);
+  const panelSnippet = viewerSource.slice(panelStart, viewerSource.lastIndexOf("</template>"));
+  expect(panelSnippet).not.toMatch(/v-html|innerHTML/);
+  expect(panelSnippet).toContain("{{ item.comment }}");
+  expect(panelSnippet).toContain("{{ line }}");
 });

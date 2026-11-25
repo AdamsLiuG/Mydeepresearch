@@ -17,6 +17,7 @@ for root in (BACKEND_ROOT, BACKEND_ROOT / "src"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+from evals.compare_variants import build_comparison, paired_bootstrap_ci  # noqa: E402
 from evals.metrics.factscore import (  # noqa: E402
     aggregate_atomic_factscores,
     aggregate_conflict_recall,
@@ -509,6 +510,37 @@ def build_report_payload(
             "aggregate_summary": aggregate_records(eval_records),
             "request_id_count": len(eval_request_ids),
         },
+    }
+
+
+def summarize_paired_eval_comparison(
+    baseline_payload: dict[str, Any],
+    candidate_payload: dict[str, Any],
+    *,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Summarize paired variant deltas and deterministic bootstrap confidence intervals."""
+    comparison = build_comparison(
+        baseline_payload,
+        candidate_payload,
+        bootstrap_samples=n_bootstrap,
+        confidence=confidence,
+        bootstrap_seed=seed,
+    )
+    return {
+        "verdict": comparison["verdict"],
+        "compared_cases": comparison["compared_cases"],
+        "normalized_quality_gain": comparison["normalized_quality_gain"],
+        "aggregate_deltas": comparison["aggregate_deltas"],
+        "paired_stats": comparison["paired_stats"],
+        "bootstrap_summary": paired_bootstrap_ci(
+            [float(case.get("net_quality_delta", 0.0)) for case in comparison["cases"]],
+            n_bootstrap=n_bootstrap,
+            confidence=confidence,
+            seed=seed,
+        ),
     }
 
 

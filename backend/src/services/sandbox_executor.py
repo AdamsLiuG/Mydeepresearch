@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -18,7 +19,9 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from urllib.parse import urlsplit
 
+import httpx
 from pydantic import (
     AliasChoices,
     BaseModel,
@@ -539,6 +542,154 @@ class PyodideSandboxBackend:
         return _parse_backend_output(stdout, proc.returncode, "pyodide")
 
 
+def _validate_sidecar_url(url: str) -> str:
+    """Validate HTTP(S) Sandbox Sidecar endpoint URL against malformed schemes or embedded credentials."""
+    raw = str(url or "").strip()
+    if not raw:
+        raise ValueError("sandbox sidecar URL is empty")
+    if any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        raise ValueError("sandbox sidecar URL contains control or whitespace characters")
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError(f"unsupported sandbox sidecar URL scheme: {parsed.scheme!r}")
+    if not parsed.hostname:
+        raise ValueError("sandbox sidecar URL missing host")
+    if parsed.username or parsed.password:
+        raise ValueError("sandbox sidecar URL must not contain embedded credentials")
+    return raw.rstrip("/")
+
+
+class HttpSandboxBackend:
+    """Remote isolated HTTP Sandbox Sidecar backend using Bearer HMAC/token auth."""
+
+    backend_name = "sidecar"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        auth_secret: str = "",
+        timeout_seconds: float = 12.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._config_error: str | None = None
+        try:
+            self.base_url = _validate_sidecar_url(base_url)
+        except ValueError as exc:
+            self.base_url = ""
+            self._config_error = str(exc)
+        self.auth_secret = str(auth_secret or "").strip()
+        self.timeout_seconds = max(1.0, min(30.0, float(timeout_seconds or 12.0)))
+        self._transport = transport
+
+    def _headers(self, traceparent: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if self.auth_secret:
+            headers["Authorization"] = f"Bearer {self.auth_secret}"
+        tp = str(traceparent or "").strip()
+        if tp:
+            headers["traceparent"] = tp[:128]
+        return headers
+
+    def is_available(self) -> bool:
+        if not self.base_url:
+            return False
+        probe_timeout = min(3.0, self.timeout_seconds)
+        try:
+            with httpx.Client(timeout=probe_timeout, transport=self._transport) as client:
+                resp = client.get(f"{self.base_url}/v1/capabilities", headers=self._headers())
+            if resp.status_code != 200:
+                return False
+            data = resp.json()
+            languages = data.get("languages") if isinstance(data, dict) else None
+            return isinstance(languages, list) and "python" in languages
+        except Exception:
+            return False
+
+    def execute(
+        self,
+        *,
+        code: str,
+        tables: list[dict[str, Any]],
+        timeout_seconds: float,
+        memory_mb: int,
+        traceparent: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.base_url:
+            return {
+                "ok": False,
+                "error_code": "backend_unavailable",
+                "error": self._config_error or "invalid sandbox sidecar URL",
+                "timed_out": False,
+            }
+        effective_timeout = max(1.0, min(self.timeout_seconds, float(timeout_seconds or self.timeout_seconds)))
+        try:
+            with httpx.Client(timeout=effective_timeout + 2.0, transport=self._transport) as client:
+                resp = client.post(
+                    f"{self.base_url}/v1/executions",
+                    headers=self._headers(traceparent=traceparent),
+                    json={
+                        "code": code,
+                        "tables": tables,
+                        "timeout_seconds": effective_timeout,
+                        "memory_mb": int(memory_mb),
+                    },
+                )
+        except httpx.TimeoutException:
+            return {
+                "ok": False,
+                "error_code": "timeout",
+                "error": f"sandbox sidecar timed out after {effective_timeout}s",
+                "timed_out": True,
+            }
+        except httpx.HTTPError as exc:
+            return {
+                "ok": False,
+                "error_code": "backend_unavailable",
+                "error": f"sandbox sidecar transport error: {exc}",
+                "timed_out": False,
+            }
+
+        if resp.status_code in {401, 403, 503}:
+            return {
+                "ok": False,
+                "error_code": "backend_unavailable",
+                "error": f"sandbox sidecar authorization rejected ({resp.status_code})",
+                "timed_out": False,
+            }
+        if resp.status_code == 422:
+            return {
+                "ok": False,
+                "error_code": "input_rejected",
+                "error": "sandbox sidecar rejected execution payload",
+                "timed_out": False,
+            }
+        if resp.status_code != 200:
+            return {
+                "ok": False,
+                "error_code": "backend_unavailable",
+                "error": f"sandbox sidecar returned HTTP {resp.status_code}",
+                "timed_out": False,
+            }
+        try:
+            data = resp.json()
+        except Exception:
+            return {
+                "ok": False,
+                "error_code": "backend_unavailable",
+                "error": "sandbox sidecar returned malformed JSON",
+                "timed_out": False,
+            }
+        if not isinstance(data, dict):
+            return {
+                "ok": False,
+                "error_code": "backend_unavailable",
+                "error": "sandbox sidecar returned non-object payload",
+                "timed_out": False,
+            }
+        return data
+
+
 class SandboxExecutorService:
     budget_provider: Callable[[], Any] | None = None
 
@@ -554,6 +705,7 @@ class SandboxExecutorService:
         max_executions_per_task: int = 4,
         docker_backend: SandboxBackend | None = None,
         pyodide_backend: SandboxBackend | None = None,
+        sidecar_backend: SandboxBackend | None = None,
         ast_validator: SandboxASTValidator | None = None,
         metrics: Any | None = None,
     ) -> None:
@@ -564,6 +716,7 @@ class SandboxExecutorService:
         self.max_executions_per_task = max(1, int(max_executions_per_task or 4))
         self.docker_backend = docker_backend or DockerSandboxBackend()
         self.pyodide_backend = pyodide_backend or PyodideSandboxBackend()
+        self.sidecar_backend = sidecar_backend
         self.ast_validator = ast_validator or SandboxASTValidator()
         self._metrics = metrics
         self._lock = threading.Lock()
@@ -588,16 +741,24 @@ class SandboxExecutorService:
 
     def _select_backend(self) -> SandboxBackend | None:
         pref = self.backend_preference
-        if pref not in {"auto", "docker", "pyodide"}:
+        if pref not in {"auto", "docker", "pyodide", "sidecar"}:
             return None
         if pref == "docker":
             return self.docker_backend if self.docker_backend.is_available() else None
         if pref == "pyodide":
             return self.pyodide_backend if self.pyodide_backend.is_available() else None
+        if pref == "sidecar":
+            return (
+                self.sidecar_backend
+                if self.sidecar_backend is not None and self.sidecar_backend.is_available()
+                else None
+            )
         if self.docker_backend.is_available():
             return self.docker_backend
         if self.pyodide_backend.is_available():
             return self.pyodide_backend
+        if self.sidecar_backend is not None and self.sidecar_backend.is_available():
+            return self.sidecar_backend
         return None
 
     def _compute_execution_hash(
@@ -713,12 +874,18 @@ class SandboxExecutorService:
                     dispatch = budget.attempt({"sandbox_calls": 1}) if budget is not None else nullcontext()
                     with dispatch as attempt:
                         self._inc_metric("sandbox_executions_total")
-                        raw_res = backend.execute(
-                            code=request.code,
-                            tables=table_payloads,
-                            timeout_seconds=min(timeout, attempt.timeout) if attempt is not None else timeout,
-                            memory_mb=self.memory_mb,
-                        )
+                        exec_kwargs: dict[str, Any] = {
+                            "code": request.code,
+                            "tables": table_payloads,
+                            "timeout_seconds": min(timeout, attempt.timeout) if attempt is not None else timeout,
+                            "memory_mb": self.memory_mb,
+                        }
+                        try:
+                            if "traceparent" in inspect.signature(backend.execute).parameters:
+                                exec_kwargs["traceparent"] = request.traceparent
+                        except (TypeError, ValueError):
+                            pass
+                        raw_res = backend.execute(**exec_kwargs)
                 finally:
                     self._execution_slots.release()
             else:

@@ -430,3 +430,88 @@ export interface RecentResearchView {
   phase?: string;
   updatedAt?: string;
 }
+
+export type AnnotationSeverity = "info" | "concern" | "disputed";
+export type AnnotationActionRequested = "comment" | "reverify";
+export type AnnotationStatus = "open" | "reverified" | "resolved";
+
+export interface ReportAnnotation {
+  annotation_id: string;
+  request_id: string;
+  tenant_id: string;
+  revision_id: number;
+  section_id: string;
+  claim_id: string;
+  target_quote: string;
+  comment: string;
+  severity: AnnotationSeverity;
+  action_requested: AnnotationActionRequested;
+  author: string;
+  created_at: string;
+  status: AnnotationStatus;
+}
+
+export interface ReportAnnotationCreatePayload {
+  section_id?: string;
+  claim_id?: string;
+  target_quote?: string;
+  comment: string;
+  severity?: AnnotationSeverity;
+  action_requested?: AnnotationActionRequested;
+  author?: string;
+  expected_state_version?: number;
+}
+
+export interface ReportAnnotationsResponse {
+  request_id: string;
+  state_version: number;
+  current_revision_id: number;
+  annotations: ReportAnnotation[];
+}
+
+export interface ReportRevisionSnapshot {
+  revision_id: number;
+  parent_revision_id: number | null;
+  request_id: string;
+  report_markdown: string;
+  reason: string;
+  source_annotation_id?: string | null;
+  evidence_refs: string[];
+  reverification_summary: Record<string, unknown>;
+  created_at: string;
+  content_sha256: string;
+}
+
+export interface ReportRevisionsResponse {
+  request_id: string;
+  state_version: number;
+  revisions: ReportRevisionSnapshot[];
+}
+
+export interface ReverifyRequestPayload {
+  annotation_id?: string;
+  section_id?: string;
+  claim_id?: string;
+  note?: string;
+  expected_state_version?: number;
+}
+
+export interface ReverifyResponse {
+  request_id: string;
+  state_version: number;
+  revision: ReportRevisionSnapshot;
+  summary: Record<string, unknown>;
+  report_markdown: string;
+}
+
+export interface RevisionDiffResponse {
+  request_id: string;
+  base_revision_id: number;
+  target_revision_id: number;
+  added_lines: string[];
+  removed_lines: string[];
+  changed_sections: string[];
+  unified_diff: string;
+  added_count: number;
+  removed_count: number;
+}

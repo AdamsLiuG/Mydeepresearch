@@ -3,6 +3,7 @@ import type {
   ChartSpecArtifact,
   ClaimVerificationSummary,
   EvidenceConflictCluster,
+  ReportRevisionSnapshot,
   ReportWorkbenchPayload,
   SkillGovernanceInfo,
   TodoTaskView,
@@ -469,5 +470,33 @@ export function buildFallbackWorkbenchPayload(
     evidence_conflicts: evidenceConflicts,
     claim_verification_summary: claimSummary,
     skill_governance: skillGovernance
+  };
+}
+
+export function summarizeRevisionLabel(
+  revision: Pick<ReportRevisionSnapshot, "revision_id" | "reason" | "created_at">
+): string {
+  const reasonMap: Record<string, string> = {
+    initial_report: "初始版本",
+    targeted_reverify: "定向复核"
+  };
+  const reasonLabel = reasonMap[revision.reason] || revision.reason || "修订";
+  return `v${revision.revision_id} · ${reasonLabel}`;
+}
+
+export function computeLocalLineDiff(
+  baseText: string,
+  targetText: string
+): { added_lines: string[]; removed_lines: string[]; changed: boolean } {
+  const baseLines = (baseText || "").split(/\r?\n/);
+  const targetLines = (targetText || "").split(/\r?\n/);
+  const baseSet = new Set(baseLines);
+  const targetSet = new Set(targetLines);
+  const removed_lines = baseLines.filter((line) => line.length > 0 && !targetSet.has(line));
+  const added_lines = targetLines.filter((line) => line.length > 0 && !baseSet.has(line));
+  return {
+    added_lines,
+    removed_lines,
+    changed: added_lines.length > 0 || removed_lines.length > 0 || baseText !== targetText
   };
 }

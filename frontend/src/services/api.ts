@@ -6,11 +6,18 @@ import type {
   MetricsSnapshot,
   PersistedRequestSummary,
   ReplayEventItem,
+  ReportAnnotation,
+  ReportAnnotationCreatePayload,
+  ReportAnnotationsResponse,
+  ReportRevisionsResponse,
   ResearchEventHandler,
   ResearchRequest,
   ResearchStreamEvent,
   ResearchTaskPlanItem,
   ResumeRequest,
+  ReverifyRequestPayload,
+  ReverifyResponse,
+  RevisionDiffResponse,
   SectionDrilldownResponse,
   SkillsCatalogResponse,
   StreamOptions,
@@ -24,10 +31,17 @@ export type {
   MetricsSnapshot,
   PersistedRequestSummary,
   ReplayEventItem,
+  ReportAnnotation,
+  ReportAnnotationCreatePayload,
+  ReportAnnotationsResponse,
+  ReportRevisionsResponse,
   ResearchRequest,
   ResearchStreamEvent,
   ResearchTaskPlanItem,
   ResumeRequest,
+  ReverifyRequestPayload,
+  ReverifyResponse,
+  RevisionDiffResponse,
   SectionDrilldownResponse,
   SkillsCatalogResponse,
   StreamOptions,
@@ -498,4 +512,141 @@ export async function fetchSkillsCatalog(
     throw new Error(errorText || `获取 Skill 目录失败，状态码：${response.status}`);
   }
   return (await response.json()) as SkillsCatalogResponse;
+}
+
+export async function fetchReportAnnotations(
+  requestId: string,
+  options: StreamOptions = {}
+): Promise<ReportAnnotationsResponse> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/annotations`,
+    {
+      method: "GET",
+      headers: buildHeaders({ Accept: "application/json" }, options),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new StreamHttpError(
+      errorText || `获取报告批注失败，状态码：${response.status}`,
+      response.status
+    );
+  }
+  return (await response.json()) as ReportAnnotationsResponse;
+}
+
+export async function createReportAnnotation(
+  requestId: string,
+  payload: ReportAnnotationCreatePayload,
+  options: StreamOptions = {}
+): Promise<{
+  request_id: string;
+  state_version: number;
+  annotation: ReportAnnotation;
+}> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/annotations`,
+    {
+      method: "POST",
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        options
+      ),
+      body: JSON.stringify(payload),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new StreamHttpError(
+      errorText || `提交报告批注失败，状态码：${response.status}`,
+      response.status
+    );
+  }
+  return (await response.json()) as {
+    request_id: string;
+    state_version: number;
+    annotation: ReportAnnotation;
+  };
+}
+
+export async function triggerTargetedReverify(
+  requestId: string,
+  payload: ReverifyRequestPayload,
+  options: StreamOptions = {}
+): Promise<ReverifyResponse> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/reverify`,
+    {
+      method: "POST",
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        options
+      ),
+      body: JSON.stringify(payload),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new StreamHttpError(
+      errorText || `触发定向复核失败，状态码：${response.status}`,
+      response.status
+    );
+  }
+  return (await response.json()) as ReverifyResponse;
+}
+
+export async function fetchReportRevisions(
+  requestId: string,
+  options: StreamOptions = {}
+): Promise<ReportRevisionsResponse> {
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/revisions`,
+    {
+      method: "GET",
+      headers: buildHeaders({ Accept: "application/json" }, options),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new StreamHttpError(
+      errorText || `获取报告修订历史失败，状态码：${response.status}`,
+      response.status
+    );
+  }
+  return (await response.json()) as ReportRevisionsResponse;
+}
+
+export async function fetchRevisionDiff(
+  requestId: string,
+  baseRevisionId: number,
+  targetRevisionId: number,
+  options: StreamOptions = {}
+): Promise<RevisionDiffResponse> {
+  const params = `?base=${encodeURIComponent(String(baseRevisionId))}&target=${encodeURIComponent(String(targetRevisionId))}`;
+  const response = await fetch(
+    `${baseURL}/requests/${encodeURIComponent(requestId)}/revisions/diff${params}`,
+    {
+      method: "GET",
+      headers: buildHeaders({ Accept: "application/json" }, options),
+      signal: options.signal
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new StreamHttpError(
+      errorText || `获取修订对比 Diff 失败，状态码：${response.status}`,
+      response.status
+    );
+  }
+  return (await response.json()) as RevisionDiffResponse;
 }

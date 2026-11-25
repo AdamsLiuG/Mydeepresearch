@@ -17,7 +17,7 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterator, Literal, TextIO, Union
+from typing import Annotated, Any, Callable, Iterator, Literal, Sequence, TextIO, Union
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -80,6 +80,9 @@ class FinaragPassageItem(BaseModel):
     distance: float
     relevance_score: float | None = None
     combined_score: float | None = None
+    bm25_rank: int | None = None
+    dense_rank: int | None = None
+    rrf_score: float | None = None
     text: str
     chunk_types: list[str] = Field(default_factory=list)
     citation_uri: str
@@ -255,6 +258,45 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 
+def _normalize_vector(raw: Sequence[float]) -> list[float]:
+    cleaned: list[float] = []
+    for value in raw:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            num = 0.0
+        cleaned.append(num if math.isfinite(num) else 0.0)
+    norm = math.sqrt(sum(v * v for v in cleaned))
+    if norm <= 0.0:
+        return [0.0 for _ in cleaned]
+    return [v / norm for v in cleaned]
+
+
+def _hashed_dense_vector(text: str, *, dim: int = 128) -> list[float]:
+    """Deterministic zero-dependency L2-normalized embedding over tokens & char 3-grams."""
+    vec = [0.0] * dim
+    tokens = _tokenize(text)
+    cleaned = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+    features: list[tuple[str, float]] = [(tok, 1.0) for tok in tokens]
+    if len(cleaned) >= 3:
+        features.extend((f"3g:{cleaned[i : i + 3]}", 0.5) for i in range(len(cleaned) - 2))
+    elif cleaned:
+        features.append((f"raw:{cleaned}", 0.5))
+    for feat, weight in features:
+        digest = hashlib.blake2b(feat.encode("utf-8"), digest_size=8).digest()
+        bucket = int.from_bytes(digest[:4], "big") % dim
+        sign = 1.0 if (digest[4] & 1) == 0 else -1.0
+        vec[bucket] += sign * weight
+    return _normalize_vector(vec)
+
+
+def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    if not vec_a or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = math.fsum(a * b for a, b in zip(vec_a, vec_b))
+    return max(0.0, min(1.0, dot)) if math.isfinite(dot) else 0.0
+
+
 class FinaRAGAdapter:
     """In-process / CLI-compatible retrieval adapter over FinaRAG chunked reports."""
 
@@ -265,6 +307,9 @@ class FinaRAGAdapter:
         acl: TenantACL | None = None,
         token_secret: str | None = None,
         answer_fn: Callable[[str, list[dict[str, Any]], str], tuple[Any, str]] | None = None,
+        hybrid_rrf_enabled: bool | None = None,
+        rrf_k: int | None = None,
+        embedder: Callable[[str], Sequence[float]] | None = None,
     ) -> None:
         self._root = Path(
             data_root
@@ -277,6 +322,18 @@ class FinaRAGAdapter:
         )
         self._token_secret = token_secret if token_secret is not None else os.getenv("MCP_TENANT_TOKEN_SECRET")
         self._answer_fn = answer_fn
+        if hybrid_rrf_enabled is None:
+            env_rrf = str(os.getenv("V4_FINARAG_HYBRID_RRF_ENABLED") or "").strip().lower()
+            self._hybrid_rrf_enabled = env_rrf in {"1", "true", "yes", "on"}
+        else:
+            self._hybrid_rrf_enabled = bool(hybrid_rrf_enabled)
+        raw_k = rrf_k if rrf_k is not None else (os.getenv("V4_FINARAG_RRF_K") or 60)
+        try:
+            parsed_k = int(raw_k)
+        except (TypeError, ValueError):
+            parsed_k = 60
+        self._rrf_k = max(1, min(200, parsed_k))
+        self._embedder = embedder
         self._subset_meta: dict[str, dict[str, Any]] | None = None
         self._reports_cache: dict[bool, dict[str, dict[str, Any]]] = {}
 
@@ -457,6 +514,11 @@ class FinaRAGAdapter:
             total=len(items),
         )
 
+    def _embed_text(self, text: str) -> list[float]:
+        if self._embedder is not None:
+            return _normalize_vector(self._embedder(text))
+        return _hashed_dense_vector(text)
+
     def retrieve_filings(
         self,
         params: FinaragFilingsInput,
@@ -485,18 +547,95 @@ class FinaRAGAdapter:
             for term in terms
             for frequency in [sum(term in count for count in counts)]
         }
-        scored = []
-        for chunk, count in zip(chunks, counts):
-            normalization = 1.5 * (0.25 + 0.75 * count.total() / average_length)
-            score = sum(weights[term] * count[term] * 2.5 / (count[term] + normalization)
-                        for term in terms if term in count)
-            if score > 0:
-                scored.append((score, chunk))
-        scored.sort(key=lambda item: (-item[0], item[1]["page"]))
 
+        bm25_scores: list[float] = []
+        for count in counts:
+            normalization = 1.5 * (0.25 + 0.75 * count.total() / average_length)
+            bm25_scores.append(
+                sum(
+                    weights[term] * count[term] * 2.5 / (count[term] + normalization)
+                    for term in terms
+                    if term in count
+                )
+            )
+
+        use_hybrid_rrf = self._hybrid_rrf_enabled and params.retrieval_mode in {"hybrid", "vector"}
         passages: list[FinaragPassageItem] = []
         seen_pages: set[int] = set()
-        for score, chunk in scored:
+
+        if not use_hybrid_rrf:
+            scored = [
+                (score, chunk)
+                for score, chunk in zip(bm25_scores, chunks)
+                if score > 0
+            ]
+            scored.sort(key=lambda item: (-item[0], item[1]["page"]))
+            for score, chunk in scored:
+                page_1based = chunk["page"]
+                page_0based = page_1based - 1
+                if params.return_parent_pages and page_1based in pages_by_no:
+                    if page_1based in seen_pages:
+                        continue
+                    seen_pages.add(page_1based)
+                    passage_text = pages_by_no[page_1based]
+                else:
+                    passage_text = str(chunk.get("text") or "")
+                chunk_types = [str(chunk.get("type") or "content")]
+                passages.append(
+                    FinaragPassageItem(
+                        page_index_1based=page_1based,
+                        page_index_0based=page_0based,
+                        distance=round(max(0.0, 1.0 - min(score, 1.0)), 4),
+                        relevance_score=round(min(1.0, score), 4),
+                        combined_score=round(score, 4),
+                        text=passage_text,
+                        chunk_types=chunk_types,
+                        citation_uri=f"finarag://{sha1}#page={page_1based}",
+                    )
+                )
+                if len(passages) >= params.top_n:
+                    break
+
+            return FinaragFilingsOutput(
+                company_name=canon_name,
+                pdf_sha1=sha1,
+                currency=currency,
+                retrieval_mode="bm25",
+                passages=passages,
+                notices=(
+                    [f"{params.retrieval_mode} retrieval is unavailable. Used local BM25."]
+                    if params.retrieval_mode != "bm25" else []
+                ),
+            )
+
+        query_vec = self._embed_text(params.query)
+        dense_scores = [_cosine_similarity(query_vec, self._embed_text(chunk["text"])) for chunk in chunks]
+
+        bm25_order = sorted(
+            (idx for idx, s in enumerate(bm25_scores) if s > 0.0),
+            key=lambda idx: (-bm25_scores[idx], chunks[idx]["page"], idx),
+        )
+        dense_order = sorted(
+            (idx for idx, s in enumerate(dense_scores) if s > 0.0),
+            key=lambda idx: (-dense_scores[idx], chunks[idx]["page"], idx),
+        )
+        bm25_ranks = {idx: pos for pos, idx in enumerate(bm25_order, start=1)}
+        dense_ranks = {idx: pos for pos, idx in enumerate(dense_order, start=1)}
+
+        fused: list[tuple[float, float, float, int]] = []
+        k = self._rrf_k
+        for idx in sorted(set(bm25_ranks) | set(dense_ranks)):
+            r_bm25 = bm25_ranks.get(idx)
+            r_dense = dense_ranks.get(idx)
+            rrf = (1.0 / (k + r_bm25) if r_bm25 is not None else 0.0) + (
+                1.0 / (k + r_dense) if r_dense is not None else 0.0
+            )
+            fused.append((rrf, bm25_scores[idx], dense_scores[idx], idx))
+
+        fused.sort(key=lambda item: (-item[0], -item[1], -item[2], chunks[item[3]]["page"], item[3]))
+
+        for rrf_score, b_score, d_score, idx in fused:
+            chunk = chunks[idx]
             page_1based = chunk["page"]
             page_0based = page_1based - 1
             if params.return_parent_pages and page_1based in pages_by_no:
@@ -507,13 +646,17 @@ class FinaRAGAdapter:
             else:
                 passage_text = str(chunk.get("text") or "")
             chunk_types = [str(chunk.get("type") or "content")]
+            signal = max(d_score, min(b_score, 1.0))
             passages.append(
                 FinaragPassageItem(
                     page_index_1based=page_1based,
                     page_index_0based=page_0based,
-                    distance=round(max(0.0, 1.0 - min(score, 1.0)), 4),
-                    relevance_score=round(min(1.0, score), 4),
-                    combined_score=round(score, 4),
+                    distance=round(max(0.0, 1.0 - min(signal, 1.0)), 4),
+                    relevance_score=round(min(1.0, signal), 4),
+                    combined_score=round(rrf_score, 6),
+                    bm25_rank=bm25_ranks.get(idx),
+                    dense_rank=dense_ranks.get(idx),
+                    rrf_score=round(rrf_score, 6),
                     text=passage_text,
                     chunk_types=chunk_types,
                     citation_uri=f"finarag://{sha1}#page={page_1based}",
@@ -526,12 +669,9 @@ class FinaRAGAdapter:
             company_name=canon_name,
             pdf_sha1=sha1,
             currency=currency,
-            retrieval_mode="bm25",
+            retrieval_mode="hybrid_rrf",
             passages=passages,
-            notices=(
-                [f"{params.retrieval_mode} retrieval is unavailable. Used local BM25."]
-                if params.retrieval_mode != "bm25" else []
-            ),
+            notices=[],
         )
 
     @staticmethod

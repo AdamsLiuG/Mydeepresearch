@@ -6,14 +6,24 @@
   >
     <div class="report-block-head">
       <h3>最终报告</h3>
-      <button
-        v-if="requestId && canDrilldown"
-        type="button"
-        class="drilldown-toggle-btn"
-        @click="showDrilldown = !showDrilldown"
-      >
-        {{ showDrilldown ? "收起章节追问" : "章节深入追问 (HITL)" }}
-      </button>
+      <div class="report-head-actions">
+        <button
+          v-if="requestId && canDrilldown && annotationsAvailable"
+          type="button"
+          class="annotation-toggle-btn"
+          @click="showAnnotations = !showAnnotations"
+        >
+          {{ showAnnotations ? "收起批注与对比" : `批注与修订 (${annotations.length})` }}
+        </button>
+        <button
+          v-if="requestId && canDrilldown"
+          type="button"
+          class="drilldown-toggle-btn"
+          @click="showDrilldown = !showDrilldown"
+        >
+          {{ showDrilldown ? "收起章节追问" : "章节深入追问 (HITL)" }}
+        </button>
+      </div>
     </div>
 
     <SkillGovernanceBar
@@ -108,13 +118,113 @@
         v-html="drilldownAnswerHtml"
       ></div>
     </div>
+
+    <div v-if="showAnnotations && requestId && annotationsAvailable" class="annotations-panel">
+      <div class="annotations-form">
+        <select v-model="annotationSection" class="drilldown-select" aria-label="批注章节">
+          <option v-for="heading in sectionHeadings" :key="heading" :value="heading">
+            {{ heading }}
+          </option>
+          <option value="核心结论" v-if="!sectionHeadings.includes('核心结论')">核心结论</option>
+        </select>
+        <select v-model="annotationSeverity" class="drilldown-select" aria-label="批注级别">
+          <option value="info">补充建议</option>
+          <option value="concern">需要复核</option>
+          <option value="disputed">存在争议</option>
+        </select>
+        <input
+          v-model="annotationComment"
+          type="text"
+          class="drilldown-input"
+          placeholder="输入对当前章节或声明的审阅批注..."
+          @keyup.enter="submitAnnotation"
+        />
+        <button
+          type="button"
+          class="drilldown-submit-btn"
+          :disabled="annotationBusy || !annotationComment.trim()"
+          @click="submitAnnotation"
+        >
+          {{ annotationBusy ? "提交中..." : "添加批注" }}
+        </button>
+      </div>
+      <p v-if="annotationError" class="drilldown-error">{{ annotationError }}</p>
+
+      <ul v-if="annotations.length" class="annotation-list">
+        <li v-for="item in annotations" :key="item.annotation_id" class="annotation-item">
+          <div class="annotation-meta">
+            <span class="annotation-badge">[{{ item.severity }}]</span>
+            <strong>{{ item.section_id || "全文" }}</strong>
+            <span class="annotation-status">· {{ item.status }}</span>
+            <button
+              type="button"
+              class="reverify-btn"
+              :disabled="annotationBusy"
+              @click="emit('trigger-reverify', { annotation_id: item.annotation_id, section_id: item.section_id || undefined, claim_id: item.claim_id || undefined, note: item.comment })"
+            >
+              定向复核
+            </button>
+          </div>
+          <p class="annotation-text">{{ item.comment }}</p>
+        </li>
+      </ul>
+
+      <div v-if="revisions.length" class="revision-diff-box">
+        <div class="revision-controls">
+          <label>基准版本：
+            <select v-model.number="baseRevisionId" class="drilldown-select" aria-label="基准修订">
+              <option v-for="rev in revisions" :key="rev.revision_id" :value="rev.revision_id">
+                {{ summarizeRevisionLabel(rev) }}
+              </option>
+            </select>
+          </label>
+          <label>目标版本：
+            <select v-model.number="targetRevisionId" class="drilldown-select" aria-label="目标修订">
+              <option v-for="rev in revisions" :key="rev.revision_id" :value="rev.revision_id">
+                {{ summarizeRevisionLabel(rev) }}
+              </option>
+            </select>
+          </label>
+          <button
+            type="button"
+            class="drilldown-toggle-btn"
+            :disabled="annotationBusy || !baseRevisionId || !targetRevisionId"
+            @click="emit('compare-revisions', { baseRevisionId, targetRevisionId })"
+          >
+            对比修订 Diff
+          </button>
+        </div>
+        <div v-if="revisionDiff" class="diff-preview">
+          <p class="diff-summary">
+            变更章节：{{ revisionDiff.changed_sections.join("、") || "无" }}（+{{ revisionDiff.added_count }} / -{{ revisionDiff.removed_count }}）
+          </p>
+          <pre v-for="(line, idx) in revisionDiff.removed_lines" :key="`rm-${idx}`" class="diff-line diff-removed">- {{ line }}</pre>
+          <pre v-for="(line, idx) in revisionDiff.added_lines" :key="`add-${idx}`" class="diff-line diff-added">+ {{ line }}</pre>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script lang="ts" setup>
 import { computed, ref, watch, watchPostEffect } from "vue";
-import type { ReportWorkbenchPayload, SkillsCatalogResponse } from "../types/research";
-import { enhanceReportCitations, enhanceReportTables, getChartSeries, sanitizeChartSpec } from "../utils/workbench";
+import type {
+  AnnotationSeverity,
+  ReportAnnotation,
+  ReportAnnotationCreatePayload,
+  ReportRevisionSnapshot,
+  ReportWorkbenchPayload,
+  ReverifyRequestPayload,
+  RevisionDiffResponse,
+  SkillsCatalogResponse
+} from "../types/research";
+import {
+  enhanceReportCitations,
+  enhanceReportTables,
+  getChartSeries,
+  sanitizeChartSpec,
+  summarizeRevisionLabel
+} from "../utils/workbench";
 import SkillGovernanceBar from "./SkillGovernanceBar.vue";
 
 const props = withDefaults(
@@ -128,12 +238,24 @@ const props = withDefaults(
     drilldownError?: string;
     workbench?: ReportWorkbenchPayload | null;
     catalog?: SkillsCatalogResponse | null;
+    annotations?: ReportAnnotation[];
+    revisions?: ReportRevisionSnapshot[];
+    revisionDiff?: RevisionDiffResponse | null;
+    annotationBusy?: boolean;
+    annotationError?: string;
+    annotationsAvailable?: boolean;
   }>(),
   {
     drilldownLoading: false,
     drilldownAnswerHtml: "",
     drilldownError: "",
-    workbench: null
+    workbench: null,
+    annotations: () => [],
+    revisions: () => [],
+    revisionDiff: null,
+    annotationBusy: false,
+    annotationError: "",
+    annotationsAvailable: false
   }
 );
 
@@ -141,6 +263,9 @@ const emit = defineEmits<{
   drilldown: [payload: { sectionTitle: string; question: string }];
   "select-citation": [sourceId: string];
   "inspect-conflicts": [];
+  "create-annotation": [payload: ReportAnnotationCreatePayload];
+  "trigger-reverify": [payload: ReverifyRequestPayload];
+  "compare-revisions": [payload: { baseRevisionId: number; targetRevisionId: number }];
 }>();
 
 const reportBody = ref<HTMLElement | null>(null);
@@ -226,6 +351,45 @@ function submitDrilldown() {
     sectionTitle: selectedSection.value || "核心结论",
     question
   });
+}
+
+const showAnnotations = ref(false);
+const annotationSection = ref(sectionHeadings.value[0] || "核心结论");
+const annotationSeverity = ref<AnnotationSeverity>("concern");
+const annotationComment = ref("");
+const baseRevisionId = ref<number>(1);
+const targetRevisionId = ref<number>(1);
+
+watch(sectionHeadings, (nextHeadings) => {
+  if (nextHeadings.length && !nextHeadings.includes(annotationSection.value)) {
+    annotationSection.value = nextHeadings[0];
+  }
+});
+
+watch(
+  () => props.revisions,
+  (nextRevisions) => {
+    if (!nextRevisions.length) {
+      return;
+    }
+    baseRevisionId.value = nextRevisions[0].revision_id;
+    targetRevisionId.value = nextRevisions[nextRevisions.length - 1].revision_id;
+  },
+  { immediate: true }
+);
+
+function submitAnnotation() {
+  const comment = annotationComment.value.trim();
+  if (!comment || props.annotationBusy) {
+    return;
+  }
+  emit("create-annotation", {
+    section_id: annotationSection.value || "核心结论",
+    severity: annotationSeverity.value,
+    action_requested: "comment",
+    comment
+  });
+  annotationComment.value = "";
 }
 </script>
 
@@ -377,5 +541,104 @@ function submitDrilldown() {
 
 .markdown-block :deep(.citation-chip:hover) {
   background: rgba(219, 234, 254, 1);
+}
+
+.report-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.annotation-toggle-btn,
+.reverify-btn {
+  border: 1px solid rgba(15, 118, 110, 0.32);
+  background: rgba(20, 184, 166, 0.08);
+  color: #0f766e;
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.annotations-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(240, 253, 250, 0.72);
+  border: 1px solid rgba(13, 148, 136, 0.24);
+}
+
+.annotations-form,
+.revision-controls {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.annotation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.annotation-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.annotation-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: #334155;
+}
+
+.annotation-text {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: #0f172a;
+}
+
+.diff-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.diff-summary {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.diff-line {
+  margin: 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-added {
+  color: #166534;
+  background: rgba(220, 252, 231, 0.65);
+}
+
+.diff-removed {
+  color: #991b1b;
+  background: rgba(254, 226, 226, 0.65);
 }
 </style>

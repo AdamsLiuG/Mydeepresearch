@@ -1365,6 +1365,13 @@ class Configuration(BaseModel):
     v4_otel_otlp_endpoint: str = Field(default="", repr=False, exclude=True)
     v4_otel_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
     v4_prometheus_metrics_enabled: bool = False
+    v4_finarag_hybrid_rrf_enabled: bool = False
+    v4_finarag_rrf_k: int = Field(default=60, ge=1, le=200)
+    v4_sandbox_sidecar_enabled: bool = False
+    v4_sandbox_sidecar_url: str = ""
+    v4_sandbox_sidecar_auth_secret: str = Field(default="", repr=False, exclude=True)
+    v4_sandbox_sidecar_timeout_seconds: float = Field(default=12.0, gt=1.0, le=30.0)
+    v4_workbench_annotations_enabled: bool = False
 
     def web_extraction_enabled_for(self, tenant_id: str) -> bool:
         return self.v4_web_extractor_enabled and tenant_id in self.v4_web_extractor_tenants
@@ -1376,6 +1383,7 @@ class Configuration(BaseModel):
             "v4_web_extractor_tenants", "v4_web_l2_origin_rules",
             "v4_web_reader_url", "v4_web_reader_token",
             "v4_knowledge_graph_tenants", "v4_knowledge_graph_dir",
+            "v4_sandbox_sidecar_auth_secret",
         ):
             values[key] = deepcopy(getattr(self, key))
         return values
@@ -2621,10 +2629,13 @@ class Configuration(BaseModel):
 
     def resolved_sandbox_effective_enabled(self) -> bool:
         """Require provisioning and explicit activation from the request's SkillPack."""
+        allowed_backends = {"auto", "docker", "pyodide"}
+        if self.v4_sandbox_sidecar_enabled:
+            allowed_backends.add("sidecar")
         return (
             self.sandbox_enabled
             and self.active_code_sandbox_enabled is True
-            and self.sandbox_backend.strip().lower() in {"auto", "docker", "pyodide"}
+            and self.sandbox_backend.strip().lower() in allowed_backends
         )
 
     def resolved_multimodal_vlm_base_url(self) -> str | None:

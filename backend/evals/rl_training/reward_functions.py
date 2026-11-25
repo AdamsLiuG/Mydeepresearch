@@ -140,6 +140,34 @@ def verifiable_policy_reward_fn(completions: list[Any], **kwargs: Any) -> list[f
     ]
 
 
+def multiturn_trajectory_reward_fn(completions: list[Any], **kwargs: Any) -> list[float]:
+    """Multi-turn RLVR reward incorporating bounded discounted turn credit when provided."""
+    base_scores = verifiable_policy_reward_fn(completions, **kwargs)
+    turns_col = kwargs.get("turns")
+    gamma = max(0.01, min(1.0, _finite(kwargs.get("discount_gamma"), 0.9)))
+    adjusted: list[float] = []
+    for index, base in enumerate(base_scores):
+        if base <= -0.35 or not isinstance(turns_col, (list, tuple)) or index >= len(turns_col):
+            adjusted.append(base)
+            continue
+        row_turns = turns_col[index]
+        if not isinstance(row_turns, list) or not row_turns:
+            adjusted.append(base)
+            continue
+        weighted_returns: list[float] = []
+        for offset, turn in enumerate(reversed(row_turns)):
+            if not isinstance(turn, dict):
+                continue
+            ret = _finite(turn.get("discounted_return"), 0.0)
+            weighted_returns.append(ret * (gamma ** offset))
+        if not weighted_returns:
+            adjusted.append(base)
+            continue
+        turn_bonus = 0.10 * max(-1.0, min(1.0, sum(weighted_returns) / len(weighted_returns)))
+        adjusted.append(round(max(-1.0, min(1.0, base + turn_bonus)), 6))
+    return adjusted
+
+
 def compute_score(
     data_source: str,
     solution_str: str,

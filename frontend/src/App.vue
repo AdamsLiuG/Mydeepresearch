@@ -630,9 +630,18 @@
           :drilldown-error="drilldownError"
           :workbench="effectiveWorkbench"
           :catalog="skillsCatalog"
+          :annotations="reportAnnotations"
+          :revisions="reportRevisions"
+          :revision-diff="revisionDiff"
+          :annotation-busy="annotationBusy"
+          :annotation-error="annotationError"
+          :annotations-available="annotationsAvailable"
           @drilldown="handleSectionDrilldown"
           @select-citation="handleSelectCitation"
           @inspect-conflicts="handleInspectConflicts"
+          @create-annotation="handleCreateAnnotation"
+          @trigger-reverify="handleTargetedReverify"
+          @compare-revisions="handleCompareRevisions"
         />
 
         <EvidenceDrawer
@@ -712,17 +721,22 @@ import {
 } from "./composables/useResilientStream";
 import {
   clarifyResearch,
+  createReportAnnotation,
   createResearchPlan,
   drilldownReportSection,
   fetchPersistedRequest,
   fetchPersistedRequests,
   fetchMetricsSnapshot,
+  fetchReportAnnotations,
+  fetchReportRevisions,
+  fetchRevisionDiff,
   fetchSkillsCatalog,
   isStreamEnd,
   resumeResearchStream,
   runResearchStream,
   sendWorkflowSignal,
   StreamHttpError,
+  triggerTargetedReverify,
   updateResearchPlan,
   type ClarifyResponse,
   type EditablePlanResponse,
@@ -732,8 +746,13 @@ import {
 import type {
   ClaimItem,
   RecentResearchView,
+  ReportAnnotation,
+  ReportAnnotationCreatePayload,
+  ReportRevisionSnapshot,
   ReportWorkbenchPayload,
+  ReverifyRequestPayload,
   ReviewIssue,
+  RevisionDiffResponse,
   SkillsCatalogResponse,
   SourceItem,
   TodoTaskView,
@@ -795,6 +814,13 @@ const drilldownLoading = ref(false);
 const drilldownAnswerMarkdown = ref("");
 const drilldownError = ref("");
 const reportWorkbench = ref<ReportWorkbenchPayload | null>(null);
+const reportAnnotations = ref<ReportAnnotation[]>([]);
+const reportRevisions = ref<ReportRevisionSnapshot[]>([]);
+const revisionDiff = ref<RevisionDiffResponse | null>(null);
+const annotationStateVersion = ref<number | null>(null);
+const annotationBusy = ref(false);
+const annotationError = ref("");
+const annotationsAvailable = ref(false);
 const selectedCitationId = ref<string | null>(null);
 const drawerVisible = ref(false);
 const pendingRecoverySession = ref<PersistedStreamSession | null>(null);
@@ -1020,6 +1046,9 @@ async function hydrateLiveSnapshot(requestId: string, signal: AbortSignal) {
   if (report) reportMarkdown.value = report;
   if (payload.request_metrics) latestRequestMetrics.value = ensureRecord(payload.request_metrics);
   reportWorkbench.value = normalizeReportWorkbench(payload);
+  if (report) {
+    void loadAnnotationsAndRevisions(requestId);
+  }
   const runner = getString(payload.runner_backend, getString(payload.workflow_runner, ""));
   if (runner && (!streamRunner.value || runner !== "inline")) streamRunner.value = runner;
   applySnapshotStatus(getString(payload.status, ""), getString(payload.phase, ""), getString(payload.error, ""));
@@ -1692,6 +1721,13 @@ function resetWorkflowState() {
   drilldownAnswerMarkdown.value = "";
   drilldownError.value = "";
   reportWorkbench.value = null;
+  reportAnnotations.value = [];
+  reportRevisions.value = [];
+  revisionDiff.value = null;
+  annotationStateVersion.value = null;
+  annotationBusy.value = false;
+  annotationError.value = "";
+  annotationsAvailable.value = false;
   selectedCitationId.value = null;
   drawerVisible.value = false;
   summaryHighlight.value = false;
@@ -1853,6 +1889,7 @@ async function viewHistoryResearch(item: RecentResearchView) {
       : [`已载入历史研究：${detailTopic}`];
 
     updatePersistedHistoryDetail(item.requestId, payload, detailMetrics);
+    void loadAnnotationsAndRevisions(item.requestId);
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
       return;
@@ -2534,6 +2571,9 @@ function handleResearchEvent(event: ResearchStreamEvent) {
     reportWorkbench.value = normalizeReportWorkbench(event);
     pulse(reportHighlight);
     progressLogs.value.push("最终报告已生成");
+    if (currentDrilldownRequestId.value) {
+      void loadAnnotationsAndRevisions(currentDrilldownRequestId.value);
+    }
     return;
   }
 
@@ -2689,6 +2729,118 @@ async function handleSectionDrilldown(payload: {
     drilldownError.value = err instanceof Error ? err.message : "章节追问失败";
   } finally {
     drilldownLoading.value = false;
+  }
+}
+
+async function loadAnnotationsAndRevisions(requestId: string) {
+  try {
+    const [annRes, revRes] = await Promise.all([
+      fetchReportAnnotations(requestId),
+      fetchReportRevisions(requestId)
+    ]);
+    if (currentDrilldownRequestId.value !== requestId) {
+      return;
+    }
+    annotationsAvailable.value = true;
+    reportAnnotations.value = annRes.annotations || [];
+    reportRevisions.value = revRes.revisions || [];
+    annotationStateVersion.value = annRes.state_version ?? revRes.state_version ?? null;
+    annotationError.value = "";
+  } catch (err) {
+    if (err instanceof StreamHttpError && err.status === 404) {
+      annotationsAvailable.value = false;
+      return;
+    }
+    console.warn("加载批注与修订历史失败", err);
+  }
+}
+
+async function handleCreateAnnotation(payload: ReportAnnotationCreatePayload) {
+  const targetRequestId = currentDrilldownRequestId.value;
+  if (!targetRequestId) {
+    annotationError.value = "未找到可用于提交批注的 request_id";
+    return;
+  }
+  annotationBusy.value = true;
+  annotationError.value = "";
+  try {
+    const res = await createReportAnnotation(targetRequestId, {
+      ...payload,
+      expected_state_version: annotationStateVersion.value ?? undefined
+    });
+    annotationStateVersion.value = res.state_version;
+    reportAnnotations.value = [...reportAnnotations.value, res.annotation];
+    const revRes = await fetchReportRevisions(targetRequestId);
+    reportRevisions.value = revRes.revisions || [];
+  } catch (err) {
+    if (err instanceof StreamHttpError && err.status === 409) {
+      annotationError.value = "报告状态已更新，已重新拉取最新批注";
+      await loadAnnotationsAndRevisions(targetRequestId);
+    } else {
+      annotationError.value = err instanceof Error ? err.message : "提交报告批注失败";
+    }
+  } finally {
+    annotationBusy.value = false;
+  }
+}
+
+async function handleTargetedReverify(payload: ReverifyRequestPayload) {
+  const targetRequestId = currentDrilldownRequestId.value;
+  if (!targetRequestId) {
+    annotationError.value = "未找到可用于定向复核的 request_id";
+    return;
+  }
+  annotationBusy.value = true;
+  annotationError.value = "";
+  try {
+    const res = await triggerTargetedReverify(targetRequestId, {
+      ...payload,
+      expected_state_version: annotationStateVersion.value ?? undefined
+    });
+    annotationStateVersion.value = res.state_version;
+    if (res.report_markdown) {
+      reportMarkdown.value = res.report_markdown;
+    }
+    await loadAnnotationsAndRevisions(targetRequestId);
+    if (res.revision.parent_revision_id) {
+      revisionDiff.value = await fetchRevisionDiff(
+        targetRequestId,
+        res.revision.parent_revision_id,
+        res.revision.revision_id
+      );
+    }
+  } catch (err) {
+    if (err instanceof StreamHttpError && err.status === 409) {
+      annotationError.value = "报告状态冲突，请确认最新修订后重试";
+      await loadAnnotationsAndRevisions(targetRequestId);
+    } else {
+      annotationError.value = err instanceof Error ? err.message : "定向复核失败";
+    }
+  } finally {
+    annotationBusy.value = false;
+  }
+}
+
+async function handleCompareRevisions(payload: {
+  baseRevisionId: number;
+  targetRevisionId: number;
+}) {
+  const targetRequestId = currentDrilldownRequestId.value;
+  if (!targetRequestId) {
+    return;
+  }
+  annotationBusy.value = true;
+  annotationError.value = "";
+  try {
+    revisionDiff.value = await fetchRevisionDiff(
+      targetRequestId,
+      payload.baseRevisionId,
+      payload.targetRevisionId
+    );
+  } catch (err) {
+    annotationError.value = err instanceof Error ? err.message : "获取修订 Diff 失败";
+  } finally {
+    annotationBusy.value = false;
   }
 }
 
