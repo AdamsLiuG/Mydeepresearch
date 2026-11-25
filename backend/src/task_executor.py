@@ -1826,6 +1826,7 @@ class TaskExecutorMixin:
         if observer:
             observer.update_task_status_counts(completed=1)
 
+        self._persist_request_state(state, phase="task_execution", status="in_progress")
         if emit_stream:
             for event in self._drain_tool_events(state, step=step):
                 yield event
@@ -1851,7 +1852,6 @@ class TaskExecutorMixin:
             }
         else:
             self._drain_tool_events(state)
-        self._persist_request_state(state, phase="task_execution", status="in_progress")
 
     def _execute_prompt_only_computations(
         self,

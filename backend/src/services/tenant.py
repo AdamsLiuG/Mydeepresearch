@@ -8,11 +8,45 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import ceil
 from threading import Lock
 from typing import Any
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+_ACQUIRE_REDIS = """
+local rpm_limit = tonumber(ARGV[1])
+local concurrent_limit = tonumber(ARGV[2])
+local lease = ARGV[3]
+local lease_ms = tonumber(ARGV[4])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+if concurrent_limit > 0 then
+    redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+    if redis.call('ZSCORE', KEYS[2], lease) then
+        return {1, 0}
+    end
+    if redis.call('ZCARD', KEYS[2]) >= concurrent_limit then
+        return {0, 5}
+    end
+end
+if rpm_limit > 0 then
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - 60000)
+    if redis.call('ZCARD', KEYS[1]) >= rpm_limit then
+        local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+        return {2, math.max(1, math.ceil((60000 - now + tonumber(oldest[2])) / 1000))}
+    end
+    redis.call('ZADD', KEYS[1], now, lease)
+    redis.call('PEXPIRE', KEYS[1], 60000)
+end
+if concurrent_limit > 0 then
+    redis.call('ZADD', KEYS[2], now + lease_ms, lease)
+    redis.call('PEXPIRE', KEYS[2], lease_ms)
+end
+return {1, 0}
+"""
+_LEASE_MILLISECONDS = 3_600_000
 
 
 @dataclass(frozen=True)
@@ -52,7 +86,7 @@ def authenticate_tenant(api_key: str | None, config: Any) -> TenantContext:
             candidate = str(configured_key or "").strip()
             if not candidate:
                 continue
-            if hmac.compare_digest(provided, candidate):
+            if hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")):
                 matched_tenant = str(tenant_id or default_tenant).strip() or default_tenant
         if matched_tenant is not None:
             return TenantContext(tenant_id=matched_tenant, authenticated=True)
@@ -82,7 +116,13 @@ class TenantRateLimiter:
         self._key_prefix = str(key_prefix or "deepresearch:ratelimit").strip()
         self._lock = Lock()
         self._timestamps: dict[str, deque[float]] = defaultdict(deque)
-        self._inflight: dict[str, int] = defaultdict(int)
+        self._inflight: dict[str, dict[str, bool]] = defaultdict(dict)
+        self._anonymous_leases: dict[str, deque[str]] = defaultdict(deque)
+
+    def _redis_keys(self, tenant_id: str) -> tuple[str, str]:
+        tenant_key = tenant_id.encode("utf-8").hex()
+        tenant_prefix = f"{self._key_prefix}:{{{tenant_key}}}"
+        return f"{tenant_prefix}:rpm", f"{tenant_prefix}:leases"
 
     def _try_acquire_redis(
         self,
@@ -90,39 +130,15 @@ class TenantRateLimiter:
         *,
         effective_rpm: int,
         effective_conc: int,
+        lease_id: str,
     ) -> tuple[bool, int, str]:
-        conc_key = f"{self._key_prefix}:conc:{tenant_id}"
-        rpm_key = f"{self._key_prefix}:rpm:{tenant_id}"
-        if effective_conc > 0:
-            active = int(self._redis.incr(conc_key))
-            if hasattr(self._redis, "expire"):
-                self._redis.expire(conc_key, 3600)
-            if active > effective_conc:
-                self._redis.decr(conc_key)
-                return False, 5, "max_concurrent_requests"
-
-        if effective_rpm > 0:
-            now_ms = time.time()
-            cutoff = now_ms - 60.0
-            self._redis.zremrangebyscore(rpm_key, "-inf", cutoff)
-            count = int(self._redis.zcard(rpm_key))
-            if count >= effective_rpm:
-                if effective_conc > 0:
-                    self._redis.decr(conc_key)
-                retry_after = 5
-                if hasattr(self._redis, "zrange"):
-                    oldest = self._redis.zrange(rpm_key, 0, 0, withscores=True)
-                    if oldest and isinstance(oldest[0], (tuple, list)) and len(oldest[0]) >= 2:
-                        retry_after = max(1, int(60.0 - (now_ms - float(oldest[0][1]))) + 1)
-                return False, retry_after, "rate_limit_rpm"
-            member = f"{now_ms:.6f}:{uuid4().hex[:8]}"
-            self._redis.zadd(rpm_key, {member: now_ms})
-            if hasattr(self._redis, "expire"):
-                self._redis.expire(rpm_key, 120)
-        elif effective_conc <= 0:
+        code, retry_after = self._redis.eval(
+            _ACQUIRE_REDIS, 2, *self._redis_keys(tenant_id),
+            effective_rpm, effective_conc, lease_id, _LEASE_MILLISECONDS,
+        )
+        if code == 1:
             return True, 0, ""
-
-        return True, 0, ""
+        return False, int(retry_after), "max_concurrent_requests" if code == 0 else "rate_limit_rpm"
 
     def try_acquire(
         self,
@@ -130,52 +146,72 @@ class TenantRateLimiter:
         *,
         rpm_limit: int | None = None,
         max_concurrent: int | None = None,
+        lease_id: str | None = None,
     ) -> tuple[bool, int, str]:
         """Attempt to reserve a rate/concurrency slot; returns (allowed, retry_after_sec, reason)."""
 
         effective_rpm = self._rpm_limit if rpm_limit is None else max(0, int(rpm_limit or 0))
         effective_conc = self._max_concurrent if max_concurrent is None else max(0, int(max_concurrent or 0))
-        if self._redis is not None:
-            try:
-                return self._try_acquire_redis(
-                    tenant_id,
-                    effective_rpm=effective_rpm,
-                    effective_conc=effective_conc,
-                )
-            except Exception as exc:
-                logger.warning("Redis rate limiter degraded to in-process lock: %s", exc)
+        if effective_rpm == 0 and effective_conc == 0:
+            return True, 0, ""
 
-        now = time.monotonic()
+        lease = lease_id if lease_id is not None else uuid4().hex
         with self._lock:
-            if effective_conc > 0 and self._inflight[tenant_id] >= effective_conc:
+            active = self._inflight.get(tenant_id, {})
+            if lease in active:
+                return True, 0, ""
+            if effective_conc > 0 and len(active) >= effective_conc:
                 return False, 5, "max_concurrent_requests"
 
+            distributed = False
+            if self._redis is not None:
+                local_count = sum(1 for shared in active.values() if not shared)
+                try:
+                    result = self._try_acquire_redis(
+                        tenant_id,
+                        effective_rpm=effective_rpm,
+                        effective_conc=max(0, effective_conc - local_count),
+                        lease_id=lease,
+                    )
+                    if not result[0]:
+                        return result
+                    distributed = True
+                except Exception as exc:
+                    logger.warning("Redis rate limiter degraded to in-process lock (%s)", type(exc).__name__)
+
             if effective_rpm > 0:
+                now = time.monotonic()
                 window = self._timestamps[tenant_id]
-                cutoff = now - 60.0
-                while window and window[0] < cutoff:
+                while window and window[0] <= now - 60.0:
                     window.popleft()
-                if len(window) >= effective_rpm:
-                    retry_after = max(1, int(60.0 - (now - window[0])) + 1)
+                if not distributed and len(window) >= effective_rpm:
+                    retry_after = max(1, ceil(60.0 - (now - window[0])))
                     return False, retry_after, "rate_limit_rpm"
                 window.append(now)
 
-            self._inflight[tenant_id] += 1
+            if effective_conc > 0:
+                self._inflight[tenant_id][lease] = distributed
+                if lease_id is None:
+                    self._anonymous_leases[tenant_id].append(lease)
             return True, 0, ""
 
-    def release(self, tenant_id: str) -> None:
-        if self._redis is not None and self._max_concurrent > 0:
-            conc_key = f"{self._key_prefix}:conc:{tenant_id}"
-            try:
-                remaining = int(self._redis.decr(conc_key))
-                if remaining < 0 and hasattr(self._redis, "delete"):
-                    self._redis.delete(conc_key)
-                return
-            except Exception as exc:
-                logger.warning("Redis rate limiter release failed: %s", exc)
+    def release(self, tenant_id: str, *, lease_id: str | None = None) -> None:
         with self._lock:
-            current = self._inflight.get(tenant_id, 0)
-            if current <= 1:
-                self._inflight.pop(tenant_id, None)
-            else:
-                self._inflight[tenant_id] = current - 1
+            if lease_id is None:
+                anonymous = self._anonymous_leases.get(tenant_id)
+                if not anonymous:
+                    return
+                lease_id = anonymous.popleft()
+                if not anonymous:
+                    self._anonymous_leases.pop(tenant_id)
+            active = self._inflight.get(tenant_id)
+            if active is None:
+                return
+            distributed = active.pop(lease_id, False)
+            if not active:
+                self._inflight.pop(tenant_id)
+        if distributed:
+            try:
+                self._redis.zrem(self._redis_keys(tenant_id)[1], lease_id)
+            except Exception as exc:
+                logger.warning("Redis rate limiter release failed (%s)", type(exc).__name__)

@@ -23,6 +23,8 @@
           </div>
         </header>
 
+        <SkillGovernanceBar :catalog="skillsCatalog" :governance="reportWorkbench?.skill_governance" />
+
         <form class="form" @submit.prevent="handleSubmit">
           <label class="field">
             <span>研究主题</span>
@@ -162,6 +164,7 @@
               v-if="loading"
               type="button"
               class="secondary-btn"
+              :disabled="cancelling"
               @click="cancelResearch"
             >
               取消研究
@@ -235,8 +238,13 @@
           </div>
         </div>
 
+        <SkillGovernanceBar :catalog="skillsCatalog" :governance="reportWorkbench?.skill_governance" />
+
         <div class="sidebar-actions">
-          <button class="new-research-btn" @click="startNewResearch">
+          <button v-if="loading" class="secondary-btn" :disabled="cancelling" @click="cancelResearch">
+            {{ cancelling ? "正在取消…" : "取消研究" }}
+          </button>
+          <button v-else class="new-research-btn" @click="startNewResearch">
             <svg viewBox="0 0 24 24" width="18" height="18">
               <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
             </svg>
@@ -286,7 +294,7 @@
           <div class="status-main">
             <div class="status-chip" :class="{ active: loading }">
               <span class="dot"></span>
-              {{ loading ? "研究进行中" : "研究流程完成" }}
+              {{ reconnecting ? "正在恢复连接…" : loading ? "研究进行中" : statusLabel }}
             </div>
             <span class="status-meta">
               任务进度：{{ completedTasks }} / {{ totalTasks || todoTasks.length || 1 }}
@@ -511,13 +519,15 @@
                     class="source-item"
                   >
                     <a
+                      v-if="safeEvidenceUrl(item.url)"
                       class="source-link"
-                      :href="item.url || '#'"
+                      :href="safeEvidenceUrl(item.url)"
                       target="_blank"
                       rel="noopener noreferrer"
                     >
                       {{ item.title || item.url || `来源 ${index + 1}` }}
                     </a>
+                    <span v-else>{{ item.title || `来源 ${index + 1}` }}</span>
                     <div v-if="item.snippet || item.raw" class="source-tooltip">
                       <p v-if="item.snippet">{{ item.snippet }}</p>
                       <p v-if="item.raw" class="muted-text">{{ item.raw }}</p>
@@ -618,6 +628,7 @@
           :drilldown-answer-html="drilldownAnswerHtml"
           :drilldown-error="drilldownError"
           :workbench="effectiveWorkbench"
+          :catalog="skillsCatalog"
           @drilldown="handleSectionDrilldown"
           @select-citation="handleSelectCitation"
           @inspect-conflicts="handleInspectConflicts"
@@ -628,6 +639,7 @@
           :selected-citation-id="selectedCitationId"
           :workbench="effectiveWorkbench"
           @close="closeEvidenceDrawer"
+          @select-citation="handleSelectCitation"
         />
         </template>
 
@@ -689,6 +701,7 @@ import EvidenceDrawer from "./components/EvidenceDrawer.vue";
 import HistorySidebar from "./components/HistorySidebar.vue";
 import PlanReviewPanel from "./components/PlanReviewPanel.vue";
 import ReportViewer from "./components/ReportViewer.vue";
+import SkillGovernanceBar from "./components/SkillGovernanceBar.vue";
 import {
   clearActiveStreamSession,
   loadActiveStreamSession,
@@ -703,8 +716,12 @@ import {
   fetchPersistedRequest,
   fetchPersistedRequests,
   fetchMetricsSnapshot,
+  fetchSkillsCatalog,
+  isStreamEnd,
   resumeResearchStream,
   runResearchStream,
+  sendWorkflowSignal,
+  StreamHttpError,
   updateResearchPlan,
   type ClarifyResponse,
   type EditablePlanResponse,
@@ -713,17 +730,16 @@ import {
 } from "./services/api";
 import type {
   ClaimItem,
-  ClaimVerificationSummary,
-  EvidenceConflictCluster,
   RecentResearchView,
   ReportWorkbenchPayload,
   ReviewIssue,
+  SkillsCatalogResponse,
   SourceItem,
   TodoTaskView,
   ToolCallLog
 } from "./types/research";
 import { renderMarkdownBlock } from "./utils/markdown";
-import { buildFallbackWorkbenchPayload } from "./utils/workbench";
+import { buildFallbackWorkbenchPayload, normalizeReportWorkbench, safeEvidenceUrl } from "./utils/workbench";
 
 interface DemoScenario {
   id: string;
@@ -761,6 +777,10 @@ const latestAggregateMetrics = ref<UnknownRecord | null>(null);
 const selectedHistoryRequestId = ref<string | null>(null);
 const activeRequestId = ref<string | null>(null);
 const lastEventId = ref<string | null>(null);
+const streamRunner = ref<string>();
+const cancelling = ref(false);
+const statusLabel = ref("研究流程完成");
+const skillsCatalog = ref<SkillsCatalogResponse | null>(null);
 const persistedHistory = ref<RecentResearchView[]>([]);
 const historyDetailLoadingRequestId = ref<string | null>(null);
 const clarificationData = ref<ClarifyResponse | null>(null);
@@ -771,12 +791,10 @@ const drilldownLoading = ref(false);
 const drilldownAnswerMarkdown = ref("");
 const drilldownError = ref("");
 const reportWorkbench = ref<ReportWorkbenchPayload | null>(null);
-const evidenceConflicts = ref<EvidenceConflictCluster[]>([]);
-const claimVerificationSummary = ref<ClaimVerificationSummary>({});
 const selectedCitationId = ref<string | null>(null);
 const drawerVisible = ref(false);
 const pendingRecoverySession = ref<PersistedStreamSession | null>(null);
-const { followWithResume } = useResilientStream();
+const { followWithResume, reconnecting } = useResilientStream();
 
 const summaryHighlight = ref(false);
 const sourcesHighlight = ref(false);
@@ -883,18 +901,23 @@ const reportMarkdownHtml = computed(() =>
   renderMarkdownBlock(reportMarkdown.value || "暂无生成的报告")
 );
 const effectiveWorkbench = computed<ReportWorkbenchPayload | null>(() => {
-  if (reportWorkbench.value) {
-    return reportWorkbench.value;
-  }
-  if (!reportMarkdown.value && !todoTasks.value.length && !evidenceConflicts.value.length) {
+  const workbench = reportWorkbench.value;
+  if (!workbench && !reportMarkdown.value && !todoTasks.value.length) {
     return null;
   }
-  return buildFallbackWorkbenchPayload(
+  const fallback = buildFallbackWorkbenchPayload(
     todoTasks.value,
     reportMarkdown.value,
-    evidenceConflicts.value,
-    claimVerificationSummary.value
+    workbench?.evidence_conflicts,
+    workbench?.claim_verification_summary,
+    workbench?.skill_governance
   );
+  return workbench ? {
+    ...fallback,
+    ...workbench,
+    citation_index: { ...fallback.citation_index, ...workbench.citation_index },
+    paragraph_bindings: workbench.paragraph_bindings.length ? workbench.paragraph_bindings : fallback.paragraph_bindings
+  } : fallback;
 });
 
 function handleSelectCitation(sourceId: string) {
@@ -924,27 +947,22 @@ async function resumeRecoveredSession() {
   resetWorkflowState();
   activeRequestId.value = session.requestId;
   lastEventId.value = session.lastEventId || null;
+  streamRunner.value = session.runner;
   if (session.topic) {
     form.topic = session.topic;
   }
   const controller = new AbortController();
   currentController = controller;
   try {
-    await followWithResume(
-      session.requestId,
-      session.topic,
-      handleResearchEvent,
-      {
-        signal: controller.signal,
-        lastEventId: session.lastEventId || undefined,
-        onEventId: (eventId) => {
-          lastEventId.value = eventId;
-        }
-      }
-    );
+    await hydrateLiveSnapshot(session.requestId, controller.signal).catch((err) => {
+      controller.signal.throwIfAborted();
+      console.warn("获取续流快照失败", err);
+    });
+    await followActiveRequest(session.requestId, session.topic, controller.signal);
   } catch (err) {
-    if (!(err instanceof DOMException && err.name === "AbortError")) {
+    if (!controller.signal.aborted) {
       error.value = err instanceof Error ? err.message : "断点续传失败";
+      restoreRecoveryAction(err);
     }
   } finally {
     loading.value = false;
@@ -954,6 +972,70 @@ async function resumeRecoveredSession() {
       currentController = null;
     }
   }
+}
+
+function restoreRecoveryAction(err: unknown) {
+  statusLabel.value = "连接已中断";
+  if (err instanceof StreamHttpError && [401, 403, 404, 410].includes(err.status)) {
+    clearActiveStreamSession();
+  }
+  pendingRecoverySession.value = loadActiveStreamSession();
+}
+
+async function hydrateLiveSnapshot(requestId: string, signal: AbortSignal) {
+  const payload = ensureRecord(await fetchPersistedRequest(requestId, { signal }));
+  signal.throwIfAborted();
+  if (activeRequestId.value !== requestId) return;
+  if (Array.isArray(payload.todo_items)) {
+    todoTasks.value = mapHistoryTasks(payload.todo_items);
+    if (!todoTasks.value.some((task) => task.id === activeTaskId.value)) {
+      activeTaskId.value = todoTasks.value[0]?.id ?? null;
+    }
+  }
+  const topic = getString(payload.topic, "");
+  if (topic) form.topic = topic;
+  const report = getString(payload.report_markdown, "");
+  if (report) reportMarkdown.value = report;
+  if (payload.request_metrics) latestRequestMetrics.value = ensureRecord(payload.request_metrics);
+  reportWorkbench.value = normalizeReportWorkbench(payload);
+  const runner = getString(payload.runner_backend, getString(payload.workflow_runner, ""));
+  if (runner && (!streamRunner.value || runner !== "inline")) streamRunner.value = runner;
+  applySnapshotStatus(getString(payload.status, ""), getString(payload.phase, ""), getString(payload.error, ""));
+}
+
+function applySnapshotStatus(status: string, phase: string, detail: string) {
+  if (phase === "awaiting_tool_approval" || status === "awaiting_tool_approval") {
+    statusLabel.value = "等待工具审批";
+  } else if (status === "approved_ready") {
+    statusLabel.value = "已批准，等待恢复";
+  } else if (status === "awaiting_approval" || status === "awaiting_plan_approval" || phase === "awaiting_approval") {
+    statusLabel.value = "等待计划审批";
+  } else if (status === "cancelled") {
+    statusLabel.value = "研究已取消";
+  } else if (["failed", "workflow_failed", "error", "rejected", "expired"].includes(status)) {
+    statusLabel.value = "研究已停止";
+    error.value = detail || statusLabel.value;
+  }
+}
+
+function followActiveRequest(requestId: string, topic: string, signal: AbortSignal) {
+  return followWithResume(requestId, topic, (event) => handleLiveEvent(event, signal), {
+    signal,
+    runner: streamRunner.value,
+    onStreamStart: ({ runner }) => { if (runner) streamRunner.value = runner; },
+    lastEventId: lastEventId.value || undefined,
+    onEventId: (eventId) => { lastEventId.value = eventId; }
+  });
+}
+
+async function handleLiveEvent(event: ResearchStreamEvent, signal: AbortSignal) {
+  if (event.type === "replay_gap" || event.type === "stream_closed") {
+    if (activeRequestId.value) await hydrateLiveSnapshot(activeRequestId.value, signal);
+    if (event.type === "replay_gap") lastEventId.value = null;
+    else if (event.status === "awaiting_tool_approval") statusLabel.value = "等待工具审批";
+    return;
+  }
+  handleResearchEvent(event);
 }
 
 function dismissRecoveredSession() {
@@ -1576,6 +1658,9 @@ function resetWorkflowState() {
   activeTaskId.value = null;
   activeRequestId.value = null;
   lastEventId.value = null;
+  streamRunner.value = undefined;
+  cancelling.value = false;
+  statusLabel.value = "研究流程完成";
   reportMarkdown.value = "";
   progressLogs.value = [];
   latestRequestMetrics.value = null;
@@ -1583,8 +1668,6 @@ function resetWorkflowState() {
   drilldownAnswerMarkdown.value = "";
   drilldownError.value = "";
   reportWorkbench.value = null;
-  evidenceConflicts.value = [];
-  claimVerificationSummary.value = {};
   selectedCitationId.value = null;
   drawerVisible.value = false;
   summaryHighlight.value = false;
@@ -1668,22 +1751,14 @@ async function resumePersistedResearch(item: RecentResearchView) {
   currentController = controller;
 
   try {
-    await resumeResearchStream(
-      item.requestId,
-      { search_api: item.searchApi || undefined },
-      handleResearchEvent,
-      {
-        signal: controller.signal,
-        onEventId: (eventId) => {
-          lastEventId.value = eventId;
-        }
-      }
-    );
+    await trackResearchStream(item.topic, controller.signal, (onEvent, options) =>
+      resumeResearchStream(item.requestId, { search_api: item.searchApi || undefined }, onEvent, options));
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
       progressLogs.value.push("已取消恢复执行");
     } else {
       error.value = err instanceof Error ? err.message : "恢复执行失败";
+      restoreRecoveryAction(err);
     }
   } finally {
     loading.value = false;
@@ -1744,6 +1819,7 @@ async function viewHistoryResearch(item: RecentResearchView) {
     todoTasks.value = detailTasks.map(cloneHistoryTask);
     activeTaskId.value = todoTasks.value[0]?.id ?? null;
     reportMarkdown.value = detailReport;
+    reportWorkbench.value = normalizeReportWorkbench(payload);
     latestRequestMetrics.value = nextRequestMetrics;
     error.value = detailError;
     progressLogs.value = detailError
@@ -2021,6 +2097,11 @@ function applyDemoScenario(scenario: DemoScenario) {
 }
 
 function handleResearchEvent(event: ResearchStreamEvent) {
+  if (typeof event.request_id === "string" && event.request_id.trim()) {
+    activeRequestId.value = event.request_id.trim();
+  }
+  if (typeof event.runner_backend === "string") streamRunner.value = event.runner_backend;
+
   if (event.type === "status") {
     const message =
       typeof event.message === "string" && event.message.trim()
@@ -2356,6 +2437,15 @@ function handleResearchEvent(event: ResearchStreamEvent) {
   if (event.type === "metrics_snapshot") {
     const payload = event as UnknownRecord;
     latestRequestMetrics.value = ensureRecord(payload.request_metrics);
+    const metrics = latestRequestMetrics.value;
+    if (metrics.skill_pack_id && !reportWorkbench.value) {
+      reportWorkbench.value = normalizeReportWorkbench({ skill_pack: {
+        pack_id: metrics.skill_pack_id,
+        version: metrics.skill_pack_version,
+        match_score: metrics.skill_pack_match_score,
+        shadow: metrics.skill_pack_shadow
+      } });
+    }
     const nextAggregate = ensureRecord(payload.aggregate_metrics);
     const previousAggregate = ensureRecord(latestAggregateMetrics.value);
     if (
@@ -2392,28 +2482,20 @@ function handleResearchEvent(event: ResearchStreamEvent) {
         ? event.report.trim()
         : "";
     reportMarkdown.value = report || "报告生成失败，未获得有效内容";
-    const rawPayload = event as Record<string, unknown>;
-    if (Array.isArray(rawPayload.evidence_conflicts)) {
-      evidenceConflicts.value = rawPayload.evidence_conflicts as EvidenceConflictCluster[];
-    }
-    if (rawPayload.claim_verification_summary && typeof rawPayload.claim_verification_summary === "object") {
-      claimVerificationSummary.value = rawPayload.claim_verification_summary as ClaimVerificationSummary;
-    }
-    if (rawPayload.workbench && typeof rawPayload.workbench === "object") {
-      reportWorkbench.value = rawPayload.workbench as ReportWorkbenchPayload;
-    }
+    reportWorkbench.value = normalizeReportWorkbench(event);
     pulse(reportHighlight);
     progressLogs.value.push("最终报告已生成");
     return;
   }
 
-  if (typeof event.request_id === "string" && event.request_id.trim()) {
-    activeRequestId.value = event.request_id.trim();
+  if (event.type === "done" || event.type === "cancelled") {
+    statusLabel.value = event.type === "cancelled" ? "研究已取消" : "研究流程完成";
+    return;
   }
 
-  if (event.type === "done" || event.type === "cancelled") {
-    clearActiveStreamSession();
-    pendingRecoverySession.value = null;
+  if (event.type === "tool_approval_required") {
+    statusLabel.value = "等待工具审批";
+    progressLogs.value.push(statusLabel.value);
     return;
   }
 
@@ -2423,8 +2505,8 @@ function handleResearchEvent(event: ResearchStreamEvent) {
         ? event.detail
         : "研究过程中发生错误";
     error.value = detail;
+    statusLabel.value = "研究已停止";
     progressLogs.value.push("研究失败，已停止流程");
-    clearActiveStreamSession();
   }
 }
 
@@ -2503,17 +2585,8 @@ async function handleApprovePlan() {
   currentController = controller;
 
   try {
-    await resumeResearchStream(
-      targetRequestId,
-      { search_api: form.searchApi || undefined },
-      handleResearchEvent,
-      {
-        signal: controller.signal,
-        onEventId: (eventId) => {
-          lastEventId.value = eventId;
-        }
-      }
-    );
+    await trackResearchStream(approvedTopic, controller.signal, (onEvent, options) =>
+      resumeResearchStream(targetRequestId, { search_api: form.searchApi || undefined }, onEvent, options));
     if (!reportMarkdown.value) {
       reportMarkdown.value = "暂无生成的报告";
     }
@@ -2522,6 +2595,7 @@ async function handleApprovePlan() {
       progressLogs.value.push("已取消当前研究任务");
     } else {
       error.value = err instanceof Error ? err.message : "批准启动失败";
+      restoreRecoveryAction(err);
     }
   } finally {
     loading.value = false;
@@ -2569,6 +2643,7 @@ async function handleSectionDrilldown(payload: {
 }
 
 const handleSubmit = async () => {
+  if (loading.value) return;
   if (!form.topic.trim()) {
     error.value = "请输入研究主题";
     return;
@@ -2598,23 +2673,8 @@ const handleSubmit = async () => {
   };
 
   try {
-    await runResearchStream(
-      payload,
-      handleResearchEvent,
-      {
-        signal: controller.signal,
-        onEventId: (eventId) => {
-          lastEventId.value = eventId;
-          if (activeRequestId.value) {
-            saveActiveStreamSession({
-              requestId: activeRequestId.value,
-              lastEventId: eventId,
-              topic: payload.topic
-            });
-          }
-        }
-      }
-    );
+    await trackResearchStream(payload.topic, controller.signal, (onEvent, options) =>
+      runResearchStream(payload, onEvent, options));
 
     if (!reportMarkdown.value) {
       reportMarkdown.value = "暂无生成的报告";
@@ -2624,6 +2684,7 @@ const handleSubmit = async () => {
       progressLogs.value.push("已取消当前研究任务");
     } else {
       error.value = err instanceof Error ? err.message : "请求失败";
+      restoreRecoveryAction(err);
     }
   } finally {
     loading.value = false;
@@ -2635,12 +2696,79 @@ const handleSubmit = async () => {
   }
 };
 
-const cancelResearch = () => {
-  if (!loading.value || !currentController) {
+async function trackResearchStream(
+  topic: string,
+  signal: AbortSignal,
+  start: (event: Parameters<typeof runResearchStream>[1], options: NonNullable<Parameters<typeof runResearchStream>[2]>) => Promise<void>
+) {
+  let ended = false;
+  let pausedForTool = false;
+  const saveCursor = () => {
+    if (activeRequestId.value && !ended) {
+      saveActiveStreamSession({
+        requestId: activeRequestId.value, lastEventId: lastEventId.value || "", topic, runner: streamRunner.value
+      });
+    }
+  };
+  try {
+    await start(async (event) => {
+      await handleLiveEvent(event, signal);
+      ended = isStreamEnd(event);
+      pausedForTool ||= event.type === "tool_approval_required";
+      saveCursor();
+    }, {
+      signal,
+      onStreamStart: ({ requestId, runner }) => {
+        if (requestId) activeRequestId.value = requestId;
+        pendingRecoverySession.value = null;
+        streamRunner.value = runner || streamRunner.value;
+        saveCursor();
+      },
+      onEventId: (eventId) => {
+        lastEventId.value = eventId;
+        saveCursor();
+      }
+    });
+  } catch (err) {
+    signal.throwIfAborted();
+    const requestId = activeRequestId.value;
+    if (!requestId || !streamRunner.value || streamRunner.value === "inline") throw err;
+    await followActiveRequest(requestId, topic, signal);
+    return;
+  }
+  signal.throwIfAborted();
+  if (ended || (pausedForTool && (!streamRunner.value || streamRunner.value === "inline"))) {
+    clearActiveStreamSession();
+  } else if (activeRequestId.value && streamRunner.value && streamRunner.value !== "inline") {
+    await followActiveRequest(activeRequestId.value, topic, signal);
+  } else {
+    throw new Error("研究事件流意外中断");
+  }
+}
+
+const cancelResearch = async () => {
+  const controller = currentController;
+  if (!loading.value || !controller || cancelling.value) {
     return;
   }
   progressLogs.value.push("正在尝试取消当前研究任务…");
-  currentController.abort();
+  if (!activeRequestId.value || !streamRunner.value || streamRunner.value === "inline") {
+    clearActiveStreamSession();
+    statusLabel.value = "研究已取消";
+    controller.abort();
+    return;
+  }
+  cancelling.value = true;
+  try {
+    const result = await sendWorkflowSignal(activeRequestId.value, "cancel", {}, { signal: controller.signal });
+    if (!result.accepted) throw new Error(result.detail || "后台未受理取消请求");
+  } catch (err) {
+    if (!controller.signal.aborted) {
+      error.value = err instanceof Error ? err.message : "取消研究失败";
+    }
+  } finally {
+    cancelling.value = false;
+  }
 };
 
 const goBack = () => {
@@ -2652,9 +2780,7 @@ const goBack = () => {
 
 const startNewResearch = () => {
   cancelHistoryDetailLoad();
-  if (loading.value) {
-    cancelResearch();
-  }
+  if (loading.value) return;
   resetWorkflowState();
   isExpanded.value = false;
   form.topic = "";
@@ -2663,6 +2789,10 @@ const startNewResearch = () => {
 
 onMounted(() => {
   pendingRecoverySession.value = loadActiveStreamSession();
+  if (pendingRecoverySession.value) void resumeRecoveredSession();
+  void fetchSkillsCatalog().then((catalog) => { skillsCatalog.value = catalog; }).catch((err) => {
+    console.warn("获取 Skill 目录失败", err);
+  });
   void refreshGlobalMetrics();
   void refreshPersistedHistory();
   globalMetricsTimer = window.setInterval(() => {

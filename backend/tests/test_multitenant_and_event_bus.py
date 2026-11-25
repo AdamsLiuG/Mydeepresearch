@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
 from fastapi.testclient import TestClient
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -18,6 +20,8 @@ from config import Configuration, SearchAPI  # noqa: E402
 from main import create_app  # noqa: E402
 from models import SummaryStateOutput, TodoItem  # noqa: E402
 from services.event_bus import InMemoryStreamEventBus, RedisStreamEventBus  # noqa: E402
+from services.reporter import build_report_workbench_payload  # noqa: E402
+from services.request_state import SnapshotConflictError  # noqa: E402
 from services.search import dispatch_search  # noqa: E402
 from services.storage_backends import PostgresRequestStateStore  # noqa: E402
 
@@ -67,6 +71,25 @@ class _StubMultiTenantAgent:
             "question": question,
             "answer_markdown": f"Drilldown for {self.tenant_id}",
         }
+
+
+def test_production_compose_shares_gateway_and_worker_settings():
+    compose_path = Path(__file__).resolve().parents[2] / "docker-compose.prod.yml"
+    services = yaml.safe_load(compose_path.read_text(encoding="utf-8"))["services"]
+
+    assert {name for name, service in services.items() if not service.get("profiles")} == {
+        "postgres", "redis", "qdrant", "backend", "frontend",
+    }
+    for service in ("postgres", "redis", "qdrant"):
+        assert "ports" not in services[service]
+    for worker in ("temporal-worker", "arq-worker"):
+        assert services[worker]["image"] == services["backend"]["image"]
+        for setting in ("DATABASE_URL", "REDIS_URL", "TEMPORAL_HOST", "ARQ_REDIS_URL"):
+            assert services[worker]["environment"][setting] == services["backend"]["environment"][setting]
+        assert services[worker]["healthcheck"]["disable"]
+    assert services["temporal-worker"]["depends_on"]["temporal"]["condition"] == "service_healthy"
+    assert services["temporal"]["profiles"] == services["temporal-ui"]["profiles"] == ["temporal"]
+    assert "POSTGRES_PASSWORD:?" in services["postgres"]["environment"]["POSTGRES_PASSWORD"]
 
 
 class MultiTenantGatewayTests(unittest.TestCase):
@@ -200,6 +223,19 @@ class MultiTenantGatewayTests(unittest.TestCase):
                     "/requests/req-alpha-1/events",
                     headers={"X-API-Key": "key-beta"},
                 ),
+                lambda: client.get(
+                    "/requests/req-alpha-1/events?follow=1",
+                    headers={"X-API-Key": "key-beta"},
+                ),
+                lambda: client.post(
+                    "/requests/req-alpha-1/signals/cancel",
+                    headers={"X-API-Key": "key-beta"},
+                ),
+                lambda: client.post(
+                    "/requests/req-alpha-1/signals/approve_tool_call",
+                    headers={"X-API-Key": "key-beta"},
+                    json={"approval_id": "a1", "decision": "approve"},
+                ),
             ):
                 self.assertEqual(req().status_code, 404)
 
@@ -255,6 +291,50 @@ class MultiTenantGatewayTests(unittest.TestCase):
 
 
 class SearchCacheAndBackendAdapterTests(unittest.TestCase):
+    def test_workbench_preserves_citation_metadata_and_filters_unsafe_links(self) -> None:
+        from types import SimpleNamespace
+
+        state = SimpleNamespace(
+            todo_items=[TodoItem(
+                id=1, title="test", intent="test", query="test",
+                evidence_items=[
+                    {"source_id": "T1-S1", "url": "javascript:void(0)"},
+                    {"source_id": "T1-C1", "computation_artifact": {"result": 5}},
+                ],
+                atomic_claims=[{"text": "Five", "source_ids": ["T1-C1"], "nli_label": "ENTAILED"}],
+            )],
+            review_summary={"verifiers_executed": ["numeric-audit"]},
+        )
+        payload = build_report_workbench_payload(state, "Five [T1-C1]")
+        self.assertEqual(payload["citation_drawer_map"]["T1-S1"]["url"], "")
+        self.assertEqual(payload["citation_drawer_map"]["T1-C1"]["computation_artifact"]["result"], 5)
+        self.assertEqual(payload["citation_drawer_map"]["T1-C1"]["linked_claims"][0]["text"], "Five")
+        self.assertEqual(payload["verifier_badges"][0]["badge_id"], "numeric-audit")
+
+    def test_follow_stops_at_first_terminal_and_reports_trimmed_cursor(self) -> None:
+        bus = InMemoryStreamEventBus(max_events_per_request=10)
+        first = bus.publish("tenant", "req", {"type": "status"})
+        for _ in range(10):
+            bus.publish("tenant", "req", {"type": "status"})
+        terminal = bus.publish("tenant", "req", {"type": "done"})
+        bus.publish("tenant", "req", {"type": "status"})
+
+        events = list(bus.tail_since("tenant", "req", first, max_idle_cycles=0))
+        self.assertEqual(events[0].payload["type"], "replay_gap")
+        self.assertEqual(events[-1].event_id, terminal)
+
+    def test_follow_unknown_request_and_invalid_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = create_app(
+                base_config=Configuration(request_state_dir=tmpdir, llm_api_key="test-key"),
+                agent_factory=_StubMultiTenantAgent,
+            )
+            client = TestClient(app)
+            response = client.get("/requests/unknown/events?follow=1")
+            self.assertEqual(response.status_code, 404)
+            response = client.get("/requests/unknown/events", headers={"Last-Event-ID": "invalid"})
+            self.assertEqual(response.status_code, 400)
+
     def test_search_cache_isolates_by_tenant_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = Configuration(
@@ -345,9 +425,10 @@ class SearchCacheAndBackendAdapterTests(unittest.TestCase):
         executed: list[tuple[str, tuple | None]] = []
 
         class _FakeCursor:
-            def __init__(self, store_rows: dict[tuple[str, str], str]) -> None:
+            def __init__(self, store_rows: dict[str, tuple[str, str, int]]) -> None:
                 self._rows = store_rows
                 self._fetched = []
+                self.rowcount = 1
 
             def __enter__(self):
                 return self
@@ -359,19 +440,31 @@ class SearchCacheAndBackendAdapterTests(unittest.TestCase):
                 executed.append((sql, params))
                 normalized = " ".join(sql.split()).upper()
                 if normalized.startswith("INSERT INTO"):
-                    req_id, tenant_id, _topic, _phase, _status, _upd, payload_json = params
-                    self._rows[(req_id, tenant_id)] = payload_json
+                    req_id, tenant_id, *_, payload_json = params
+                    existing = self._rows.get(req_id)
+                    if existing and existing[0] != tenant_id:
+                        self.rowcount = 0
+                        return
+                    state_version = existing[2] + 1 if existing else 1
+                    if "JSONB_SET" in normalized and existing:
+                        payload = json.loads(payload_json)
+                        if any("\x00" in value for value in payload.values() if isinstance(value, str)):
+                            raise ValueError("PostgreSQL jsonb rejects escaped NUL characters")
+                        payload["state_version"] = state_version
+                        payload_json = json.dumps(payload)
+                    self._rows[req_id] = (tenant_id, payload_json, state_version)
+                    self._fetched = [(state_version,)]
                 elif "WHERE REQUEST_ID = %S AND TENANT_ID = %S" in normalized:
                     req_id, tenant_id = params
-                    val = self._rows.get((req_id, tenant_id))
-                    self._fetched = [(tenant_id, val)] if val is not None else []
+                    val = self._rows.get(req_id)
+                    self._fetched = [val] if val is not None and val[0] == tenant_id else []
                 elif "WHERE REQUEST_ID = %S" in normalized:
                     req_id = params[0]
-                    matches = [(t, v) for (r, t), v in self._rows.items() if r == req_id]
-                    self._fetched = matches[:1]
+                    val = self._rows.get(req_id)
+                    self._fetched = [val] if val is not None else []
                 elif "FROM DEEPRESEARCH_REQUEST_STATES WHERE TENANT_ID = %S" in normalized:
                     tenant_id, _limit = params
-                    self._fetched = [(v,) for (_r, t), v in self._rows.items() if t == tenant_id]
+                    self._fetched = [(v,) for t, v, _ in self._rows.values() if t == tenant_id]
 
             def fetchone(self):
                 return self._fetched[0] if self._fetched else None
@@ -379,7 +472,7 @@ class SearchCacheAndBackendAdapterTests(unittest.TestCase):
             def fetchall(self):
                 return list(self._fetched)
 
-        rows_backing: dict[tuple[str, str], str] = {}
+        rows_backing: dict[str, tuple[str, str, int]] = {}
 
         class _FakeConn:
             def __enter__(self):
@@ -392,6 +485,9 @@ class SearchCacheAndBackendAdapterTests(unittest.TestCase):
                 return _FakeCursor(rows_backing)
 
             def commit(self):
+                return None
+
+            def rollback(self):
                 return None
 
         store = PostgresRequestStateStore(
@@ -407,10 +503,50 @@ class SearchCacheAndBackendAdapterTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded["tenant_id"], "tenant-pg")
         self.assertIsNone(store.load("req-pg-1", tenant_id="other-tenant"))
+        updated = store.save(
+            "req-pg-1",
+            {
+                "state_version": 99,
+                "runner_backend": "temporal",
+                "workflow_run_id": "run-1",
+                "report_markdown": "A\x00B",
+            },
+            tenant_id="tenant-pg",
+        )
+        self.assertEqual(updated["state_version"], 2)
+        self.assertEqual(store.load("req-pg-1", tenant_id="tenant-pg")["state_version"], 2)
+        self.assertEqual(store.load("req-pg-1", tenant_id="tenant-pg")["report_markdown"], "A\x00B")
+        with self.assertRaises(SnapshotConflictError):
+            store.save("req-pg-1", {"phase": "forged"}, tenant_id="other-tenant")
+        rows_backing["legacy"] = ("tenant-pg", '{"request_id":"legacy"}', 1)
+        self.assertEqual(store.load("legacy", tenant_id="tenant-pg")["state_version"], 1)
 
         recent = store.list_recent(tenant_id="tenant-pg")
-        self.assertEqual(len(recent), 1)
+        self.assertEqual(len(recent), 2)
         self.assertEqual(recent[0]["request_id"], "req-pg-1")
         # Confirm every non-DDL query bound parameters safely via %s placeholders.
         dml_queries = [q for q, p in executed if p is not None]
         self.assertTrue(all("%s" in q for q in dml_queries))
+        self.assertTrue(any("runner_backend = EXCLUDED.runner_backend" in sql for sql, _ in executed))
+
+    def test_postgres_opens_a_closed_pool_before_first_connection(self) -> None:
+        class ClosedPool:
+            closed = True
+            open_count = 0
+
+            def __init__(self, dsn, **kwargs):
+                self.connection_token = object()
+
+            def open(self, *, wait):
+                self.open_count += 1
+                self.closed = False
+
+            def connection(self):
+                if self.closed:
+                    raise RuntimeError("connection attempt on a closed pool")
+                return self.connection_token
+
+        with patch("services.storage_backends._PsycopgConnectionPool", ClosedPool):
+            store = PostgresRequestStateStore(dsn="postgresql://example/test")
+        self.assertIs(store._connect(), store._connect())
+        self.assertEqual(store._pool.open_count, 1)

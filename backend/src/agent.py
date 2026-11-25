@@ -796,6 +796,7 @@ class DeepResearchAgent(
             config=self.config,
         )
         self._request_state_store = build_request_state_store(self.config)
+        self._workflow_checkpoint = None
         self._request_snapshot_lock = Lock()
         self._policy_controller = build_policy_controller(self.config)
         self._note_memory = NoteMemoryService(self.config)
@@ -1604,6 +1605,20 @@ class DeepResearchAgent(
         cancel_event = getattr(self, "_cancel_event", None)
         return bool(cancel_event is not None and cancel_event.is_set())
 
+    def bind_workflow_checkpoint(self, checkpoint: Any) -> None:
+        previous_store = self._request_state_store
+        if previous_store is not checkpoint.store:
+            close = getattr(previous_store, "close", None)
+            if close is not None:
+                close()
+        self._workflow_checkpoint = checkpoint
+        self._request_state_store = checkpoint.store
+
+    def close_workflow(self) -> None:
+        if self._owns_mcp_bridge and self._mcp_bridge is not None:
+            bridge, self._mcp_bridge = self._mcp_bridge, None
+            bridge.close()
+
     def _export_observability_trace(self, snapshot: dict[str, Any] | None) -> None:
         adapter = getattr(self, "_observability", None)
         if adapter is None or not snapshot:
@@ -2329,6 +2344,8 @@ class DeepResearchAgent(
                             state,
                             **stream_kwargs,
                         ):
+                            if self._is_cancelled():
+                                break
                             report_event.setdefault("step", final_step)
                             yield report_event
                         report = state.structured_report or ""
@@ -2361,6 +2378,12 @@ class DeepResearchAgent(
                     "step": final_step,
                 }
 
+            if self._is_cancelled():
+                observer.complete_request(status="cancelled")
+                request_completed = True
+                self._persist_request_state(state, phase="cancelled", status="cancelled")
+                return
+
             if emit_stream:
                 for event in self._drain_tool_events(state, step=final_step):
                     yield event
@@ -2369,6 +2392,19 @@ class DeepResearchAgent(
 
             state.structured_report = report
             state.running_summary = report
+            workbench = build_report_workbench_payload(
+                state, report, evidence_store=self._evidence_store, config=self.config,
+            )
+            state.report_charts = workbench["charts_spec"]
+            state.evidence_conflicts = workbench["evidence_conflicts"]
+            if (
+                workbench["citation_index"]
+                or workbench["evidence_conflicts"]
+                or workbench["claim_verification_summary"]
+                or workbench["verifier_badges"]
+                or workbench["skill_governance"]["pack_id"] != "_neutral"
+            ):
+                state.report_workbench = workbench
 
             note_event = self._persist_final_report(state, report)
             if emit_stream and note_event:
@@ -2400,18 +2436,6 @@ class DeepResearchAgent(
 
             if emit_stream:
                 yield observer.metrics_event()
-                workbench = build_report_workbench_payload(
-                    state,
-                    report,
-                    evidence_store=self._evidence_store,
-                    config=self.config,
-                )
-                has_workbench = bool(
-                    workbench.get("citation_index")
-                    or workbench.get("evidence_conflicts")
-                    or workbench.get("claim_verification_summary")
-                    or (workbench.get("skill_governance") or {}).get("pack_id", "_neutral") != "_neutral"
-                )
                 yield {
                     "type": "final_report",
                     "report": report,
@@ -2422,7 +2446,11 @@ class DeepResearchAgent(
                     "claim_verification_summary": dict(
                         getattr(state, "claim_verification_summary", None) or {}
                     ),
-                    **({"workbench": workbench} if has_workbench else {}),
+                    **({
+                        "workbench": state.report_workbench,
+                        "citation_drawer_map": workbench["citation_index"],
+                        "verifier_badges": workbench["verifier_badges"],
+                    } if state.report_workbench else {}),
                 }
                 yield {"type": "done"}
         except MCPHitlApprovalRequired as hitl_exc:
@@ -2492,6 +2520,7 @@ class DeepResearchAgent(
             running_summary=state.running_summary,
             report_markdown=state.structured_report,
             report_charts=list(getattr(state, "report_charts", None) or []),
+            report_workbench=dict(getattr(state, "report_workbench", None) or {}),
             evidence_conflicts=list(getattr(state, "evidence_conflicts", None) or []),
             claim_verification_summary=dict(
                 getattr(state, "claim_verification_summary", None) or {}
@@ -2513,6 +2542,8 @@ class DeepResearchAgent(
         target = next((task for task in state.todo_items if task.id == task_id), None)
         if target is None:
             raise ValueError(f"task_id not found: {task_id}")
+        if target.status == "completed":
+            return target
         self._refresh_context_checkpoints(state)
         self._prepare_upstream_contexts(state, [target])
         for _ in self._execute_task(state, target, emit_stream=False):

@@ -925,7 +925,7 @@ class Configuration(BaseModel):
         description="Optional PostgreSQL DSN for persistent request snapshot storage",
     )
     event_bus_max_events_per_request: int = Field(
-        default=500,
+        default=2000,
         ge=50,
         title="Event Bus Max Events Per Request",
         description="Maximum buffered SSE events retained per request for Last-Event-ID replay",
@@ -941,6 +941,9 @@ class Configuration(BaseModel):
         title="Workflow Runner Backend",
         description="Execution backend: inline, local_durable, arq, or temporal",
     )
+    workflow_runner_fallback_inline: bool = False
+    temporal_activity_heartbeat_seconds: float = Field(default=15.0, gt=1.0)
+    hitl_signal_timeout_seconds: int = Field(default=86400, ge=1)
     temporal_address: str = Field(
         default="127.0.0.1:7233",
         title="Temporal Server Address",
@@ -1843,12 +1846,15 @@ class Configuration(BaseModel):
             "event_bus_max_events_per_request": os.getenv("EVENT_BUS_MAX_EVENTS_PER_REQUEST"),
             "event_bus_stream_ttl_seconds": os.getenv("EVENT_BUS_STREAM_TTL_SECONDS"),
             "workflow_runner": os.getenv("WORKFLOW_RUNNER"),
-            "temporal_address": os.getenv("TEMPORAL_ADDRESS"),
+            "workflow_runner_fallback_inline": os.getenv("WORKFLOW_RUNNER_FALLBACK_INLINE"),
+            "temporal_activity_heartbeat_seconds": os.getenv("TEMPORAL_ACTIVITY_HEARTBEAT_SECONDS"),
+            "hitl_signal_timeout_seconds": os.getenv("HITL_SIGNAL_TIMEOUT_SECONDS"),
+            "temporal_address": os.getenv("TEMPORAL_HOST") or os.getenv("TEMPORAL_ADDRESS"),
             "temporal_namespace": os.getenv("TEMPORAL_NAMESPACE"),
             "temporal_task_queue": os.getenv("TEMPORAL_TASK_QUEUE"),
-            "arq_redis_dsn": os.getenv("ARQ_REDIS_DSN"),
-            "postgres_pool_min_size": os.getenv("POSTGRES_POOL_MIN_SIZE"),
-            "postgres_pool_max_size": os.getenv("POSTGRES_POOL_MAX_SIZE"),
+            "arq_redis_dsn": os.getenv("ARQ_REDIS_URL") or os.getenv("ARQ_REDIS_DSN"),
+            "postgres_pool_min_size": os.getenv("PG_POOL_MIN_SIZE") or os.getenv("POSTGRES_POOL_MIN_SIZE"),
+            "postgres_pool_max_size": os.getenv("PG_POOL_MAX_SIZE") or os.getenv("POSTGRES_POOL_MAX_SIZE"),
             "policy_model_enabled": os.getenv("POLICY_MODEL_ENABLED"),
             "policy_model_id": os.getenv("POLICY_MODEL_ID"),
             "policy_model_base_url": os.getenv("POLICY_MODEL_BASE_URL"),

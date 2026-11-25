@@ -19,16 +19,53 @@
     <SkillGovernanceBar
       v-if="workbench"
       :governance="workbench.skill_governance"
+      :catalog="catalog"
+      :verifier-badges="workbench.verifier_badges"
       :claim-summary="workbench.claim_verification_summary"
       :conflict-count="workbench.evidence_conflicts.length"
       @inspect-conflicts="$emit('inspect-conflicts')"
     />
 
     <div
+      ref="reportBody"
       class="markdown-block"
-      v-html="decoratedReportHtml"
+      v-html="reportHtml"
       @click="handleMarkdownClick"
     ></div>
+
+    <template v-for="(chart, index) in chartViews" :key="index">
+      <figure v-if="chart" class="report-chart">
+        <figcaption><strong>{{ chart.title }}</strong><p v-if="chart.caption">{{ chart.caption }}</p></figcaption>
+        <svg viewBox="0 0 640 220" role="img" :aria-label="chart.title">
+          <line x1="24" x2="616" :y1="chart.zero" :y2="chart.zero" stroke="#94a3b8" />
+          <g v-for="(series, seriesIndex) in chart.series" :key="seriesIndex" :style="{ color: chartColors[seriesIndex % chartColors.length] }">
+            <polyline v-if="series.type === 'line'" :points="series.coordinates" fill="none" stroke="currentColor" stroke-width="2" />
+            <template v-for="(point, pointIndex) in series.points" :key="pointIndex">
+              <rect v-if="series.type === 'bar'" :x="point.x - point.width / 2" :y="Math.min(point.y, chart.zero)"
+                :width="point.width" :height="Math.abs(chart.zero - point.y) || 1" fill="currentColor">
+                <title>{{ series.name }} · {{ point.label }}: {{ point.value }}</title>
+              </rect>
+              <circle v-else :cx="point.x" :cy="point.y" r="3" fill="currentColor">
+                <title>{{ series.name }} · {{ point.label }}: {{ point.value }}</title>
+              </circle>
+            </template>
+          </g>
+        </svg>
+        <details>
+          <summary>图表数据</summary>
+          <table>
+            <thead><tr><th scope="col">系列</th><th scope="col">项目</th><th scope="col">数值</th></tr></thead>
+            <tbody v-for="(series, seriesIndex) in chart.series" :key="seriesIndex">
+              <tr v-for="(point, pointIndex) in series.points" :key="pointIndex"><td>{{ series.name }}</td><td>{{ point.label }}</td><td>{{ point.value }}</td></tr>
+            </tbody>
+          </table>
+        </details>
+        <button v-for="sourceId in chart.source_ids" :key="sourceId" type="button" class="citation-chip" @click="emit('select-citation', sourceId)">
+          [{{ sourceId }}]
+        </button>
+      </figure>
+      <p v-else class="chart-fallback">此图表无法显示，可查看报告中的数据表。</p>
+    </template>
 
     <div v-if="showDrilldown && requestId" class="drilldown-panel">
       <div class="drilldown-controls">
@@ -75,9 +112,9 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, ref, watch } from "vue";
-import type { ReportWorkbenchPayload } from "../types/research";
-import { decorateReportHtmlWithCitations } from "../utils/workbench";
+import { computed, ref, watch, watchPostEffect } from "vue";
+import type { ReportWorkbenchPayload, SkillsCatalogResponse } from "../types/research";
+import { enhanceReportCitations, enhanceReportTables, getChartSeries, sanitizeChartSpec } from "../utils/workbench";
 import SkillGovernanceBar from "./SkillGovernanceBar.vue";
 
 const props = withDefaults(
@@ -90,6 +127,7 @@ const props = withDefaults(
     drilldownAnswerHtml?: string;
     drilldownError?: string;
     workbench?: ReportWorkbenchPayload | null;
+    catalog?: SkillsCatalogResponse | null;
   }>(),
   {
     drilldownLoading: false,
@@ -105,13 +143,43 @@ const emit = defineEmits<{
   "inspect-conflicts": [];
 }>();
 
-const decoratedReportHtml = computed(() =>
-  decorateReportHtmlWithCitations(props.reportHtml || "")
-);
+const reportBody = ref<HTMLElement | null>(null);
+watchPostEffect(() => {
+  if (props.reportHtml && reportBody.value) {
+    enhanceReportCitations(reportBody.value);
+    enhanceReportTables(reportBody.value);
+  }
+});
+
+const chartColors = ["#1d4ed8", "#047857", "#9a3412", "#7c3aed", "#0369a1"];
+const chartViews = computed(() => (props.workbench?.charts_spec || []).map((raw) => {
+  const chart = sanitizeChartSpec(raw);
+  if (!chart) return null;
+  const series = getChartSeries(chart);
+  if (!series.length) return null;
+  const values = series.flatMap((item) => item.points.map((point) => point.value));
+  const magnitude = Math.max(1, ...values.map(Math.abs));
+  const min = Math.min(0, ...values) / magnitude;
+  const max = Math.max(0, ...values) / magnitude;
+  const y = (value: number) => 202 - ((value / magnitude - min) / (max - min || 1)) * 184;
+  const labels = [...new Set(series.flatMap((item) => item.points.map((point) => point.label)))];
+  const columns = new Map(labels.map((label, index) => [label, index]));
+  const step = 592 / labels.length;
+  const width = Math.min(32, step * 0.8 / series.length);
+  return { ...chart, zero: y(0), series: series.map((item, seriesIndex) => {
+    const points = item.points.map((point) => ({
+      ...point,
+      x: 24 + ((columns.get(point.label) ?? 0) + 0.5) * step +
+        (item.type === "bar" ? (seriesIndex - (series.length - 1) / 2) * width : 0),
+      y: y(point.value), width
+    }));
+    return { ...item, points, coordinates: points.map((point) => `${point.x},${point.y}`).join(" ") };
+  }) };
+}));
 
 function handleMarkdownClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null;
-  const chip = target?.closest<HTMLElement>("[data-citation-id]");
+  const chip = target?.closest<HTMLElement>("button.citation-chip[data-citation-id]");
   const citationId = chip?.dataset?.citationId?.trim();
   if (citationId) {
     emit("select-citation", citationId);
@@ -162,6 +230,24 @@ function submitDrilldown() {
 </script>
 
 <style scoped>
+.report-chart {
+  margin: 16px 0;
+  border-top: 1px solid #cbd5e1;
+  padding-top: 12px;
+}
+.report-chart svg {
+  display: block;
+  width: 100%;
+  max-height: 280px;
+}
+.report-chart details { margin: 8px 0; }
+.report-chart td, .report-chart th { padding: 2px 8px; text-align: left; }
+.chart-fallback { color: #475569; }
+.markdown-block :deep(.table-export) { display: flex; flex-wrap: wrap; gap: 6px; }
+.markdown-block :deep(.table-sort),
+.markdown-block :deep(.table-export button) { cursor: pointer; }
+.markdown-block :deep([aria-sort="ascending"] .table-sort)::after { content: " ↑"; }
+.markdown-block :deep([aria-sort="descending"] .table-sort)::after { content: " ↓"; }
 .report-block {
   background: rgba(255, 255, 255, 0.94);
   border: 1px solid rgba(148, 163, 184, 0.26);

@@ -8,7 +8,7 @@ import {
   useResilientStream,
   type StorageLike
 } from "../composables/useResilientStream";
-import { sendWorkflowSignal, submitAsyncResearch } from "../services/api";
+import { sendWorkflowSignal, streamRequestEvents, submitAsyncResearch } from "../services/api";
 
 function makeMemoryStorage(): StorageLike {
   const store = new Map<string, string>();
@@ -26,6 +26,62 @@ function makeMemoryStorage(): StorageLike {
 describe("resilient durable SSE stream & session recovery", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("reconnects after clean EOF from the last applied frame", async () => {
+    const storage = makeMemoryStorage();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('id: 10\ndata: {"type":"status"}\n\nid: 11\ndata: {"type":"status"}'))
+      .mockResolvedValueOnce(new Response('id: 10\ndata: {"type":"status"}\n\nid: 11\ndata: {"type":"done"}\n\n'));
+    vi.stubGlobal("fetch", fetchMock);
+    const received: string[] = [];
+
+    await useResilientStream().followWithResume("req-42", "Topic", (event) => {
+      received.push(event.type);
+    }, { storage, sleepFn: async () => {} });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][1].headers["Last-Event-ID"]).toBe("10");
+    expect(received).toEqual(["status", "done"]);
+    expect(loadActiveStreamSession(storage)).toBeNull();
+  });
+
+  it("applies frames and hydrates a replay gap before advancing the cursor", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      'data: {"type":"replay_gap"}\n\nid: 2\ndata: {"type":"status"}\n\ndata: {"type":"stream_closed","status":"completed"}\n\n'
+    )));
+    const order: string[] = [];
+    await streamRequestEvents("req-42", async (event) => {
+      await Promise.resolve();
+      order.push(event.type);
+    }, { onEventId: (id) => order.push(id) });
+    expect(order).toEqual(["replay_gap", "status", "2", "stream_closed"]);
+  });
+
+  it("retains the starting cursor and stops immediately when backoff is aborted", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const storage = makeMemoryStorage();
+    const streamFn = vi.fn().mockRejectedValue(new Error("offline"));
+    const { followWithResume, reconnecting } = useResilientStream();
+    const result = followWithResume("req-42", "Topic", () => {}, {
+      signal: controller.signal,
+      storage,
+      lastEventId: "42-2",
+      runner: "local_durable",
+      streamFn
+    });
+    const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    await Promise.resolve();
+    expect(reconnecting.value).toBe(true);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reconnecting.value).toBe(false);
+    await rejected;
+    expect(streamFn).toHaveBeenCalledTimes(1);
+    expect(loadActiveStreamSession(storage)).toMatchObject({ lastEventId: "42-2", runner: "local_durable" });
   });
 
   it("persists active session state and computes capped exponential backoff", () => {

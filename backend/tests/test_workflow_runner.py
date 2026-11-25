@@ -184,63 +184,56 @@ def test_snapshot_cas_conflict_on_file_and_mock_postgres(tmp_path: Path) -> None
 
 def test_tenant_rate_limiter_redis_zset_and_fallback() -> None:
     class _FakeRedisRL:
-        def __init__(self, *, fail: bool = False) -> None:
-            self.fail = fail
-            self.zsets: dict[str, dict[str, float]] = {}
-            self.counts: dict[str, int] = {}
+        def __init__(self) -> None:
+            self.fail = False
+            self.rpm: dict[str, set[str]] = {}
+            self.concurrent: dict[str, set[str]] = {}
+            self.atomic_calls = 0
 
-        def incr(self, key: str) -> int:
+        def eval(self, script, num_keys, rpm_key, conc_key, rpm, concurrency, lease, ttl):
+            self.atomic_calls += 1
             if self.fail:
                 raise ConnectionError("redis down")
-            self.counts[key] = self.counts.get(key, 0) + 1
-            return self.counts[key]
+            assert num_keys == 2 and ttl > 0
+            assert "redis.call('TIME')" in script
+            active = self.concurrent.setdefault(conc_key, set())
+            requests = self.rpm.setdefault(rpm_key, set())
+            if concurrency and len(active) >= concurrency:
+                return [0, 5]
+            if rpm and len(requests) >= rpm:
+                return [2, 60]
+            if concurrency:
+                active.add(lease)
+            if rpm:
+                requests.add(lease)
+            return [1, 0]
 
-        def decr(self, key: str) -> int:
-            if self.fail:
-                raise ConnectionError("redis down")
-            self.counts[key] = self.counts.get(key, 0) - 1
-            return self.counts[key]
+        def zrem(self, key, lease):
+            self.concurrent.setdefault(key, set()).discard(lease)
 
-        def expire(self, key: str, ttl: int) -> None:
-            del key, ttl
-
-        def delete(self, key: str) -> None:
-            self.counts.pop(key, None)
-
-        def zremrangebyscore(self, key: str, min_s: Any, max_s: float) -> None:
-            del min_s
-            bucket = self.zsets.setdefault(key, {})
-            for member in [m for m, score in bucket.items() if score <= max_s]:
-                del bucket[member]
-
-        def zcard(self, key: str) -> int:
-            return len(self.zsets.get(key, {}))
-
-        def zadd(self, key: str, mapping: dict[str, float]) -> None:
-            self.zsets.setdefault(key, {}).update(mapping)
-
-        def zrange(self, key: str, start: int, end: int, withscores: bool = False) -> list[Any]:
-            items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
-            return items[start : end + 1] if withscores else [k for k, _ in items[start : end + 1]]
-
-    limiter = TenantRateLimiter(rpm_limit=2, max_concurrent=5, redis_client=_FakeRedisRL())
+    redis = _FakeRedisRL()
+    limiter = TenantRateLimiter(rpm_limit=2, max_concurrent=5, redis_client=redis)
+    replica = TenantRateLimiter(rpm_limit=2, max_concurrent=5, redis_client=redis)
     ok1, _, _ = limiter.try_acquire("t1")
     limiter.release("t1")
     ok2, _, _ = limiter.try_acquire("t1")
     limiter.release("t1")
-    ok3, retry_after, reason = limiter.try_acquire("t1")
+    ok3, retry_after, reason = replica.try_acquire("t1")
     assert ok1 is True and ok2 is True
     assert ok3 is False and reason == "rate_limit_rpm" and retry_after >= 1
+    assert redis.atomic_calls == 3
 
-    # Fallback on Redis failure keeps working in-process
-    degraded_limiter = TenantRateLimiter(
-        rpm_limit=1,
-        max_concurrent=1,
-        redis_client=_FakeRedisRL(fail=True),
-    )
-    a1, _, _ = degraded_limiter.try_acquire("t2")
-    a2, _, reason2 = degraded_limiter.try_acquire("t2")
-    assert a1 is True and a2 is False and reason2 == "max_concurrent_requests"
+    limiter = TenantRateLimiter(redis_client=redis)
+    assert limiter.try_acquire("t2", max_concurrent=2, lease_id="distributed")[0]
+    redis.fail = True
+    assert limiter.try_acquire("t2", max_concurrent=2, lease_id="local")[0]
+    assert limiter.try_acquire("t2", max_concurrent=2, lease_id="blocked")[2] == "max_concurrent_requests"
+
+    redis.fail = False
+    limiter.release("t2", lease_id="local")
+    assert replica.try_acquire("t2", max_concurrent=1, lease_id="other-replica")[2] == "max_concurrent_requests"
+    limiter.release("t2", lease_id="distributed")
+    assert replica.try_acquire("t2", max_concurrent=1, lease_id="other-replica")[0]
 
 
 def test_async_research_endpoints_follow_stream_and_signal(tmp_path: Path) -> None:
@@ -387,3 +380,180 @@ def test_build_report_workbench_payload_and_worker_imports() -> None:
     assert "arq-worker" in compose_data["services"]
     assert compose_data["services"]["temporal-worker"]["profiles"] == ["temporal"]
     assert compose_data["services"]["arq-worker"]["profiles"] == ["arq"]
+
+
+def test_local_submit_reuses_run_and_rejects_late_signals(tmp_path: Path) -> None:
+    running = threading.Event()
+    finish = threading.Event()
+    bus = InMemoryStreamEventBus()
+    releases: list[str | None] = []
+
+    class Agent:
+        def __init__(self, config: Configuration) -> None:
+            pass
+
+        def run_stream(self, topic: str):
+            running.set()
+            assert finish.wait(2)
+            yield {"type": "done"}
+
+    runner = LocalDurableWorkflowRunner(
+        agent_factory=Agent, event_bus=bus,
+        state_store=RequestStateStore(str(tmp_path)),
+        on_release=lambda tenant, *, lease_id: releases.append(lease_id),
+    )
+    args = {"request_id": "duplicate", "tenant_id": "t1", "config": Configuration()}
+    original = runner.submit("test", **args, lease_id="lease1")
+    assert running.wait(2)
+    duplicate = runner.submit("test", **args, lease_id="lease2")
+    finish.set()
+    assert list(bus.tail_since("t1", "duplicate", block_ms=1000))[-1].payload["type"] == "done"
+    runner.shutdown()
+    assert duplicate.workflow_run_id == original.workflow_run_id
+    assert duplicate.metadata["duplicate"] is True
+    assert releases == ["lease1"]
+    assert runner.signal("duplicate", "cancel", tenant_id="t1")["accepted"] is False
+    assert runner.signal("duplicate", "cancel", tenant_id="t2")["accepted"] is False
+
+
+def test_worker_reclaims_expired_lease_and_reuses_completed_tasks(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
+
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    checkpoint = WorkflowCheckpoint(store, "tenant", "retry", "temporal", "run-1")
+    checkpoint.reserve("topic")
+    payload = store.load("retry", tenant_id="tenant")
+    store.save(
+        "retry",
+        {**payload, "phase": "task_execution", "workflow_lease": {"owner": "crashed", "expires_at": 1},
+         "todo_items": [{"id": 1, "status": "completed"}, {"id": 2, "status": "completed"},
+                        {"id": 3, "status": "pending"}]},
+        tenant_id="tenant", expected_version=payload["state_version"],
+    )
+    executed: list[int] = []
+
+    class Agent:
+        def run_stream_resume(self, request_id: str, *, cancel_event: threading.Event):
+            snapshot = store.load(request_id, tenant_id="tenant")
+            executed.extend(item["id"] for item in snapshot["todo_items"] if item["status"] != "completed")
+            yield {"type": "final_report", "report": "# Done"}
+            yield {"type": "done"}
+
+    assert run_durable_attempt(checkpoint, lambda: Agent(), bus, threading.Event())["status"] == "completed"
+    assert run_durable_attempt(checkpoint, lambda: Agent(), bus, threading.Event())["status"] == "completed"
+    assert executed == [3]
+
+
+def test_plan_checkpoint_waits_for_matching_revision(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
+
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    checkpoint = WorkflowCheckpoint(store, "tenant", "plan", "temporal", "run-1")
+    checkpoint.reserve("topic", plan_first=True)
+    calls: list[str] = []
+
+    class Agent:
+        def plan_only(self, topic: str):
+            calls.append("plan")
+            return {"todo_items": [{"id": 1, "title": "Task"}]}
+
+        def run_stream_resume(self, request_id: str, *, cancel_event: threading.Event):
+            calls.append("execution")
+            yield {"type": "done"}
+
+    waiting = run_durable_attempt(checkpoint, Agent, bus, threading.Event())
+    assert waiting["status"] == "awaiting_approval"
+    event = bus.replay_since("tenant", "plan")[-1].payload
+    assert checkpoint.signal("approve_plan", {"revision": event["revision"] - 1})["accepted"] is False
+    assert checkpoint.signal("approve_plan", {"revision": event["revision"]})["accepted"] is True
+    assert run_durable_attempt(checkpoint, Agent, bus, threading.Event())["status"] == "completed"
+    assert calls == ["plan", "execution"]
+
+
+def test_live_lease_renews_and_stale_worker_cannot_write(tmp_path: Path, monkeypatch) -> None:
+    from services import workflow_runner as workflow
+
+    now = 100.0
+    monkeypatch.setattr(workflow, "time", lambda: now)
+    store = RequestStateStore(str(tmp_path))
+    owner = workflow.WorkflowCheckpoint(store, "tenant", "lease", "temporal", "run", lease_seconds=10)
+    recovery = workflow.WorkflowCheckpoint(store, "tenant", "lease", "temporal", "run", lease_seconds=10)
+    owner.reserve("topic")
+    assert owner.claim()[1]
+    now = 106
+    owner.refresh(threading.Event())
+    now = 111
+    assert recovery.claim()[1] is False
+    now = 117
+    assert recovery.claim()[1]
+    with pytest.raises(workflow.WorkflowLeaseLost):
+        owner.persist({"status": "completed"})
+
+
+def test_durable_tool_approval_does_not_complete_and_cancel_closes_it(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
+
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    checkpoint = WorkflowCheckpoint(store, "tenant", "tool", "temporal", "run")
+    checkpoint.reserve("topic")
+    constructions = []
+
+    class Agent:
+        def __init__(self):
+            constructions.append(True)
+
+        def run_stream(self, topic: str):
+            checkpoint.persist({
+                "phase": "awaiting_tool_approval", "status": "awaiting_approval",
+                "pending_tool_approval": {
+                    "approval_id": "A1", "status": "awaiting_approval", "expires_at": time.time() + 60,
+                },
+            })
+            yield {"type": "tool_approval_required", "approval_id": "A1"}
+
+    assert run_durable_attempt(checkpoint, Agent, bus, threading.Event())["status"] == "awaiting_approval"
+    assert [item.payload["type"] for item in bus.replay_since("tenant", "tool")] == ["tool_approval_required"]
+    assert checkpoint.signal("approve_tool", {"approval_id": "A1"})["accepted"] is False
+    assert checkpoint.signal("cancel", {})["accepted"] is True
+    assert run_durable_attempt(checkpoint, Agent, bus, threading.Event())["status"] == "cancelled"
+    assert len(constructions) == 1
+    assert bus.replay_since("tenant", "tool")[-1].payload["type"] == "cancelled"
+
+
+def test_temporal_explicit_fallback_executes_and_reports_real_backend(tmp_path: Path, monkeypatch) -> None:
+    from services.workflow_runner import (
+        TemporalWorkflowRunner,
+        WorkflowUnavailableError,
+    )
+
+    class Agent:
+        def __init__(self, config: Configuration):
+            pass
+
+        def run_stream(self, topic: str):
+            yield {"type": "final_report", "report": topic}
+            yield {"type": "done"}
+
+    def unavailable():
+        raise ImportError("temporalio")
+
+    monkeypatch.setattr(TemporalWorkflowRunner, "_ensure_temporalio", staticmethod(unavailable))
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    config = Configuration(workflow_runner="temporal")
+    runner = build_workflow_runner(config, agent_factory=Agent, event_bus=bus, state_store=store)
+    with pytest.raises(WorkflowUnavailableError):
+        runner.submit("test", request_id="fallback", tenant_id="tenant", config=config)
+    assert store.load("fallback", tenant_id="tenant") is None
+
+    config = Configuration(workflow_runner="temporal", workflow_runner_fallback_inline=True)
+    runner = build_workflow_runner(config, agent_factory=Agent, event_bus=bus, state_store=store)
+    handle = runner.submit("test", request_id="fallback", tenant_id="tenant", config=config)
+    items = list(bus.tail_since("tenant", "fallback", block_ms=1000))
+    runner.shutdown()
+    assert handle.runner_backend == "local_durable"
+    assert handle.metadata["degraded_reason"] == "temporal_unavailable_fallback_inline"
+    assert items[-1].payload["type"] == "done"

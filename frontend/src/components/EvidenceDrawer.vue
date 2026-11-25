@@ -32,8 +32,8 @@
       </div>
       <h5>{{ citationEntry.title }}</h5>
       <a
-        v-if="citationEntry.url"
-        :href="citationEntry.url"
+        v-if="safeEvidenceUrl(citationEntry.url)"
+        :href="safeEvidenceUrl(citationEntry.url)"
         target="_blank"
         rel="noopener noreferrer"
         class="source-link"
@@ -41,8 +41,28 @@
         {{ citationEntry.url }}
       </a>
       <p class="excerpt-text">
-        {{ citationEntry.snippet || "暂无详细摘要片段。" }}
+        {{ citationEntry.excerpt || citationEntry.snippet || "暂无详细摘要片段。" }}
       </p>
+      <p v-if="citationEntry.page_no != null || citationEntry.anchor_id || citationEntry.bbox?.length" class="side-meta">
+        <span v-if="citationEntry.page_no != null">第 {{ citationEntry.page_no }} 页 </span>
+        <span v-if="citationEntry.anchor_id">{{ citationEntry.anchor_id }} </span>
+        <span v-if="citationEntry.bbox?.length">坐标 {{ citationEntry.bbox.join(", ") }}</span>
+      </p>
+      <p v-if="citationEntry.derived_from_source_ids?.length" class="side-meta">
+        计算依据
+        <button v-for="sourceId in citationEntry.derived_from_source_ids" :key="sourceId" type="button" @click="$emit('select-citation', sourceId)">
+          [{{ sourceId }}]
+        </button>
+      </p>
+      <details v-if="citationEntry.computation_artifact">
+        <summary>计算工件</summary>
+        <pre class="artifact">{{ JSON.stringify(citationEntry.computation_artifact, null, 2) }}</pre>
+      </details>
+      <ul v-if="citationEntry.linked_claims?.length" class="excerpt-text">
+        <li v-for="(claim, index) in citationEntry.linked_claims" :key="index">
+          {{ claim.text }} · {{ claim.nli_label }}
+        </li>
+      </ul>
     </div>
 
     <div v-else-if="selectedCitationId" class="drawer-card muted-card">
@@ -71,12 +91,12 @@
             :class="{ recommended: cluster.recommended_source_id === side.source_id }"
           >
             <div class="side-top">
-              <code>[{{ side.source_id }}]</code>
+              <button type="button" @click="$emit('select-citation', side.source_id)">[{{ side.source_id }}]</button>
               <span>{{ side.title }}</span>
             </div>
-            <p class="side-claim">{{ side.claim_text }}</p>
+            <p class="side-claim">{{ side.evidence_excerpt || side.claim_text }}</p>
             <p v-if="side.published_at" class="side-meta">
-              发布时间：{{ side.published_at }} · 权威分 {{ (side.authority_rank || 0).toFixed(2) }}
+              发布时间：{{ side.published_at }} · 权威分 {{ Number(side.authority_rank || 0).toFixed(2) }}
             </p>
           </div>
         </div>
@@ -88,7 +108,7 @@
 <script lang="ts" setup>
 import { computed } from "vue";
 import type { ReportWorkbenchPayload } from "../types/research";
-import { conflictsForCitation } from "../utils/workbench";
+import { conflictsForCitation, safeEvidenceUrl } from "../utils/workbench";
 
 const props = defineProps<{
   visible: boolean;
@@ -98,6 +118,7 @@ const props = defineProps<{
 
 defineEmits<{
   close: [];
+  "select-citation": [sourceId: string];
 }>();
 
 const citationEntry = computed(() => {
@@ -283,5 +304,12 @@ const relevantConflicts = computed(() => {
   margin: 0;
   font-size: 11px;
   color: #64748b;
+}
+
+.artifact {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 </style>

@@ -1,6 +1,6 @@
 import { ref } from "vue";
-import { streamRequestEvents } from "../services/api";
-import type { ResearchStreamEvent, StreamOptions } from "../types/research";
+import { isStreamEnd, StreamHttpError, streamRequestEvents } from "../services/api";
+import type { ResearchEventHandler, StreamOptions } from "../types/research";
 
 export const ACTIVE_STREAM_STORAGE_KEY = "deepresearch:active_stream";
 
@@ -9,6 +9,7 @@ export interface PersistedStreamSession {
   lastEventId: string;
   topic: string;
   savedAt: string;
+  runner?: string;
 }
 
 export interface StorageLike {
@@ -50,7 +51,8 @@ export function saveActiveStreamSession(
       requestId: session.requestId.trim(),
       lastEventId: session.lastEventId || "",
       topic: session.topic || "",
-      savedAt: new Date().toISOString()
+      savedAt: new Date().toISOString(),
+      runner: session.runner
     };
     storage.setItem(ACTIVE_STREAM_STORAGE_KEY, JSON.stringify(payload));
   } catch {
@@ -77,7 +79,8 @@ export function loadActiveStreamSession(
       requestId: parsed.requestId.trim(),
       lastEventId: typeof parsed.lastEventId === "string" ? parsed.lastEventId : "",
       topic: typeof parsed.topic === "string" ? parsed.topic : "",
-      savedAt: typeof parsed.savedAt === "string" ? parsed.savedAt : ""
+      savedAt: typeof parsed.savedAt === "string" ? parsed.savedAt : "",
+      runner: typeof parsed.runner === "string" ? parsed.runner : undefined
     };
   } catch {
     return null;
@@ -104,71 +107,109 @@ export function useResilientStream() {
   async function followWithResume(
     requestId: string,
     topic: string,
-    onEvent: (event: ResearchStreamEvent) => void,
+    onEvent: ResearchEventHandler,
     options: StreamOptions & {
       maxRetries?: number;
       storage?: StorageLike | null;
       sleepFn?: (ms: number) => Promise<void>;
       streamFn?: typeof streamRequestEvents;
+      runner?: string;
     } = {}
   ): Promise<void> {
     const maxRetries = Math.max(0, options.maxRetries ?? 3);
-    const storage = options.storage ?? defaultStorage();
-    const sleepFn =
-      options.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    const storage = options.storage === undefined ? defaultStorage() : options.storage;
     const streamFn = options.streamFn ?? streamRequestEvents;
+    const { signal, runner } = options;
 
     let cursor = options.lastEventId || "";
     let finished = false;
     reconnectAttempt.value = 0;
+    signal?.throwIfAborted();
+    saveActiveStreamSession({ requestId, lastEventId: cursor, topic, runner }, storage);
 
-    while (!finished) {
-      try {
-        await streamFn(
-          requestId,
-          (event) => {
-            if (
-              event.type === "done" ||
-              event.type === "error" ||
-              event.type === "cancelled"
-            ) {
-              finished = true;
-              clearActiveStreamSession(storage);
+    try {
+      while (!finished) {
+        signal?.throwIfAborted();
+        try {
+          await streamFn(
+            requestId,
+            async (event) => {
+              signal?.throwIfAborted();
+              await onEvent(event);
+              if (event.type === "replay_gap") {
+                cursor = "";
+                saveActiveStreamSession({ requestId, lastEventId: cursor, topic, runner }, storage);
+              }
+              finished = isStreamEnd(event);
+            },
+            {
+              ...options,
+              lastEventId: cursor || undefined,
+              onStreamStart: (metadata) => {
+                reconnecting.value = false;
+                options.onStreamStart?.(metadata);
+              },
+              onEventId: (eventId) => {
+                cursor = eventId;
+                saveActiveStreamSession({ requestId, lastEventId: eventId, topic, runner }, storage);
+                options.onEventId?.(eventId);
+              }
             }
-            onEvent(event);
-          },
-          {
-            ...options,
-            lastEventId: cursor || undefined,
-            onEventId: (eventId) => {
-              cursor = eventId;
-              saveActiveStreamSession({ requestId, lastEventId: eventId, topic }, storage);
-              options.onEventId?.(eventId);
-            }
+          );
+          signal?.throwIfAborted();
+          if (!finished) {
+            throw new Error("研究事件流意外中断");
           }
-        );
-        finished = true;
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") {
-          reconnecting.value = false;
-          throw err;
+          clearActiveStreamSession(storage);
+        } catch (err) {
+          signal?.throwIfAborted();
+          if ((err instanceof Error && err.name === "AbortError") ||
+              (err instanceof StreamHttpError && err.status < 500 && ![408, 429].includes(err.status)) ||
+              reconnectAttempt.value >= maxRetries) {
+            throw err;
+          }
+          reconnecting.value = true;
+          const delay = computeReconnectDelayMs(reconnectAttempt.value);
+          reconnectAttempt.value += 1;
+          await waitForReconnect(delay, signal, options.sleepFn);
         }
-        if (reconnectAttempt.value >= maxRetries) {
-          reconnecting.value = false;
-          throw err;
-        }
-        reconnecting.value = true;
-        const delay = computeReconnectDelayMs(reconnectAttempt.value);
-        reconnectAttempt.value += 1;
-        await sleepFn(delay);
       }
+    } finally {
+      reconnecting.value = false;
     }
-    reconnecting.value = false;
   }
 
-  return {
-    reconnecting,
-    reconnectAttempt,
-    followWithResume
-  };
+  return { reconnecting, reconnectAttempt, followWithResume };
+}
+
+function waitForReconnect(
+  delay: number,
+  signal?: AbortSignal,
+  sleepFn?: (ms: number) => Promise<void>
+): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(signal?.reason);
+    };
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (sleepFn) {
+      void Promise.resolve().then(() => sleepFn(delay)).then(onReady, (error: unknown) => {
+        cleanup();
+        reject(error);
+      });
+    } else {
+      timer = setTimeout(onReady, delay);
+    }
+  });
 }

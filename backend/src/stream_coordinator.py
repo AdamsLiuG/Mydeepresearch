@@ -186,6 +186,7 @@ class StreamCoordinatorMixin:
 
         active_workers = len(tasks)
         finished_workers = 0
+        pending_approval = None
 
         try:
             while finished_workers < active_workers:
@@ -199,7 +200,9 @@ class StreamCoordinatorMixin:
                     finished_workers += 1
                     continue
                 if event.get("type") == "__tool_approval_required__":
-                    raise event["exception"]
+                    if pending_approval is None:
+                        pending_approval = event["exception"]
+                    continue
                 yield event
 
             if not _cancelled():
@@ -208,8 +211,10 @@ class StreamCoordinatorMixin:
                         event = event_queue.get_nowait()
                     except Empty:
                         break
-                    if event.get("type") != "__task_done__":
+                    if event.get("type") not in {"__task_done__", "__tool_approval_required__"}:
                         yield event
+                if pending_approval is not None:
+                    raise pending_approval
         finally:
             self._set_tool_event_sink(None)
             join_timeout = 2.0 if _cancelled() else None

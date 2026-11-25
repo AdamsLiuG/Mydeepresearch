@@ -1,10 +1,19 @@
 <template>
   <div v-if="hasMetadata" class="skill-gov-bar">
+    <span v-if="catalog" class="gov-pill">Skill System {{ catalog.enabled ? "已启用" : "已关闭" }}</span>
     <span v-if="governance" class="gov-pill gov-pack">
       策略包：<strong>{{ governance.pack_id || "_neutral" }}</strong>
       <template v-if="governance.version">v{{ governance.version }}</template>
       <template v-if="governance.maturity">({{ governance.maturity }})</template>
     </span>
+    <span v-if="governance?.secondary_pack_id" class="gov-pill">辅助包 {{ governance.secondary_pack_id }}</span>
+    <span v-if="governance?.format_pack_id" class="gov-pill">格式 {{ activeFormat?.title || governance.format_pack_id }}</span>
+    <span v-if="governance?.routing_method" class="gov-pill">
+      {{ governance.routing_method }}<template v-if="routingScore"> · {{ routingScore }}</template>
+    </span>
+    <span v-if="governance?.shadow || activeDomain?.status === 'shadow'" class="gov-pill">Shadow</span>
+    <span v-if="governance?.code_sandbox_enabled || activeDomain?.code_sandbox" class="gov-pill">计算沙箱</span>
+    <span v-if="governance?.mcp_tool_scopes && Object.keys(governance.mcp_tool_scopes).length" class="gov-pill">MCP</span>
 
     <span
       v-for="verifier in governance?.active_verifiers || []"
@@ -21,6 +30,13 @@
     <span v-if="faithfulnessText" class="gov-pill gov-score">
       原子一致率：{{ faithfulnessText }}
     </span>
+    <span v-for="badge in verifierBadges" :key="badge.badge_id" class="gov-pill">
+      {{ badge.label || badge.badge_id }} · {{ badge.status }}
+    </span>
+    <details v-if="catalog?.registered_verifiers.length">
+      <summary>已注册核验器 ({{ catalog.registered_verifiers.length }})</summary>
+      {{ catalog.registered_verifiers.join("、") }}
+    </details>
 
     <button
       v-if="conflictCount > 0"
@@ -35,13 +51,15 @@
 
 <script lang="ts" setup>
 import { computed } from "vue";
-import type { ClaimVerificationSummary, SkillGovernanceInfo } from "../types/research";
+import type { ClaimVerificationSummary, SkillGovernanceInfo, SkillsCatalogResponse, VerifierBadge } from "../types/research";
 
 const props = withDefaults(
   defineProps<{
     governance?: SkillGovernanceInfo | null;
     claimSummary?: ClaimVerificationSummary | null;
     conflictCount?: number;
+    catalog?: SkillsCatalogResponse | null;
+    verifierBadges?: VerifierBadge[];
   }>(),
   {
     governance: null,
@@ -63,6 +81,7 @@ const faithfulnessText = computed(() => {
 });
 
 const hasMetadata = computed(() => {
+  if (props.catalog || props.verifierBadges?.length) return true;
   const gov = props.governance;
   if (!gov) {
     return props.conflictCount > 0 || Boolean(faithfulnessText.value);
@@ -74,6 +93,13 @@ const hasMetadata = computed(() => {
       faithfulnessText.value ||
       props.conflictCount > 0
   );
+});
+
+const activeDomain = computed(() => props.catalog?.domain_packs.find((pack) => pack.pack_id === props.governance?.pack_id));
+const activeFormat = computed(() => props.catalog?.format_packs.find((pack) => pack.pack_id === props.governance?.format_pack_id));
+const routingScore = computed(() => {
+  const score = props.governance?.match_score;
+  return typeof score === "number" && Number.isFinite(score) ? score.toFixed(2) : "";
 });
 </script>
 

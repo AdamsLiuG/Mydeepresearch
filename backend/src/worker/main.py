@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import signal
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 _SRC_ROOT = Path(__file__).resolve().parents[1]
@@ -38,9 +40,24 @@ async def _run_temporal_worker(config: Configuration) -> None:  # pragma: no cov
         task_queue=config.temporal_task_queue,
         workflows=[wf_cls],
         activities=activities,
+        graceful_shutdown_timeout=timedelta(seconds=10),
     )
     logger.info("Starting Temporal worker on task_queue=%s", config.temporal_task_queue)
-    await worker.run()
+    loop = asyncio.get_running_loop()
+    stopping = asyncio.Event()
+    registered_signals = []
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(shutdown_signal, stopping.set)
+        except NotImplementedError:
+            continue
+        registered_signals.append(shutdown_signal)
+    try:
+        async with worker:
+            await stopping.wait()
+    finally:
+        for shutdown_signal in registered_signals:
+            loop.remove_signal_handler(shutdown_signal)
 
 
 def _run_arq_worker(config: Configuration) -> None:  # pragma: no cover - runtime daemon
@@ -56,10 +73,12 @@ def _run_arq_worker(config: Configuration) -> None:  # pragma: no cover - runtim
         functions = [run_research_arq_job]
         redis_settings = RedisSettings.from_dsn(dsn)
 
-    logger.info("Starting ARQ worker on redis=%s", dsn)
+    logger.info("Starting ARQ worker")
     Worker(
         functions=WorkerSettings.functions,
         redis_settings=WorkerSettings.redis_settings,
+        job_timeout=getattr(config, "hitl_signal_timeout_seconds", 86400) + 1800,
+        max_tries=3,
     ).run()
 
 

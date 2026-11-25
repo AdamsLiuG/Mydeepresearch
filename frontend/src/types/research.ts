@@ -2,6 +2,7 @@ export interface ResearchRequest {
   topic: string;
   search_api?: string;
   output_format?: string;
+  mode?: "auto" | "plan_first";
 }
 
 export interface SkillsCatalogResponse {
@@ -15,6 +16,7 @@ export interface SkillsCatalogResponse {
     composable_with: string[];
     version: number;
     status: string;
+    code_sandbox?: boolean;
   }>;
   format_packs: Array<{
     pack_id: string;
@@ -41,7 +43,10 @@ export interface StreamOptions {
   apiKey?: string;
   lastEventId?: string;
   onEventId?: (eventId: string) => void;
+  onStreamStart?: (metadata: { requestId?: string; runner?: string }) => void;
 }
+
+export type ResearchEventHandler = (event: ResearchStreamEvent) => void;
 
 export interface MetricsSnapshot {
   generated_at?: string;
@@ -189,6 +194,16 @@ export interface WorkbenchCitationEntry {
   published_at?: string | null;
   modality?: string;
   anchors?: string[];
+  source_origin?: string;
+  excerpt?: string;
+  page_no?: number | null;
+  bbox?: number[] | null;
+  anchor_id?: string | null;
+  freshness_label?: string;
+  derived_from_source_ids?: string[];
+  computation_artifact?: Record<string, unknown> | null;
+  linked_claims?: Array<{ text: string; nli_label: string; calibrated_confidence?: number }>;
+  conflict_ids?: string[];
 }
 
 export interface WorkbenchParagraphBinding {
@@ -253,6 +268,27 @@ export interface SkillGovernanceInfo {
   code_sandbox_enabled?: boolean;
   nli_verifier_enabled?: boolean;
   mcp_tool_scopes?: Record<string, unknown>;
+  secondary_pack_id?: string | null;
+  format_pack_id?: string | null;
+  routing_method?: string;
+  match_score?: number;
+  status?: string;
+  shadow?: boolean;
+}
+
+export interface ChartSpecArtifact {
+  chart_id: string;
+  title: string;
+  library: "echarts" | "vega-lite";
+  spec: Record<string, unknown>;
+  source_ids: string[];
+  caption?: string;
+}
+
+export interface VerifierBadge {
+  badge_id: string;
+  label?: string;
+  status: string;
 }
 
 export interface ReportWorkbenchPayload {
@@ -261,6 +297,8 @@ export interface ReportWorkbenchPayload {
   evidence_conflicts: EvidenceConflictCluster[];
   claim_verification_summary: ClaimVerificationSummary;
   skill_governance: SkillGovernanceInfo;
+  verifier_badges?: VerifierBadge[];
+  charts_spec?: unknown[];
 }
 
 export interface AsyncResearchSubmitResponse {
@@ -270,6 +308,8 @@ export interface AsyncResearchSubmitResponse {
   status: string;
   tenant_id: string;
   events_url: string;
+  runner?: string;
+  stream_url?: string;
 }
 
 export interface WorkflowSignalResponse {

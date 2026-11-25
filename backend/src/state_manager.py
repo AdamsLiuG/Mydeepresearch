@@ -61,6 +61,11 @@ class StateManagerMixin:
             "report_markdown": report_markdown or state.structured_report or state.running_summary or "",
             "report_charts": list(getattr(state, "report_charts", None) or []),
             **({"charts_spec": list(state.report_charts)} if state.report_charts else {}),
+            **({
+                "workbench": state.report_workbench,
+                "citation_drawer_map": state.report_workbench.get("citation_index", {}),
+                "verifier_badges": state.report_workbench.get("verifier_badges", []),
+            } if getattr(state, "report_workbench", None) else {}),
             "report_note_id": state.report_note_id,
             "report_note_path": state.report_note_path,
             "review_summary": dict(state.review_summary or {}),
@@ -108,7 +113,14 @@ class StateManagerMixin:
             )
             payload["approved_tool_calls"] = dict(getattr(state, "approved_tool_calls", None) or {})
             payload["state_version"] = int(getattr(state, "state_version", 0) or 0)
-            if self._store_supports_tenant_id("save"):
+            checkpoint = getattr(self, "_workflow_checkpoint", None)
+            if checkpoint is not None:
+                payload["runner_backend"] = checkpoint.backend
+                payload["workflow_run_id"] = checkpoint.run_id
+                state.runner_backend = checkpoint.backend
+                state.workflow_run_id = checkpoint.run_id
+                saved = checkpoint.persist(payload)
+            elif self._store_supports_tenant_id("save"):
                 kwargs: dict[str, Any] = {"tenant_id": tenant_id}
                 if payload["pending_tool_approval"] or payload["approved_tool_calls"]:
                     kwargs["expected_version"] = payload["state_version"]
@@ -124,6 +136,14 @@ class StateManagerMixin:
         if state is None or self._request_state_store is None:
             return False
         with getattr(self, "_request_snapshot_lock", nullcontext()):
+            checkpoint = getattr(self, "_workflow_checkpoint", None)
+            if checkpoint is not None:
+                saved = checkpoint.consume_tool_approval(key, entry)
+                if saved is None:
+                    return False
+                state.state_version = saved["state_version"]
+                state.approved_tool_calls[key] = saved["approved_tool_calls"][key]
+                return True
             snapshot = self._load_resume_snapshot(self.request_id)
             registry = dict(snapshot.get("approved_tool_calls") or {})
             current = registry.get(key)
@@ -293,6 +313,9 @@ class StateManagerMixin:
                 list(payload.get("report_charts") or [])
                 if isinstance(payload.get("report_charts"), list)
                 else list(payload["charts_spec"]) if isinstance(payload.get("charts_spec"), list) else []
+            ),
+            report_workbench=(
+                deepcopy(payload["workbench"]) if isinstance(payload.get("workbench"), dict) else {}
             ),
             evidence_conflicts=(
                 [deepcopy(conflict) for conflict in payload["evidence_conflicts"] if isinstance(conflict, dict)]

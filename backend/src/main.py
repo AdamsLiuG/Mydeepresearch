@@ -6,22 +6,27 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import Event, Thread
 from typing import Any, Callable, Dict, Iterator, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
 
 from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
-from services.event_bus import build_stream_event_bus
+from services.event_bus import (
+    TERMINAL_EVENT_TYPES,
+    build_stream_event_bus,
+    event_id_parts,
+)
 from services.hitl import HitlService
 from services.mcp_bridge import (
     MCPBridgeManager,
@@ -37,7 +42,11 @@ from services.tenant import (
     authenticate_tenant,
     extract_api_key,
 )
-from services.workflow_runner import build_workflow_runner
+from services.workflow_runner import (
+    WorkflowRunHandle,
+    WorkflowUnavailableError,
+    build_workflow_runner,
+)
 
 try:  # pragma: no cover - optional runtime dependency
     import redis as _redis_mod
@@ -121,6 +130,9 @@ class ResearchResponse(BaseModel):
         default_factory=dict,
         description="Atomic claim NLI verification aggregate metrics",
     )
+    citation_drawer_map: dict[str, Any] | None = None
+    verifier_badges: list[dict[str, Any]] | None = None
+    workbench: dict[str, Any] | None = None
 
 
 class ClarifyRequest(BaseModel):
@@ -149,6 +161,7 @@ class PlanUpdateRequest(BaseModel):
     """Payload for updating a persisted awaiting_approval task plan."""
 
     tasks: list[EditableTaskPayload] = Field(..., min_length=1)
+    revision: int | None = None
 
 
 class DrilldownRequest(BaseModel):
@@ -187,12 +200,7 @@ class AsyncResearchRequest(BaseModel):
         default=None,
         description="Optional output format skill id",
     )
-
-
-class WorkflowSignalRequest(BaseModel):
-    """Payload delivered via POST /requests/{request_id}/signals/{signal_name}."""
-
-    payload: dict[str, Any] = Field(default_factory=dict, description="Optional signal metadata")
+    mode: Literal["auto", "plan_first"] = "auto"
 
 
 def _mask_secret(value: str | None, visible: int = 4) -> str:
@@ -455,6 +463,9 @@ def create_app(
         try:
             yield
         finally:
+            shutdown = getattr(app.state.workflow_runner, "shutdown", None)
+            if callable(shutdown):
+                await asyncio.to_thread(shutdown)
             bridge = getattr(app.state, "mcp_bridge", None)
             if bridge is not None and hasattr(bridge, "close"):
                 bridge.close()
@@ -462,6 +473,11 @@ def create_app(
             state_store = getattr(app.state, "request_state_store", None)
             if state_store is not None and hasattr(state_store, "close"):
                 state_store.close()
+            close_event_bus = getattr(app.state.event_bus, "close", None)
+            if callable(close_event_bus):
+                close_event_bus()
+            if rate_limit_redis is not None:
+                rate_limit_redis.close()
 
     app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
     app.state.base_config = base_config
@@ -475,6 +491,8 @@ def create_app(
             rate_limit_redis = _redis_mod.Redis.from_url(
                 str(base_config.redis_url),
                 decode_responses=True,
+                socket_connect_timeout=1,
+                socket_timeout=1,
             )
         except Exception:
             rate_limit_redis = None
@@ -505,6 +523,7 @@ def create_app(
             "Last-Event-ID",
             "Accept",
         ],
+        expose_headers=["X-Request-ID", "X-Workflow-Runner"],
     )
 
     @app.middleware("http")
@@ -513,6 +532,8 @@ def create_app(
         call_next,
     ):
         request_id = request.headers.get("X-Request-ID") or uuid4().hex[:12]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
+            return JSONResponse({"detail": "Invalid X-Request-ID"}, status_code=400)
         request.state.request_id = request_id
         start_time = time.perf_counter()
 
@@ -577,12 +598,14 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             ) from exc
 
-    def _acquire_rate_limit(tenant: TenantContext) -> None:
+    def _acquire_rate_limit(tenant: TenantContext) -> str:
         cfg = app.state.base_config
+        lease_id = uuid4().hex
         allowed, retry_after, reason = app.state.rate_limiter.try_acquire(
             tenant.tenant_id,
             rpm_limit=getattr(cfg, "tenant_rate_limit_rpm", 0),
             max_concurrent=getattr(cfg, "tenant_max_concurrent_requests", 0),
+            lease_id=lease_id,
         )
         if not allowed:
             raise HTTPException(
@@ -590,9 +613,10 @@ def create_app(
                 detail=f"Tenant rate limit exceeded ({reason})",
                 headers={"Retry-After": str(retry_after)},
             )
+        return lease_id
 
-    def _release_rate_limit(tenant: TenantContext) -> None:
-        app.state.rate_limiter.release(tenant.tenant_id)
+    def _release_rate_limit(tenant: TenantContext, lease_id: str) -> None:
+        app.state.rate_limiter.release(tenant.tenant_id, lease_id=lease_id)
 
     def _instantiate_agent(
         *,
@@ -640,9 +664,12 @@ def create_app(
         *,
         tenant_id: str | None,
     ) -> dict[str, Any]:
+        kwargs = {}
         if _store_supports_tenant_id(store, "save"):
-            return store.save(request_id, payload, tenant_id=tenant_id)
-        return store.save(request_id, payload)
+            kwargs["tenant_id"] = tenant_id
+        if "state_version" in payload and _accepts_kwarg(store.save, "expected_version"):
+            kwargs["expected_version"] = payload["state_version"]
+        return store.save(request_id, payload, **kwargs)
 
     def _store_list_recent(
         store: Any,
@@ -662,7 +689,9 @@ def create_app(
             if tenant_id is None or (item.get("tenant_id") or "default") == tenant_id
         ]
 
-    def _ensure_request_ownership(request_id: str, tenant: TenantContext) -> None:
+    def _ensure_request_ownership(
+        request_id: str, tenant: TenantContext, *, inline_mutation: bool = False,
+    ) -> None:
         store = app.state.request_state_store
         if store is None:
             return
@@ -675,6 +704,8 @@ def create_app(
                 status_code=404,
                 detail=f"request snapshot not found: {request_id}",
             )
+        if inline_mutation and owned.get("workflow_run_id"):
+            raise HTTPException(status_code=409, detail="Request belongs to a durable workflow")
 
     def _save_tool_approval_snapshot(store: Any, snapshot: dict[str, Any], tenant: TenantContext) -> None:
         if not _accepts_kwarg(store.save, "expected_version") or "state_version" not in snapshot:
@@ -708,6 +739,16 @@ def create_app(
         if pending.get("status") != "approved_once":
             raise HTTPException(status_code=409, detail="Tool approval is required before resuming")
 
+    def _workbench_response(result: Any) -> dict[str, Any]:
+        workbench = getattr(result, "report_workbench", None)
+        if not workbench:
+            return {}
+        return {
+            "workbench": workbench,
+            "citation_drawer_map": workbench.get("citation_index"),
+            "verifier_badges": workbench.get("verifier_badges"),
+        }
+
     @app.get("/healthz")
     async def health_check() -> Dict[str, str]:
         return {"status": "ok"}
@@ -731,8 +772,8 @@ def create_app(
     def run_research(payload: ResearchRequest, request: Request) -> ResearchResponse:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
-        _ensure_request_ownership(request_id, tenant)
-        _acquire_rate_limit(tenant)
+        _ensure_request_ownership(request_id, tenant, inline_mutation=True)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(payload, base_config=app.state.base_config)
             agent = _instantiate_agent(
@@ -758,7 +799,7 @@ def create_app(
                 detail=f"Research failed (request_id={request_id})",
             ) from exc
         finally:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
 
         todo_payload = [
             {
@@ -800,12 +841,13 @@ def create_app(
             charts_spec=list(getattr(result, "report_charts", []) or []) or None,
             **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
             **({"claim_verification_summary": raw_summary} if raw_summary else {}),
+            **_workbench_response(result),
         )
 
     @app.post("/research/clarify")
     async def clarify_research(payload: ClarifyRequest, request: Request) -> Dict[str, Any]:
         tenant = _resolve_tenant(request)
-        _acquire_rate_limit(tenant)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(topic=payload.topic, search_api=payload.search_api),
@@ -822,14 +864,14 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
 
     @app.post("/research/plan")
     def create_editable_plan(payload: ResearchRequest, request: Request) -> Dict[str, Any]:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
-        _ensure_request_ownership(request_id, tenant)
-        _acquire_rate_limit(tenant)
+        _ensure_request_ownership(request_id, tenant, inline_mutation=True)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(payload, base_config=app.state.base_config)
             agent = _instantiate_agent(
@@ -855,7 +897,7 @@ def create_app(
                 detail=f"Planning failed (request_id={request_id})",
             ) from exc
         finally:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
 
     @app.put("/requests/{request_id}/plan")
     async def update_editable_plan(
@@ -879,6 +921,15 @@ def create_app(
 
         if snapshot.get("pending_tool_approval") or snapshot.get("approved_tool_calls"):
             raise HTTPException(status_code=409, detail="Request has a tool approval record")
+        if snapshot.get("workflow_run_id") and (
+            snapshot.get("phase") != "awaiting_approval"
+            or snapshot.get("status") != "awaiting_approval"
+            or snapshot.get("workflow_plan_revision") is not None
+        ):
+            raise HTTPException(status_code=409, detail="Request is no longer awaiting plan approval")
+        plan_revision = int(snapshot.get("plan_revision") or snapshot.get("workflow_plan_pending_revision") or 0)
+        if payload.revision is not None and payload.revision != plan_revision:
+            raise HTTPException(status_code=409, detail="Plan revision changed")
 
         config = app.state.base_config
         try:
@@ -899,24 +950,31 @@ def create_app(
         updated_snapshot["review_summary"] = {}
         updated_snapshot["evidence_conflicts"] = []
         updated_snapshot["claim_verification_summary"] = {}
+        for field in ("workbench", "citation_drawer_map", "verifier_badges", "charts_spec", "report_charts"):
+            updated_snapshot.pop(field, None)
         if isinstance(updated_snapshot.get("request_metrics"), dict):
             updated_snapshot["request_metrics"] = {
                 key: value for key, value in updated_snapshot["request_metrics"].items()
                 if key not in {"review_summary", "claim_verification_summary", "todo_items"}
             }
-        saved = await asyncio.to_thread(
-            _store_save,
-            store,
-            request_id,
-            updated_snapshot,
-            tenant_id=tenant.tenant_id,
-        )
+        updated_snapshot["plan_revision"] = plan_revision + 1
+        try:
+            saved = await asyncio.to_thread(
+                _store_save,
+                store,
+                request_id,
+                updated_snapshot,
+                tenant_id=tenant.tenant_id,
+            )
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Request snapshot changed") from exc
         return {
             "request_id": request_id,
             "topic": saved.get("topic", ""),
             "status": saved.get("status", "awaiting_approval"),
             "phase": saved.get("phase", "awaiting_approval"),
             "todo_items": saved.get("todo_items", []),
+            "plan_revision": saved.get("plan_revision"),
             "estimated_duration_seconds": HitlService.estimate_duration_seconds(
                 len(normalized_tasks), config
             ),
@@ -930,7 +988,7 @@ def create_app(
     ) -> Dict[str, Any]:
         tenant = _resolve_tenant(request)
         _ensure_request_ownership(request_id, tenant)
-        _acquire_rate_limit(tenant)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(topic="drilldown", search_api=payload.search_api),
@@ -962,7 +1020,7 @@ def create_app(
                 detail=f"Drilldown failed (request_id={request_id})",
             ) from exc
         finally:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
 
     @app.get("/requests")
     async def list_persisted_requests(
@@ -1000,6 +1058,84 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
         return payload
 
+    def _sse_frame(payload: dict[str, Any], event_id: str = "") -> str:
+        prefix = f"id: {event_id}\n" if event_id else ""
+        return f"{prefix}data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def _stream_response(iterator: AsyncIterator[str], request_id: str, backend: str | None = None) -> StreamingResponse:
+        headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Request-ID": request_id,
+        }
+        if backend:
+            headers["X-Workflow-Runner"] = backend
+        return StreamingResponse(iterator, media_type="text/event-stream", headers=headers)
+
+    def _follow_events(
+        request: Request,
+        request_id: str,
+        tenant: TenantContext,
+        cursor: str | None,
+        backend: str | None = None,
+    ) -> StreamingResponse:
+        runner = app.state.workflow_runner
+        store = app.state.request_state_store
+        terminal_status: str | None = None
+        heartbeat = app.state.base_config.sse_heartbeat_interval_seconds
+        finished_statuses = {
+            "success", "partial_success", "completed", "failed", "workflow_failed", "cancelled", "expired", "rejected",
+        }
+
+        def _is_terminal() -> bool:
+            nonlocal terminal_status
+            tracked = runner.status(request_id, tenant_id=tenant.tenant_id) or {}
+            if tracked and tracked.get("status") not in finished_statuses:
+                return False
+            snap = _store_load(store, request_id, tenant_id=tenant.tenant_id) if store is not None else None
+            snap = snap or {}
+            status = tracked.get("status") or snap.get("status")
+            is_paused_inline = snap.get("runner_backend", "inline") == "inline" and status in {
+                "awaiting_approval", "approved_ready",
+            }
+            if is_paused_inline or status in finished_statuses:
+                terminal_status = status
+                return True
+            return False
+
+        async def _follow_iter() -> AsyncIterator[str]:
+            iterator = iter(app.state.event_bus.tail_since(
+                tenant.tenant_id,
+                request_id,
+                last_event_id=cursor,
+                is_terminal_fn=_is_terminal,
+                block_ms=int(min(heartbeat, 1.0) * 1000),
+            ))
+            last_emitted = time.monotonic()
+            try:
+                while not await request.is_disconnected():
+                    envelope = await asyncio.to_thread(next, iterator, None)
+                    if envelope is None:
+                        if terminal_status or await asyncio.to_thread(_is_terminal):
+                            yield _sse_frame({"type": "stream_closed", "status": terminal_status})
+                        else:
+                            yield _sse_frame({"type": "stream_closed", "status": "completed"})
+                        return
+                    if envelope.payload.get("type") == "__keepalive__":
+                        if time.monotonic() - last_emitted < heartbeat:
+                            continue
+                        yield ": keepalive\n\n"
+                    else:
+                        yield _sse_frame(envelope.payload, envelope.event_id)
+                        if envelope.payload.get("type") in TERMINAL_EVENT_TYPES:
+                            return
+                    last_emitted = time.monotonic()
+            except Exception:
+                logger.exception("Event tail interrupted request_id=%s", request_id)
+
+        return _stream_response(_follow_iter(), request_id, backend)
+
     @app.get("/requests/{request_id}/events")
     async def replay_request_events(
         request_id: str,
@@ -1009,117 +1145,27 @@ def create_app(
     ) -> Any:
         tenant = _resolve_tenant(request)
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
-        resolved_last_id = (
-            last_event_id
-            if last_event_id is not None
-            else request.headers.get("last-event-id")
-        )
+        resolved_last_id = last_event_id if last_event_id is not None else request.headers.get("last-event-id")
+        if resolved_last_id:
+            try:
+                event_id_parts(resolved_last_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if follow:
-            runner = getattr(app.state, "workflow_runner", None)
-            store = getattr(app.state, "request_state_store", None)
-
-            def _is_terminal() -> bool:
-                if runner is not None:
-                    rstat = runner.status(request_id, tenant_id=tenant.tenant_id)
-                    if isinstance(rstat, dict) and rstat.get("status") in {
-                        "completed",
-                        "failed",
-                        "cancelled",
-                    }:
-                        return True
-                if store is not None:
-                    snap = _store_load(store, request_id, tenant_id=tenant.tenant_id)
-                    if isinstance(snap, dict) and snap.get("status") in {
-                        "success",
-                        "partial_success",
-                        "failed",
-                        "cancelled",
-                    }:
-                        return True
-                return False
-
-            async def _follow_iter() -> AsyncIterator[str]:
-                tail_q: Queue[tuple[str, Any]] = Queue()
-
-                def _pump() -> None:
-                    try:
-                        tail_fn = getattr(app.state.event_bus, "tail_since", None)
-                        if callable(tail_fn):
-                            for env in tail_fn(
-                                tenant.tenant_id,
-                                request_id,
-                                last_event_id=resolved_last_id,
-                                is_terminal_fn=_is_terminal,
-                                block_ms=int(
-                                    max(
-                                        200,
-                                        float(
-                                            getattr(
-                                                app.state.base_config,
-                                                "sse_heartbeat_interval_seconds",
-                                                15.0,
-                                            )
-                                            or 15.0
-                                        )
-                                        * 1000,
-                                    )
-                                ),
-                            ):
-                                tail_q.put(("env", env))
-                        else:
-                            for env in app.state.event_bus.replay_since(
-                                tenant.tenant_id,
-                                request_id,
-                                last_event_id=resolved_last_id,
-                            ):
-                                tail_q.put(("env", env))
-                    except Exception as exc:
-                        tail_q.put(("error", exc))
-                    finally:
-                        tail_q.put(("end", None))
-
-                pump_thread = Thread(
-                    target=_pump,
-                    name=f"sse-tail-{request_id[:8]}",
-                    daemon=True,
+            def _exists() -> bool:
+                store = app.state.request_state_store
+                return bool(
+                    (store is not None and _store_load(store, request_id, tenant_id=tenant.tenant_id))
+                    or app.state.workflow_runner.status(request_id, tenant_id=tenant.tenant_id)
+                    or app.state.event_bus.has_events(tenant.tenant_id, request_id)
                 )
-                pump_thread.start()
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    try:
-                        kind, item = await asyncio.to_thread(tail_q.get, True, 0.25)
-                    except Empty:
-                        continue
-                    if kind == "env":
-                        payload = item.payload
-                        if payload.get("type") == "__keepalive__":
-                            yield ": keepalive\n\n"
-                        else:
-                            yield (
-                                f"id: {item.event_id}\n"
-                                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                            )
-                    elif kind == "error":
-                        yield (
-                            f"data: {json.dumps({'type': 'error', 'detail': str(item)}, ensure_ascii=False)}\n\n"
-                        )
-                        break
-                    else:
-                        break
 
-            return StreamingResponse(
-                _follow_iter(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                    "X-Request-ID": request_id,
-                },
-            )
+            if not await asyncio.to_thread(_exists):
+                raise HTTPException(status_code=404, detail="Request stream not found")
+            return _follow_events(request, request_id, tenant, resolved_last_id)
 
-        envelopes = app.state.event_bus.replay_since(
+        envelopes = await asyncio.to_thread(
+            app.state.event_bus.replay_since,
             tenant.tenant_id,
             request_id,
             last_event_id=resolved_last_id,
@@ -1128,20 +1174,9 @@ def create_app(
         if "text/event-stream" in accept:
             async def _replay_iter() -> AsyncIterator[str]:
                 for envelope in envelopes:
-                    yield (
-                        f"id: {envelope.event_id}\n"
-                        f"data: {json.dumps(envelope.payload, ensure_ascii=False)}\n\n"
-                    )
+                    yield _sse_frame(envelope.payload, envelope.event_id)
 
-            return StreamingResponse(
-                _replay_iter(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            return _stream_response(_replay_iter(), request_id)
         return {
             "request_id": request_id,
             "tenant_id": tenant.tenant_id,
@@ -1151,68 +1186,119 @@ def create_app(
             ],
         }
 
+    async def _submit_workflow(
+        payload: ResearchRequest | AsyncResearchRequest,
+        request_id: str,
+        tenant: TenantContext,
+        *,
+        plan_first: bool = False,
+    ) -> WorkflowRunHandle:
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
+
+        def _submit() -> WorkflowRunHandle:
+            lease_id = _acquire_rate_limit(tenant)
+            retain_lease = False
+            try:
+                config = _build_config(payload, base_config=app.state.base_config)
+                handle = app.state.workflow_runner.submit(
+                    payload.topic,
+                    request_id=request_id,
+                    tenant_id=tenant.tenant_id,
+                    config=config,
+                    output_format=payload.output_format,
+                    plan_first=plan_first,
+                    lease_id=lease_id,
+                )
+                retain_lease = handle.runner_backend == "local_durable" and not handle.metadata.get("duplicate")
+                return handle
+            finally:
+                if not retain_lease:
+                    _release_rate_limit(tenant, lease_id)
+
+        try:
+            return await asyncio.to_thread(_submit)
+        except WorkflowUnavailableError as exc:
+            logger.warning("Workflow backend unavailable for request %s", request_id)
+            raise HTTPException(
+                status_code=503, detail="Workflow backend unavailable", headers={"Retry-After": "5"},
+            ) from exc
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Request snapshot changed") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/research/async", status_code=202)
-    async def submit_async_research(
-        payload: AsyncResearchRequest,
-        request: Request,
-    ) -> Dict[str, Any]:
+    async def submit_async_research(payload: AsyncResearchRequest, request: Request) -> Dict[str, Any]:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
-        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
-        _acquire_rate_limit(tenant)
-        try:
-            config = _build_config(
-                ResearchRequest(
-                    topic=payload.topic,
-                    search_api=payload.search_api,
-                    output_format=payload.output_format,
-                ),
-                base_config=app.state.base_config,
-            )
-            runner = app.state.workflow_runner
-            handle = await asyncio.to_thread(
-                runner.submit,
-                payload.topic,
-                request_id=request_id,
-                tenant_id=tenant.tenant_id,
-                config=config,
-                output_format=payload.output_format,
-            )
-            if runner.backend_name == "inline":
-                _release_rate_limit(tenant)
-            return {
-                **handle.to_dict(),
-                "events_url": f"/requests/{request_id}/events?follow=1",
-            }
-        except HTTPException:
-            _release_rate_limit(tenant)
-            raise
-        except ValueError as exc:
-            _release_rate_limit(tenant)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            _release_rate_limit(tenant)
-            logger.exception("Async submit failed request_id=%s", request_id)
-            raise HTTPException(status_code=500, detail=f"Async submit failed: {exc}") from exc
+        handle = await _submit_workflow(payload, request_id, tenant, plan_first=payload.mode == "plan_first")
+        events_url = f"/requests/{request_id}/events?follow=1"
+        return {
+            **handle.to_dict(),
+            "runner": handle.runner_backend,
+            "events_url": events_url,
+            "stream_url": events_url,
+        }
 
     @app.post("/requests/{request_id}/signals/{signal_name}")
     async def send_workflow_signal(
         request_id: str,
-        signal_name: str,
+        signal_name: Literal["approve_plan", "approve_tool_call", "approve_tool", "cancel"],
         request: Request,
-        payload: WorkflowSignalRequest | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         tenant = _resolve_tenant(request)
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
         runner = app.state.workflow_runner
-        signal_body = payload.payload if payload is not None else {}
-        return await asyncio.to_thread(
-            runner.signal,
-            request_id,
-            signal_name,
-            signal_body,
-            tenant_id=tenant.tenant_id,
-        )
+        signal_body = payload or {}
+        if "payload" in signal_body:
+            signal_body = signal_body["payload"]
+            if not isinstance(signal_body, dict):
+                raise HTTPException(status_code=422, detail="Signal payload must be an object")
+
+        if signal_name in {"approve_tool_call", "approve_tool"}:
+            approval_id = signal_body.get("approval_id")
+            if not isinstance(approval_id, str) or not approval_id.strip():
+                raise HTTPException(status_code=422, detail="Approval ID is required")
+            try:
+                approval = ToolApprovalDecisionRequest.model_validate(signal_body)
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail="Valid tool approval decision is required") from exc
+            return await asyncio.to_thread(resolve_mcp_tool_approval, request_id, approval_id, approval, request)
+
+        if signal_name == "approve_plan" and "tasks" in signal_body:
+            try:
+                revision = signal_body.get("revision", signal_body.get("plan_revision"))
+                edits = PlanUpdateRequest.model_validate({**signal_body, "revision": revision})
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail="Invalid edited plan") from exc
+            edited = await update_editable_plan(request_id, edits, request)
+            signal_body = {"revision": edited["plan_revision"]}
+
+        try:
+            result = await asyncio.to_thread(
+                runner.signal, request_id, signal_name, signal_body, tenant_id=tenant.tenant_id,
+            )
+        except WorkflowUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="Workflow backend unavailable", headers={"Retry-After": "5"},
+            ) from exc
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Request snapshot changed") from exc
+        if not result.get("accepted"):
+            store = app.state.request_state_store
+            snapshot = await asyncio.to_thread(_store_load, store, request_id, tenant_id=tenant.tenant_id) if store else None
+            if snapshot is None and not result.get("run_found"):
+                raise HTTPException(status_code=404, detail="Workflow request not found")
+            if (
+                signal_name == "approve_plan"
+                and snapshot
+                and snapshot.get("phase") == "awaiting_approval"
+                and not snapshot.get("workflow_run_id")
+            ):
+                return {**result, "accepted": True, "status": "awaiting_approval", "resume_required": True}
+            raise HTTPException(status_code=409, detail="Workflow cannot accept this signal in its current state")
+        return result
 
     @app.post(
         "/requests/{request_id}/resume",
@@ -1226,9 +1312,9 @@ def create_app(
         payload: ResumeRequest | None = None,
     ) -> ResearchResponse:
         tenant = _resolve_tenant(request)
-        _ensure_request_ownership(request_id, tenant)
+        _ensure_request_ownership(request_id, tenant, inline_mutation=True)
         _check_tool_approval_before_resume(request_id, tenant)
-        _acquire_rate_limit(tenant)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(
@@ -1258,7 +1344,7 @@ def create_app(
                 detail=f"Resume failed (request_id={request_id})",
             ) from exc
         finally:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
 
         todo_payload = [
             {
@@ -1299,119 +1385,98 @@ def create_app(
             charts_spec=list(getattr(result, "report_charts", []) or []) or None,
             **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
             **({"claim_verification_summary": raw_summary} if raw_summary else {}),
+            **_workbench_response(result),
         )
 
     def _build_sse_stream(
         stream_starter: Callable[[Event], Iterator[dict[str, Any]]],
         *,
-        request: Request | None,
+        request: Request,
         request_id: str,
-        tenant_id: str = "default",
+        tenant_id: str,
         heartbeat_seconds: float,
         error_log_label: str,
-        cancel_on_disconnect: bool = True,
-        on_complete: Callable[[], None] | None = None,
+        on_complete: Callable[[], None],
     ) -> StreamingResponse:
         cancel_event = Event()
-        event_queue: Queue[tuple[str, Any]] = Queue()
-        heartbeat_interval = max(0.05, float(heartbeat_seconds or 15.0))
-        client_detached = Event()
+        producer_finished = Event()
+        frames: Queue[str] = Queue(maxsize=64)
 
-        def _publish_and_format(event_payload: dict[str, Any]) -> str:
-            event_id = app.state.event_bus.publish(tenant_id, request_id, event_payload)
-            return (
-                f"id: {event_id}\n"
-                f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
-            )
+        def _enqueue(payload: dict[str, Any], *, persist: bool = True) -> None:
+            event_id = app.state.event_bus.publish(tenant_id, request_id, payload) if persist else ""
+            frame = _sse_frame(payload, event_id)
+            while not cancel_event.is_set():
+                try:
+                    frames.put(frame, timeout=0.1)
+                    return
+                except Full:
+                    continue
 
         def producer() -> None:
+            iterator = None
             try:
-                for event in stream_starter(cancel_event):
-                    if cancel_on_disconnect and cancel_event.is_set():
+                iterator = stream_starter(cancel_event)
+                paused = False
+                for event in iterator:
+                    _enqueue(event)
+                    if event.get("type") in TERMINAL_EVENT_TYPES:
+                        return
+                    if event.get("type") == "tool_approval_required":
+                        paused = True
+                    if cancel_event.is_set():
                         break
-                    if not cancel_on_disconnect and client_detached.is_set():
-                        if isinstance(event, dict):
-                            app.state.event_bus.publish(tenant_id, request_id, event)
-                        continue
-                    event_queue.put(("event", event))
-            except Exception as exc:  # pragma: no cover - defensive guardrail
-                logger.exception(
-                    "%s",
-                    error_log_label,
-                    extra={"request_id": request_id},
-                )
-                if not cancel_on_disconnect and client_detached.is_set():
-                    app.state.event_bus.publish(
-                        tenant_id,
-                        request_id,
-                        {"type": "error", "detail": f"{exc} (request_id={request_id})"},
-                    )
+                if paused and not cancel_event.is_set():
+                    _enqueue({"type": "stream_closed", "status": "awaiting_tool_approval"}, persist=False)
+                elif cancel_event.is_set():
+                    _enqueue({"type": "cancelled", "request_id": request_id})
                 else:
-                    event_queue.put(("error", exc))
+                    _enqueue({"type": "done", "request_id": request_id})
+            except Exception:
+                logger.exception("%s", error_log_label, extra={"request_id": request_id})
+                error = {"type": "error", "detail": f"Research failed (request_id={request_id})"}
+                try:
+                    _enqueue(error)
+                except Exception:
+                    _enqueue(error, persist=False)
             finally:
-                if not cancel_on_disconnect and client_detached.is_set():
-                    if on_complete is not None:
+                try:
+                    close = getattr(iterator, "close", None)
+                    if close:
+                        close()
+                finally:
+                    try:
                         on_complete()
-                event_queue.put(("done", None))
+                    finally:
+                        producer_finished.set()
 
-        worker = Thread(
-            target=producer,
-            name=f"sse-producer-{request_id[:8]}",
-            daemon=True,
-        )
-        worker.start()
+        worker = Thread(target=producer, name=f"sse-producer-{request_id[:8]}", daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            on_complete()
+            raise
 
         async def event_iterator() -> AsyncIterator[str]:
             last_emitted = time.monotonic()
-            poll_slice = min(0.1, heartbeat_interval)
-            detached = False
+            poll_slice = min(0.1, heartbeat_seconds)
             try:
-                while True:
-                    if request is not None and await request.is_disconnected():
-                        detached = True
-                        client_detached.set()
-                        if cancel_on_disconnect:
-                            cancel_event.set()
-                        break
-
+                while not await request.is_disconnected():
                     try:
-                        kind, payload = await asyncio.to_thread(event_queue.get, True, poll_slice)
+                        frame = await asyncio.to_thread(frames.get, True, poll_slice)
                     except Empty:
+                        if producer_finished.is_set() and frames.empty():
+                            break
                         now = time.monotonic()
-                        if now - last_emitted >= heartbeat_interval:
+                        if now - last_emitted >= heartbeat_seconds:
                             yield ": keepalive\n\n"
                             last_emitted = now
                         continue
-
-                    if kind == "event":
-                        yield _publish_and_format(payload)
-                        last_emitted = time.monotonic()
-                    elif kind == "error":
-                        error_payload = {
-                            "type": "error",
-                            "detail": f"{payload} (request_id={request_id})",
-                        }
-                        yield _publish_and_format(error_payload)
-                        break
-                    else:
-                        break
+                    yield frame
+                    last_emitted = time.monotonic()
             finally:
-                if cancel_on_disconnect or not detached:
-                    cancel_event.set()
-                    await asyncio.to_thread(worker.join, 1.0)
-                    if on_complete is not None:
-                        on_complete()
+                cancel_event.set()
 
-        return StreamingResponse(
-            event_iterator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-                "X-Request-ID": request_id,
-            },
-        )
+        return _stream_response(event_iterator(), request_id, "inline")
 
     def _supports_cancel_event(fn: Callable[..., Any]) -> bool:
         return _accepts_kwarg(fn, "cancel_event")
@@ -1420,8 +1485,11 @@ def create_app(
     async def stream_research(payload: ResearchRequest, request: Request) -> StreamingResponse:
         request_id = _request_id(request)
         tenant = _resolve_tenant(request)
-        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
-        _acquire_rate_limit(tenant)
+        if app.state.workflow_runner.backend_name != "inline":
+            handle = await _submit_workflow(payload, request_id, tenant)
+            return _follow_events(request, request_id, tenant, None, handle.runner_backend)
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant, inline_mutation=True)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(payload, base_config=app.state.base_config)
             agent = _instantiate_agent(
@@ -1430,13 +1498,13 @@ def create_app(
                 tenant_id=tenant.tenant_id,
             )
         except HTTPException:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
             raise
         except ValueError as exc:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
             logger.exception(
                 "Failed to initialise streaming research topic=%s",
                 payload.topic,
@@ -1459,8 +1527,7 @@ def create_app(
             tenant_id=tenant.tenant_id,
             heartbeat_seconds=config.sse_heartbeat_interval_seconds,
             error_log_label=f"Streaming research failed topic={payload.topic}",
-            cancel_on_disconnect=(getattr(config, "workflow_runner", "inline") == "inline"),
-            on_complete=lambda: _release_rate_limit(tenant),
+            on_complete=lambda: _release_rate_limit(tenant, lease_id),
         )
 
     @app.post("/requests/{request_id}/resume/stream")
@@ -1471,8 +1538,14 @@ def create_app(
     ) -> StreamingResponse:
         tenant = _resolve_tenant(request)
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant)
+        tracked = await asyncio.to_thread(
+            app.state.workflow_runner.status, request_id, tenant_id=tenant.tenant_id,
+        )
+        if tracked and tracked.get("workflow_run_id"):
+            return _follow_events(request, request_id, tenant, None, tracked.get("runner_backend"))
+        await asyncio.to_thread(_ensure_request_ownership, request_id, tenant, inline_mutation=True)
         await asyncio.to_thread(_check_tool_approval_before_resume, request_id, tenant)
-        _acquire_rate_limit(tenant)
+        lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(
                 ResearchRequest(
@@ -1487,13 +1560,13 @@ def create_app(
                 tenant_id=tenant.tenant_id,
             )
         except HTTPException:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
             raise
         except ValueError as exc:
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
-            _release_rate_limit(tenant)
+            _release_rate_limit(tenant, lease_id)
             logger.exception(
                 "Failed to initialise streaming resume request_id=%s",
                 request_id,
@@ -1516,8 +1589,7 @@ def create_app(
             tenant_id=tenant.tenant_id,
             heartbeat_seconds=config.sse_heartbeat_interval_seconds,
             error_log_label=f"Streaming resume failed request_id={request_id}",
-            cancel_on_disconnect=(getattr(config, "workflow_runner", "inline") == "inline"),
-            on_complete=lambda: _release_rate_limit(tenant),
+            on_complete=lambda: _release_rate_limit(tenant, lease_id),
         )
 
     @app.post("/requests/{request_id}/tool-approvals/{approval_id}")
@@ -1562,9 +1634,22 @@ def create_app(
             "decision": payload.decision,
             "status": desired,
         }
+
+        def _notify_runner() -> Dict[str, Any]:
+            if snapshot.get("workflow_run_id"):
+                try:
+                    app.state.workflow_runner.signal(
+                        request_id, "approve_tool_call",
+                        {"approval_id": approval_id, "decision": payload.decision},
+                        tenant_id=tenant.tenant_id,
+                    )
+                except (SnapshotConflictError, WorkflowUnavailableError):
+                    logger.warning("Approval persisted for worker poll request_id=%s", request_id)
+            return response
+
         status = pending.get("status")
         if status == "rejected" and status == desired:
-            return response
+            return _notify_runner()
         if status == "expired" or (status in {"awaiting_approval", "approved_once"} and tool_approval_expired(pending)):
             if status != "expired":
                 _expire_tool_approval(snapshot, pending)
@@ -1574,7 +1659,7 @@ def create_app(
                     raise HTTPException(status_code=409, detail="Tool approval state changed") from exc
             raise HTTPException(status_code=410, detail="Tool approval expired")
         if status == "approved_once" and status == desired:
-            return response
+            return _notify_runner()
         if status != "awaiting_approval" or snapshot.get("phase") != "awaiting_tool_approval":
             raise HTTPException(status_code=409, detail="Tool approval is already resolved")
 
@@ -1608,9 +1693,9 @@ def create_app(
             latest = _store_load(store, request_id, tenant_id=tenant.tenant_id) or {}
             resolved = latest.get("pending_tool_approval") or {}
             if resolved.get("approval_id") == approval_id and resolved.get("status") == desired:
-                return response
+                return _notify_runner()
             raise HTTPException(status_code=409, detail="Tool approval state changed") from exc
-        return response
+        return _notify_runner()
 
     @app.post("/api/research/tool-approval")
     def resolve_research_tool_approval(payload: ResearchToolApprovalRequest, request: Request) -> Dict[str, Any]:

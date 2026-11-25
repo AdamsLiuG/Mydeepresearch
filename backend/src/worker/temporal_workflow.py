@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from threading import Event
 from typing import Any
-
-from config import Configuration
-from services.event_bus import build_stream_event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -24,88 +22,110 @@ class DeepResearchWorkflowSpec:
     tenant_id: str = "default"
     search_api: str | None = None
     output_format: str | None = None
+    workflow_run_id: str | None = None
 
 
-def execute_durable_research_activity(spec: DeepResearchWorkflowSpec) -> dict[str, Any]:
-    """Run one complete research job inside a background worker and publish events to StreamEventBus."""
+def execute_durable_research_activity(
+    spec: DeepResearchWorkflowSpec,
+    *,
+    backend: str = "temporal",
+    failure: str | None = None,
+    stop_event: Event | None = None,
+) -> dict[str, Any]:
+    """Execute or resume one persisted run, returning only control metadata."""
 
     from agent import DeepResearchAgent
+    from config import Configuration
+    from services.event_bus import build_stream_event_bus
+    from services.storage_backends import build_request_state_store
+    from services.workflow_runner import (
+        WorkflowCheckpoint,
+        _workflow_run_id,
+        require_shared_workflow_backends,
+        run_durable_attempt,
+    )
 
     config = Configuration.from_env()
-    event_bus = build_stream_event_bus(config)
-    agent = DeepResearchAgent(
-        config=config,
-        request_id=spec.request_id,
-        tenant_id=spec.tenant_id,
-    )
-    final_payload: dict[str, Any] = {}
-    for event in agent.run_stream(spec.topic):
-        if isinstance(event, dict):
-            event_bus.publish(spec.tenant_id, spec.request_id, event)
-            if event.get("type") == "final_report":
-                final_payload = event
-    return {
-        "request_id": spec.request_id,
-        "tenant_id": spec.tenant_id,
-        "status": "completed",
-        "has_report": bool(final_payload.get("report")),
+    overrides = {
+        name: value for name, value in {
+            "search_api": spec.search_api, "default_output_format": spec.output_format,
+        }.items() if value is not None
     }
+    if overrides:
+        values = config.model_dump()
+        if "policy_model_mode" not in config.model_fields_set:
+            values.pop("policy_model_mode", None)
+        config = Configuration.model_validate({**values, **overrides})
+    store = build_request_state_store(config)
+    if store is None:
+        raise RuntimeError("Durable research workers require request snapshots")
+    checkpoint = WorkflowCheckpoint(
+        store, spec.tenant_id, spec.request_id, backend,
+        spec.workflow_run_id or _workflow_run_id(backend, spec.tenant_id, spec.request_id),
+        lease_seconds=max(5, getattr(config, "temporal_activity_heartbeat_seconds", 15) * 2),
+    )
+    event_bus = None
+    try:
+        event_bus = build_stream_event_bus(config)
+        require_shared_workflow_backends(config, store, event_bus)
+        if checkpoint.load() is None:
+            checkpoint.reserve(spec.topic)
+
+        def agent_factory() -> DeepResearchAgent:
+            if failure is not None:
+                raise RuntimeError(failure)
+            return DeepResearchAgent(config=config, request_id=spec.request_id, tenant_id=spec.tenant_id)
+
+        return run_durable_attempt(
+            checkpoint, agent_factory, event_bus, Event(),
+            hitl_timeout=getattr(config, "hitl_signal_timeout_seconds", 86400),
+            retry_error=failure is None, stop_event=stop_event,
+        )
+    finally:
+        for resource in (event_bus, store):
+            close = getattr(resource, "close", None)
+            if close is not None:
+                close()
 
 
-async def run_research_arq_job(ctx: Any, *, topic: str, request_id: str, tenant_id: str = "default") -> dict[str, Any]:
-    """ARQ worker entrypoint wrapping the synchronous research activity in a worker thread."""
+async def run_research_arq_job(
+    ctx: Any, *, topic: str, request_id: str, tenant_id: str = "default",
+    search_api: str | None = None, output_format: str | None = None, workflow_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Resume a queued request and yield to ARQ while waiting for human approval."""
 
-    del ctx
-    spec = DeepResearchWorkflowSpec(topic=topic, request_id=request_id, tenant_id=tenant_id)
-    return await asyncio.to_thread(execute_durable_research_activity, spec)
+    from arq import Retry
+
+    spec = DeepResearchWorkflowSpec(topic, request_id, tenant_id, search_api, output_format, workflow_run_id)
+    stop_event = Event()
+    while True:
+        task = asyncio.create_task(asyncio.to_thread(
+            execute_durable_research_activity, spec, backend="arq", stop_event=stop_event,
+        ))
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            stop_event.set()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        except Exception:
+            if ctx.get("job_try", 1) < 3:
+                raise Retry(defer=2 ** ctx.get("job_try", 1)) from None
+            return await asyncio.to_thread(
+                execute_durable_research_activity, spec, backend="arq", failure="Research worker retries exhausted",
+            )
+        if result["status"] not in {"awaiting_approval", "lease_busy"}:
+            return result
+        await asyncio.sleep(2)
 
 
 def build_temporal_worker_definitions() -> tuple[Any, list[Any]]:
-    """Return Temporal Workflow/Activity classes if temporalio is installed."""
-
+    """Import the SDK-backed definitions only when a Temporal worker starts."""
     try:  # pragma: no cover - optional runtime dependency
-        from datetime import timedelta
-
-        from temporalio import activity, workflow
-    except ImportError as exc:  # pragma: no cover - optional runtime dependency
-        raise RuntimeError("temporalio package is not installed") from exc
-
-    @activity.defn(name="run_deepresearch_request")
-    async def run_deepresearch_request(payload: dict[str, Any]) -> dict[str, Any]:
-        spec = DeepResearchWorkflowSpec(
-            topic=str(payload.get("topic") or ""),
-            request_id=str(payload.get("request_id") or ""),
-            tenant_id=str(payload.get("tenant_id") or "default"),
+        from worker.temporal_definitions import (
+            DeepResearchWorkflow,
+            run_deepresearch_request,
         )
-        return await asyncio.to_thread(execute_durable_research_activity, spec)
-
-    @workflow.defn(name="DeepResearchWorkflow")
-    class DeepResearchWorkflow:
-        def __init__(self) -> None:
-            self._signals: list[tuple[str, dict[str, Any]]] = []
-            self._cancelled = False
-
-        @workflow.signal(name="cancel")
-        def cancel(self, payload: dict[str, Any] | None = None) -> None:
-            self._cancelled = True
-            self._signals.append(("cancel", dict(payload or {})))
-
-        @workflow.signal(name="approve_plan")
-        def approve_plan(self, payload: dict[str, Any] | None = None) -> None:
-            self._signals.append(("approve_plan", dict(payload or {})))
-
-        @workflow.signal(name="approve_tool")
-        def approve_tool(self, payload: dict[str, Any] | None = None) -> None:
-            self._signals.append(("approve_tool", dict(payload or {})))
-
-        @workflow.run
-        async def run(self, payload: dict[str, Any]) -> dict[str, Any]:
-            if self._cancelled:
-                return {"status": "cancelled", "request_id": payload.get("request_id")}
-            return await workflow.execute_activity(
-                run_deepresearch_request,
-                payload,
-                start_to_close_timeout=timedelta(minutes=30),
-            )
-
+    except ImportError as exc:
+        raise RuntimeError("temporalio package is not installed") from exc
     return DeepResearchWorkflow, [run_deepresearch_request]

@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterator
 from html import escape
 from typing import Any
+from urllib.parse import urlsplit
 
 from hello_agents import ToolAwareSimpleAgent
 
@@ -40,6 +41,16 @@ from services.text_processing import (
 from utils import strip_thinking_tokens, truncate_text
 
 _STRICT_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+
+
+def _safe_workbench_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not re.match(r"https?://", url, flags=re.IGNORECASE) or re.search(r"[\x00-\x20\x7f\\]", url):
+        return ""
+    try:
+        return url if urlsplit(url).hostname else ""
+    except ValueError:
+        return ""
 
 
 class ReportingService:
@@ -1747,14 +1758,16 @@ def build_report_workbench_payload(
     """Build structured workbench metadata for citation drawer, conflict card, and governance bar."""
 
     citation_index: dict[str, dict[str, Any]] = {}
+    claims_by_source: dict[str, list[dict[str, Any]]] = {}
     rejected_ids = ReportingService._rejected_computation_ids(state)
 
     def _ingest_record(rec: dict[str, Any], default_task_id: int | None = None) -> None:
         sid = str(rec.get("source_id") or "").strip()
-        if not sid or sid in rejected_ids:
+        if not CITATION_PATTERN.fullmatch(f"[{sid}]") or sid in rejected_ids:
             return
+        existing = citation_index.get(sid) or {}
         anchors: list[str] = []
-        modality = "text"
+        modality = str(rec.get("modality") or existing.get("modality") or "text")
         if rec.get("computation_artifact") or "-C" in sid:
             modality = "computed"
             anchors.append("compute-1")
@@ -1764,7 +1777,6 @@ def build_report_workbench_payload(
                 anchor = str(block.get("anchor_id") or f"mm-{idx}")
                 if anchor not in anchors:
                     anchors.append(anchor)
-        existing = citation_index.get(sid) or {}
         snippet_text = truncate_text(
             str(
                 rec.get("snippet")
@@ -1776,20 +1788,26 @@ def build_report_workbench_payload(
             400,
         )
         citation_index[sid] = {
+            **existing,
             "source_id": sid,
-            "task_id": rec.get("task_id") if rec.get("task_id") is not None else default_task_id,
+            "task_id": rec.get("task_id", default_task_id if default_task_id is not None else existing.get("task_id")),
             "title": str(rec.get("title") or existing.get("title") or sid),
-            "url": str(rec.get("url") or existing.get("url") or ""),
+            "url": _safe_workbench_url(rec.get("url") or existing.get("url")),
             "domain": str(rec.get("domain") or existing.get("domain") or ""),
             "snippet": snippet_text,
+            "excerpt": snippet_text,
             "quality_label": str(rec.get("quality_label") or existing.get("quality_label") or "medium"),
             "source_type": str(rec.get("source_type") or existing.get("source_type") or "web_general"),
             "published_at": rec.get("published_at") or existing.get("published_at"),
             "modality": modality,
-            "anchors": anchors,
+            "anchors": list(dict.fromkeys([*(existing.get("anchors") or []), *anchors])),
             "source_origin": str(rec.get("source_origin") or existing.get("source_origin") or "web"),
             **({"page_no": rec["page_no"]} if rec.get("page_no") is not None else {}),
             **({"bbox": rec["bbox"]} if rec.get("bbox") is not None else {}),
+            **({"anchor_id": rec["anchor_id"]} if rec.get("anchor_id") else {}),
+            **({"freshness_label": rec["freshness_label"]} if rec.get("freshness_label") else {}),
+            **({"computation_artifact": rec["computation_artifact"]}
+               if isinstance(rec.get("computation_artifact"), dict) else {}),
             **({"derived_from_source_ids": list(rec["derived_from_source_ids"])}
                if isinstance(rec.get("derived_from_source_ids"), list) else {}),
         }
@@ -1799,6 +1817,18 @@ def build_report_workbench_payload(
         for item in getattr(task, "evidence_items", None) or []:
             if isinstance(item, dict):
                 _ingest_record(item, default_task_id=tid)
+        for claim in getattr(task, "atomic_claims", None) or []:
+            if not isinstance(claim, dict) or not claim.get("text") or not claim.get("nli_label"):
+                continue
+            linked_claim = {
+                key: claim[key] for key in ("text", "nli_label", "calibrated_confidence") if key in claim
+            }
+            for sid in claim.get("source_ids") or []:
+                if not isinstance(sid, str):
+                    continue
+                claims = claims_by_source.setdefault(sid, [])
+                if linked_claim not in claims:
+                    claims.append(linked_claim)
 
     if evidence_store is not None and hasattr(evidence_store, "lookup"):
         for item in evidence_store.lookup(include_full_content=False) or []:
@@ -1806,6 +1836,9 @@ def build_report_workbench_payload(
                 _ingest_record(item)
 
     conflicts = ReportingService._filtered_conflicts(state, set(citation_index))
+    for cluster in conflicts:
+        for side in cluster["sides"]:
+            side["url"] = _safe_workbench_url(side.get("url"))
     conflicts_by_source: dict[str, list[str]] = {}
     # Older snapshots can still link surviving citations to a conflict ID when
     # an evidence record is no longer available to render its side of the graph.
@@ -1822,6 +1855,9 @@ def build_report_workbench_payload(
                     conflicts_by_source.setdefault(sid, [])
                     if cid not in conflicts_by_source[sid]:
                         conflicts_by_source[sid].append(cid)
+    for sid, entry in citation_index.items():
+        entry["linked_claims"] = claims_by_source.get(sid, [])
+        entry["conflict_ids"] = conflicts_by_source.get(sid, [])
 
     paragraph_bindings: list[dict[str, Any]] = []
     visible_report = "".join(
@@ -1862,6 +1898,7 @@ def build_report_workbench_payload(
 
     pack_meta = dict(getattr(state, "skill_pack_metadata", None) or {})
     skill_governance = {
+        **pack_meta,
         "pack_id": str(pack_meta.get("pack_id") or "_neutral"),
         "version": pack_meta.get("version"),
         "maturity": pack_meta.get("maturity"),
@@ -1882,11 +1919,29 @@ def build_report_workbench_payload(
             else {}
         ),
     }
+    review = getattr(state, "review_summary", None) or {}
+    verifier_badges = [
+        {"badge_id": verifier_id, "status": "executed" if review.get("verifier_issue_count") else "passed"}
+        for verifier_id in dict.fromkeys(review.get("verifiers_executed") or [])
+        if isinstance(verifier_id, str)
+    ]
+    verification = dict(getattr(state, "claim_verification_summary", None) or {})
+    if verification:
+        status = "degraded" if verification.get("degraded") else "warning" if verification.get("contradicted_count") else "passed"
+        verifier_badges.append({"badge_id": "atomic-nli", "status": status})
+    charts = [
+        sanitized for chart in getattr(state, "report_charts", None) or []
+        if isinstance(chart, dict)
+        if (sanitized := sanitize_chart_spec(chart, valid_source_ids=set(citation_index))) is not None
+    ]
 
     return {
         "citation_index": citation_index,
+        "citation_drawer_map": citation_index,
         "paragraph_bindings": paragraph_bindings,
         "evidence_conflicts": conflicts,
-        "claim_verification_summary": dict(getattr(state, "claim_verification_summary", None) or {}),
+        "claim_verification_summary": verification,
+        "verifier_badges": verifier_badges,
+        "charts_spec": charts,
         "skill_governance": skill_governance,
     }

@@ -68,6 +68,7 @@ class SummaryState:
     pending_tool_approval: dict[str, Any] | None = field(default=None)
     approved_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
     report_charts: list[dict[str, Any]] = field(default_factory=list)
+    report_workbench: dict[str, Any] = field(default_factory=dict)
     evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
     claim_verification_summary: dict[str, Any] = field(default_factory=dict)
     state_version: int = field(default=0)
@@ -85,6 +86,7 @@ class SummaryStateOutput:
     running_summary: str = field(default=None)  # Backward-compatible文本
     report_markdown: str | None = field(default=None)
     report_charts: list[dict[str, Any]] = field(default_factory=list)
+    report_workbench: dict[str, Any] = field(default_factory=dict)
     evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
     claim_verification_summary: dict[str, Any] = field(default_factory=dict)
     state_version: int = field(default=0)

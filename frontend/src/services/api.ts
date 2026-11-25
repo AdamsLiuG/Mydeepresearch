@@ -6,6 +6,7 @@ import type {
   MetricsSnapshot,
   PersistedRequestSummary,
   ReplayEventItem,
+  ResearchEventHandler,
   ResearchRequest,
   ResearchStreamEvent,
   ResearchTaskPlanItem,
@@ -66,7 +67,7 @@ function buildHeaders(
 
 export async function runResearchStream(
   payload: ResearchRequest,
-  onEvent: (event: ResearchStreamEvent) => void,
+  onEvent: ResearchEventHandler,
   options: StreamOptions = {}
 ): Promise<void> {
   return streamFromEndpoint("/research/stream", payload, onEvent, options);
@@ -75,7 +76,7 @@ export async function runResearchStream(
 export async function resumeResearchStream(
   requestId: string,
   payload: ResumeRequest,
-  onEvent: (event: ResearchStreamEvent) => void,
+  onEvent: ResearchEventHandler,
   options: StreamOptions = {}
 ): Promise<void> {
   return streamFromEndpoint(
@@ -86,48 +87,90 @@ export async function resumeResearchStream(
   );
 }
 
+export function isStreamEnd(event: ResearchStreamEvent): boolean {
+  return ["done", "error", "cancelled", "stream_closed"].includes(event.type);
+}
+
+export class StreamHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 async function consumeSseBody(
   body: ReadableStream<Uint8Array>,
-  onEvent: (event: ResearchStreamEvent) => void,
+  onEvent: ResearchEventHandler,
   options: StreamOptions = {}
 ): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
-  const parser = createSseFrameParser(options.lastEventId);
+  const parser = createSseFrameParser();
+  let cursor = options.lastEventId;
+  let reachedEof = false;
 
-  const dispatchFrames = (frames: ReturnType<typeof parser.feed>): boolean => {
-    for (const frame of frames) {
-      if (frame.id) {
-        options.onEventId?.(frame.id);
+  try {
+    while (true) {
+      options.signal?.throwIfAborted();
+      const { value, done } = await reader.read();
+      if (done) {
+        reachedEof = true;
+        return;
       }
-      const event = parseSseJson<ResearchStreamEvent>(frame);
-      if (event) {
-        onEvent(event);
-        if (event.type === "error" || event.type === "done" || event.type === "cancelled") {
-          return true;
+      for (const frame of parser.feed(decoder.decode(value, { stream: true }))) {
+        options.signal?.throwIfAborted();
+        if (frame.data.trim() === "[DONE]") continue;
+        const event = parseSseJson<ResearchStreamEvent>(frame);
+        if (!event || typeof event.type !== "string") {
+          throw new Error("研究事件流包含无效的数据帧");
+        }
+        if (frame.id && cursor && isEventIdAtOrBefore(frame.id, cursor)) {
+          continue;
+        }
+        await onEvent(event);
+        if (event.type === "replay_gap") {
+          cursor = undefined;
+        }
+        if (frame.id !== undefined) {
+          cursor = frame.id;
+          options.onEventId?.(frame.id);
+        }
+        if (isStreamEnd(event)) {
+          return;
         }
       }
     }
-    return false;
-  };
-
-  while (true) {
-    const { value, done } = await reader.read();
-    const chunk = decoder.decode(value || new Uint8Array(), { stream: !done });
-    if (dispatchFrames(parser.feed(chunk))) {
-      return;
+  } finally {
+    if (!reachedEof) {
+      void reader.cancel().catch(() => {});
     }
-    if (done) {
-      dispatchFrames(parser.flush());
-      break;
-    }
+    reader.releaseLock();
   }
+}
+
+function notifyStreamStart(response: Response, options: StreamOptions): void {
+  options.onStreamStart?.({
+    requestId: response.headers.get("X-Request-ID") || undefined,
+    runner: response.headers.get("X-Workflow-Runner") || undefined
+  });
+}
+
+function isEventIdAtOrBefore(eventId: string, cursor: string): boolean {
+  if (eventId === cursor) {
+    return true;
+  }
+  if (!/^\d+(?:-\d+)?$/.test(eventId) || !/^\d+(?:-\d+)?$/.test(cursor) ||
+      eventId.includes("-") !== cursor.includes("-")) {
+    return false;
+  }
+  const [major, minor = 0n] = eventId.split("-").map(BigInt);
+  const [cursorMajor, cursorMinor = 0n] = cursor.split("-").map(BigInt);
+  return major < cursorMajor || (major === cursorMajor && minor <= cursorMinor);
 }
 
 async function streamFromEndpoint(
   endpoint: string,
   payload: unknown,
-  onEvent: (event: ResearchStreamEvent) => void,
+  onEvent: ResearchEventHandler,
   options: StreamOptions = {}
 ): Promise<void> {
   let response: Response;
@@ -165,6 +208,7 @@ async function streamFromEndpoint(
     throw new Error("浏览器不支持流式响应，无法获取研究进度");
   }
 
+  notifyStreamStart(response, options);
   await consumeSseBody(body, onEvent, options);
 }
 
@@ -221,7 +265,7 @@ export async function sendWorkflowSignal(
 
 export async function streamRequestEvents(
   requestId: string,
-  onEvent: (event: ResearchStreamEvent) => void,
+  onEvent: ResearchEventHandler,
   options: StreamOptions = {}
 ): Promise<void> {
   const query = options.lastEventId
@@ -237,11 +281,12 @@ export async function streamRequestEvents(
   );
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(errorText || `续传事件流失败，状态码：${response.status}`);
+    throw new StreamHttpError(errorText || `续传事件流失败，状态码：${response.status}`, response.status);
   }
   if (!response.body) {
     throw new Error("浏览器不支持事件流读取");
   }
+  notifyStreamStart(response, options);
   await consumeSseBody(response.body, onEvent, options);
 }
 

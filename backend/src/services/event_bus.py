@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
@@ -18,6 +19,21 @@ except Exception:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 TERMINAL_EVENT_TYPES = frozenset({"done", "error", "cancelled"})
+_STREAM_ID = re.compile(r"[0-9]{1,20}(?:-[0-9]{1,20})?")
+
+
+def event_id_parts(event_id: str) -> tuple[int, int]:
+    if not _STREAM_ID.fullmatch(event_id):
+        raise ValueError("Invalid Last-Event-ID")
+    major, _, minor = event_id.partition("-")
+    parts = (int(major), int(minor or 0))
+    if any(part >= 2**64 for part in parts):
+        raise ValueError("Invalid Last-Event-ID")
+    return parts
+
+
+def _is_terminal(payload: dict[str, Any]) -> bool:
+    return str(payload.get("type") or "").strip().lower() in TERMINAL_EVENT_TYPES
 
 
 @dataclass(frozen=True)
@@ -59,8 +75,8 @@ class StreamEventBus(Protocol):
 class InMemoryStreamEventBus:
     """Process-local ring-buffered event bus keyed by (tenant_id, request_id)."""
 
-    def __init__(self, *, max_events_per_request: int = 500) -> None:
-        self._max_events = max(10, int(max_events_per_request or 500))
+    def __init__(self, *, max_events_per_request: int = 2000) -> None:
+        self._max_events = max(10, int(max_events_per_request or 2000))
         self._condition = Condition()
         self._buffers: dict[tuple[str, str], deque[tuple[int, dict[str, Any]]]] = defaultdict(
             lambda: deque(maxlen=self._max_events)
@@ -75,7 +91,7 @@ class InMemoryStreamEventBus:
             self._counters[key] = seq
             stored = dict(payload)
             self._buffers[key].append((seq, stored))
-            if str(stored.get("type") or "").strip().lower() in TERMINAL_EVENT_TYPES:
+            if _is_terminal(stored):
                 self._terminal_keys.add(key)
             self._condition.notify_all()
             return str(seq)
@@ -103,6 +119,10 @@ class InMemoryStreamEventBus:
             if seq > after_seq
         ]
 
+    def has_events(self, tenant_id: str, request_id: str) -> bool:
+        with self._condition:
+            return bool(self._buffers.get((tenant_id, request_id)))
+
     def tail_since(
         self,
         tenant_id: str,
@@ -119,22 +139,26 @@ class InMemoryStreamEventBus:
         cursor = last_event_id
         wait_sec = max(0.05, float(block_ms or 5000) / 1000.0)
         idle_cycles = 0
+        with self._condition:
+            buffer = self._buffers.get(key)
+            has_gap = bool(cursor and (
+                not buffer or not buffer[0][0] <= event_id_parts(cursor)[0] <= buffer[-1][0]
+            ))
+        if has_gap:
+            cursor = None
+            yield EventEnvelope(event_id="", payload={"type": "replay_gap"})
 
         while True:
             batch = self.replay_since(tenant_id, request_id, last_event_id=cursor)
-            saw_terminal = False
             if batch:
                 idle_cycles = 0
                 for env in batch:
                     cursor = env.event_id
                     yield env
-                    if str(env.payload.get("type") or "").strip().lower() in TERMINAL_EVENT_TYPES:
-                        saw_terminal = True
-                if saw_terminal:
-                    return
+                    if _is_terminal(env.payload):
+                        return
 
-            if is_terminal_fn is not None and is_terminal_fn():
-                return
+            terminal = is_terminal_fn is not None and is_terminal_fn()
 
             with self._condition:
                 # Re-check under lock so no event published between replay and wait is missed
@@ -147,13 +171,11 @@ class InMemoryStreamEventBus:
                         cur_seq = 0
                 if latest_seq > cur_seq:
                     continue
-                if key in self._terminal_keys:
+                if terminal or key in self._terminal_keys:
                     return
                 notified = self._condition.wait(timeout=wait_sec)
 
             if not notified:
-                if is_terminal_fn is not None and is_terminal_fn():
-                    return
                 idle_cycles += 1
                 if max_idle_cycles is not None and idle_cycles > max(0, int(max_idle_cycles)):
                     return
@@ -168,17 +190,19 @@ class RedisStreamEventBus:
         *,
         redis_url: str | None = None,
         client: Any | None = None,
-        max_events_per_request: int = 500,
+        max_events_per_request: int = 2000,
         stream_ttl_seconds: int = 86400,
     ) -> None:
-        self._max_events = max(10, int(max_events_per_request or 500))
+        self._max_events = max(10, int(max_events_per_request or 2000))
         self._stream_ttl_seconds = max(60, int(stream_ttl_seconds or 86400))
         if client is not None:
             self._client = client
         else:
             if _redis_mod is None:
                 raise RuntimeError("redis package is not installed")
-            self._client = _redis_mod.Redis.from_url(str(redis_url or ""), decode_responses=True)
+            self._client = _redis_mod.Redis.from_url(
+                str(redis_url or ""), decode_responses=True, socket_connect_timeout=2, socket_timeout=20,
+            )
 
     @staticmethod
     def _stream_key(tenant_id: str, request_id: str) -> str:
@@ -193,13 +217,13 @@ class RedisStreamEventBus:
     def _decode_entry(entry_id: Any, fields: Any) -> EventEnvelope | None:
         eid = entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
         raw_payload = fields.get("payload") if isinstance(fields, dict) else None
-        if isinstance(raw_payload, bytes):
-            raw_payload = raw_payload.decode("utf-8")
+        if raw_payload is None and isinstance(fields, dict):
+            raw_payload = fields.get(b"payload")
         if not raw_payload:
             return None
         try:
             parsed = json.loads(raw_payload)
-        except json.JSONDecodeError:
+        except (ValueError, TypeError):
             return None
         if not isinstance(parsed, dict):
             return None
@@ -208,15 +232,18 @@ class RedisStreamEventBus:
     def publish(self, tenant_id: str, request_id: str, payload: dict[str, Any]) -> str:
         stream_key = self._stream_key(tenant_id, request_id)
         encoded = json.dumps(payload, ensure_ascii=False)
-        entry_id = self._client.xadd(
+        terminal = _is_terminal(payload)
+        pipeline = self._client.pipeline() if terminal and hasattr(self._client, "pipeline") else None
+        entry_id = (pipeline if pipeline is not None else self._client).xadd(
             stream_key,
             {"payload": encoded},
             maxlen=self._max_events,
             approximate=True,
         )
-        if str(payload.get("type") or "").strip().lower() in TERMINAL_EVENT_TYPES and hasattr(
-            self._client, "expire"
-        ):
+        if pipeline is not None:
+            pipeline.expire(stream_key, self._stream_ttl_seconds)
+            entry_id = pipeline.execute()[0]
+        elif terminal and hasattr(self._client, "expire"):
             self._client.expire(stream_key, self._stream_ttl_seconds)
         return entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
 
@@ -236,6 +263,12 @@ class RedisStreamEventBus:
                 envelopes.append(env)
         return envelopes
 
+    def has_events(self, tenant_id: str, request_id: str) -> bool:
+        return bool(self._client.exists(self._stream_key(tenant_id, request_id)))
+
+    def close(self) -> None:
+        self._client.close()
+
     def tail_since(
         self,
         tenant_id: str,
@@ -250,21 +283,36 @@ class RedisStreamEventBus:
         stream_key = self._stream_key(tenant_id, request_id)
         cursor = str(last_event_id).strip() if last_event_id and str(last_event_id).strip() else None
 
+        if cursor and hasattr(self._client, "xrevrange"):
+            oldest = self._client.xrange(stream_key, count=1)
+            newest = self._client.xrevrange(stream_key, count=1)
+            def parts(row: Any) -> tuple[int, int]:
+                entry_id = row[0][0]
+                return event_id_parts(entry_id.decode() if isinstance(entry_id, bytes) else entry_id)
+
+            if not oldest or not newest or not parts(oldest) <= event_id_parts(cursor) <= parts(newest):
+                cursor = None
+                yield EventEnvelope(event_id="", payload={"type": "replay_gap"})
+            elif event_id_parts(cursor) == parts(newest):
+                last = self._decode_entry(*newest[0])
+                if last is not None and _is_terminal(last.payload):
+                    return
         initial = self.replay_since(tenant_id, request_id, last_event_id=cursor)
         for env in initial:
             cursor = env.event_id
             yield env
-            if str(env.payload.get("type") or "").strip().lower() in TERMINAL_EVENT_TYPES:
+            if _is_terminal(env.payload):
                 return
-
-        if is_terminal_fn is not None and is_terminal_fn():
-            return
 
         xread_cursor = cursor or "0-0"
         idle_cycles = 0
         while True:
+            terminal = is_terminal_fn is not None and is_terminal_fn()
             if hasattr(self._client, "xread"):
-                rows_by_stream = self._client.xread({stream_key: xread_cursor}, block=max(50, int(block_ms or 5000)))
+                kwargs = {"block": max(50, int(block_ms or 5000))} if not terminal else {}
+                if hasattr(self._client, "xrevrange"):
+                    kwargs["count"] = 64
+                rows_by_stream = self._client.xread({stream_key: xread_cursor}, **kwargs)
             else:  # pragma: no cover - fallback when fake client lacks xread
                 time.sleep(max(0.01, poll_interval))
                 rows_by_stream = []
@@ -273,16 +321,16 @@ class RedisStreamEventBus:
                 idle_cycles = 0
                 for _, entries in rows_by_stream:
                     for entry_id, fields in entries:
+                        xread_cursor = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
                         env = self._decode_entry(entry_id, fields)
                         if env is None:
                             continue
-                        xread_cursor = env.event_id
                         yield env
-                        if str(env.payload.get("type") or "").strip().lower() in TERMINAL_EVENT_TYPES:
+                        if _is_terminal(env.payload):
                             return
                 continue
 
-            if is_terminal_fn is not None and is_terminal_fn():
+            if terminal:
                 return
             idle_cycles += 1
             if max_idle_cycles is not None and idle_cycles > max(0, int(max_idle_cycles)):
@@ -293,16 +341,22 @@ class RedisStreamEventBus:
 def build_stream_event_bus(config: Any) -> StreamEventBus:
     """Build RedisStreamEventBus when REDIS_URL & driver are ready, otherwise InMemoryStreamEventBus."""
 
-    max_events = int(getattr(config, "event_bus_max_events_per_request", 500) or 500)
+    max_events = int(getattr(config, "event_bus_max_events_per_request", 2000) or 2000)
     stream_ttl = int(getattr(config, "event_bus_stream_ttl_seconds", 86400) or 86400)
     redis_url = str(getattr(config, "redis_url", None) or "").strip()
     if redis_url and _redis_mod is not None:
         try:
-            return RedisStreamEventBus(
+            bus = RedisStreamEventBus(
                 redis_url=redis_url,
                 max_events_per_request=max_events,
                 stream_ttl_seconds=stream_ttl,
             )
-        except Exception as exc:
-            logger.warning("Failed to initialize RedisStreamEventBus; falling back to in-memory bus: %s", exc)
+            try:
+                bus._client.ping()
+            except Exception:
+                bus.close()
+                raise
+            return bus
+        except Exception:
+            logger.warning("Failed to initialize RedisStreamEventBus; falling back to in-memory bus")
     return InMemoryStreamEventBus(max_events_per_request=max_events)
