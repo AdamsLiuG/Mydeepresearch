@@ -14,9 +14,10 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from pydantic import (
     AliasChoices,
@@ -538,6 +539,8 @@ class PyodideSandboxBackend:
 
 
 class SandboxExecutorService:
+    budget_provider: Callable[[], Any] | None = None
+
     """Orchestrates AST verification, per-task execution caps, backend selection, and hash provenance."""
 
     def __init__(
@@ -695,17 +698,26 @@ class SandboxExecutorService:
                 )
             self._task_execution_counts[request.task_id] = used + 1
 
-        self._inc_metric("sandbox_executions_total")
+        budget = self.budget_provider() if self.budget_provider else None
         timeout = min(self.timeout_seconds, float(request.timeout_seconds or self.timeout_seconds))
+        if budget is not None:
+            timeout = min(timeout, budget.governor.remaining_timeout(
+                stage=budget.stage, work_class="required",
+            ))
+            if timeout <= 0:
+                budget.refuse("deadline_exceeded")
         try:
             if self._execution_slots.acquire(timeout=timeout):
                 try:
-                    raw_res = backend.execute(
-                        code=request.code,
-                        tables=table_payloads,
-                        timeout_seconds=timeout,
-                        memory_mb=self.memory_mb,
-                    )
+                    dispatch = budget.attempt({"sandbox_calls": 1}) if budget is not None else nullcontext()
+                    with dispatch as attempt:
+                        self._inc_metric("sandbox_executions_total")
+                        raw_res = backend.execute(
+                            code=request.code,
+                            tables=table_payloads,
+                            timeout_seconds=min(timeout, attempt.timeout) if attempt is not None else timeout,
+                            memory_mb=self.memory_mb,
+                        )
                 finally:
                     self._execution_slots.release()
             else:

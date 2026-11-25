@@ -21,6 +21,12 @@ class _StubToolRegistry:
         return None
 
 
+class _StubSearchTool:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
 class _StubToolAwareSimpleAgent:
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
@@ -38,14 +44,22 @@ sys.modules.setdefault("hello_agents", hello_agents_stub)
 
 tools_stub = sys.modules.get("hello_agents.tools") or types.ModuleType("hello_agents.tools")
 tools_stub.ToolRegistry = _StubToolRegistry
+if not hasattr(tools_stub, "SearchTool"):
+    tools_stub.SearchTool = _StubSearchTool
 sys.modules.setdefault("hello_agents.tools", tools_stub)
+sys.modules.setdefault("hello_agents.tools.builtin", types.ModuleType("hello_agents.tools.builtin"))
+note_stub = types.ModuleType("hello_agents.tools.builtin.note_tool")
+note_stub.NoteTool = type("_StubNoteTool", (), {})
+sys.modules.setdefault("hello_agents.tools.builtin.note_tool", note_stub)
 
 from config import Configuration
-from models import SummaryState, TodoItem
+from models import DagAction, DagPatch, SummaryState, TodoItem
 from services.dag_scheduler import (
+    apply_dag_patch,
     build_upstream_context,
     partition_into_waves,
     sanitize_task_dependencies,
+    select_wave_one,
 )
 from services.evidence import EvidenceStore
 from services.planner import PlanningService
@@ -77,6 +91,48 @@ class DagSchedulerTests(unittest.TestCase):
 
         waves = partition_into_waves([t1, t2, t3, t4])
         self.assertEqual([[t.id for t in w] for w in waves], [[1, 2], [3], [4]])
+
+    def test_v4_wave_one_selection_does_not_change_legacy_static_waves(self):
+        tasks = [
+            TodoItem(id=4, title="A", intent="i", query="q4"),
+            TodoItem(id=2, title="B", intent="i", query="q2"),
+            TodoItem(id=1, title="C", intent="i", query="q1"),
+            TodoItem(id=3, title="D", intent="i", query="q3", depends_on=[1]),
+        ]
+        tasks[0].coverage_keys = ["vendors"]
+        tasks[1].coverage_keys = ["cost"]
+        tasks[2].coverage_keys = ["vendors", "cost"]
+
+        selected = select_wave_one(tasks, "standard")
+        legacy_waves = partition_into_waves(tasks)
+
+        self.assertEqual([task.id for task in selected], [1, 2])
+        self.assertEqual([[task.id for task in wave] for wave in legacy_waves], [[4, 2, 1], [3]])
+
+    def test_invalid_v4_patch_keeps_legacy_task_graph_unchanged(self):
+        tasks = [
+            TodoItem(id=1, title="Root", intent="Root intent", query="root query", status="completed"),
+            TodoItem(id=2, title="Child", intent="Child intent", query="child query", depends_on=[1]),
+        ]
+        patch = DagPatch(
+            base_revision=0,
+            decision_id="wave1-r1",
+            actions=[
+                DagAction(
+                    action="PIVOT",
+                    task_id=2,
+                    parent_task_ids=[1],
+                    reason_code="conflict_density",
+                    after={"query": "root query"},
+                )
+            ],
+        )
+
+        result = apply_dag_patch(tasks, patch, current_revision=0)
+
+        self.assertFalse(result.applied)
+        self.assertEqual([task.query for task in tasks], ["root query", "child query"])
+        self.assertEqual(tasks[1].depends_on, [1])
 
     def test_planner_parses_depends_on_and_sanitizes_cycles(self):
         payload = {

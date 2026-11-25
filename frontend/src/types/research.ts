@@ -1,8 +1,62 @@
+export type ResearchDepth = "quick" | "standard" | "deep";
+
 export interface ResearchRequest {
   topic: string;
   search_api?: string;
   output_format?: string;
   mode?: "auto" | "plan_first";
+  research_depth?: ResearchDepth;
+}
+
+export interface BudgetSnapshot {
+  limit: {
+    depth: ResearchDepth;
+    limits: Record<string, number>;
+    finalization_reserve: Record<string, number>;
+    deadline_at: string;
+    finalization_reserve_ms: number;
+    profile_version: number;
+  };
+  spent: Record<string, number>;
+  reserved: Record<string, number>;
+  remaining: Record<string, number>;
+  pressure: "normal" | "high" | "exhausted";
+  last_denial_reason?: string;
+  external_attempts?: number;
+  overrun?: Record<string, number>;
+}
+
+export interface V4ResearchProjection {
+  schema_version: 1;
+  budget?: BudgetSnapshot;
+  replan?: {
+    dag_revision: number;
+    decision_id?: string;
+    pruned_task_ids: number[];
+  };
+  report?: Record<string, unknown>;
+}
+
+interface V4ResearchEvent {
+  schema_version: 1;
+  request_id: string;
+  event_key: string;
+  state_version?: number;
+}
+
+export interface BudgetUpdatedEvent extends V4ResearchEvent {
+  type: "budget_updated";
+  budget: BudgetSnapshot;
+  stage: string;
+}
+
+export interface ResearchReplannedEvent extends V4ResearchEvent {
+  type: "research_replanned";
+  dag_revision: number;
+  decision_id: string;
+  actions: Record<string, unknown>[];
+  scores: Record<string, unknown>[];
+  pruned_task_ids: number[];
 }
 
 export interface SkillsCatalogResponse {
@@ -35,6 +89,7 @@ export interface ResumeRequest {
 
 export interface ResearchStreamEvent {
   type: string;
+  v4?: V4ResearchProjection;
   [key: string]: unknown;
 }
 
@@ -93,6 +148,8 @@ export interface EditablePlanResponse {
   phase: string;
   todo_items: ResearchTaskPlanItem[];
   estimated_duration_seconds: number;
+  plan_revision?: number;
+  v4?: V4ResearchProjection;
   [key: string]: unknown;
 }
 
@@ -113,6 +170,7 @@ export interface PersistedRequestSummary {
   updated_at?: string;
   completed?: boolean;
   error?: string;
+  v4?: V4ResearchProjection;
   [key: string]: unknown;
 }
 

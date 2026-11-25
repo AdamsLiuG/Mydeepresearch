@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import re
-from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+import unicodedata
+from contextlib import ExitStack, contextmanager, nullcontext
+from copy import deepcopy
+from dataclasses import asdict, replace
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
-from threading import Event, Lock, Semaphore, Thread, local
+from threading import Event, Lock, RLock, Semaphore, Thread, local
+from time import monotonic
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -44,7 +49,15 @@ from services.context_builder import (
     PromptSegment,
     ProviderCacheAdapter,
 )
-from services.dag_scheduler import build_upstream_context, partition_into_waves
+from services.dag_scheduler import (
+    ResearchTreeRePlanner,
+    apply_dag_patch,
+    build_upstream_context,
+    normalize_depends_on,
+    partition_into_waves,
+    score_wave1_branch,
+    select_wave_one,
+)
 from services.evidence import (
     EvidenceLookupTool,
     EvidenceStore,
@@ -76,6 +89,7 @@ from services.planner import PlanningService
 from services.policy_controller import build_policy_controller
 from services.reflection import ReflectionAssessment, ReflectionService
 from services.reporter import ReportingService, build_report_workbench_payload
+from services.request_state import SnapshotConflictError
 from services.reviewer import ReviewService
 from services.sandbox_executor import (
     DockerSandboxBackend,
@@ -94,7 +108,12 @@ from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService
 from services.tool_events import ToolCallTracker
-from state_manager import StateManagerMixin
+from state_manager import (
+    BudgetDispatchDenied,
+    RequestBudgetController,
+    StateManagerMixin,
+    public_v4_projection,
+)
 from stream_coordinator import StreamCoordinatorMixin
 from task_executor import TaskExecutorMixin
 
@@ -103,6 +122,9 @@ logger = logging.getLogger(__name__)
 
 class SafeHelloAgentsLLM(HelloAgentsLLM):
     """Provide safer local-vLLM response handling for sync and streaming calls."""
+
+    budget_provider: Callable[[], Any] | None = None
+    budget_pricing_catalog: dict[str, Any] | None = None
 
     def __init__(self, *args: Any, allow_reasoning_fallback: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -197,23 +219,131 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
             ]
         return stripped
 
-    def _open_stream(self, req_kwargs: dict[str, Any]) -> Any:
+    def _budget_pricing(self, model: str) -> dict[str, Decimal] | None:
+        provider_prices = (self.budget_pricing_catalog or {}).get(self.provider, {})
+        if not isinstance(provider_prices, dict):
+            return None
+        entry = provider_prices.get(model, provider_prices.get("default"))
+        if not isinstance(entry, dict):
+            return None
         try:
-            return self._client.chat.completions.create(
-                **req_kwargs,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
+            prompt = Decimal(str(entry["prompt_per_1k_tokens"]))
+            completion = Decimal(str(entry["completion_per_1k_tokens"]))
+            cached = Decimal(str(entry.get("cached_prompt_per_1k_tokens", prompt)))
+            creation = Decimal(str(entry.get("cache_creation_per_1k_tokens", prompt)))
+            if not all(rate.is_finite() and rate >= 0 for rate in (prompt, completion, cached, creation)):
+                return None
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            return None
+        return {
+            "prompt_per_1k_tokens": prompt,
+            "completion_per_1k_tokens": completion,
+            "cached_prompt_per_1k_tokens": cached,
+            "cache_creation_per_1k_tokens": creation,
+        }
+
+    @staticmethod
+    def _budget_reported_usage(counters: dict[str, int], pricing: dict[str, Decimal]) -> dict[str, int] | None:
+        if not (
+            counters.keys() & {"prompt_tokens", "input_tokens"}
+            and counters.keys() & {"completion_tokens", "output_tokens"}
+        ):
+            return None
+        usage = normalize_reported_usage(counters)
+        if usage is None:
+            return None
+        prompt, completion = usage["prompt_tokens"], usage["completion_tokens"]
+        if usage["total_tokens"] > prompt + completion:
+            return None
+        cached = usage.get("cached_tokens", 0)
+        creation = usage.get("cache_creation_tokens", 0)
+        cost = (
+            (prompt - cached - creation) * pricing["prompt_per_1k_tokens"]
+            + cached * pricing["cached_prompt_per_1k_tokens"]
+            + creation * pricing["cache_creation_per_1k_tokens"]
+            + completion * pricing["completion_per_1k_tokens"]
+        ) * 1000
+        return {
+            "input_tokens": prompt, "output_tokens": completion,
+            "cost_microusd": int(cost.to_integral_value(rounding=ROUND_CEILING)),
+        }
+
+    @contextmanager
+    def _provider_stream(self, req_kwargs: dict[str, Any]) -> Iterator[Any]:
+        budget = self.budget_provider() if self.budget_provider else None
+        if budget is None:
+            yield self._client.chat.completions.create(**req_kwargs, stream=True), None, None, None
+            return
+
+        request = dict(req_kwargs)
+        messages = request["messages"]
+        if request.get("n", 1) != 1 or request.get("extra_body") or request.get("audio"):
+            budget.refuse("dispatch_unbounded")
+        for message in messages:
+            content = message.get("content")
+            if content is None or isinstance(content, str):
+                continue
+            if not isinstance(content, list) or any(
+                not isinstance(block, dict) or block.get("type") != "text" for block in content
+            ):
+                budget.refuse("dispatch_unbounded")
+        output_tokens = request.get("max_completion_tokens", request.get("max_tokens"))
+        if output_tokens is None:
+            output_tokens = {"planning": 1024, "report": 2000}.get(budget.stage, 768)
+        if type(output_tokens) is not int or output_tokens <= 0:
+            budget.refuse("dispatch_unbounded")
+        if "max_completion_tokens" in request:
+            request.pop("max_tokens", None)
+            request["max_completion_tokens"] = output_tokens
+        else:
+            request["max_tokens"] = output_tokens
+        pricing = self._budget_pricing(request["model"])
+        # Bound byte-tokenized input including tool schemas and message framing.
+        try:
+            input_tokens = len(json.dumps(request, ensure_ascii=True).encode("utf-8")) + 128 + 64 * len(messages)
+        except (TypeError, ValueError):
+            budget.refuse("dispatch_unbounded")
+        provider_timeout = request.get("timeout") or self.timeout
+        client = self._client
+        if isinstance(client, OpenAI):
+            # OpenAI retries and HTTP redirects could launch additional HTTP requests.
+            client = client.with_options(max_retries=0, http_client=self._budget_http_client())
+        with budget.attempt({}, llm=(input_tokens, output_tokens, pricing)) as attempt:
+            timeout = min(attempt.timeout, float(provider_timeout))
+            deadline = monotonic() + timeout
+            request["timeout"] = timeout
+            self._usage_local.provider_attempts += 1
+            response = client.chat.completions.create(**request, stream=True)
+            try:
+                yield response, deadline, attempt, pricing
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+
+    def _budget_http_client(self) -> httpx.Client:
+        with self._cache_header_lock:
+            client = getattr(self, "_bounded_http_client", None)
+            if client is None:
+                client = self._bounded_http_client = httpx.Client(
+                    follow_redirects=False,
+                    trust_env=not self._should_bypass_env_proxy(self.base_url),
+                )
+            return client
+
+    def _open_stream(self, stack: ExitStack, req_kwargs: dict[str, Any]) -> Any:
+        try:
+            return stack.enter_context(self._provider_stream({
+                **req_kwargs, "stream_options": {"include_usage": True},
+            }))
         except Exception as exc:
             if not self._stream_options_unsupported(exc):
                 raise
-            return self._client.chat.completions.create(
-                **req_kwargs,
-                stream=True,
-            )
+            return stack.enter_context(self._provider_stream(req_kwargs))
 
     def _create_stream_completion(
         self,
+        stack: ExitStack,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> Any:
@@ -225,7 +355,7 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
             request_kwargs = self._strip_cache_options(messages, request_kwargs)
             has_cache_options = False
         try:
-            return self._open_stream(request_kwargs)
+            return self._open_stream(stack, request_kwargs)
         except Exception as exc:
             if has_cache_options and self._cache_options_unsupported(exc):
                 cache_lock = getattr(self, "_cache_header_lock", None)
@@ -236,8 +366,29 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
                         self._cache_header_unsupported = True
                         self._usage_local.cache_downgraded = True
                 stripped_kwargs = self._strip_cache_options(messages, request_kwargs)
-                return self._open_stream(stripped_kwargs)
+                return self._open_stream(stack, stripped_kwargs)
             raise
+
+    def _stream_chunks(self, messages: list[dict[str, Any]], **kwargs: Any) -> Iterator[Any]:
+        self._usage_local.last_usage = None
+        self._usage_local.provider_attempts = 0
+        counters: dict[str, int] = {}
+        with ExitStack() as stack:
+            response, deadline, attempt, pricing = self._create_stream_completion(stack, messages, **kwargs)
+            for chunk in response:
+                if deadline is not None and monotonic() >= deadline:
+                    raise TimeoutError("LLM stream exceeded its attempt timeout")
+                self._capture_stream_usage(chunk, counters)
+                yield chunk
+            if attempt is not None:
+                if monotonic() >= deadline:
+                    raise TimeoutError("LLM stream exceeded its attempt timeout")
+                attempt.usage = self._budget_reported_usage(counters, pricing)
+
+    def consume_budget_attempt_count(self) -> int:
+        count = getattr(self._usage_local, "provider_attempts", 0)
+        self._usage_local.provider_attempts = 0
+        return count
 
     @staticmethod
     def _should_bypass_env_proxy(base_url: str | None) -> bool:
@@ -383,13 +534,7 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         """Aggregate a streaming response to avoid long blocking reads with local vLLM."""
         visible_parts: list[str] = []
         reasoning_parts: list[str] = []
-        self._usage_local.last_usage = None
-        counters: dict[str, int] = {}
-
-        response = self._create_stream_completion(messages, **kwargs)
-
-        for chunk in response:
-            self._capture_stream_usage(chunk, counters)
+        for chunk in self._stream_chunks(messages, **kwargs):
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 visible_parts.append(content)
@@ -409,13 +554,7 @@ class SafeHelloAgentsLLM(HelloAgentsLLM):
         """Stream visible content, falling back to reasoning text if no answer content exists."""
         saw_visible_content = False
         buffered_reasoning: list[str] = []
-        self._usage_local.last_usage = None
-        counters: dict[str, int] = {}
-
-        response = self._create_stream_completion(messages, **kwargs)
-
-        for chunk in response:
-            self._capture_stream_usage(chunk, counters)
+        for chunk in self._stream_chunks(messages, **kwargs):
             content, reasoning = self._extract_chunk_text(chunk)
             if content:
                 saw_visible_content = True
@@ -537,6 +676,8 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
         finally:
             consume = getattr(self.llm, "consume_last_usage", None)
             usage = normalize_reported_usage(consume()) if callable(consume) else None
+            count_attempts = getattr(self.llm, "consume_budget_attempt_count", None)
+            provider_attempts = count_attempts() if callable(count_attempts) else 0
             if usage is None:
                 rendered_messages = [
                     SafeHelloAgentsLLM._flatten_message_content(message.get("content")) for message in messages
@@ -547,9 +688,11 @@ class CacheAwareToolAgent(ToolAwareSimpleAgent):
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
-                    "estimated_provider_calls": 1,
+                    "estimated_provider_calls": provider_attempts or 1,
                 }
-            usage["provider_calls"] = 1
+            elif provider_attempts > 1:
+                usage["estimated_provider_calls"] = provider_attempts - 1
+            usage["provider_calls"] = provider_attempts or 1
             pending = getattr(self._envelope_usage_local, "last_usage", None)
             totals = pending[1] if pending is not None and pending[0] is self else {}
             for key, count in usage.items():
@@ -770,6 +913,7 @@ class DeepResearchAgent(
         self._mcp_bridge = mcp_bridge
         self._owns_mcp_bridge = mcp_bridge is None
         self._active_state: SummaryState | None = None
+        self._research_budget: RequestBudgetController | None = None
         self.llm = self._init_llm()
         self._content_only_llm = self._init_llm(allow_reasoning_fallback=False)
         self.fast_llm = self._init_fast_llm(allow_reasoning_fallback=True)
@@ -797,7 +941,7 @@ class DeepResearchAgent(
         )
         self._request_state_store = build_request_state_store(self.config)
         self._workflow_checkpoint = None
-        self._request_snapshot_lock = Lock()
+        self._request_snapshot_lock = RLock()
         self._policy_controller = build_policy_controller(self.config)
         self._note_memory = NoteMemoryService(self.config)
         self._strategy_synthesizer = StrategySynthesizer(
@@ -866,6 +1010,8 @@ class DeepResearchAgent(
             timeout_seconds=float(self.config.search_tool_timeout_seconds or 10.0),
             multimodal_parser=self._multimodal_parser,
         )
+        for tool in (self.search_web_tool, self.fetch_page_tool, self._sandbox_service):
+            tool.budget_provider = lambda: self._research_budget
         self.evidence_lookup_tool = EvidenceLookupTool(
             evidence_store=self._evidence_store,
             retrieval_service=self._evidence_retrieval,
@@ -995,7 +1141,10 @@ class DeepResearchAgent(
                 llm_kwargs["api_key"] = self.config.llm_api_key
 
         llm_kwargs["allow_reasoning_fallback"] = allow_reasoning_fallback
-        return SafeHelloAgentsLLM(**llm_kwargs)
+        client = SafeHelloAgentsLLM(**llm_kwargs)
+        client.budget_provider = lambda: getattr(self, "_research_budget", None)
+        client.budget_pricing_catalog = self.config.llm_pricing_json
+        return client
 
     def _init_fast_llm(self, *, allow_reasoning_fallback: bool = True) -> HelloAgentsLLM:
         """Instantiate an optional fast-tier LLM for planning/summarization/reflection.
@@ -1031,7 +1180,10 @@ class DeepResearchAgent(
             llm_kwargs["api_key"] = "ollama"
 
         llm_kwargs["allow_reasoning_fallback"] = allow_reasoning_fallback
-        return SafeHelloAgentsLLM(**llm_kwargs)
+        client = SafeHelloAgentsLLM(**llm_kwargs)
+        client.budget_provider = lambda: getattr(self, "_research_budget", None)
+        client.budget_pricing_catalog = self.config.llm_pricing_json
+        return client
 
     def _ensure_evidence_retrieval(self) -> EvidenceRetrievalService:
         if not hasattr(self, "_evidence_memory"):
@@ -1126,13 +1278,16 @@ class DeepResearchAgent(
         if not self._request_trace:
             return "success"
 
-        has_incomplete_tasks = any(task.status in {"skipped", "failed"} for task in state.todo_items)
+        pruned = set(((state.v4 or {}).get("replan") or {}).get("pruned_task_ids", []))
+        has_incomplete_tasks = any(task.status in {"skipped", "failed"} and task.id not in pruned for task in state.todo_items)
         review_blocked = str(state.review_summary.get("overall_status") or "").strip() == "blocked"
         if (
             self._request_trace.fallback_count
             or self._request_trace.degraded_reasons
             or has_incomplete_tasks
             or review_blocked
+            or (state.v4 or {}).get("degradation_reason")
+            or getattr(getattr(self, "_research_budget", None), "blocked", False)
         ):
             return "partial_success"
 
@@ -1244,8 +1399,11 @@ class DeepResearchAgent(
         mcp_adapters: list[Any] = []
         if mcp_enabled and getattr(self.config, "mcp_max_tools_per_stage", 6):
             bridge = self._ensure_mcp_bridge()
-            if bridge is not None:
+            if bridge is not None and not (self.config.v4_research_budget_enabled and getattr(self, "_active_state", None) is None):
                 try:
+                    budget_kwargs = {}
+                    if self._callable_accepts_kwarg(bridge.build_tool_adapters, "budget_provider"):
+                        budget_kwargs["budget_provider"] = lambda: getattr(self, "_research_budget", None)
                     mcp_adapters = bridge.build_tool_adapters(
                         evidence_store=self._evidence_store,
                         tenant_id_getter=lambda: self.tenant_id,
@@ -1255,6 +1413,7 @@ class DeepResearchAgent(
                         approved_registry_getter=lambda: getattr(self._active_state, "approved_tool_calls", None),
                         consume_approval=self._consume_mcp_approval if self._request_state_store is not None else None,
                         observer_getter=lambda: self._request_trace,
+                        **budget_kwargs,
                     )
                 except Exception as exc:
                     logger.warning("MCP adapter discovery failed stage=%s error=%s", stage, exc)
@@ -1725,6 +1884,11 @@ class DeepResearchAgent(
 
         total_cap = self.config.resolved_max_total_tasks()
         raw_remaining = max(0, total_cap - len(state.todo_items))
+        budget = getattr(self, "_research_budget", None)
+        if budget is not None:
+            if budget.blocked or budget.replan["plan_locked"] or not budget.can_dispatch({"tasks": 1}):
+                return 0
+            raw_remaining = min(raw_remaining, budget.governor.snapshot().remaining["tasks"])
         if stage == "reflection":
             base_cap = max(1, int(self.config.max_agent_tasks or 1))
             if (
@@ -1845,6 +2009,324 @@ class DeepResearchAgent(
 
         return review_summary
 
+    @staticmethod
+    def _graph_expectation(replan: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "expected_dag_revision": replan["dag_revision"],
+            "expected_wave_1_committed": replan["wave_1_committed"],
+            "expected_plan_locked": replan["plan_locked"],
+        }
+
+    @staticmethod
+    def _coverage_text(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+    def _plan_coverage(self, state: SummaryState) -> tuple[dict[str, str], dict[int, list[str]]]:
+        topic = state.research_topic or ""
+        explicit = re.search(r"(?:compare|比较|对比).{0,200}?(?:by|across|维度[：:]?|包括)\s*(.+)", topic, re.I)
+        dimensions = re.split(r"[,，、;；]|\band\b", explicit[1]) if explicit else []
+        selection = getattr(self, "_skill_selection", None)
+        if selection and not selection.shadow:
+            gates = getattr(selection.pack, "quality_gates", {})
+            configured = gates.get("required_coverage", [])
+            if isinstance(configured, list):
+                dimensions.extend(value for value in configured if isinstance(value, str))
+        coverage = {}
+        for dimension in dimensions[:24]:
+            label = dimension.strip(" .。:：\t\n")[:120]
+            if label:
+                coverage.setdefault(self._coverage_text(label), label)
+        by_task = {}
+        for task in state.todo_items:
+            wording = self._coverage_text(f"{task.title} {task.intent} {task.query}")
+            by_task[task.id] = [key for key in coverage if re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", wording)]
+        if not coverage:
+            return {"research_topic": topic}, {task.id: ["research_topic"] for task in state.todo_items}
+        return coverage, by_task
+
+    def _prepare_budget_plan(self, state: SummaryState, budget: RequestBudgetController, *, draft: bool = False, lock: bool = False) -> None:
+        replan = budget.replan
+        if replan["slots_allocated"]:
+            return
+        expected = self._graph_expectation(replan)
+        required, coverage = self._plan_coverage(state)
+        if not (lock or replan["plan_locked"]):
+            cap = min(self.config.resolved_initial_plan_max_tasks(), budget.governor.budget.limits["tasks"])
+            by_id = {task.id: task for task in state.todo_items}
+            chosen: set[int] = set()
+            covered: set[str] = set()
+
+            def closure(task_id: int, path: frozenset[int] = frozenset()) -> set[int]:
+                if task_id in path or task_id not in by_id:
+                    raise ValueError("Invalid plan dependency")
+                ids = {task_id}
+                for parent in normalize_depends_on(by_id[task_id].depends_on):
+                    ids.update(closure(parent, path | {task_id}))
+                return ids
+
+            try:
+                if len(by_id) != len(state.todo_items) or any(type(task_id) is not int or task_id < 1 for task_id in by_id):
+                    raise ValueError("Invalid task IDs")
+                candidates = {task_id: closure(task_id) for task_id in by_id}
+            except ValueError:
+                fallback = self.planner.create_fallback_task(state)
+                state.todo_items = [fallback]
+                required, coverage = self._plan_coverage(state)
+                candidates = {fallback.id: {fallback.id}}
+            while candidates:
+                ready = [(task_id, ids, set().union(*(set(coverage.get(i, [])) for i in ids)))
+                         for task_id, ids in candidates.items() if len(ids | chosen) <= cap]
+                if not ready:
+                    break
+                task_id, ids, keys = min(ready, key=lambda item: (-len(item[2] - covered), item[0]))
+                covered.update(keys)
+                chosen.update(ids)
+                candidates.pop(task_id)
+            if len(chosen) < len(state.todo_items):
+                budget.degrade("limit_exceeded")
+            state.todo_items = [task for task in state.todo_items if task.id in chosen]
+        replan.update(
+            required_coverage=required, coverage_by_task={str(task.id): coverage.get(task.id, []) for task in state.todo_items},
+            next_task_id=max((task.id for task in state.todo_items), default=0) + 1,
+        )
+        if draft:
+            return
+        replan["plan_locked"] = lock or replan["plan_locked"]
+        if state.todo_items:
+            try:
+                budget.charge_tasks(len(state.todo_items))
+            except BudgetDispatchDenied:
+                for task in state.todo_items:
+                    if task.status in {"pending", "queued", "awaiting_approval", "in_progress"}:
+                        task.status = "skipped"
+        replan.update(slots_allocated=True, dag_revision=replan["dag_revision"] + 1)
+        self._persist_request_state(state, phase="planned", v4_expected=expected)
+
+    def _budget_event(self, budget: RequestBudgetController, boundary: str) -> dict[str, Any]:
+        snapshot = asdict(budget.snapshot())
+        budget.observation += 1
+        pressure = snapshot["pressure"]
+        if budget.last_emitted_pressure is not None and budget.last_emitted_pressure != pressure:
+            metrics_registry.record_budget_event("pressure", reason=pressure)
+        budget.last_emitted_pressure = pressure
+        return {
+            "type": "budget_updated", "schema_version": 1, "request_id": self.request_id,
+            "event_key": f"{self.request_id}:budget:{budget.state.state_version + 1}:{budget.observation}:{boundary}",
+            "stage": budget.stage, "boundary": boundary,
+            "budget": {key: value for key, value in snapshot.items() if value is not None},
+        }
+
+    def _finish_budget_stage(self, state: SummaryState, budget: RequestBudgetController, phase: str) -> list[dict[str, Any]]:
+        return self._persist_request_state(
+            state, phase=phase, v4_events=None if budget.blocked else [self._budget_event(budget, phase)],
+        )
+
+    def _wave_material(self, state: SummaryState, task_ids: set[int] | None = None) -> dict[str, Any]:
+        records = self._evidence_store.lookup(include_full_content=True)
+        sources = [record for record in records if (
+            (task_ids is None or record.get("task_id") in task_ids)
+            and record.get("source_id")
+            and (record.get("raw_content") or record.get("full_content") or record.get("source_origin") in {"mcp", "sandbox"})
+            and record.get("quality_label") != "low"
+        )]
+        ids = {source["source_id"] for source in sources}
+        ledger = FactLedger.from_dict(state.fact_ledger)
+        if not getattr(self.config, "context_compaction_enabled", True):
+            ledger = FactLedgerCompactor().update_ledger(ledger, state.todo_items, valid_source_ids=ids)
+        facts = [
+            {**entry.to_dict(), "source_id": source_id}
+            for entry in ledger.entries if entry.stance != "gap" for source_id in entry.source_ids if source_id in ids
+        ]
+        # Persist only scoring inputs, not a second copy of the evidence archive.
+        source_fields = ("source_id", "task_id", "url", "domain", "title", "source_origin", "archive_doc_key")
+        return {"facts": facts, "sources": [{key: record[key] for key in source_fields if key in record} for record in sources]}
+
+    def _commit_wave_one(self, state: SummaryState, budget: RequestBudgetController, channel_map: dict, next_step: int) -> list[dict[str, Any]]:
+        replan = budget.replan
+        expected = self._graph_expectation(replan)
+        coverage = {int(key): value for key, value in replan["coverage_by_task"].items()}
+        baseline = replan.get("wave_1_baseline") or {"facts": [], "sources": []}
+        covered_before = {key for source in baseline["sources"] for key in coverage.get(source.get("task_id"), [])}
+        scores = []
+        for task_id in replan.get("wave_1_task_ids", []):
+            material = self._wave_material(state, {task_id})
+            scores.append(score_wave1_branch(
+                task_id=task_id, required_coverage=coverage.get(task_id, []), baseline_coverage=covered_before,
+                wave_coverage=coverage.get(task_id, []) if material["facts"] else [],
+                baseline_facts=baseline["facts"], baseline_sources=baseline["sources"],
+                wave_facts=material["facts"], wave_sources=material["sources"],
+            ))
+        remaining_slots = self._remaining_task_budget(state)
+        depth = budget.governor.budget.depth
+        dispatched = set(replan.get("dispatched_task_ids", []))
+        reason = "plan_locked" if replan["plan_locked"] else "replan_disabled"
+        events = []
+        patch = None
+        if self.config.v4_replan_enabled and not replan["plan_locked"] and budget.can_dispatch({"search_calls": 1}):
+            decision = ResearchTreeRePlanner().plan(
+                state.todo_items, scores, depth=depth, available_task_slots=remaining_slots,
+                next_task_id=replan["next_task_id"], current_revision=replan["dag_revision"], dispatched_ids=dispatched,
+                pivot_queries={task.id: f"{task.query} independent comparable sources" for task in state.todo_items if task.depends_on},
+                needs_cross_check={score.task_id: score.independent_source_clusters == 1 for score in scores},
+                optional_task_ids={task.id for task in state.todo_items if not coverage.get(task.id)},
+            )
+            patch = decision.patch
+            reason = decision.reason_code
+        elif self.config.v4_replan_enabled and not replan["plan_locked"]:
+            reason = "budget_denied"
+        else:
+            metrics_registry.record_replan_event(reason=reason)
+        if patch:
+            applied = apply_dag_patch(
+                state.todo_items, patch, current_revision=replan["dag_revision"], depth=depth,
+                next_task_id=replan["next_task_id"], available_task_slots=remaining_slots,
+                dispatched_ids=dispatched, required_coverage=replan["required_coverage"], coverage_by_task=coverage,
+            )
+            reason = applied.reason_code
+            if applied.applied:
+                try:
+                    budget.charge_tasks(len(applied.added_task_ids))
+                except BudgetDispatchDenied:
+                    applied = None
+                    reason = "budget_denied"
+            if applied and applied.applied:
+                state.todo_items = applied.tasks
+                replan.update(dag_revision=applied.revision, decision_id=patch.decision_id,
+                              pruned_task_ids=applied.pruned_task_ids, decision=asdict(patch),
+                              next_task_id=replan["next_task_id"] + len(applied.added_task_ids),
+                              expansion_count=len(applied.added_task_ids))
+                for task in state.todo_items:
+                    if task.id in applied.pruned_task_ids:
+                        task.status = "skipped"
+                        task.notices.append("计划已裁剪：此任务与已覆盖范围重复。")
+                    if task.id in applied.added_task_ids:
+                        replan["coverage_by_task"][str(task.id)] = list(getattr(task, "coverage_keys", []))
+                self._assign_stream_channels([task for task in state.todo_items if task.id in applied.added_task_ids], channel_map, start_step=next_step)
+                events.append({
+                    "type": "research_replanned", "schema_version": 1, "request_id": self.request_id,
+                    "event_key": f"{self.request_id}:replan:{patch.decision_id}", "dag_revision": applied.revision,
+                    "decision_id": patch.decision_id, "pruned_task_ids": applied.pruned_task_ids,
+                    "actions": [{"action": action.action, "task_id": action.task_id, "parent_task_ids": action.parent_task_ids,
+                                 "reason_code": action.reason_code} for action in patch.actions],
+                    "scores": [asdict(score) for score in scores],
+                })
+        replan.update(wave_1_committed=True, reason_code=reason, scores=[asdict(score) for score in scores], score_version=1)
+        self._update_pending_task_ids(state, replan)
+        events.append(self._budget_event(budget, "wave_1"))
+        events.append(self._budget_todo_event(state, replan, boundary="wave_1"))
+        return self._persist_request_state(state, phase="task_execution", v4_expected=expected, v4_events=events)
+
+    @staticmethod
+    def _update_pending_task_ids(state: SummaryState, replan: dict) -> None:
+        replan["pending_task_ids"] = [task.id for task in state.todo_items if task.status not in {"completed", "failed", "skipped"}]
+
+    def _commit_stage_tasks(self, state: SummaryState, budget: RequestBudgetController, tasks: list[TodoItem], *, phase: str) -> None:
+        replan = budget.replan
+        expected = self._graph_expectation(replan)
+        try:
+            budget.charge_tasks(len(tasks))
+        except BudgetDispatchDenied:
+            ids = {task.id for task in tasks}
+            state.todo_items = [task for task in state.todo_items if task.id not in ids]
+            tasks.clear()
+            return
+        replan.update(dag_revision=replan["dag_revision"] + 1, next_task_id=max(task.id for task in tasks) + 1)
+        self._update_pending_task_ids(state, replan)
+        self._persist_request_state(state, phase=phase, v4_expected=expected)
+
+    def _budget_todo_event(self, state: SummaryState, replan: dict, *, boundary: str) -> dict:
+        return {
+            "type": "todo_list", "schema_version": 1, "request_id": self.request_id,
+            "event_key": f"{self.request_id}:todo:{replan['dag_revision']}:{boundary}",
+            "dag_revision": replan["dag_revision"],
+            "v4": {"schema_version": 1, "replan": public_v4_projection(state.v4)["replan"]},
+            "tasks": [self._serialize_task(task) for task in state.todo_items], "step": 0,
+        }
+
+    def _run_budget_waves(self, state: SummaryState, budget: RequestBudgetController, channel_map: dict, next_step: int, emit_stream: bool) -> Iterator[dict[str, Any]]:
+        replan = budget.replan
+        budget.stage = "research"
+        if not replan["wave_1_committed"] and "wave_1_task_ids" not in replan:
+            if self.config.v4_replan_enabled and not replan["plan_locked"]:
+                coverage = {int(key): value for key, value in replan["coverage_by_task"].items()}
+                first = select_wave_one(state.todo_items, budget.governor.budget.depth, coverage_by_task=coverage)
+            else:
+                pending = [task for task in state.todo_items if task.status in {"pending", "queued"}]
+                first = next(iter(partition_into_waves(pending)), [])
+            replan.update(wave_1_task_ids=[task.id for task in first], wave_1_baseline=self._wave_material(state))
+            self._persist_request_state(state, phase="task_execution", v4_expected=self._graph_expectation(replan))
+
+        while not self._is_cancelled():
+            pending = [task for task in state.todo_items if task.status not in {"completed", "failed", "skipped"}]
+            first_wave = not replan["wave_1_committed"]
+            merged = replan.get("wave_1_merged", False)
+            waves = partition_into_waves(pending)
+            tasks = ([task for task in pending if task.id in replan["wave_1_task_ids"]]
+                     if first_wave else next(iter(waves), []))
+            if not first_wave and not tasks:
+                break
+            wave = 1 if first_wave else replan.get("completed_waves", 1) + 1
+            total = wave - 1 + max(1, len(waves))
+            frame = {"wave": wave, "total_waves": total, "task_ids": [task.id for task in tasks]}
+            if tasks and not (first_wave and merged):
+                if budget.governor.remaining_timeout(stage="research") <= 0:
+                    budget.degrade("deadline_exceeded")
+                    for task in pending:
+                        task.status = "skipped"
+                else:
+                    replan["dispatched_task_ids"] = sorted(set(replan.get("dispatched_task_ids", [])) | {task.id for task in tasks})
+                    self._update_pending_task_ids(state, replan)
+                    self._persist_request_state(state, phase="task_execution", v4_expected=self._graph_expectation(replan))
+                    self._prepare_upstream_contexts(state, tasks)
+                    if emit_stream:
+                        yield {"type": "wave_started", **frame}
+                        yield from self._execute_task_batch_stream(state, tasks, channel_map)
+                    else:
+                        self._execute_task_batch_sync(state, tasks)
+                if self._is_cancelled():
+                    break
+                self._refresh_context_checkpoints(state)
+            if first_wave:
+                replan["wave_1_merged"] = True
+            replan["completed_waves"] = wave
+            self._update_pending_task_ids(state, replan)
+            self._persist_request_state(state, phase="task_execution", v4_expected=self._graph_expectation(replan))
+            if emit_stream and tasks and not merged:
+                yield {"type": "wave_completed", **frame}
+            if first_wave:
+                events = self._commit_wave_one(state, budget, channel_map, next_step)
+            elif budget.snapshot().pressure != budget.last_emitted_pressure:
+                events = self._persist_request_state(state, phase="task_execution", v4_events=[self._budget_event(budget, "pressure")])
+            else:
+                events = []
+            if emit_stream:
+                yield from events
+
+    def _budget_report(self, state: SummaryState, budget: RequestBudgetController) -> str:
+        report = ReportingService(None, self.config, evidence_store=self._evidence_store)
+        # A local report is restricted to claims verified against registered evidence.
+        safe_state = deepcopy(state)
+        valid_ids = {item["source_id"] for item in self._evidence_store.lookup() if item.get("source_id")}
+        for task in safe_state.todo_items:
+            task.claims = []
+            task.fact_claims = []
+            task.summary_payload = None
+            task.summary = None
+            task.atomic_claims = [claim for claim in task.atomic_claims if claim.get("nli_label") == "ENTAILED"
+                                  and claim.get("best_source_id") in valid_ids]
+            task.claims = [{"text": claim["text"], "source_ids": [claim["best_source_id"]]} for claim in task.atomic_claims]
+            task.evidence_items = []
+        coverage = budget.replan.get("coverage_by_task", {}) if not budget.blocked else {}
+        required = budget.replan.get("required_coverage", {}) if not budget.blocked else {}
+        covered = {key for task in safe_state.todo_items if task.atomic_claims for key in coverage.get(str(task.id), [])}
+        gaps = [label for key, label in required.items() if key not in covered]
+        gaps.extend(task.title for task in safe_state.todo_items if task.status in {"skipped", "failed"} and not task.atomic_claims)
+        coverage_text = "、".join(required[key] for key in required if key in covered) or "暂无已核验覆盖"
+        rendered = report._render_structured_report({"background_overview": f"研究问题：{state.research_topic}\n\n已覆盖范围：{coverage_text}"}, state=safe_state)
+        if not gaps and not covered:
+            gaps = ["目前没有足够的可核验证据。"]
+        return rendered + ("\n\n## 未完成的研究项\n" + "\n".join(f"- {gap}" for gap in dict.fromkeys(gaps)) if gaps else "")
+
     def _execute_workflow(
         self,
         topic: str,
@@ -1865,10 +2347,20 @@ class DeepResearchAgent(
         report = state.structured_report or ""
         request_completed = False
         try:
+            budget = self._init_request_budget(state, resumed=resumed)
+            if budget is not None and resume_phase != "completed":
+                report = ""
+            if budget is not None and not resumed:
+                initial_events = self._persist_request_state(
+                    state, phase="planning", v4_expected=self._graph_expectation(budget.replan) if not budget.blocked else None,
+                    v4_events=[self._budget_event(budget, "initialized")] if not budget.blocked else None,
+                )
             self._select_skill_pack(state.research_topic or topic, observer, state=state)
             if emit_stream:
                 logger.debug("Starting streaming research: topic=%s", topic)
                 yield {"type": "status", "message": "初始化研究流程"}
+                if budget is not None and not resumed:
+                    yield from initial_events
             if self._is_cancelled():
                 observer.record_degraded("client_disconnected")
                 observer.complete_request(status="cancelled")
@@ -1878,14 +2370,18 @@ class DeepResearchAgent(
             if resumed and resume_phase:
                 self._restore_task_counters(observer, state)
                 self._refresh_context_checkpoints(state)
-                self._persist_request_state(state, phase=resume_phase, status="in_progress")
+                if budget is None or resume_phase != "awaiting_approval":
+                    self._persist_request_state(state, phase=resume_phase, status="in_progress")
                 if emit_stream:
                     yield {
                         "type": "status",
                         "message": f"已从持久化快照恢复请求：{self.request_id}",
                     }
 
-            if not resumed or not state.todo_items:
+            needs_plan = not resumed or not state.todo_items
+            if budget is not None:
+                needs_plan = needs_plan and not budget.blocked and not budget.replan["slots_allocated"] and resume_phase != "awaiting_approval"
+            if needs_plan:
                 planning_span = observer.start_stage(
                     "planning",
                     scope="request",
@@ -1895,6 +2391,8 @@ class DeepResearchAgent(
                     yield planning_span.started_event()
 
                 try:
+                    if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
+                        budget.refuse("limit_exceeded")
                     historical_memory_context = self._planning_memory_context(state, observer)
                     state.todo_items = self.planner.plan_todo_list(
                         state,
@@ -1907,6 +2405,10 @@ class DeepResearchAgent(
                         status="success",
                         metadata={"task_count": len(state.todo_items)},
                     )
+                    if emit_stream:
+                        yield completed_event
+                except BudgetDispatchDenied:
+                    completed_event = planning_span.complete(status="partial_success", metadata={"task_count": 0})
                     if emit_stream:
                         yield completed_event
                 except Exception as exc:
@@ -1929,7 +2431,9 @@ class DeepResearchAgent(
                 for event in self._drain_tool_events(state, step=0):
                     yield event
 
-            if not state.todo_items:
+            if not state.todo_items and (budget is None or (
+                needs_plan and budget.can_dispatch({"tasks": 1, "search_calls": 1})
+            )):
                 logger.info("No TODO items generated; falling back to single task")
                 state.todo_items = [self.planner.create_fallback_task(state)]
                 fallback_event = observer.record_fallback("planning_returned_no_tasks")
@@ -1938,7 +2442,11 @@ class DeepResearchAgent(
                     yield fallback_event
                     yield degraded_event
 
-            budget_notice = self._apply_task_budget(state, observer)
+            budget_notice = self._apply_task_budget(state, observer) if budget is None else None
+            if budget is not None and not budget.blocked:
+                self._prepare_budget_plan(state, budget, lock=resume_phase == "awaiting_approval")
+                if not state.todo_items:
+                    budget.degrade("limit_exceeded")
             if emit_stream and budget_notice:
                 yield {
                     "type": "status",
@@ -1957,16 +2465,29 @@ class DeepResearchAgent(
                     channel_map,
                     start_step=1,
                 )
-                yield {
+                todo_event = {
                     "type": "todo_list",
                     "tasks": [self._serialize_task(t) for t in state.todo_items],
                     "step": 0,
                 }
+                if budget is not None and not budget.blocked:
+                    boundary = f"start:{state.state_version}" if resumed else "start"
+                    todo_event = self._budget_todo_event(state, budget.replan, boundary=boundary)
+                    if self._request_state_store is not None:
+                        todo_event["state_version"] = state.state_version
+                yield todo_event
 
             pending_tasks = [
                 task for task in state.todo_items if task.status not in {"completed"}
             ]
-            if pending_tasks:
+            if budget is not None and not budget.blocked:
+                yield from self._run_budget_waves(state, budget, channel_map, next_step, emit_stream)
+                next_step = max((channel["step"] for channel in channel_map.values()), default=0) + 1
+            elif budget is not None:
+                for task in pending_tasks:
+                    if task.status not in {"failed", "skipped"}:
+                        task.status = "skipped"
+            elif pending_tasks:
                 completed_ids = {
                     int(task.id) for task in state.todo_items if task.status == "completed"
                 }
@@ -2014,11 +2535,13 @@ class DeepResearchAgent(
                 return
 
             if not state.reflection_completed:
+                if budget is not None:
+                    budget.stage = "reflection"
                 reflection_gap_signals = self._reflection_gap_signals(state)
                 if self.config.request_reflection_enabled and reflection_gap_signals:
                     reflection_step = next_step
                     remaining_budget = self._remaining_task_budget(state, stage="reflection")
-                    if remaining_budget <= 0:
+                    if remaining_budget <= 0 or (budget is not None and not budget.can_dispatch({"llm_calls": 1})):
                         reason = "发现覆盖缺口，但任务预算已满，直接生成报告。"
                         observer.record_reflection_skip(
                             reason=reason,
@@ -2049,6 +2572,9 @@ class DeepResearchAgent(
                             additional_tasks, reflection_notice, assessment, _ = (
                                 self._run_reflection_cycle(state, observer)
                             )
+                            if budget is not None and additional_tasks:
+                                state.reflection_completed = True
+                                self._commit_stage_tasks(state, budget, additional_tasks, phase="reflection")
                             completed_event = reflection_span.complete(
                                 status="success",
                                 metadata={
@@ -2097,7 +2623,7 @@ class DeepResearchAgent(
                                 else:
                                     self._execute_task_batch_sync(state, additional_tasks)
                                 self._refresh_context_checkpoints(state)
-                        except MCPHitlApprovalRequired:
+                        except (MCPHitlApprovalRequired, SnapshotConflictError):
                             raise
                         except Exception as exc:
                             completed_event = reflection_span.complete(status="failed", error=exc)
@@ -2119,9 +2645,15 @@ class DeepResearchAgent(
                             else:
                                 logger.warning("Reflection stage failed topic=%s error=%s", topic, exc)
                 state.reflection_completed = True
-                self._persist_request_state(state, phase="reflection", status="in_progress")
+                stage_events = self._finish_budget_stage(state, budget, "reflection") if budget is not None else ()
+                if budget is None:
+                    self._persist_request_state(state, phase="reflection", status="in_progress")
+                if emit_stream:
+                    yield from stage_events
 
             if not state.review_completed:
+                if budget is not None:
+                    budget.stage = "review"
                 review_step = next_step
                 review_span = observer.start_stage(
                     "review",
@@ -2165,11 +2697,20 @@ class DeepResearchAgent(
                     raise
                 if emit_stream:
                     next_step = review_step + 1
-                self._persist_request_state(state, phase="review", status="in_progress")
+                if budget is None:
+                    self._persist_request_state(state, phase="review", status="in_progress")
+                else:
+                    stage_events = self._finish_budget_stage(state, budget, "review")
+                    if emit_stream:
+                        yield from stage_events
 
             if not state.report_repair_completed:
+                if budget is not None:
+                    budget.stage = "repair"
                 repair_candidates = self._select_report_repair_candidates(state)
-                if self.config.report_repair_enabled and repair_candidates:
+                if self.config.report_repair_enabled and repair_candidates and (budget is None or (
+                    self._remaining_task_budget(state, stage="repair") > 0 and budget.can_dispatch({"llm_calls": 1})
+                )):
                     repair_step = next_step
                     repair_span = observer.start_stage(
                         "repair",
@@ -2192,6 +2733,8 @@ class DeepResearchAgent(
                         repair_tasks, repair_notice, _ = self._prepare_report_repair_tasks(
                             state, observer
                         )
+                        if budget is not None and repair_tasks:
+                            self._commit_stage_tasks(state, budget, repair_tasks, phase="report_repair")
                         state.report_repair_cycles += 1
                         if emit_stream and repair_notice:
                             yield {
@@ -2286,6 +2829,8 @@ class DeepResearchAgent(
                                 "step": repair_step,
                             }
                     except Exception as exc:
+                        if isinstance(exc, SnapshotConflictError) or (budget is not None and isinstance(exc, MCPHitlApprovalRequired)):
+                            raise
                         repair_span.complete(status="failed", error=exc)
                         observer.record_degraded("report_repair_failed")
                         if emit_stream:
@@ -2317,6 +2862,8 @@ class DeepResearchAgent(
                 self._persist_request_state(state, phase="cancelled", status="cancelled", report_markdown=report)
                 return
             if not report:
+                if budget is not None:
+                    budget.stage = "report"
                 report_span = observer.start_stage(
                     "report",
                     scope="request",
@@ -2327,6 +2874,8 @@ class DeepResearchAgent(
                     report_started["step"] = final_step
                     yield report_started
                 try:
+                    if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
+                        budget.refuse("limit_exceeded")
                     if emit_stream and hasattr(self.reporting, "stream_generate_report"):
                         stream_kwargs: dict[str, Any] = {
                             "observer": observer,
@@ -2355,6 +2904,8 @@ class DeepResearchAgent(
                             observer=observer,
                             skill_pack_context=self._skill_stage_context("report"),
                         )
+                    if budget is not None and (not report.strip() or report == "报告生成失败，请检查输入。"):
+                        budget.refuse("dispatch_unbounded")
                     completed_event = report_span.complete(
                         status="success",
                         metadata={"report_length": len(report or "")},
@@ -2363,14 +2914,22 @@ class DeepResearchAgent(
                         completed_event["step"] = final_step
                         yield completed_event
                 except Exception as exc:
-                    completed_event = report_span.complete(status="failed", error=exc)
+                    fallback = budget is not None and (
+                        isinstance(exc, (BudgetDispatchDenied, TimeoutError, httpx.TimeoutException))
+                        or type(exc).__name__ == "APITimeoutError"
+                    )
+                    if fallback:
+                        budget.degrade("report_fallback")
+                        report = self._budget_report(state, budget)
+                    completed_event = report_span.complete(status="partial_success" if fallback else "failed", error=exc)
                     if emit_stream:
                         completed_event["step"] = final_step
                         yield completed_event
                         yield observer.metrics_event()
-                    observer.complete_request(status="failed", error=exc)
-                    request_completed = True
-                    raise
+                    if not fallback:
+                        observer.complete_request(status="failed", error=exc)
+                        request_completed = True
+                        raise
             elif emit_stream:
                 yield {
                     "type": "status",
@@ -2423,18 +2982,21 @@ class DeepResearchAgent(
             snapshot = observer.complete_request(status=request_status)
             request_completed = True
             self._export_observability_trace(snapshot)
-            self._persist_request_state(
+            terminal_kwargs = {}
+            if budget is not None and not budget.blocked:
+                terminal_kwargs["v4_events"] = [self._budget_event(budget, "completed")]
+            terminal_events = self._persist_request_state(
                 state,
                 phase="completed",
                 status=request_status,
                 report_markdown=report,
+                **terminal_kwargs,
             )
-            self._refresh_strategy_memory_for_request(
-                self.request_id,
-                observer=observer,
-            )
+            if budget is None:
+                self._refresh_strategy_memory_for_request(self.request_id, observer=observer)
 
             if emit_stream:
+                yield from terminal_events or ()
                 yield observer.metrics_event()
                 yield {
                     "type": "final_report",
@@ -2446,6 +3008,7 @@ class DeepResearchAgent(
                     "claim_verification_summary": dict(
                         getattr(state, "claim_verification_summary", None) or {}
                     ),
+                    **({"v4": projection} if (projection := public_v4_projection(state.v4)) is not None else {}),
                     **({
                         "workbench": state.report_workbench,
                         "citation_drawer_map": workbench["citation_index"],
@@ -2474,6 +3037,8 @@ class DeepResearchAgent(
                 }
                 yield observer.metrics_event()
             return
+        except SnapshotConflictError:
+            raise
         except Exception as exc:
             if not request_completed:
                 failed_snapshot = observer.complete_request(status="failed", error=exc)
@@ -2484,12 +3049,11 @@ class DeepResearchAgent(
                 status="failed",
                 report_markdown=report,
             )
-            self._refresh_strategy_memory_for_request(
-                self.request_id,
-                observer=observer,
-            )
+            if getattr(self, "_research_budget", None) is None:
+                self._refresh_strategy_memory_for_request(self.request_id, observer=observer)
             raise
         finally:
+            self._research_budget = None
             self._active_state = None
             self._cancel_event = None
             self._restore_request_config()
@@ -2526,6 +3090,7 @@ class DeepResearchAgent(
                 getattr(state, "claim_verification_summary", None) or {}
             ),
             todo_items=state.todo_items,
+            v4=public_v4_projection(state.v4),
         )
 
     def run_resume(self, request_id: str) -> SummaryStateOutput:
@@ -2557,10 +3122,19 @@ class DeepResearchAgent(
 
         observer = self._start_request_trace(topic)
         state = SummaryState(research_topic=topic)
-        self._select_skill_pack(topic, observer, state=state)
+        self._active_state = state
         try:
+            budget = self._init_request_budget(state, resumed=False)
+            if budget is not None and not budget.blocked:
+                self._persist_request_state(
+                    state, phase="planning", v4_expected=self._graph_expectation(budget.replan),
+                    v4_events=[self._budget_event(budget, "initialized")],
+                )
+            self._select_skill_pack(topic, observer, state=state)
             planning_span = observer.start_stage("planning", scope="request", metadata={"topic": topic})
             try:
+                if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
+                    budget.refuse("limit_exceeded")
                 historical_memory_context = self._planning_memory_context(state, observer)
                 state.todo_items = self.planner.plan_todo_list(
                     state,
@@ -2570,18 +3144,26 @@ class DeepResearchAgent(
                     skill_pack_context=self._skill_stage_context("planning"),
                 )
                 planning_span.complete(status="success", metadata={"task_count": len(state.todo_items)})
+            except BudgetDispatchDenied:
+                planning_span.complete(status="partial_success", metadata={"task_count": 0})
             except Exception as exc:
                 planning_span.complete(status="failed", error=exc)
                 observer.complete_request(status="failed", error=exc)
                 raise
 
-            if not state.todo_items:
+            if not state.todo_items and (budget is None or budget.can_dispatch({"tasks": 1, "search_calls": 1})):
                 state.todo_items = [self.planner.create_fallback_task(state)]
 
-            self._apply_task_budget(state, observer)
+            persist_kwargs = {}
+            if budget is None:
+                self._apply_task_budget(state, observer)
+            elif not budget.blocked:
+                persist_kwargs["v4_expected"] = self._graph_expectation(budget.replan)
+                self._prepare_budget_plan(state, budget, draft=True)
+                persist_kwargs["v4_events"] = [self._budget_event(budget, "awaiting_approval")]
             observer.set_task_totals(total_tasks=len(state.todo_items))
             observer.complete_request(status="awaiting_approval")
-            self._persist_request_state(state, phase="awaiting_approval", status="awaiting_approval")
+            self._persist_request_state(state, phase="awaiting_approval", status="awaiting_approval", **persist_kwargs)
             return {
                 "request_id": self.request_id,
                 "topic": topic,
@@ -2589,11 +3171,15 @@ class DeepResearchAgent(
                 "phase": "awaiting_approval",
                 "skill_pack": dict(state.skill_pack_metadata or {}),
                 "todo_items": [self._serialize_task(task) for task in state.todo_items],
+                **({"v4": projection} if (projection := public_v4_projection(state.v4)) is not None else {}),
+                **({"plan_revision": 0} if budget is not None and getattr(self, "_workflow_checkpoint", None) is None else {}),
                 "estimated_duration_seconds": HitlService.estimate_duration_seconds(
                     len(state.todo_items), self.config
                 ),
             }
         finally:
+            self._research_budget = None
+            self._active_state = None
             self._restore_request_config()
 
     def drilldown_section(

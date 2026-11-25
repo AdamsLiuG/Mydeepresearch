@@ -1198,6 +1198,31 @@ class Configuration(BaseModel):
         title="Max Total Tasks",
         description="Optional hard total task ceiling across planning, reflection, and report repair",
     )
+    v4_research_budget_enabled: bool = Field(
+        default=False,
+        title="V4 Research Budget Enabled",
+        description="Enable the v4 request budget controller",
+    )
+    v4_replan_enabled: bool = Field(
+        default=False,
+        title="V4 Replan Enabled",
+        description="Enable the v4 Wave 1 research tree replanner",
+    )
+    v4_default_research_depth: str = Field(
+        default="standard",
+        title="V4 Default Research Depth",
+        description="Default profile used when a request does not select a research depth",
+    )
+    v4_research_budget_limits: dict[str, int] = Field(
+        default_factory=dict,
+        title="V4 Research Budget Limits",
+        description="Optional service-wide resource ceilings applied to v4 profiles",
+    )
+    v4_tenant_budget_limits: dict[str, dict[str, int]] = Field(
+        default_factory=dict,
+        title="V4 Tenant Budget Limits",
+        description="Optional tenant-specific resource ceilings applied to v4 profiles",
+    )
     request_reflection_enabled: bool = Field(
         default=True,
         title="Request Reflection Enabled",
@@ -1548,6 +1573,62 @@ class Configuration(BaseModel):
                 return {}
             return parsed if isinstance(parsed, dict) else {}
         return value if isinstance(value, dict) else {}
+
+    @field_validator("v4_research_budget_limits", "v4_tenant_budget_limits", mode="before")
+    @classmethod
+    def _normalize_v4_budget_limits(cls, value: Any) -> Any:
+        if value in (None, "", {}):
+            return {}
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("v4 budget limits must contain valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("v4 budget limits must be a JSON object")
+        return value
+
+    @field_validator("v4_default_research_depth", mode="before")
+    @classmethod
+    def _normalize_v4_research_depth(cls, value: Any) -> str:
+        depth = str(value or "standard").strip().lower()
+        if depth not in {"quick", "standard", "deep"}:
+            raise ValueError("v4_default_research_depth must be quick, standard, or deep")
+        return depth
+
+    @field_validator("v4_research_budget_limits")
+    @classmethod
+    def _validate_v4_service_budget_limits(cls, value: dict[str, int]) -> dict[str, int]:
+        valid_resources = {
+            "tasks", "search_calls", "web_fetches", "dynamic_fetches", "sandbox_calls",
+            "llm_calls", "input_tokens", "output_tokens", "cost_microusd",
+        }
+        if set(value).difference(valid_resources):
+            raise ValueError("v4_research_budget_limits contains an unknown resource")
+        if any(isinstance(amount, bool) or amount < 0 for amount in value.values()):
+            raise ValueError("v4 research budget limits must be non-negative integers")
+        return dict(value)
+
+    @field_validator("v4_tenant_budget_limits")
+    @classmethod
+    def _validate_v4_tenant_budget_limits(
+        cls,
+        value: dict[str, dict[str, int]],
+    ) -> dict[str, dict[str, int]]:
+        valid_resources = {
+            "tasks", "search_calls", "web_fetches", "dynamic_fetches", "sandbox_calls",
+            "llm_calls", "input_tokens", "output_tokens", "cost_microusd",
+        }
+        result: dict[str, dict[str, int]] = {}
+        for tenant_id, limits in value.items():
+            if not str(tenant_id).strip() or not isinstance(limits, dict):
+                raise ValueError("each v4 tenant budget limit must map a tenant to resource limits")
+            if set(limits).difference(valid_resources):
+                raise ValueError("v4 tenant budget limits contain an unknown resource")
+            if any(isinstance(amount, bool) or amount < 0 for amount in limits.values()):
+                raise ValueError("v4 tenant budget limits must be non-negative integers")
+            result[str(tenant_id)] = dict(limits)
+        return result
 
     @model_validator(mode="after")
     def _normalize_paths(self) -> "Configuration":

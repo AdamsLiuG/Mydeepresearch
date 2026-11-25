@@ -299,8 +299,23 @@ class MetricsRegistry:
             "policy_model_shadow_agree_total": 0,
             "policy_model_canary_total": 0,
             "policy_circuit_breaker_trip_total": 0,
+            "budget_reserve_total": 0,
+            "budget_dispatch_total": 0,
+            "budget_settle_total": 0,
+            "budget_release_total": 0,
+            "budget_denied_total": 0,
+            "budget_external_attempt_total": 0,
+            "replan_decision_total": 0,
+            "replan_patch_total": 0,
+            "replan_pivot_total": 0,
+            "replan_deepen_total": 0,
+            "replan_prune_total": 0,
+            "replan_no_patch_total": 0,
+            "replan_validation_rejected_total": 0,
         }
         self._task_react_stop_reason_counts: dict[str, int] = {}
+        self._budget_denial_reason_counts: dict[str, int] = {}
+        self._replan_reason_counts: dict[str, int] = {}
         self._kv_cache_by_stage: dict[str, dict[str, Any]] = {}
         self._estimated_cost = 0.0
         self._latencies: dict[str, LatencyStats] = {
@@ -329,6 +344,8 @@ class MetricsRegistry:
             for key in list(self._counters.keys()):
                 self._counters[key] = 0
             self._task_react_stop_reason_counts = {}
+            self._budget_denial_reason_counts = {}
+            self._replan_reason_counts = {}
             self._kv_cache_by_stage.clear()
             self._estimated_cost = 0.0
             self._latencies = {
@@ -421,6 +438,58 @@ class MetricsRegistry:
                 self._task_react_stop_reason_counts.get(normalized, 0) + 1
             )
 
+    def record_budget_event(self, event: str, *, reason: str | None = None) -> None:
+        counter = {
+            "reserve": "budget_reserve_total",
+            "dispatch": "budget_dispatch_total",
+            "settle": "budget_settle_total",
+            "release": "budget_release_total",
+            "denied": "budget_denied_total",
+            "external_attempt": "budget_external_attempt_total",
+        }.get(event)
+        if counter is None:
+            return
+        with self._lock:
+            self._counters[counter] += 1
+            if event == "denied" and reason:
+                normalized = reason if reason in {
+                    "limit_exceeded", "finalization_reserved", "deadline_exceeded",
+                    "optional_pressure", "pricing_unavailable", "dispatch_unbounded",
+                    "operation_conflict", "lease_lost",
+                } else "other"
+                self._budget_denial_reason_counts[normalized] = (
+                    self._budget_denial_reason_counts.get(normalized, 0) + 1
+                )
+
+    def record_replan_event(
+        self,
+        *,
+        action: str | None = None,
+        patched: bool = False,
+        rejected: bool = False,
+        reason: str | None = None,
+        decision: bool = True,
+    ) -> None:
+        with self._lock:
+            if decision:
+                self._counters["replan_decision_total"] += 1
+            if patched:
+                self._counters["replan_patch_total"] += 1
+            elif not rejected:
+                self._counters["replan_no_patch_total"] += 1
+            if action in {"PIVOT", "DEEPEN", "PRUNE"}:
+                self._counters[f"replan_{action.lower()}_total"] += 1
+            if rejected:
+                self._counters["replan_validation_rejected_total"] += 1
+            if reason:
+                normalized = reason if reason in {
+                    "no_eligible_signal", "insufficient_samples", "no_successor",
+                    "budget_denied", "coverage_required", "plan_locked",
+                    "approval_pending", "invalid_patch", "stale_revision",
+                    "replan_disabled",
+                } else "other"
+                self._replan_reason_counts[normalized] = self._replan_reason_counts.get(normalized, 0) + 1
+
     def store_request(self, payload: dict[str, Any]) -> None:
         with self._lock:
             self._recent_requests.appendleft(_clone_dict(payload))
@@ -438,6 +507,8 @@ class MetricsRegistry:
                 if tenant_id is None or request.get("tenant_id") == tenant_id
             ] if include_recent_requests else []
             stop_reason_counts = dict(self._task_react_stop_reason_counts)
+            budget_denial_reason_counts = dict(self._budget_denial_reason_counts)
+            replan_reason_counts = dict(self._replan_reason_counts)
             kv_cache_by_stage = _clone_dict(self._kv_cache_by_stage)
 
         request_total = counters.get("request_total", 0)
@@ -487,6 +558,8 @@ class MetricsRegistry:
             "latencies_ms": latencies,
             "estimated_cost": estimated_cost,
             "task_react_stop_reason_counts": stop_reason_counts,
+            "budget_denial_reason_counts": budget_denial_reason_counts,
+            "replan_reason_counts": replan_reason_counts,
             "avg_task_react_rounds": round(task_react_round_total / task_react_stop_total, 4)
             if task_react_stop_total
             else 0.0,

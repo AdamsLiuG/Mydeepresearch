@@ -40,6 +40,7 @@ def execute_durable_research_activity(
     from services.storage_backends import build_request_state_store
     from services.workflow_runner import (
         WorkflowCheckpoint,
+        _apply_workflow_request_options,
         _workflow_run_id,
         require_shared_workflow_backends,
         run_durable_attempt,
@@ -71,10 +72,13 @@ def execute_durable_research_activity(
         if checkpoint.load() is None:
             checkpoint.reserve(spec.topic)
 
-        def agent_factory() -> DeepResearchAgent:
+        def agent_factory(*, workflow_request_options: dict[str, Any] | None = None) -> DeepResearchAgent:
             if failure is not None:
                 raise RuntimeError(failure)
-            return DeepResearchAgent(config=config, request_id=spec.request_id, tenant_id=spec.tenant_id)
+            return DeepResearchAgent(
+                config=_apply_workflow_request_options(config, workflow_request_options),
+                request_id=spec.request_id, tenant_id=spec.tenant_id,
+            )
 
         return run_durable_attempt(
             checkpoint, agent_factory, event_bus, Event(),

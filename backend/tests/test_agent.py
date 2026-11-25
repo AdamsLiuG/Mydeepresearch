@@ -217,6 +217,95 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertEqual(result.todo_items[0].status, "completed")
         self.assertEqual(result.todo_items[0].summary, "summary")
 
+    def test_v4_wave_barrier_and_resume_do_not_repeat_decision_or_tasks(self):
+        from tempfile import TemporaryDirectory
+
+        from services.request_state import RequestStateStore
+
+        with TemporaryDirectory() as directory:
+            store = RequestStateStore(directory)
+            agent = self._build_agent()
+            agent._request_state_store = store
+            agent.config = agent.config.model_copy(update={
+                "v4_research_budget_enabled": True,
+                "v4_replan_enabled": True,
+                "v4_default_research_depth": "quick",
+            })
+            agent.planner.plan_todo_list = lambda *args, **kwargs: [
+                TodoItem(id=i, title=f"Angle {i}", intent="Test", query=f"Topic {i}") for i in (1, 2)
+            ]
+            calls = []
+
+            def batch(state, tasks, channels):
+                calls.append([task.id for task in tasks])
+                for task in tasks:
+                    task.status = "completed"
+                yield from ()
+
+            agent._execute_task_batch_stream = batch
+            events = agent.run_stream("Topic")
+            first_todo = None
+            for event in events:
+                if event["type"] == "todo_list":
+                    first_todo = event
+                if event["type"] == "budget_updated" and event.get("boundary") == "wave_1":
+                    break
+            events.close()
+            snapshot = store.load(agent.request_id)
+            self.assertEqual(first_todo["dag_revision"], 1)
+            self.assertIn("state_version", first_todo)
+            self.assertEqual(calls, [[1]])
+            self.assertTrue(snapshot["v4"]["replan"]["wave_1_committed"])
+            self.assertEqual(snapshot["v4"]["budget"]["snapshot"]["spent"]["tasks"], 2)
+            recovered = self._build_agent()
+            recovered._request_state_store = store
+            recovered._execute_task_batch_stream = batch
+            payloads = list(recovered.run_stream_resume(recovered.request_id))
+            self.assertEqual(calls, [[1], [2]])
+            self.assertEqual([event["type"] for event in payloads[-2:]], ["final_report", "done"])
+            self.assertEqual(payloads[-2]["v4"]["budget"]["limit"]["depth"], "quick")
+
+    def test_v4_zero_tasks_returns_a_deterministic_partial_report(self):
+        agent = self._build_agent()
+        agent.config = agent.config.model_copy(update={
+            "v4_research_budget_enabled": True,
+            "v4_research_budget_limits": {"tasks": 0, "llm_calls": 0},
+        })
+        agent.reporting.generate_report = lambda *args, **kwargs: self.fail("report provider called")
+        events = list(agent.run_stream("Budget test"))
+        self.assertEqual([event["type"] for event in events[-2:]], ["final_report", "done"])
+        self.assertIn("Budget test", events[-2]["report"])
+        self.assertEqual(agent._request_trace.snapshot()["status"], "partial_success")
+
+    def test_v4_plan_draft_is_approved_once_without_truncating_the_edited_graph(self):
+        from tempfile import TemporaryDirectory
+
+        from services.request_state import RequestStateStore
+
+        with TemporaryDirectory() as directory:
+            store = RequestStateStore(directory)
+            agent = self._build_agent()
+            agent._request_state_store = store
+            agent.config = agent.config.model_copy(update={"v4_research_budget_enabled": True, "v4_replan_enabled": True})
+            draft = agent.plan_only("Topic")
+            self.assertEqual(draft["plan_revision"], 0)
+            self.assertEqual(draft["v4"]["budget"]["spent"]["tasks"], 0)
+            snapshot = store.load(agent.request_id)
+            snapshot["todo_items"][0]["id"] = 9
+            store.save(agent.request_id, snapshot, expected_version=snapshot["state_version"])
+
+            def execute(state, tasks):
+                for task in tasks:
+                    task.status = "completed"
+
+            agent._execute_task_batch_sync = execute
+            result = agent.run_resume(agent.request_id)
+            self.assertEqual([task.id for task in result.todo_items], [9])
+            self.assertEqual(result.v4["budget"]["spent"]["tasks"], 1)
+            saved = store.load(agent.request_id)
+            self.assertEqual(saved["v4"]["replan"]["reason_code"], "plan_locked")
+            self.assertEqual(agent.run_resume(agent.request_id).v4["budget"]["spent"]["tasks"], 1)
+
     def test_run_applies_task_budget_limit(self):
         agent = self._build_agent()
         agent.config = Configuration.from_env(

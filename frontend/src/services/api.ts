@@ -402,7 +402,7 @@ export async function createResearchPlan(
 export async function updateResearchPlan(
   requestId: string,
   tasks: ResearchTaskPlanItem[],
-  options: StreamOptions = {}
+  options: StreamOptions & { planRevision?: number } = {}
 ): Promise<EditablePlanResponse> {
   const response = await fetch(
     `${baseURL}/requests/${encodeURIComponent(requestId)}/plan`,
@@ -415,7 +415,7 @@ export async function updateResearchPlan(
         },
         options
       ),
-      body: JSON.stringify({ tasks }),
+      body: JSON.stringify({ tasks, revision: options.planRevision }),
       signal: options.signal
     }
   );

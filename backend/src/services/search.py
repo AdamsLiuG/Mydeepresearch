@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections.abc import Mapping
@@ -1550,6 +1551,7 @@ def _execute_semantic_scholar_backend(
     config: Configuration,
     *,
     max_results: int,
+    timeout: float | None = None,
 ) -> tuple[dict[str, Any], list[str], str | None, str]:
     """Execute the local Semantic Scholar provider without relying on hello-agents."""
 
@@ -1562,7 +1564,8 @@ def _execute_semantic_scholar_backend(
                 "limit": max(1, int(max_results or 1)),
             },
             headers=_semantic_scholar_headers(config),
-            timeout=_semantic_scholar_timeout_seconds(config),
+            timeout=timeout if timeout is not None else _semantic_scholar_timeout_seconds(config),
+            **({"allow_redirects": False} if timeout is not None else {}),
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"Semantic Scholar 请求失败: {exc}") from exc
@@ -1601,6 +1604,45 @@ def _execute_semantic_scholar_backend(
         "notices": [],
     }
     return normalized_payload, [], None, "semanticscholar"
+
+
+def _execute_bounded_search(
+    query: str, search_api: str, config: Configuration, *, max_results: int,
+    budget: Any, required: bool,
+) -> tuple[dict[str, Any], list[str], str | None, str]:
+    backends = config.resolved_advanced_search_backends() if search_api == "advanced" else [search_api]
+    bounded_backends = [backend for backend in backends if backend in {"semanticscholar", "searxng"}]
+    if not bounded_backends:
+        budget.refuse("dispatch_unbounded", required=required)
+
+    result = None
+    for backend in bounded_backends:
+        with budget.attempt({"search_calls": 1}, required=required) as attempt:
+            timeout = min(attempt.timeout, float(config.search_tool_timeout_seconds or 10.0))
+            if backend == "semanticscholar":
+                result = _execute_semantic_scholar_backend(
+                    query, config, max_results=max_results,
+                    timeout=min(timeout, _semantic_scholar_timeout_seconds(config)),
+                )
+            else:
+                endpoint = f"{os.getenv('SEARXNG_URL', 'http://localhost:8888').rstrip('/')}/search"
+                response = requests.get(
+                    endpoint, params={"q": query, "format": "json", "language": "zh-CN", "safesearch": 1,
+                                      "categories": "general"},
+                    timeout=timeout, allow_redirects=False,
+                )
+                response.raise_for_status()
+                results = [
+                    {"title": item.get("title") or item["url"], "url": item["url"],
+                     "content": item.get("content") or item.get("snippet") or ""}
+                    for item in response.json().get("results", [])[:max_results]
+                    if isinstance(item, dict) and item.get("url")
+                ]
+                result = ({"results": results, "backend": backend}, [], None, backend)
+        if result[0].get("results"):
+            return result
+    assert result is not None
+    return result
 
 
 def _execute_search_backend(
@@ -2578,6 +2620,9 @@ def dispatch_search(
     observer: RequestTrace | None = None,
     cache_context: dict[str, Any] | None = None,
     max_results: int = 5,
+    *,
+    budget: Any = None,
+    required: bool = True,
 ) -> tuple[dict[str, Any] | None, list[str], str | None, str, bool, str]:
     """Execute configured search backend and normalise response payload."""
 
@@ -2633,7 +2678,7 @@ def dispatch_search(
             topic_scope=topic_scope,
         )
         if approximate_cache_allowed:
-            if config.resolved_approximate_cache_dense_enabled():
+            if budget is None and config.resolved_approximate_cache_dense_enabled():
                 approximate_embedding = _embed_query(approximate_text or query, config)
             approximate_match = _read_approximate_cache(
                 approximate_embedding,
@@ -2697,7 +2742,11 @@ def dispatch_search(
             )
 
     try:
-        if search_api == "advanced":
+        if budget is not None:
+            payload, notices, answer_text, backend_label = _execute_bounded_search(
+                query, search_api, config, max_results=max_results, budget=budget, required=required,
+            )
+        elif search_api == "advanced":
             payload, notices, answer_text, backend_label = _fuse_advanced_search_results(
                 query,
                 config,
@@ -2713,6 +2762,8 @@ def dispatch_search(
                 max_results=max_results,
             )
     except Exception as exc:  # pragma: no cover - defensive logging
+        if getattr(exc, "budget_denied", False):
+            raise
         if observer:
             observer.record_search_attempt(
                 cache_hit=False,
@@ -2755,7 +2806,7 @@ def dispatch_search(
             ),
         )
 
-    if config.search_cache_enabled:
+    if config.search_cache_enabled and (budget is None or (search_api != "advanced" and not effective_fetch_full_page)):
         created_at = time.time()
         cache_entry = SearchCacheEntry(
             query=query.strip(),

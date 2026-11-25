@@ -193,37 +193,39 @@ class TaskExecutorMixin:
         retry_backoff_seconds = max(float(self.config.search_tool_retry_backoff_seconds or 0.0), 0.0)
         timeout_seconds = self.config.search_tool_timeout_seconds
         operation_name = f"搜索工具调用[{candidate}]"
+        budget = getattr(self, "_research_budget", None)
+        cache_context = {
+            "research_topic": state.research_topic,
+            "task_title": task.title,
+            "task_intent": task.intent,
+            "request_id": str(getattr(self, "request_id", "") or ""),
+            "task_id": str(task.id),
+        }
+        tenant = str(getattr(self, "tenant_id", "") or "").strip()
+        if tenant not in {"", "default"}:
+            cache_context["tenant_id"] = tenant
 
         for retry_index in range(retry_attempts + 1):
             try:
+                if budget is not None:
+                    return dispatch_search(
+                        candidate, self.config, state.research_loop_count,
+                        observer=observer, cache_context=cache_context, budget=budget,
+                    )
                 return self._run_with_timeout(
                     lambda: dispatch_search(
                         candidate,
                         self.config,
                         state.research_loop_count,
                         observer=observer,
-                        cache_context={
-                            "research_topic": state.research_topic,
-                            "task_title": task.title,
-                            "task_intent": task.intent,
-                            "request_id": str(getattr(self, "request_id", "") or ""),
-                            "task_id": str(task.id),
-                            **(
-                                {
-                                    "tenant_id": str(
-                                        getattr(self, "tenant_id", "") or ""
-                                    ).strip()
-                                }
-                                if str(getattr(self, "tenant_id", "") or "").strip()
-                                not in {"", "default"}
-                                else {}
-                            ),
-                        },
+                        cache_context=cache_context,
                     ),
                     timeout_seconds=timeout_seconds,
                     operation_name=operation_name,
                 )
             except Exception as exc:
+                if getattr(exc, "budget_denied", False):
+                    raise
                 timed_out = isinstance(exc, ToolExecutionTimeoutError)
                 logger.warning(
                     "Search tool call failed task_id=%s title=%s query=%s retry=%s/%s error=%s",
@@ -258,7 +260,10 @@ class TaskExecutorMixin:
                     observer.record_degraded(f"search_tool_retry:{task.id}:{retry_index + 1}")
 
                 if retry_backoff_seconds > 0:
-                    sleep(retry_backoff_seconds)
+                    delay = retry_backoff_seconds
+                    if budget is not None:
+                        delay = budget.governor.remaining_timeout(delay, stage=budget.stage, work_class="required")
+                    sleep(delay)
 
     def _normalize_query_candidate(self, value: str) -> str:
         """Normalize a candidate search query and strip request-style boilerplate."""
@@ -321,6 +326,25 @@ class TaskExecutorMixin:
             },
         )
         try:
+            budget = getattr(self, "_research_budget", None)
+            if budget is not None:
+                result = dispatch_search(
+                    topic_query, self.config, state.research_loop_count, observer=observer,
+                    cache_context={"research_topic": state.research_topic, "tenant_id": self.tenant_id},
+                    budget=budget, required=False,
+                )
+            else:
+                result = self._run_with_timeout(
+                    lambda: dispatch_search(
+                        topic_query,
+                        self.config,
+                        state.research_loop_count,
+                        observer=observer,
+                        cache_context={"research_topic": state.research_topic},
+                    ),
+                    timeout_seconds=self.config.search_tool_timeout_seconds,
+                    operation_name=f"主题缓存预热[{topic_query}]",
+                )
             (
                 search_result,
                 notices,
@@ -328,18 +352,11 @@ class TaskExecutorMixin:
                 backend,
                 cache_hit,
                 cache_strategy,
-            ) = self._run_with_timeout(
-                lambda: dispatch_search(
-                    topic_query,
-                    self.config,
-                    state.research_loop_count,
-                    observer=observer,
-                    cache_context={"research_topic": state.research_topic},
-                ),
-                timeout_seconds=self.config.search_tool_timeout_seconds,
-                operation_name=f"主题缓存预热[{topic_query}]",
-            )
+            ) = result
         except Exception as exc:
+            if getattr(exc, "budget_denied", False):
+                search_span.complete(status="skipped")
+                return
             observer.record_degraded("topic_cache_warmup_failed")
             search_span.complete(
                 status="failed",
@@ -798,7 +815,7 @@ class TaskExecutorMixin:
         observer: RequestTrace | None,
         repair_hits: list[EvidenceRetrievalHit] | None = None,
     ) -> TaskReactDecision | None:
-        mode = self.config.resolved_policy_model_mode()
+        mode = "off" if getattr(self, "_research_budget", None) is not None else self.config.resolved_policy_model_mode()
         controller = getattr(self, "_policy_controller", None)
         if mode == "off":
             controller = RuleBasedPolicyController()
@@ -1392,9 +1409,10 @@ class TaskExecutorMixin:
                 except MCPHitlApprovalRequired:
                     raise
                 except Exception as exc:
+                    refused = getattr(exc, "budget_denied", False)
                     if search_span:
                         completed = search_span.complete(
-                            status="failed",
+                            status="skipped" if refused else "failed",
                             error=exc,
                             metadata={"query": task.query},
                         )
@@ -1418,6 +1436,7 @@ class TaskExecutorMixin:
                         summary="搜索阶段失败，未获得可用来源。",
                         emit_stream=emit_stream,
                         step=step,
+                        skipped=refused,
                     ):
                         yield event
                     self._persist_request_state(state, phase="task_execution", status="in_progress")
@@ -1743,6 +1762,7 @@ class TaskExecutorMixin:
                         summary="总结阶段失败，请参考已收集来源。",
                         emit_stream=emit_stream,
                         step=step,
+                        skipped=getattr(exc, "budget_denied", False),
                     ):
                         yield event
                     self._persist_request_state(state, phase="task_execution", status="in_progress")
@@ -1786,6 +1806,7 @@ class TaskExecutorMixin:
                         detail=f"总结失败：{exc}",
                         summary="总结阶段失败，请参考已收集来源。",
                         emit_stream=False,
+                        skipped=getattr(exc, "budget_denied", False),
                     )
                     self._persist_request_state(state, phase="task_execution", status="in_progress")
                     return
@@ -1959,10 +1980,12 @@ class TaskExecutorMixin:
             )
 
         def call(server: str, tool: str, **arguments: Any) -> Any:
+            budget = getattr(self, "_research_budget", None)
             result = bridge.call_tool(
                 server_id=server, tool_name=tool, arguments=arguments, tenant_id=tenant_id,
                 request_id=request_id, task_id=task.id, active_scopes=scopes, readonly_required=True,
                 stage="task_execution", observer=observer,
+                **({"budget": budget} if budget is not None else {}),
             )
             if not result.ok:
                 notice = f"MCP {server}:{tool} unavailable ({result.error_code})."
@@ -1978,7 +2001,12 @@ class TaskExecutorMixin:
             if server_id == "finarag" and tool_name in {"finarag_filings", "finarag_structured_query"}:
                 if not allowed("finarag", "finarag_list_companies"):
                     continue
-                companies_res = call("finarag", "finarag_list_companies", limit=200)
+                try:
+                    companies_res = call("finarag", "finarag_list_companies", limit=200)
+                except Exception as exc:
+                    if not getattr(exc, "budget_denied", False):
+                        raise
+                    continue
                 companies = (
                     (companies_res.structured_payload or {}).get("companies") or []
                     if companies_res.ok
@@ -2000,7 +2028,12 @@ class TaskExecutorMixin:
                 query_key = "question" if tool_name == "finarag_structured_query" else "query"
                 args = {query_key: query_text, "company_name": matches.pop()}
 
-            call_res = call(server_id, tool_name, **args)
+            try:
+                call_res = call(server_id, tool_name, **args)
+            except Exception as exc:
+                if not getattr(exc, "budget_denied", False):
+                    raise
+                continue
             if call_res.ok and call_res.normalized_evidence:
                 evidence_store.record_mcp_results(
                     task_id=task.id,
@@ -2021,9 +2054,10 @@ class TaskExecutorMixin:
         summary: str,
         emit_stream: bool,
         step: int | None = None,
+        skipped: bool = False,
     ) -> list[dict[str, Any]]:
         """Update task state for a recoverable failure and emit stream events when needed."""
-        task.status = "failed"
+        task.status = "skipped" if skipped else "failed"
         task.summary = summary
         task.summary_payload = None
         task.claims = []
@@ -2032,7 +2066,7 @@ class TaskExecutorMixin:
 
         events: list[dict[str, Any]] = []
         if observer:
-            observer.update_task_status_counts(failed=1)
+            observer.update_task_status_counts(skipped=int(skipped), failed=int(not skipped))
             if emit_stream:
                 degraded_event = observer.record_degraded(reason)
                 if step is not None:
@@ -2044,7 +2078,7 @@ class TaskExecutorMixin:
                 {
                     "type": "task_status",
                     "task_id": task.id,
-                    "status": "failed",
+                    "status": task.status,
                     "detail": detail,
                     "summary": task.summary,
                     "sources_summary": task.sources_summary,

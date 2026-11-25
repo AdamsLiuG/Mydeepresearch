@@ -2,20 +2,255 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from typing import Any
+from dataclasses import asdict, dataclass
+from inspect import Parameter, signature
+from threading import RLock
+from typing import Any, Iterator
+from uuid import uuid4
 
-from metrics import RequestTrace
-from models import SummaryState, TodoItem
+from metrics import RequestTrace, metrics_registry
+from models import BudgetDenial, RequestBudget, SummaryState, TodoItem
+from services.budget import BudgetGovernor, build_request_budget_for_config
 from services.dag_scheduler import normalize_depends_on
 from services.evidence import EvidenceStore, format_evidence_sources
 from services.mcp_bridge import tool_approval_expired
 from services.request_state import SnapshotConflictError
 
 
+def public_v4_projection(v4: Any) -> dict[str, Any] | None:
+    if not isinstance(v4, dict) or v4.get("schema_version") != 1:
+        return None
+    result: dict[str, Any] = {"schema_version": 1}
+    budget = v4.get("budget")
+    snapshot = budget.get("snapshot") if isinstance(budget, dict) else None
+    if isinstance(snapshot, dict):
+        result["budget"] = {
+            key: deepcopy(snapshot[key]) for key in (
+                "spent", "reserved", "remaining", "pressure", "last_denial_reason",
+                "external_attempts", "overrun",
+            ) if key in snapshot and snapshot[key] is not None
+        }
+        limit = snapshot.get("limit")
+        if isinstance(limit, dict):
+            result["budget"]["limit"] = {
+                key: deepcopy(limit[key]) for key in (
+                    "depth", "limits", "finalization_reserve", "deadline_at",
+                    "finalization_reserve_ms", "profile_version",
+                ) if key in limit
+            }
+    replan = v4.get("replan")
+    if isinstance(replan, dict):
+        result["replan"] = {
+            key: deepcopy(replan[key]) for key in ("dag_revision", "decision_id", "pruned_task_ids")
+            if key in replan and replan[key] is not None
+        }
+    return result
+
+
+class BudgetDispatchDenied(RuntimeError):
+    """The request cannot dispatch this external attempt."""
+
+    budget_denied = True
+
+
+@dataclass
+class BudgetAttempt:
+    timeout: float
+    usage: dict[str, int] | None = None
+
+
+class RequestBudgetController:
+    def __init__(self, agent: Any, state: SummaryState, governor: BudgetGovernor, *, blocked: bool = False):
+        self.agent = agent
+        self.state = state
+        self.governor = governor
+        self.blocked = blocked
+        self.stage = "planning"
+        self.lock = getattr(agent, "_request_snapshot_lock", None) or RLock()
+        self.observation = 0
+        self.pressure = None
+        self.last_emitted_pressure = None
+        self._scope = uuid4().hex
+        self._attempt_number = 0
+
+    def _operation_id(self) -> str:
+        self._attempt_number += 1
+        return f"{self._scope}:{self._attempt_number}"
+
+    @property
+    def replan(self) -> dict[str, Any]:
+        return self.state.v4["replan"]
+
+    def snapshot(self):
+        demand = {"llm_calls": 1} if self.stage in {"planning", "reflection", "review", "report"} else {"search_calls": 1}
+        return self.governor.snapshot(minimum_demand=demand, work_class="required", stage=self.stage)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "limit": self.governor.budget.to_dict(),
+            "snapshot": asdict(self.snapshot()),
+            "ledger": self.governor.export_ledger(),
+        }
+
+    def degrade(self, reason: str) -> None:
+        with self.lock:
+            if not self.blocked:
+                self.state.v4.setdefault("degradation_reason", reason)
+
+    def refuse(self, reason: str, *, required: bool = True) -> None:
+        metrics_registry.record_budget_event("denied", reason=reason)
+        if required:
+            self.degrade(reason)
+        raise BudgetDispatchDenied(reason)
+
+    def can_dispatch(self, demand: dict[str, int]) -> bool:
+        return (
+            not self.blocked
+            and self.governor.remaining_timeout(stage=self.stage, work_class="required") > 0
+            and self.governor.snapshot(minimum_demand=demand, stage=self.stage, work_class="required").pressure != "exhausted"
+        )
+
+    def charge_tasks(self, count: int) -> None:
+        # Graph and this balance must be committed in the same CAS.
+        if not count:
+            return
+        lease = self.governor.reserve(self._operation_id(), {"tasks": count}, "required", stage=self.stage)
+        if isinstance(lease, BudgetDenial):
+            self.refuse(lease.reason)
+        if not self.governor.dispatch(lease):
+            self.refuse("deadline_exceeded")
+        self.governor.settle(lease, {"tasks": count})
+
+    @contextmanager
+    def attempt(self, demand: dict[str, int], *, llm=None, required: bool = True) -> Iterator[BudgetAttempt]:
+        work_class = "required" if required else "optional"
+        stage = self.stage
+        with self.lock:
+            if self.blocked or self.agent._is_cancelled():
+                self.refuse("dispatch_unbounded" if self.blocked else "lease_lost", required=required)
+            operation_id = self._operation_id()
+            if llm is None:
+                lease = self.governor.reserve(operation_id, demand, work_class, stage=stage)
+            else:
+                input_tokens, output_tokens, pricing = llm
+                lease = self.governor.reserve_llm_attempt(
+                    operation_id, input_tokens=input_tokens, output_tokens=output_tokens,
+                    pricing=pricing, work_class=work_class, stage=stage,
+                )
+            if isinstance(lease, BudgetDenial):
+                if required:
+                    self.degrade(lease.reason)
+                self.agent._persist_v4_budget(self.state, self.payload())
+                raise BudgetDispatchDenied(lease.reason)
+            self.agent._persist_v4_budget(self.state, self.payload())
+            timeout = self.governor.remaining_timeout(stage=stage, work_class=work_class)
+            if timeout <= 0 or self.agent._is_cancelled():
+                self.governor.release(lease)
+                self.agent._persist_v4_budget(self.state, self.payload())
+                self.refuse("deadline_exceeded" if timeout <= 0 else "lease_lost", required=required)
+            if not self.governor.dispatch(lease):
+                self.agent._persist_v4_budget(self.state, self.payload())
+                self.refuse("deadline_exceeded", required=required)
+            self.agent._persist_v4_budget(self.state, self.payload())
+            attempt = BudgetAttempt(self.governor.remaining_timeout(stage=stage, work_class=work_class))
+        try:
+            if attempt.timeout <= 0 or self.agent._is_cancelled():
+                self.refuse("deadline_exceeded" if attempt.timeout <= 0 else "lease_lost", required=required)
+            yield attempt
+        except BaseException:
+            with self.lock:
+                self.governor.settle_timeout(lease)
+                self.agent._persist_v4_budget(self.state, self.payload())
+            raise
+        else:
+            with self.lock:
+                self.governor.settle(lease, attempt.usage, usage_source="reported" if attempt.usage is not None else "estimated")
+                self.agent._persist_v4_budget(self.state, self.payload())
+
+
 class StateManagerMixin:
     """Persist, restore, and serialize request workflow state."""
+
+    def _init_request_budget(self, state: SummaryState, *, resumed: bool) -> RequestBudgetController | None:
+        self._research_budget = None
+        store = self._request_state_store
+        if store is not None and not (
+            self._store_supports_tenant_id("load") and self._store_supports_tenant_id("save")
+            and self._callable_accepts_kwarg(store.save, "expected_version")
+        ):
+            return None
+        if not hasattr(self, "_request_snapshot_lock"):
+            self._request_snapshot_lock = RLock()
+        checkpoint = getattr(self, "_workflow_checkpoint", None)
+        frozen = checkpoint.load() if checkpoint is not None and not resumed else None
+        if frozen:
+            checkpoint.check_owner(frozen)
+            state.state_version = frozen["state_version"]
+            state.v4 = deepcopy(frozen.get("v4"))
+        v4 = state.v4
+        if v4 is None and (resumed or frozen or not getattr(self.config, "v4_research_budget_enabled", False)):
+            return None
+        if isinstance(v4, dict) and "budget" not in v4:
+            return None
+        tenant_id = getattr(self, "tenant_id", "default")
+        blocked = False
+        try:
+            if v4 is None:
+                budget = build_request_budget_for_config(self.config, tenant_id=tenant_id)
+            else:
+                if not isinstance(v4, dict) or v4.get("schema_version") != 1:
+                    raise ValueError("Unsupported budget snapshot version")
+                budget = RequestBudget(**v4["budget"]["limit"])
+                if budget.profile_version != 1:
+                    raise ValueError("Unsupported budget profile version")
+            governor = BudgetGovernor(budget, tenant_id=tenant_id, request_id=self.request_id)
+            if v4 is not None:
+                if "ledger" in v4["budget"]:
+                    governor.restore_ledger(v4["budget"]["ledger"])
+                elif not frozen or frozen.get("phase") not in {"queued", "planning"}:
+                    raise ValueError("Missing budget ledger")
+                if not isinstance(v4.get("replan"), dict):
+                    raise ValueError("Missing budget execution checkpoint")
+        except (TypeError, ValueError, KeyError, AttributeError):
+            governor = BudgetGovernor(
+                build_request_budget_for_config(self.config, tenant_id=tenant_id),
+                tenant_id=tenant_id, request_id=self.request_id,
+            )
+            blocked = True
+            if not isinstance(v4, dict):
+                state.v4 = {}
+        if state.v4 is None:
+            state.v4 = {"schema_version": 1, "replan": {}}
+        if not blocked:
+            for key, value in {
+                "dag_revision": 0, "pruned_task_ids": [], "wave_1_committed": False,
+                "plan_locked": False, "slots_allocated": False,
+            }.items():
+                state.v4["replan"].setdefault(key, value)
+        self._research_budget = RequestBudgetController(self, state, governor, blocked=blocked)
+        return self._research_budget
+
+    def _persist_v4_budget(self, state: SummaryState, budget: dict[str, Any]) -> None:
+        """Write the ledger without changing committed plan, approvals or outbox."""
+        checkpoint = getattr(self, "_workflow_checkpoint", None)
+        if checkpoint is not None:
+            saved = checkpoint.persist_budget(budget)
+        elif self._request_state_store is not None:
+            current = self._load_resume_snapshot(self.request_id)
+            if current.get("state_version") != state.state_version:
+                raise SnapshotConflictError("Request budget ownership changed")
+            current["v4"] = {**current.get("v4", {}), "budget": budget}
+            saved = self._request_state_store.save(
+                self.request_id, current, tenant_id=getattr(self, "tenant_id", "default"),
+                expected_version=state.state_version,
+            )
+        else:
+            saved = None
+        state.v4["budget"] = budget
+        if saved:
+            state.state_version = saved["state_version"]
 
     def _restore_task_counters(self, observer: RequestTrace, state: SummaryState) -> None:
         """Replay persisted task counts into a fresh request trace."""
@@ -35,11 +270,16 @@ class StateManagerMixin:
         phase: str,
         status: str = "in_progress",
         report_markdown: str | None = None,
-    ) -> None:
+        v4_expected: dict[str, Any] | None = None,
+        v4_events: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Persist the latest request snapshot for history and resume."""
 
+        controller = getattr(self, "_research_budget", None)
         if self._request_state_store is None:
-            return
+            if controller is not None and not controller.blocked:
+                state.v4["budget"] = controller.payload()
+            return list(v4_events or [])
 
         observer_snapshot = self._request_trace.snapshot() if self._request_trace else {}
         cache_diagnostics = {
@@ -114,22 +354,41 @@ class StateManagerMixin:
             payload["approved_tool_calls"] = dict(getattr(state, "approved_tool_calls", None) or {})
             payload["state_version"] = int(getattr(state, "state_version", 0) or 0)
             checkpoint = getattr(self, "_workflow_checkpoint", None)
+            if controller is not None and not controller.blocked:
+                state.v4["budget"] = controller.payload()
+                payload["v4"] = {key: deepcopy(value) for key, value in state.v4.items() if key != "pending_events"}
+                if checkpoint is not None and v4_expected is None:
+                    # The coordinator sends the graph explicitly when it advances.
+                    payload["v4"].pop("replan", None)
+            elif state.v4 is not None and checkpoint is None:
+                payload["v4"] = deepcopy(state.v4)
             if checkpoint is not None:
                 payload["runner_backend"] = checkpoint.backend
                 payload["workflow_run_id"] = checkpoint.run_id
                 state.runner_backend = checkpoint.backend
                 state.workflow_run_id = checkpoint.run_id
-                saved = checkpoint.persist(payload)
+                if v4_expected is not None or v4_events:
+                    saved = checkpoint.persist(payload, **(v4_expected or {}), pending_events=v4_events or ())
+                else:
+                    saved = checkpoint.persist(payload)
             elif self._store_supports_tenant_id("save"):
                 kwargs: dict[str, Any] = {"tenant_id": tenant_id}
-                if payload["pending_tool_approval"] or payload["approved_tool_calls"]:
+                if controller is not None:
+                    current = self._request_state_store.load(self.request_id, tenant_id=tenant_id) or {}
+                    previous_v4 = current.get("v4")
+                    if isinstance(previous_v4, dict) and "v4" in payload:
+                        payload["v4"] = {**previous_v4, **payload["v4"]}
+                    payload = {**current, **payload}
+                if controller is not None or payload["pending_tool_approval"] or payload["approved_tool_calls"]:
                     kwargs["expected_version"] = payload["state_version"]
                 saved = self._request_state_store.save(self.request_id, payload, **kwargs)
             else:
                 saved = self._request_state_store.save(self.request_id, payload)
             if isinstance(saved, dict) and "state_version" in saved:
                 state.state_version = int(saved.get("state_version") or state.state_version or 0)
-        self._refresh_note_memory_for_state(state, observer=self._request_trace)
+        if controller is None:
+            self._refresh_note_memory_for_state(state, observer=self._request_trace)
+        return [{**event, "state_version": state.state_version} for event in v4_events or []]
 
     def _consume_mcp_approval(self, key: str, entry: dict[str, Any]) -> bool:
         state = self._active_state
@@ -167,17 +426,15 @@ class StateManagerMixin:
         return True
 
     def _store_supports_tenant_id(self, method_name: str) -> bool:
-        import inspect
-
         method = getattr(self._request_state_store, method_name, None)
         if method is None:
             return False
         try:
-            params = inspect.signature(method).parameters
+            params = signature(method).parameters
         except (TypeError, ValueError):
             return False
         return "tenant_id" in params or any(
-            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            param.kind == Parameter.VAR_KEYWORD for param in params.values()
         )
 
     def _load_resume_snapshot(self, request_id: str) -> dict[str, Any]:
@@ -330,6 +587,7 @@ class StateManagerMixin:
             state_version=max(0, int(payload.get("state_version") or 0)),
             runner_backend=str(payload.get("runner_backend") or "inline").strip() or "inline",
             workflow_run_id=str(payload.get("workflow_run_id") or "").strip() or None,
+            v4=deepcopy(payload.get("v4")),
         )
         self._evidence_store.hydrate_from_tasks(state.todo_items)
         sandbox = getattr(self, "_sandbox_service", None)

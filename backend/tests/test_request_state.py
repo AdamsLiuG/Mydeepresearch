@@ -12,6 +12,34 @@ from services.request_state import RequestStateStore
 
 
 class RequestStateStoreTests(unittest.TestCase):
+    def test_budget_write_cannot_revert_newer_graph_and_preserves_other_v4_fields(self):
+        from types import SimpleNamespace
+
+        from models import SummaryState
+        from services.request_state import SnapshotConflictError
+        from state_manager import StateManagerMixin
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RequestStateStore(temp_dir)
+            stale = store.save("v4-budget", {"v4": {"schema_version": 1, "replan": {"dag_revision": 1}}})
+            latest = store.save("v4-budget", {"v4": {
+                "schema_version": 1, "replan": {"dag_revision": 2}, "future_extension": {"value": True},
+            }}, expected_version=stale["state_version"])
+            manager = StateManagerMixin()
+            manager._request_state_store = store
+            manager.request_id = "v4-budget"
+            manager.tenant_id = "default"
+            state = SummaryState(v4=stale["v4"], state_version=stale["state_version"])
+            budget = {"snapshot": {"spent": {"search_calls": 1}}}
+            with self.assertRaises(SnapshotConflictError):
+                manager._persist_v4_budget(state, budget)
+            state.state_version = latest["state_version"]
+            manager._persist_v4_budget(state, budget)
+            persisted = SimpleNamespace(**store.load("v4-budget")["v4"])
+            self.assertEqual(persisted.replan["dag_revision"], 2)
+            self.assertEqual(persisted.future_extension, {"value": True})
+            self.assertEqual(persisted.budget, budget)
+
     def test_save_load_and_list_recent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = RequestStateStore(temp_dir, recent_limit=10)

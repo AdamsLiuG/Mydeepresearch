@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -153,6 +154,24 @@ class MCPServerConfig:
     circuit_recovery_seconds: float = 60.0
     allow_write_hitl_tools: list[str] = field(default_factory=list)
     in_process_handler: Callable[[dict[str, Any], dict[str, str]], dict[str, Any] | None] | None = None
+    budget_tool_demands: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def budget_demand(self, tool_name: str) -> dict[str, int] | None:
+        configured = self.budget_tool_demands.get(tool_name)
+        if isinstance(configured, dict) and "cost_microusd" in configured and all(
+            key in {"search_calls", "web_fetches", "cost_microusd"} and type(value) is int and value >= 0
+            for key, value in configured.items()
+        ):
+            return configured
+        if (
+            self.server_id == "finarag" and self.trust_tier == "curated_private"
+            and self.command[1:] == ["src/services/finarag_mcp_server.py", "--transport", "stdio"]
+        ):
+            if tool_name in {"finarag_list_companies", "finarag_filings", "finarag_structured_query"}:
+                return {"search_calls": 1}
+            if tool_name == "finarag_get_report_pages":
+                return {"web_fetches": 1}
+        return None
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1072,7 @@ class MCPBridgeManager:
         force_refresh: bool = False,
         tenant_id: str = "default",
         request_id: str = "local",
+        budget: Any = None,
     ) -> list[MCPToolSpec]:
         if self._closed or not bool(getattr(self._config, "mcp_enabled", False)):
             return []
@@ -1074,6 +1094,10 @@ class MCPBridgeManager:
             if not force_refresh and ttl and cached and now - cached[0] < ttl:
                 specs.extend(cached[1])
                 continue
+            if budget is not None and not any(cfg.budget_demand(tool) is not None for tool in (
+                *cfg.budget_tool_demands.keys(), "finarag_filings",
+            )):
+                continue
 
             breaker = self._breakers[sid]
             allowed, _, generation = breaker.acquire()
@@ -1082,11 +1106,18 @@ class MCPBridgeManager:
             pool = self._pools[sid]
             headers, meta = self._request_identity(cfg, tenant_id, request_id, "mcp:read")
             try:
-                raw_tools = self._get_reactor().submit(
-                    pool.discover_tools(meta, headers),
-                    timeout=cfg.connect_timeout_seconds,
-                )
+                reactor = self._get_reactor()
+                dispatch = budget.attempt({}, required=False) if budget is not None else nullcontext()
+                with dispatch as attempt:
+                    raw_tools = reactor.submit(
+                        pool.discover_tools(meta, headers),
+                        timeout=min(cfg.connect_timeout_seconds, attempt.timeout)
+                        if attempt is not None else cfg.connect_timeout_seconds,
+                    )
             except Exception as exc:
+                if getattr(exc, "budget_denied", False):
+                    breaker.release_probe(generation)
+                    continue
                 breaker.record_failure(generation)
                 logger.warning("MCP tool discovery failed server_id=%s error=%s", sid, exc)
                 continue
@@ -1129,8 +1160,12 @@ class MCPBridgeManager:
 
     def get_tool_spec(
         self, server_id: str, tool_name: str, *, tenant_id: str = "default", request_id: str = "local",
+        budget: Any = None,
     ) -> MCPToolSpec | None:
-        specs = self.list_tools(server_id, tenant_id=tenant_id, request_id=request_id)
+        specs = self.list_tools(
+            server_id, tenant_id=tenant_id, request_id=request_id,
+            **({"budget": budget} if budget is not None else {}),
+        )
         return next((spec for spec in specs if spec.tool_name == tool_name), None)
 
     def _request_identity(
@@ -1164,6 +1199,7 @@ class MCPBridgeManager:
         consume_approval: Callable[[str, dict[str, Any]], bool] | None = None,
         readonly_required: bool = False,
         observer: RequestTrace | None = None,
+        budget: Any = None,
     ) -> MCPCallResult:
         started = time.perf_counter()
 
@@ -1185,9 +1221,15 @@ class MCPBridgeManager:
             active_scopes, server_id=server_id, tool_name=tool_name, stage=stage, readonly=True,
         ):
             return fail("scope_forbidden", "MCP tool is outside the active Skill scope")
+        demand = cfg.budget_demand(tool_name) if budget is not None else None
+        if budget is not None and demand is None:
+            budget.refuse("dispatch_unbounded")
         metrics_registry.increment("mcp_call_total")
         breaker, pool = self._breakers[server_id], self._pools[server_id]
-        spec = self.get_tool_spec(server_id, tool_name, tenant_id=tenant_id, request_id=request_id)
+        spec = self.get_tool_spec(
+            server_id, tool_name, tenant_id=tenant_id, request_id=request_id,
+            **({"budget": budget} if budget is not None else {}),
+        )
         if spec is None:
             if breaker.state != CircuitState.CLOSED:
                 metrics_registry.increment("mcp_circuit_open_total")
@@ -1239,6 +1281,9 @@ class MCPBridgeManager:
         if not allowed:
             metrics_registry.increment("mcp_circuit_open_total")
             return fail("circuit_open", "MCP circuit is open", degraded=True)
+        if entry is not None and budget is not None and not budget.can_dispatch(demand):
+            breaker.release_probe(generation)
+            budget.refuse("limit_exceeded")
         if entry is not None:
             assert consume_approval is not None
             try:
@@ -1265,14 +1310,17 @@ class MCPBridgeManager:
                 if remaining <= 0:
                     break
                 try:
-                    result = self._get_reactor().submit(
-                        pool.send_jsonrpc(
-                            method="tools/call",
-                            params={"name": tool_name, "arguments": args, "_meta": meta},
-                            headers=headers,
-                        ),
-                        timeout=remaining,
-                    )
+                    reactor = self._get_reactor()
+                    dispatch = budget.attempt(demand) if budget is not None else nullcontext()
+                    with dispatch as attempt:
+                        result = reactor.submit(
+                            pool.send_jsonrpc(
+                                method="tools/call",
+                                params={"name": tool_name, "arguments": args, "_meta": meta},
+                                headers=headers,
+                            ),
+                            timeout=min(remaining, attempt.timeout) if attempt is not None else remaining,
+                        )
                     normalized = self._normalize_call_result(cfg, tool_name, result, latency_ms=elapsed())
                 except _MCPRemoteError as exc:
                     breaker.record_success(generation)
@@ -1283,6 +1331,9 @@ class MCPBridgeManager:
                     failure = ("ssrf_blocked", "MCP endpoint failed network validation")
                     break
                 except Exception as exc:
+                    if getattr(exc, "budget_denied", False):
+                        breaker.release_probe(generation)
+                        raise
                     logger.debug("MCP call failed server_id=%s error=%s", server_id, type(exc).__name__)
                     failure = ("transport_error", "MCP transport failed")
                 else:
@@ -1433,8 +1484,10 @@ class MCPBridgeManager:
         approved_registry_getter: Callable[[], dict[str, dict[str, Any]] | None] | None = None,
         consume_approval: Callable[[str, dict[str, Any]], bool] | None = None,
         observer_getter: Callable[[], RequestTrace | None] | None = None,
+        budget_provider: Callable[[], Any] | None = None,
     ) -> list[MCPToolAdapter]:
         adapters: list[MCPToolAdapter] = []
+        budget = budget_provider() if budget_provider else None
         scopes = active_scopes_getter() if active_scopes_getter else None
         servers = scopes.get("allowed_servers", []) if isinstance(scopes, dict) else []
         refs = scopes.get("allowed_tools", []) if isinstance(scopes, dict) else []
@@ -1446,7 +1499,12 @@ class MCPBridgeManager:
                 scopes, server_id=ref.partition(":")[0], tool_name=ref.partition(":")[2], stage=stage, readonly=True,
             )
         ):
-            for spec in self.list_tools(server_id, tenant_id=tenant_id_getter(), request_id=request_id_getter()):
+            for spec in self.list_tools(
+                server_id, tenant_id=tenant_id_getter(), request_id=request_id_getter(),
+                **({"budget": budget} if budget is not None else {}),
+            ):
+                if budget is not None and self._servers[server_id].budget_demand(spec.tool_name) is None:
+                    continue
                 if not _scope_allows_tool(
                     scopes, server_id=spec.server_id, tool_name=spec.tool_name, stage=stage, readonly=spec.is_readonly,
                 ):
@@ -1458,6 +1516,7 @@ class MCPBridgeManager:
                         active_scopes_getter=active_scopes_getter, stage=stage,
                         approved_registry_getter=approved_registry_getter, consume_approval=consume_approval,
                         observer_getter=observer_getter,
+                        budget_provider=budget_provider,
                     )
                 )
         return adapters
@@ -1498,6 +1557,7 @@ class MCPToolAdapter(Tool):
         approved_registry_getter: Callable[[], dict[str, dict[str, Any]] | None] | None = None,
         consume_approval: Callable[[str, dict[str, Any]], bool] | None = None,
         observer_getter: Callable[[], RequestTrace | None] | None = None,
+        budget_provider: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__(
             name=spec.qualified_name,
@@ -1513,6 +1573,7 @@ class MCPToolAdapter(Tool):
         self._approved_registry_getter = approved_registry_getter
         self._consume_approval = consume_approval
         self._observer_getter = observer_getter
+        self._budget_provider = budget_provider
 
     def get_parameters(self) -> list[ToolParameter]:
         props = (self.spec.input_schema or {}).get("properties") or {}
@@ -1545,6 +1606,7 @@ class MCPToolAdapter(Tool):
         request_id = self._request_id_getter() if self._request_id_getter else "local"
         approved_registry = self._approved_registry_getter() if self._approved_registry_getter else None
         observer = self._observer_getter() if self._observer_getter else None
+        budget = self._budget_provider() if self._budget_provider else None
 
         result = self._bridge.call_tool(
             server_id=self.spec.server_id,
@@ -1558,6 +1620,7 @@ class MCPToolAdapter(Tool):
             approved_registry=approved_registry,
             consume_approval=self._consume_approval,
             observer=observer,
+            **({"budget": budget} if budget is not None else {}),
         )
         if not result.ok:
             return json.dumps(

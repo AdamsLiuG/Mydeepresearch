@@ -201,6 +201,28 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(extract_llm_usage(fake_agent)["total_tokens"], 60)
         self.assertIsNone(extract_llm_usage(fake_agent))
 
+    def test_budget_and_replan_counters_are_exposed_in_aggregate_snapshot(self):
+        metrics_registry.record_budget_event("reserve")
+        metrics_registry.record_budget_event("dispatch")
+        metrics_registry.record_budget_event("external_attempt")
+        metrics_registry.record_budget_event("denied", reason="finalization_reserved")
+        metrics_registry.record_replan_event(action="PIVOT", patched=True, reason="conflict_density")
+        metrics_registry.record_replan_event(reason="no_eligible_signal")
+        metrics_registry.record_replan_event(rejected=True, reason="stale_revision")
+
+        snapshot = metrics_registry.snapshot()
+
+        self.assertEqual(snapshot["counters"]["budget_reserve_total"], 1)
+        self.assertEqual(snapshot["counters"]["budget_dispatch_total"], 1)
+        self.assertEqual(snapshot["counters"]["budget_external_attempt_total"], 1)
+        self.assertEqual(snapshot["counters"]["budget_denied_total"], 1)
+        self.assertEqual(snapshot["budget_denial_reason_counts"]["finalization_reserved"], 1)
+        self.assertEqual(snapshot["counters"]["replan_decision_total"], 3)
+        self.assertEqual(snapshot["counters"]["replan_patch_total"], 1)
+        self.assertEqual(snapshot["counters"]["replan_pivot_total"], 1)
+        self.assertEqual(snapshot["counters"]["replan_no_patch_total"], 1)
+        self.assertEqual(snapshot["counters"]["replan_validation_rejected_total"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

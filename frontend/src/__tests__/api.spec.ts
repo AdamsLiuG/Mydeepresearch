@@ -14,6 +14,24 @@ describe("frontend API client", () => {
     vi.restoreAllMocks();
   });
 
+  it("forwards optional depth on creation and the reviewed plan revision on edits", async () => {
+    const requests: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ request_id: "draft", plan_revision: 8 }));
+    }));
+
+    const tasks = [{ id: 1, title: "Edited", intent: "", query: "" }];
+    await createResearchPlan({ topic: "RAG", research_depth: "quick" });
+    await updateResearchPlan("draft", tasks, { planRevision: 7 });
+    await updateResearchPlan("draft", tasks);
+    expect(requests).toEqual([
+      { topic: "RAG", research_depth: "quick" },
+      { tasks, revision: 7 },
+      { tasks }
+    ]);
+  });
+
   it("calls HITL clarify, plan, update, drilldown, and replay endpoints with tenant headers", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);

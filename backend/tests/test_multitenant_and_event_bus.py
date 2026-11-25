@@ -291,6 +291,50 @@ class MultiTenantGatewayTests(unittest.TestCase):
 
 
 class SearchCacheAndBackendAdapterTests(unittest.TestCase):
+    def test_v4_terminal_repair_replays_state_before_projecting_report(self) -> None:
+        from tempfile import TemporaryDirectory
+        from threading import Event
+
+        from services.request_state import RequestStateStore
+        from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
+        from state_manager import public_v4_projection
+
+        with TemporaryDirectory() as directory:
+            store = RequestStateStore(directory)
+            checkpoint = WorkflowCheckpoint(store, "alpha", "terminal-v4", "arq", "run")
+            checkpoint.reserve("topic", config=Configuration(v4_research_budget_enabled=True))
+            self.assertTrue(checkpoint.claim()[1])
+            committed = checkpoint.persist(
+                {
+                    "status": "success",
+                    "phase": "completed",
+                    "report_markdown": "# Finished",
+                    "report_note_id": "note-1",
+                    "report_note_path": "note-1.md",
+                    "v4": {"budget": {"ledger": {"private": "operation data"}}},
+                },
+                pending_events=({"type": "budget_updated", "event_key": "terminal-budget", "stage": "report"},),
+            )
+            checkpoint.release()
+            bus = InMemoryStreamEventBus()
+
+            def agent_factory():
+                self.fail("Terminal repair started research work")
+
+            for _ in range(2):
+                result = run_durable_attempt(checkpoint, agent_factory, bus, Event())
+                self.assertEqual(result["status"], "success")
+            events = bus.replay_since("alpha", "terminal-v4")
+            self.assertEqual([item.payload["type"] for item in events], ["budget_updated", "final_report", "done"])
+            self.assertEqual(events[0].payload, committed["v4"]["pending_events"][0])
+            self.assertEqual(events[1].payload["report"], "# Finished")
+            self.assertEqual(events[1].payload["note_id"], "note-1")
+            self.assertEqual(events[1].payload["v4"], public_v4_projection(committed["v4"]))
+            self.assertNotIn("pending_events", events[1].payload["v4"])
+            self.assertNotIn("ledger", events[1].payload["v4"]["budget"])
+            self.assertEqual(bus.replay_since("beta", "terminal-v4"), [])
+            self.assertEqual(checkpoint.load()["v4"].get("pending_events", []), [])
+
     def test_workbench_preserves_citation_metadata_and_filters_unsafe_links(self) -> None:
         from types import SimpleNamespace
 

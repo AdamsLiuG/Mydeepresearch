@@ -9,6 +9,7 @@ import {
   type StorageLike
 } from "../composables/useResilientStream";
 import { sendWorkflowSignal, streamRequestEvents, submitAsyncResearch } from "../services/api";
+import { createResearchV4State } from "../utils/researchV4";
 
 function makeMemoryStorage(): StorageLike {
   const store = new Map<string, string>();
@@ -28,6 +29,47 @@ describe("resilient durable SSE stream & session recovery", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it("merges v4 telemetry by request, replay key, and committed plan revision", () => {
+    const telemetry = createResearchV4State();
+    telemetry.hydrate("req-42", {
+      state_version: 7,
+      v4: {
+        schema_version: 1,
+        budget: { pressure: "high", remaining: { tasks: 2 } },
+        replan: { dag_revision: 2, pruned_task_ids: [3] }
+      }
+    });
+
+    const event = {
+      type: "research_replanned", schema_version: 1, request_id: "req-42",
+      event_key: "decision-d3", state_version: 8, dag_revision: 3, pruned_task_ids: [3, 5]
+    };
+    expect(telemetry.accept("req-42", { ...event, request_id: "foreign" })).toBe(false);
+    expect(telemetry.accept("req-42", { ...event, state_version: 7 })).toBe(false);
+    expect(telemetry.accept("req-42", event)).toBe(true);
+    expect(telemetry.accept("req-42", event)).toBe(false);
+    expect(telemetry.accept("req-42", { type: "todo_list", dag_revision: 2 })).toBe(false);
+    const revisedTasks = { ...event, type: "todo_list", event_key: "todo-d3" };
+    expect(telemetry.accept("req-42", revisedTasks)).toBe(true);
+    expect(telemetry.accept("req-42", revisedTasks)).toBe(false);
+    expect([...telemetry.prunedTaskIds.value]).toEqual([3, 5]);
+
+    const budget = { type: "budget_updated", schema_version: 1, request_id: "req-42" };
+    expect(telemetry.accept("req-42", {
+      ...budget, event_key: "old-budget", state_version: 6, budget: { pressure: "normal" }
+    })).toBe(false);
+    expect(telemetry.budget.value?.pressure).toBe("high");
+    expect(telemetry.accept("req-42", {
+      ...budget, event_key: "new-budget", state_version: 9, budget: { pressure: "exhausted" }
+    })).toBe(true);
+    expect(telemetry.budget.value?.pressure).toBe("exhausted");
+
+    telemetry.hydrate("req-43", {});
+    expect(telemetry.budget.value).toBeUndefined();
+    expect([...telemetry.prunedTaskIds.value]).toEqual([]);
+    expect(telemetry.accept("req-43", { type: "todo_list", tasks: [] })).toBe(true);
   });
 
   it("reconnects after clean EOF from the last applied frame", async () => {

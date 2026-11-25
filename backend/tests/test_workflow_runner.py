@@ -445,6 +445,228 @@ def test_worker_reclaims_expired_lease_and_reuses_completed_tasks(tmp_path: Path
     assert executed == [3]
 
 
+def test_v4_durable_reservation_freezes_budget_and_options(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
+
+    checkpoint = WorkflowCheckpoint(RequestStateStore(str(tmp_path)), "tenant", "v4-plan", "arq", "run")
+    config = Configuration(v4_research_budget_enabled=True, v4_default_research_depth="quick")
+    initial, created = checkpoint.reserve("topic", config=config, plan_first=True, output_format="finance")
+    assert created
+    assert initial["v4"]["schema_version"] == 1
+    assert initial["v4"]["budget"]["limit"]["depth"] == "quick"
+    assert initial["workflow_request_options"]["default_output_format"] == "finance"
+    repeated, created = checkpoint.reserve("topic", config=config, plan_first=True, output_format="finance")
+    assert not created
+    assert repeated["v4"]["budget"]["limit"] == initial["v4"]["budget"]["limit"]
+    with pytest.raises(SnapshotConflictError):
+        checkpoint.reserve("topic", config=config, plan_first=True, output_format="general")
+    with pytest.raises(SnapshotConflictError):
+        checkpoint.reserve("topic", config=config, plan_first=True, output_format="finance", research_depth="deep")
+
+    class Agent:
+        def plan_only(self, topic: str) -> dict[str, Any]:
+            assert topic == "topic"
+            return {"todo_items": [{"id": 1}]}
+
+    def agent_factory(*, workflow_request_options: dict[str, Any]) -> Agent:
+        assert workflow_request_options == initial["workflow_request_options"]
+        return Agent()
+
+    bus = InMemoryStreamEventBus()
+    assert run_durable_attempt(checkpoint, agent_factory, bus, threading.Event())["status"] == "awaiting_approval"
+    plan_event = bus.replay_since("tenant", "v4-plan")[-1].payload
+    assert checkpoint.signal("approve_plan", {"revision": plan_event["revision"]})["accepted"]
+    assert checkpoint.load()["v4"]["replan"]["plan_locked"] is True
+
+
+def test_v4_durable_checkpoint_preserves_ack_and_rejects_stale_graph_commit(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, WorkflowLeaseLost
+
+    store = RequestStateStore(str(tmp_path))
+    checkpoint = WorkflowCheckpoint(store, "tenant", "v4-cas", "arq", "run")
+    config = Configuration(v4_research_budget_enabled=True)
+    checkpoint.reserve("topic", config=config)
+    assert checkpoint.claim()[1]
+    budget = checkpoint.load()["v4"]["budget"]
+    checkpoint.persist({"v4": {"report": {"report_version": 2}}})
+    saved = checkpoint.persist(
+        {"v4": {"replan": {"dag_revision": 1, "wave_1_committed": True}}},
+        expected_dag_revision=0,
+        expected_wave_1_committed=False,
+        pending_events=({"type": "research_replanned", "event_key": "wave1-r1", "decision_id": "wave1-r1"},),
+    )
+    assert saved["v4"]["pending_events"][0]["state_version"] == saved["state_version"]
+    checkpoint.acknowledge_event("wave1-r1")
+    latest = checkpoint.persist({"v4": saved["v4"], "status": "in_progress"})
+    assert latest["v4"].get("pending_events", []) == []
+    with pytest.raises(SnapshotConflictError):
+        checkpoint.persist(
+            {"v4": {"replan": {"dag_revision": 2, "wave_1_committed": False}}},
+            expected_dag_revision=0,
+            expected_wave_1_committed=False,
+        )
+    latest = checkpoint.persist_budget({**budget, "ledger": {"revision": 1}})
+    assert latest["v4"]["budget"]["ledger"] == {"revision": 1}
+    assert latest["v4"]["replan"]["dag_revision"] == 1
+    assert latest["v4"]["report"] == {"report_version": 2}
+    with pytest.raises(SnapshotConflictError):
+        checkpoint.persist_budget({**budget, "limit": {**budget["limit"], "deadline_at": "2200-01-01T00:00:00Z"}})
+    checkpoint.release()
+    with pytest.raises(WorkflowLeaseLost):
+        checkpoint.persist_budget(budget)
+
+
+def test_v4_durable_runner_replays_pending_events_before_dispatch(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
+
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    original = WorkflowCheckpoint(store, "tenant", "v4-replay", "arq", "run")
+    original.reserve("topic", config=Configuration(v4_research_budget_enabled=True))
+    assert original.claim()[1]
+    committed = original.persist(
+        {
+            "phase": "task_execution",
+            "v4": {"replan": {"dag_revision": 1, "wave_1_committed": True, "decision_id": "wave1-r1"}},
+        },
+        expected_dag_revision=0,
+        expected_wave_1_committed=False,
+        pending_events=({"type": "research_replanned", "event_key": "wave1-r1", "decision_id": "wave1-r1"},),
+    )
+    original.release()
+    recovered = WorkflowCheckpoint(store, "tenant", "v4-replay", "arq", "run")
+
+    class Agent:
+        def run_stream_resume(self, request_id: str, *, cancel_event: threading.Event):
+            published = bus.replay_since("tenant", request_id)
+            assert [event.payload for event in published] == committed["v4"]["pending_events"]
+            assert recovered.load()["v4"].get("pending_events", []) == []
+            budget_event = {"type": "budget_updated", "event_key": "wave2-budget", "stage": "research"}
+            saved = recovered.persist({}, pending_events=(budget_event,))
+            yield budget_event
+            published = bus.replay_since("tenant", request_id)
+            assert [event.payload["type"] for event in published] == ["research_replanned", "budget_updated"]
+            assert published[-1].payload["state_version"] == saved["state_version"]
+            assert recovered.load()["v4"].get("pending_events", []) == []
+            yield {"type": "todo_list", "tasks": [{"id": 2}]}
+            yield {"type": "done"}
+
+    assert run_durable_attempt(recovered, Agent, bus, threading.Event())["status"] == "completed"
+    assert [event.payload["type"] for event in bus.replay_since("tenant", "v4-replay")] == [
+        "research_replanned", "budget_updated", "todo_list", "done",
+    ]
+
+
+def test_v4_durable_runner_retries_saved_event_after_lost_ack(tmp_path: Path, monkeypatch) -> None:
+    from services.workflow_runner import (
+        WorkflowCheckpoint,
+        WorkflowEventDeliveryError,
+        run_durable_attempt,
+    )
+
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    checkpoint = WorkflowCheckpoint(store, "tenant", "v4-lost-ack", "arq", "run")
+    checkpoint.reserve("topic", config=Configuration(v4_research_budget_enabled=True))
+    assert checkpoint.claim()[1]
+    committed = checkpoint.persist(
+        {"phase": "task_execution"},
+        pending_events=({"type": "budget_updated", "event_key": "budget-1", "stage": "research"},),
+    )
+    checkpoint.release()
+
+    def lost_ack(event_key: str) -> None:
+        raise SnapshotConflictError(event_key)
+
+    def unexpected_agent() -> None:
+        pytest.fail("Research resumed before the pending event was acknowledged")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint, "acknowledge_event", lost_ack)
+        with pytest.raises(WorkflowEventDeliveryError):
+            run_durable_attempt(checkpoint, unexpected_agent, bus, threading.Event())
+    event = committed["v4"]["pending_events"][0]
+    assert checkpoint.load()["v4"]["pending_events"] == [event]
+
+    class Agent:
+        def run_stream_resume(self, request_id: str):
+            assert checkpoint.load()["v4"]["pending_events"] == []
+            yield {"type": "done"}
+
+    assert run_durable_attempt(checkpoint, Agent, bus, threading.Event())["status"] == "completed"
+    events = bus.replay_since("tenant", "v4-lost-ack")
+    assert [item.payload for item in events[:2]] == [event, event]
+    assert events[0].event_id != events[1].event_id
+    assert events[2].payload["type"] == "done"
+
+
+def test_v4_durable_terminal_delivery_failure_preserves_completed_report(tmp_path: Path) -> None:
+    from services.workflow_runner import (
+        WorkflowCheckpoint,
+        WorkflowEventDeliveryError,
+        run_durable_attempt,
+    )
+
+    class FailFirstDoneBus(InMemoryStreamEventBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_done = True
+
+        def publish(self, tenant_id: str, request_id: str, payload: dict[str, Any]) -> str:
+            if payload.get("type") == "done" and self.fail_done:
+                self.fail_done = False
+                raise RuntimeError("Event bus interrupted")
+            return super().publish(tenant_id, request_id, payload)
+
+    store = RequestStateStore(str(tmp_path))
+    bus = FailFirstDoneBus()
+    checkpoint = WorkflowCheckpoint(store, "tenant", "v4-terminal-failure", "arq", "run")
+    checkpoint.reserve("topic", config=Configuration(v4_research_budget_enabled=True))
+
+    class Agent:
+        def run_stream(self, topic: str):
+            checkpoint.persist({"phase": "completed", "status": "success", "report_markdown": "# Complete"})
+            yield {"type": "final_report", "report": "# Complete"}
+            yield {"type": "done"}
+
+    with pytest.raises(WorkflowEventDeliveryError):
+        run_durable_attempt(checkpoint, Agent, bus, threading.Event())
+    assert checkpoint.load()["status"] == "success"
+
+    def unexpected_agent() -> None:
+        pytest.fail("Terminal event recovery started research work")
+
+    assert run_durable_attempt(checkpoint, unexpected_agent, bus, threading.Event())["status"] == "success"
+    events = bus.replay_since("tenant", "v4-terminal-failure")
+    assert [item.payload["type"] for item in events] == ["final_report", "done"]
+
+
+def test_v4_local_duplicate_repairs_terminal_delivery(tmp_path: Path) -> None:
+    from services.workflow_runner import WorkflowCheckpoint, _workflow_run_id
+
+    store = RequestStateStore(str(tmp_path))
+    bus = InMemoryStreamEventBus()
+    run_id = _workflow_run_id("local_durable", "tenant", "v4-duplicate-terminal")
+    checkpoint = WorkflowCheckpoint(store, "tenant", "v4-duplicate-terminal", "local_durable", run_id)
+    config = Configuration(v4_research_budget_enabled=True)
+    checkpoint.reserve("topic", config=config)
+    assert checkpoint.claim()[1]
+    checkpoint.persist({"phase": "completed", "status": "success", "report_markdown": "# Complete"})
+    checkpoint.release()
+
+    def unexpected_agent() -> None:
+        pytest.fail("A duplicate terminal request started research work")
+
+    runner = LocalDurableWorkflowRunner(agent_factory=unexpected_agent, event_bus=bus, state_store=store)
+    handle = runner.submit("topic", request_id="v4-duplicate-terminal", tenant_id="tenant", config=config)
+    runner.shutdown()
+    assert handle.metadata["duplicate"] is True
+    assert handle.status == "success"
+    assert [item.payload["type"] for item in bus.replay_since("tenant", "v4-duplicate-terminal")] == [
+        "final_report", "done",
+    ]
+
+
 def test_plan_checkpoint_waits_for_matching_revision(tmp_path: Path) -> None:
     from services.workflow_runner import WorkflowCheckpoint, run_durable_attempt
 

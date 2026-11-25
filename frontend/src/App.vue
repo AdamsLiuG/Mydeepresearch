@@ -297,9 +297,10 @@
               {{ reconnecting ? "正在恢复连接…" : loading ? "研究进行中" : statusLabel }}
             </div>
             <span class="status-meta">
-              任务进度：{{ completedTasks }} / {{ totalTasks || todoTasks.length || 1 }}
+              任务进度：{{ completedTasks }} / {{ todoTasks.length ? totalTasks : 1 }}
               · 阶段记录 {{ progressLogs.length }} 条
             </span>
+            <span v-if="researchBudgetLabel" class="status-meta">{{ researchBudgetLabel }}</span>
           </div>
           <div class="status-controls">
             <button class="secondary-btn" @click="toggleLogsVisibility">
@@ -482,10 +483,10 @@
               </div>
             </header>
 
-            <section v-if="currentTask && currentTask.notices.length" class="task-notices">
+            <section v-if="currentTaskNotices.length" class="task-notices">
               <h4>系统提示</h4>
               <ul>
-                <li v-for="(notice, idx) in currentTask.notices" :key="`${notice}-${idx}`">
+                <li v-for="(notice, idx) in currentTaskNotices" :key="`${notice}-${idx}`">
                   {{ notice }}
                 </li>
               </ul>
@@ -739,6 +740,7 @@ import type {
   ToolCallLog
 } from "./types/research";
 import { renderMarkdownBlock } from "./utils/markdown";
+import { createResearchV4State } from "./utils/researchV4";
 import { buildFallbackWorkbenchPayload, normalizeReportWorkbench, safeEvidenceUrl } from "./utils/workbench";
 
 interface DemoScenario {
@@ -770,6 +772,7 @@ const logsCollapsed = ref(false);
 const isExpanded = ref(false);
 
 const todoTasks = ref<TodoTaskView[]>([]);
+const researchV4 = createResearchV4State();
 const activeTaskId = ref<number | null>(null);
 const reportMarkdown = ref("");
 const latestRequestMetrics = ref<UnknownRecord | null>(null);
@@ -867,10 +870,20 @@ function isSupplementalTask(task: Pick<TodoTaskView, "origin" | "round">): boole
   return task.origin === "replanned" || task.origin === "repair" || task.round > 1;
 }
 
-const totalTasks = computed(() => todoTasks.value.length);
-const completedTasks = computed(() =>
-  todoTasks.value.filter((task) => task.status === "completed").length
+const executableTasks = computed(() =>
+  todoTasks.value.filter((task) => !researchV4.prunedTaskIds.value.has(task.id))
 );
+const totalTasks = computed(() => executableTasks.value.length);
+const completedTasks = computed(() =>
+  executableTasks.value.filter((task) => task.status === "completed").length
+);
+const researchBudgetLabel = computed(() => {
+  const budget = researchV4.budget.value;
+  if (budget?.pressure === "exhausted") return "研究预算已耗尽";
+  if (budget?.pressure === "high") return "研究预算接近上限";
+  if (budget?.pressure === "normal") return "研究预算正常";
+  return "";
+});
 
 const currentTask = computed(() => {
   if (activeTaskId.value !== null) {
@@ -883,6 +896,12 @@ const currentTaskSources = computed(() => currentTask.value?.sourceItems ?? []);
 const currentTaskSummary = computed(() => currentTask.value?.summary ?? "");
 const currentTaskClaims = computed(() => currentTask.value?.claims ?? []);
 const currentTaskReviewIssues = computed(() => currentTask.value?.reviewIssues ?? []);
+const currentTaskNotices = computed(() => {
+  const task = currentTask.value;
+  if (!task) return [];
+  if (!researchV4.prunedTaskIds.value.has(task.id)) return task.notices;
+  return [...new Set([...task.notices, "研究计划调整后跳过此任务"])];
+});
 const currentTaskTitle = computed(() => currentTask.value?.title ?? "");
 const currentTaskIntent = computed(() => currentTask.value?.intent ?? "");
 const currentTaskQuery = computed(() => currentTask.value?.query ?? "");
@@ -986,6 +1005,7 @@ async function hydrateLiveSnapshot(requestId: string, signal: AbortSignal) {
   const payload = ensureRecord(await fetchPersistedRequest(requestId, { signal }));
   signal.throwIfAborted();
   if (activeRequestId.value !== requestId) return;
+  researchV4.hydrate(requestId, payload);
   if (Array.isArray(payload.todo_items)) {
     todoTasks.value = mapHistoryTasks(payload.todo_items);
     if (!todoTasks.value.some((task) => task.id === activeTaskId.value)) {
@@ -1655,6 +1675,7 @@ async function refreshPersistedHistory(signal?: AbortSignal) {
 
 function resetWorkflowState() {
   todoTasks.value = [];
+  researchV4.reset();
   activeTaskId.value = null;
   activeRequestId.value = null;
   lastEventId.value = null;
@@ -1816,6 +1837,7 @@ async function viewHistoryResearch(item: RecentResearchView) {
 
     form.topic = detailTopic;
     form.searchApi = detailSearchApi === "-" ? item.searchApi : detailSearchApi;
+    researchV4.hydrate(item.requestId, payload);
     todoTasks.value = detailTasks.map(cloneHistoryTask);
     activeTaskId.value = todoTasks.value[0]?.id ?? null;
     reportMarkdown.value = detailReport;
@@ -2097,10 +2119,17 @@ function applyDemoScenario(scenario: DemoScenario) {
 }
 
 function handleResearchEvent(event: ResearchStreamEvent) {
+  if (!researchV4.accept(activeRequestId.value, event)) return;
   if (typeof event.request_id === "string" && event.request_id.trim()) {
     activeRequestId.value = event.request_id.trim();
   }
   if (typeof event.runner_backend === "string") streamRunner.value = event.runner_backend;
+
+  if (event.type === "budget_updated") return;
+  if (event.type === "research_replanned") {
+    progressLogs.value.push(`已调整研究计划（修订 ${getNumber(event.dag_revision)}）`);
+    return;
+  }
 
   if (event.type === "status") {
     const message =
@@ -2547,7 +2576,8 @@ async function handleSaveEditablePlan(tasks: ResearchTaskPlanItem[]) {
   try {
     editablePlan.value = await updateResearchPlan(
       editablePlan.value.request_id,
-      tasks
+      tasks,
+      { planRevision: editablePlan.value.v4 ? editablePlan.value.plan_revision : undefined }
     );
   } catch (err) {
     hitlError.value = err instanceof Error ? err.message : "保存规划修改失败";

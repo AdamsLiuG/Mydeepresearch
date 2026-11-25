@@ -4,8 +4,11 @@ import sys
 import tempfile
 import types
 import unittest
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
+from time import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -40,6 +43,7 @@ sys.modules.setdefault("agent", agent_stub)
 
 import main
 from metrics import metrics_registry
+from services.budget import BudgetGovernor, build_request_budget_for_config
 
 _ORIGINAL_FROM_ENV = main.Configuration.from_env
 
@@ -238,6 +242,157 @@ class CapturingAgent(StubAgent):
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         metrics_registry.reset()
+
+    def test_v4_creation_routes_validate_depth_and_ignore_client_budget(self):
+        class DepthAgent(StubAgent):
+            def run(self, topic):
+                result = super().run(topic)
+                result.v4 = projection(self.config)
+                return result
+
+            def plan_only(self, topic):
+                return {"topic": topic, "status": "awaiting_approval", "v4": projection(self.config)}
+
+            def run_stream(self, topic):
+                yield {"type": "status", "message": "started"}
+                yield {"type": "final_report", "report": "# Report", "v4": projection(self.config)}
+                yield {"type": "done"}
+
+        def projection(config):
+            if not config.v4_research_budget_enabled:
+                return None
+            budget = build_request_budget_for_config(config, "default")
+            return {"schema_version": 1, "budget": asdict(BudgetGovernor(budget).snapshot())}
+
+        def submit(_topic, *, request_id, config, **_kwargs):
+            return main.WorkflowRunHandle(
+                request_id, "run", "inline", metadata={"v4": projection(config)},
+            )
+
+        routes = ("/research", "/research/plan", "/research/stream", "/research/async")
+        for enabled in (False, True):
+            with isolated_configuration(), patch.object(main, "DeepResearchAgent", DepthAgent):
+                config = main.Configuration(
+                    v4_research_budget_enabled=enabled,
+                    v4_default_research_depth="deep",
+                )
+                app = main.create_app(base_config=config)
+                with TestClient(app) as client, patch.object(app.state.workflow_runner, "submit", side_effect=submit):
+                    for route in routes:
+                        for choice in ({}, {"research_depth": None}, *(
+                            {"research_depth": value} for value in ("quick", "standard", "deep", "unknown", {}, 1, False)
+                        )):
+                            depth = choice.get("research_depth")
+                            with self.subTest(enabled=enabled, route=route, depth=depth):
+                                response = client.post(route, json={
+                                    "topic": "research", "budget": {"limits": {"tasks": 999}}, **choice,
+                                })
+                                if enabled and depth not in (None, "quick", "standard", "deep"):
+                                    self.assertEqual(response.status_code, 422)
+                                    self.assertNotIn("text/event-stream", response.headers["content-type"])
+                                    continue
+                                self.assertEqual(response.status_code, 202 if route.endswith("/async") else 200)
+                                if route.endswith("/stream"):
+                                    events = [json.loads(line[6:]) for line in response.text.splitlines()
+                                              if line.startswith("data: ")]
+                                    self.assertEqual([event["type"] for event in events], ["status", "final_report", "done"])
+                                    payload = events[1]
+                                else:
+                                    payload = response.json()
+                                    if route.endswith("/async"):
+                                        self.assertEqual(payload["events_url"], payload["stream_url"])
+                                        payload = payload["metadata"]
+                                public = payload.get("v4")
+                                if enabled:
+                                    self.assertEqual(public["budget"]["limit"]["depth"], depth or "deep")
+                                    self.assertLess(public["budget"]["limit"]["limits"]["tasks"], 999)
+                                else:
+                                    self.assertIsNone(public)
+
+    def test_v4_request_detail_and_plan_edit_use_frozen_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir, isolated_configuration():
+            config = main.Configuration(
+                request_state_enabled=True, request_state_dir=temp_dir,
+                v4_research_budget_enabled=True, v4_default_research_depth="deep",
+            )
+            budget = build_request_budget_for_config(config, "default", depth="quick")
+            snapshot = asdict(BudgetGovernor(budget).snapshot())
+            snapshot["internal_path"] = "/private/snapshot"
+            raw = {
+                "schema_version": 1,
+                "budget": {"limit": budget.to_dict(), "snapshot": snapshot, "ledger": {"secret": "private"}},
+                "replan": {"dag_revision": 1, "decision_id": "d1", "pruned_task_ids": [3], "plan_locked": False},
+                "outbox": [{"value": "private"}],
+            }
+            with TestClient(main.create_app(base_config=config)) as client:
+                store = client.app.state.request_state_store
+                store.save("draft", {
+                    "topic": "draft", "phase": "awaiting_approval", "status": "awaiting_approval",
+                    "plan_revision": 1, "v4": raw,
+                })
+                endpoint = "/requests/draft"
+                detail = client.get(endpoint)
+                self.assertEqual(detail.status_code, 200)
+                projection = detail.json()["v4"]
+                self.assertEqual(projection["budget"]["limit"]["depth"], "quick")
+                self.assertEqual(projection["replan"], {"dag_revision": 1, "decision_id": "d1", "pruned_task_ids": [3]})
+                self.assertNotIn("private", json.dumps(projection))
+
+                foreign = store.save("foreign", {"v4": raw}, tenant_id="foreign-tenant")
+                self.assertEqual(foreign["tenant_id"], "foreign-tenant")
+                self.assertEqual(client.get("/requests/foreign").status_code, 404)
+
+                too_many = [{"title": f"task {i}"} for i in range(budget.limits["tasks"] + 1)]
+                update = client.put(endpoint + "/plan", json={"revision": 1, "tasks": too_many})
+                self.assertEqual(update.status_code, 400)
+                invalid = [{"id": 1, "title": "first", "depends_on": [2]},
+                           {"id": 2, "title": "second", "depends_on": [1]}]
+                update = client.put(endpoint + "/plan", json={"revision": 1, "tasks": invalid})
+                self.assertEqual(update.status_code, 400)
+                edit = {"revision": 1, "tasks": [{"id": 7, "title": "allowed"}]}
+                updated = client.put(endpoint + "/plan", json=edit)
+                self.assertEqual(updated.status_code, 200)
+                self.assertEqual(updated.json()["todo_items"][0]["id"], 7)
+                self.assertEqual(updated.json()["v4"], projection)
+                self.assertEqual(store.load("draft")["v4"], raw)
+                self.assertEqual(client.put(endpoint + "/plan", json=edit).status_code, 409)
+
+                saved = store.load("draft")
+                store.save("draft", {**saved, "phase": "task_execution", "status": "in_progress"},
+                           expected_version=saved["state_version"])
+                self.assertEqual(client.put(endpoint + "/plan", json={**edit, "revision": 2}).status_code, 409)
+
+    def test_v4_follow_waits_for_committed_events_and_running_terminal_delivery(self):
+        with tempfile.TemporaryDirectory() as temp_dir, isolated_configuration():
+            config = main.Configuration(request_state_enabled=True, request_state_dir=temp_dir)
+            with TestClient(main.create_app(base_config=config)) as client:
+                store = client.app.state.request_state_store
+                bus = client.app.state.event_bus
+                request_id = "finished"
+                snapshot = store.save(request_id, {
+                    "status": "completed", "v4": {"schema_version": 1, "pending_events": [{"type": "budget_updated"}]},
+                })
+                cursor = bus.publish("default", request_id, {"type": "status"})
+                tail = bus.tail_since
+
+                def exercise_tail(*args, is_terminal_fn: Callable[[], bool], **kwargs):
+                    self.assertFalse(is_terminal_fn())
+                    saved = store.save(request_id, {
+                        **snapshot, "v4": {"schema_version": 1},
+                        "workflow_lease": {"owner": "worker", "expires_at": time() + 60},
+                    }, expected_version=snapshot["state_version"])
+                    self.assertFalse(is_terminal_fn())
+                    bus.publish("default", request_id, {"type": "budget_updated", "event_key": "budget-finished"})
+                    bus.publish("default", request_id, {"type": "final_report", "report": "Ready"})
+                    bus.publish("default", request_id, {"type": "done"})
+                    saved.pop("workflow_lease")
+                    store.save(request_id, saved, expected_version=saved["state_version"])
+                    yield from tail(*args, is_terminal_fn=is_terminal_fn, **kwargs)
+
+                with patch.object(bus, "tail_since", side_effect=exercise_tail):
+                    response = client.get(f"/requests/{request_id}/events?follow=1", headers={"Last-Event-ID": cursor})
+                events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                self.assertEqual([event["type"] for event in events], ["budget_updated", "final_report", "done"])
 
     def test_dev_reload_only_watches_backend_src(self):
         with isolated_configuration():

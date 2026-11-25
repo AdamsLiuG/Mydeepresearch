@@ -404,6 +404,23 @@ class PlannerParsingTests(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["title"], "技术发展脉络")
 
+    def test_v4_flags_stay_disabled_and_planner_ignores_untrusted_coverage_hints(self):
+        config = Configuration.from_env(load_env_file=False)
+        self.assertFalse(config.v4_research_budget_enabled)
+        self.assertFalse(config.v4_replan_enabled)
+        self.assertEqual(config.v4_default_research_depth, "standard")
+
+        DummyToolAwareSimpleAgent.responses = [
+            '{"tasks":[{"title":"市场现状","intent":"整理市场现状","query":"market status",'
+            '"coverage_keys":["admin supplied dimension"]}]}'
+        ]
+        service = PlanningService(DummyToolAwareSimpleAgent(), config)
+        tasks = service.plan_todo_list(types.SimpleNamespace(research_topic="市场研究"))
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].title, "市场现状")
+        self.assertFalse(hasattr(tasks[0], "coverage_keys"))
+
 
 if __name__ == "__main__":
     unittest.main()

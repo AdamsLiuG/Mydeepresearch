@@ -9,7 +9,7 @@ import re
 import socket
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
@@ -725,6 +725,7 @@ class _PinnedFetchAdapter(requests.adapters.HTTPAdapter):
 @contextmanager
 def _open_public_fetch(
     url: str, *, timeout: float, headers: dict[str, str] | None = None,
+    budget: Any = None,
 ) -> Iterator[requests.Response]:
     validated = url if isinstance(url, _ValidatedFetchURL) else _validate_fetch_url(url)
     prepared = requests.Request(
@@ -736,14 +737,23 @@ def _open_public_fetch(
     for idx, ip in enumerate(validated.ips):
         adapter = _PinnedFetchAdapter(ip, parsed.hostname, port, parsed.scheme)
         try:
-            try:
-                response = adapter.send(prepared, stream=True, timeout=timeout)
-            except requests.exceptions.ConnectionError:
-                if idx == len(validated.ips) - 1:
-                    raise
-                continue
-            with response:
-                yield response
+            with ExitStack() as stack:
+                try:
+                    dispatch = budget.attempt({"web_fetches": 1}) if budget is not None else nullcontext()
+                    attempt = stack.enter_context(dispatch)
+                    effective_timeout = min(timeout, attempt.timeout) if attempt is not None else timeout
+                    deadline = time.monotonic() + effective_timeout
+                    response = adapter.send(prepared, stream=True, timeout=effective_timeout)
+                except requests.exceptions.ConnectionError:
+                    if idx == len(validated.ips) - 1:
+                        raise
+                    continue
+                with response:
+                    if attempt is not None:
+                        response._budget_deadline = deadline
+                    yield response
+                if attempt is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Web fetch exceeded its attempt timeout")
             return
         finally:
             adapter.close()
@@ -756,6 +766,7 @@ def _fetch_page_artifact(
     max_bytes: int | None = None,
     parser: Any | None = None,
     multimodal_enabled: bool = False,
+    budget: Any = None,
 ) -> Any:
     """Safely fetch a web page or PDF into a normalized FetchedPageArtifact."""
 
@@ -771,6 +782,7 @@ def _fetch_page_artifact(
         with _open_public_fetch(
             current_url,
             timeout=timeout_seconds,
+            **({"budget": budget} if budget is not None else {}),
         ) as response:
             if response.status_code in _REDIRECT_STATUS_CODES:
                 location = str(response.headers.get("Location") or "").strip()
@@ -803,6 +815,8 @@ def _fetch_page_artifact(
             chunks: list[bytes] = []
             total_bytes = 0
             for chunk in response.iter_content(chunk_size=65536):
+                if budget is not None and time.monotonic() >= response._budget_deadline:
+                    raise TimeoutError("Web fetch exceeded its attempt timeout")
                 if not chunk:
                     continue
                 total_bytes += len(chunk)
@@ -2733,6 +2747,8 @@ def _keyword_match_count(text: str, keywords: list[str]) -> int:
 class SearchWebTool(Tool):
     """Tool wrapper around the repo's structured web-search dispatcher."""
 
+    budget_provider: Callable[[], Any] | None = None
+
     def __init__(
         self,
         *,
@@ -2774,7 +2790,8 @@ class SearchWebTool(Tool):
             overrides["search_api"] = backend
         if "fetch_full_page" in parameters:
             overrides["fetch_full_page"] = bool(parameters.get("fetch_full_page"))
-        config = self._config.model_copy(update=overrides) if overrides else self._config
+        budget = self.budget_provider() if self.budget_provider else None
+        config = self._config.model_copy(update=overrides) if overrides and budget is None else self._config
 
         payload, notices, answer_text, backend_label, cache_hit, cache_strategy = dispatch_search(
             query,
@@ -2785,8 +2802,10 @@ class SearchWebTool(Tool):
                 "research_topic": parameters.get("research_topic"),
                 "task_title": parameters.get("task_title"),
                 "task_intent": parameters.get("task_intent"),
+                **({"tenant_id": budget.governor.tenant_id} if budget is not None else {}),
             },
             max_results=int(parameters.get("max_results") or 5),
+            **({"budget": budget} if budget is not None else {}),
         )
         evidence_items = self._evidence_store.record_search_results(
             task_id=task_id,
@@ -2812,6 +2831,8 @@ class SearchWebTool(Tool):
 
 class FetchPageTool(Tool):
     """Fetch and normalize a specific page to enrich existing evidence."""
+
+    budget_provider: Callable[[], Any] | None = None
 
     def __init__(
         self,
@@ -2854,7 +2875,11 @@ class FetchPageTool(Tool):
                 raise ValueError("source_id does not match the task's web evidence URL")
 
         parser = getattr(self, "_multimodal_parser", None)
-        if parser is not None and getattr(parser, "enabled", False):
+        budget = self.budget_provider() if self.budget_provider else None
+        if budget is not None:
+            artifact = _fetch_page_artifact(url, timeout_seconds=self._timeout_seconds, budget=budget)
+            title, content, multimodal_blocks = artifact.title, artifact.content, None
+        elif parser is not None and getattr(parser, "enabled", False):
             artifact = _fetch_page_artifact(
                 url,
                 timeout_seconds=self._timeout_seconds,

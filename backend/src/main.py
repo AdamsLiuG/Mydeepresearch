@@ -18,10 +18,11 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from config import Configuration, SearchAPI, backend_root
 from metrics import metrics_registry
+from models import RequestBudget, ResearchDepth
 from services.event_bus import (
     TERMINAL_EVENT_TYPES,
     build_stream_event_bus,
@@ -97,6 +98,7 @@ class ResearchRequest(BaseModel):
         default=None,
         description="Optional output format skill id (e.g., exec-brief, engineering-rfc, deep-whitepaper)",
     )
+    research_depth: Any = Field(default=None, description="Research depth when v4 budgets are enabled")
 
 
 class ResumeRequest(BaseModel):
@@ -133,6 +135,7 @@ class ResearchResponse(BaseModel):
     citation_drawer_map: dict[str, Any] | None = None
     verifier_badges: list[dict[str, Any]] | None = None
     workbench: dict[str, Any] | None = None
+    v4: dict[str, Any] | None = None
 
 
 class ClarifyRequest(BaseModel):
@@ -201,6 +204,7 @@ class AsyncResearchRequest(BaseModel):
         description="Optional output format skill id",
     )
     mode: Literal["auto", "plan_first"] = "auto"
+    research_depth: Any = Field(default=None, description="Research depth when v4 budgets are enabled")
 
 
 def _mask_secret(value: str | None, visible: int = 4) -> str:
@@ -214,13 +218,21 @@ def _mask_secret(value: str | None, visible: int = 4) -> str:
     return f"{value[:visible]}...{value[-visible:]}"
 
 
-def _build_config(payload: ResearchRequest, *, base_config: Configuration) -> Configuration:
+_research_depth_adapter = TypeAdapter(ResearchDepth)
+
+
+def _build_config(payload: ResearchRequest | AsyncResearchRequest, *, base_config: Configuration) -> Configuration:
     overrides: Dict[str, Any] = {}
 
     if payload.search_api is not None:
         overrides["search_api"] = payload.search_api
     if getattr(payload, "output_format", None) is not None and str(payload.output_format).strip():
         overrides["default_output_format"] = str(payload.output_format).strip().lower()
+    if base_config.v4_research_budget_enabled and payload.research_depth is not None:
+        try:
+            overrides["v4_default_research_depth"] = _research_depth_adapter.validate_python(payload.research_depth)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail="research_depth must be quick, standard, or deep") from exc
 
     values = base_config.model_dump()
     if "policy_model_mode" not in base_config.model_fields_set:
@@ -842,6 +854,7 @@ def create_app(
             **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
             **({"claim_verification_summary": raw_summary} if raw_summary else {}),
             **_workbench_response(result),
+            v4=getattr(result, "v4", None),
         )
 
     @app.post("/research/clarify")
@@ -921,7 +934,9 @@ def create_app(
 
         if snapshot.get("pending_tool_approval") or snapshot.get("approved_tool_calls"):
             raise HTTPException(status_code=409, detail="Request has a tool approval record")
-        if snapshot.get("workflow_run_id") and (
+        raw_v4 = snapshot.get("v4")
+        budgeted_plan = isinstance(raw_v4, dict) and "budget" in raw_v4
+        if (snapshot.get("workflow_run_id") or budgeted_plan) and (
             snapshot.get("phase") != "awaiting_approval"
             or snapshot.get("status") != "awaiting_approval"
             or snapshot.get("workflow_plan_revision") is not None
@@ -932,11 +947,33 @@ def create_app(
             raise HTTPException(status_code=409, detail="Plan revision changed")
 
         config = app.state.base_config
+        max_tasks = config.resolved_max_total_tasks()
+        projection = None
+        if budgeted_plan:
+            if not _accepts_kwarg(store.save, "expected_version") or "state_version" not in snapshot:
+                raise HTTPException(status_code=409, detail="Budgeted plan edits require a versioned request snapshot")
+            from state_manager import public_v4_projection
+
+            projection = public_v4_projection(raw_v4)
+            try:
+                if projection is None:
+                    raise ValueError("Unsupported v4 snapshot")
+                max_tasks = RequestBudget(**raw_v4["budget"]["limit"]).limits["tasks"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail="Request has an invalid frozen research budget") from exc
+            if len(payload.tasks) > max_tasks:
+                raise HTTPException(status_code=400, detail=f"plan exceeds max_tasks limit ({max_tasks})")
         try:
             normalized_tasks = HitlService.validate_editable_tasks(
                 [item.model_dump() for item in payload.tasks],
-                max_tasks=config.resolved_max_total_tasks(),
+                max_tasks=max_tasks,
             )
+            if budgeted_plan and any(
+                (raw.id is not None and raw.id != task["id"])
+                or set(raw.depends_on) != set(task["depends_on"])
+                for raw, task in zip(payload.tasks, normalized_tasks)
+            ):
+                raise ValueError("plan contains invalid task IDs or dependencies")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -978,6 +1015,7 @@ def create_app(
             "estimated_duration_seconds": HitlService.estimate_duration_seconds(
                 len(normalized_tasks), config
             ),
+            **({"v4": projection} if projection is not None else {}),
         }
 
     @app.post("/requests/{request_id}/drilldown")
@@ -1056,7 +1094,17 @@ def create_app(
         )
         if payload is None:
             raise HTTPException(status_code=404, detail=f"request snapshot not found: {request_id}")
-        return payload
+        if "v4" not in payload:
+            return payload
+        from state_manager import public_v4_projection
+
+        public_payload = dict(payload)
+        projection = public_v4_projection(public_payload.pop("v4"))
+        public_payload.pop("workflow_lease", None)
+        public_payload.pop("workflow_request_options", None)
+        if projection is not None:
+            public_payload["v4"] = projection
+        return public_payload
 
     def _sse_frame(payload: dict[str, Any], event_id: str = "") -> str:
         prefix = f"id: {event_id}\n" if event_id else ""
@@ -1096,6 +1144,13 @@ def create_app(
             snap = _store_load(store, request_id, tenant_id=tenant.tenant_id) if store is not None else None
             snap = snap or {}
             status = tracked.get("status") or snap.get("status")
+            v4 = snap.get("v4")
+            lease = snap.get("workflow_lease")
+            expires_at = lease.get("expires_at") if isinstance(lease, dict) else None
+            if isinstance(v4, dict) and (
+                v4.get("pending_events") or (isinstance(expires_at, (int, float)) and expires_at > time.time())
+            ):
+                return False
             is_paused_inline = snap.get("runner_backend", "inline") == "inline" and status in {
                 "awaiting_approval", "approved_ready",
             }
@@ -1331,6 +1386,8 @@ def create_app(
             result = agent.run_resume(request_id)
         except HTTPException:
             raise
+        except SnapshotConflictError as exc:
+            raise HTTPException(status_code=409, detail="Request snapshot changed") from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -1386,6 +1443,7 @@ def create_app(
             **({"evidence_conflicts": raw_conflicts} if raw_conflicts else {}),
             **({"claim_verification_summary": raw_summary} if raw_summary else {}),
             **_workbench_response(result),
+            v4=getattr(result, "v4", None),
         )
 
     def _build_sse_stream(
