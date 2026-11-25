@@ -33,6 +33,20 @@ def _lock_snapshot_directory(directory: Path) -> Iterator[None]:
         os.close(fd)
 
 
+def queue_snapshot_events(snapshot: dict, v4: dict, events, request_id: str) -> list[dict]:
+    """Append state events using the version that will be assigned by the CAS."""
+    queued = list(v4.get("pending_events") or [])
+    keys = {event["event_key"] for event in queued}
+    for event in events:
+        if event["event_key"] not in keys:
+            queued.append({
+                **event, "schema_version": 1, "request_id": request_id,
+                "state_version": int(snapshot.get("state_version") or 0) + 1,
+            })
+            keys.add(event["event_key"])
+    return queued
+
+
 class SnapshotConflictError(RuntimeError):
     """Raised on optimistic CAS mismatch when persisting request snapshots."""
 

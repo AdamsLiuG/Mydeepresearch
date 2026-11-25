@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from prompts import REPORT_MAP_ROLE, REPORT_MAP_SCHEMA
+
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
@@ -268,6 +270,38 @@ class ContextPrefixBuilder:
         )
 
 
+    def freeze_report_prefix(
+        self, *, tenant_id: str, request_id: str, topic: str, ledger_version: int,
+        prefix_version: int, format_context: str = "", layout: str = "flexible",
+        role: str = REPORT_MAP_ROLE, schema: str = REPORT_MAP_SCHEMA, stage: str = "report_map",
+        llm: Any = None, terminology: tuple[tuple[str, str], ...] = (),
+    ) -> FrozenReportPrefix:
+        """Freeze a provider-rendered projection with no evidence, history, or tools."""
+        mode = self.resolve_provider_mode(llm=llm)
+        model = str(getattr(llm, "model", None) or self._config.resolved_model() or "")
+        checkpoint = report_json({
+            "format_hash": hashlib.sha256(format_context.encode("utf-8")).hexdigest(),
+            "layout": layout,
+            "ledger_version": ledger_version,
+            "frozen_prefix_version": prefix_version,
+            "template_version": 1,
+            "topic": topic[:400],
+            "terminology": terminology,
+        })
+        envelope = self.build_envelope(
+            stage=stage, tenant_id=tenant_id, request_id=request_id,
+            system_role=role, static_schema_and_rules=schema,
+            skill_pack_context=format_context[:1200], frozen_index_and_ledger=checkpoint,
+        )
+        messages, options = ProviderCacheAdapter.render_messages_and_kwargs(
+            envelope, provider_mode=mode, config=self._config,
+        )
+        fingerprint = hashlib.sha256(
+            report_json([mode, model, stage, messages, options, []]).encode("utf-8"),
+        ).hexdigest()
+        return FrozenReportPrefix(mode, model, fingerprint, report_json(messages), report_json(options))
+
+
 class ProviderCacheAdapter:
     """Render PromptEnvelope into provider-specific OpenAI, Anthropic, or vLLM payloads."""
 
@@ -361,3 +395,80 @@ class ProviderCacheAdapter:
                 envelope, request_tools=bool(request_tool_section.strip())
             )
         return messages, extra_kwargs
+
+
+def report_json(value: Any) -> str:
+    """Encode report contracts deterministically and protect the enclosing data tag."""
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).replace("<", r"\u003C").replace(">", r"\u003E")
+
+
+def parse_report_json(text: str, *, byte_limit: int) -> dict[str, Any] | None:
+    def unique(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError("duplicate JSON member")
+        return result
+
+    def invalid_constant(value):
+        raise ValueError(value)
+
+    try:
+        if len(text) > byte_limit or len(text.encode("utf-8")) > byte_limit:
+            return None
+        payload = json.loads(text, object_pairs_hook=unique, parse_constant=invalid_constant)
+        return payload if isinstance(payload, dict) else None
+    except (ValueError, RecursionError):
+        return None
+
+
+@dataclass(frozen=True)
+class ReportModelRequest:
+    kind: str
+    data_json: str
+    prefix_fingerprint: str
+    messages_json: str
+    options_json: str
+    provider_mode: str
+    model: str
+    max_tokens: int
+    timeout: float
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        return json.loads(self.messages_json)
+
+    @property
+    def options(self) -> dict[str, Any]:
+        return json.loads(self.options_json)
+
+    @property
+    def input_upper_bound(self) -> int:
+        # Byte accounting, including serialized message boundaries, bounds text tokens.
+        return len(self.messages_json.encode("utf-8")) + len(self.options_json.encode("utf-8")) + 64
+
+
+@dataclass(frozen=True)
+class FrozenReportPrefix:
+    provider_mode: str
+    model: str
+    prefix_fingerprint: str
+    messages_json: str
+    options_json: str
+
+    def request(
+        self, kind: str, data: dict[str, Any], *, max_tokens: int, timeout: float = 12,
+    ) -> ReportModelRequest:
+        payload = report_json(data)
+        suffix = f"<REPORT_DATA>\n{payload}\n</REPORT_DATA>"
+        messages = json.loads(self.messages_json)
+        content = messages[-1]["content"]
+        if isinstance(content, list):
+            content.append({"type": "text", "text": suffix})
+        else:
+            messages[-1]["content"] = f"{content}\n\n{suffix}"
+        return ReportModelRequest(
+            kind, payload, self.prefix_fingerprint, report_json(messages), self.options_json,
+            self.provider_mode, self.model, max_tokens, timeout,
+        )

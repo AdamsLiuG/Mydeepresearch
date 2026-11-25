@@ -409,6 +409,8 @@ class BudgetGovernor:
         work_class: str = "optional",
         *,
         stage: str = "research",
+        allow_optional_finalization: bool = False,
+        keep_available: dict[str, int] | None = None,
     ) -> BudgetLease | BudgetDenial:
         resolved = _demand_vector(demand)
         if work_class not in {"required", "optional"}:
@@ -428,7 +430,15 @@ class BudgetGovernor:
                 return self._deny("dispatch_unbounded", "cost_microusd")
             if self._remaining_seconds() <= 0:
                 return self._deny("deadline_exceeded")
-            finalization = work_class == "required" and stage in FINALIZATION_STAGES
+            report_optional = allow_optional_finalization and stage == "report" and work_class == "optional"
+            finalization = report_optional or (work_class == "required" and stage in FINALIZATION_STAGES)
+            if report_optional:
+                combined = {name: amount + (keep_available or {}).get(name, 0) for name, amount in resolved.items()}
+                pressure = self.snapshot(
+                    minimum_demand=combined, work_class=work_class, stage=stage, allow_optional_finalization=True,
+                ).pressure
+                if pressure != "normal":
+                    return self._deny("optional_pressure" if pressure == "high" else "limit_exceeded")
             if not finalization and self.remaining_timeout(stage=stage, work_class=work_class) <= 0:
                 return self._deny("deadline_exceeded")
 
@@ -479,6 +489,8 @@ class BudgetGovernor:
         pricing: dict[str, Any] | None,
         work_class: str = "optional",
         stage: str = "research",
+        allow_optional_finalization: bool = False,
+        keep_available: dict[str, int] | None = None,
     ) -> BudgetLease | BudgetDenial:
         cost = estimate_llm_cost_microusd(
             input_tokens=input_tokens,
@@ -497,7 +509,7 @@ class BudgetGovernor:
                 "cost_microusd": cost,
             },
             work_class,
-            stage=stage,
+            stage=stage, allow_optional_finalization=allow_optional_finalization, keep_available=keep_available,
         )
 
     def dispatch(self, lease: BudgetLease, *, commit: Callable[[], None] | None = None) -> bool:
@@ -658,6 +670,7 @@ class BudgetGovernor:
         minimum_demand: dict[str, int] | None = None,
         work_class: str = "optional",
         stage: str = "research",
+        allow_optional_finalization: bool = False,
     ) -> BudgetSnapshot:
         if work_class not in {"required", "optional"}:
             raise ValueError("work_class must be required or optional")
@@ -672,7 +685,9 @@ class BudgetGovernor:
                 name: max(0, self.budget.limits[name] - spent[name] - reserved[name])
                 for name in RESOURCE_NAMES
             }
-            finalization = work_class == "required" and stage in FINALIZATION_STAGES
+            finalization = (
+                work_class == "required" and stage in FINALIZATION_STAGES
+            ) or (allow_optional_finalization and stage == "report")
             pressure = "normal"
             if self._paid_work_blocked(minimum["cost_microusd"]) or self._remaining_seconds() <= 0:
                 pressure = "exhausted"

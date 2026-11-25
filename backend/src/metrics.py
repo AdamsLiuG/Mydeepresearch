@@ -41,6 +41,27 @@ _WEB_COUNTER_LABELS = {
 }
 _WEB_LATENCY_EVENTS = {"queue", "elapsed", "http_elapsed", "render"}
 
+_REPORT_OPERATIONS = {"outline", "map", "reduce", "critic", "revision", "legacy"}
+_REPORT_OUTCOMES = {"ok", "fallback", "skipped", "timeout", "invalid"}
+_REPORT_REASONS = {
+    "ok", "disabled", "budget_denied", "deadline", "timeout", "invalid_output", "citation_rejected",
+    "missing_scope", "outcome_unknown", "no_model", "no_candidates", "input_limit", "provider_error",
+}
+_REPORT_EVENTS = {
+    "report_citation_rejected_total": {
+        "unknown_source", "ineligible", "cross_section", "unsupported_claim", "stale_anchor",
+    },
+    "report_coverage_gap_total": {"required", "uncovered"},
+    "report_critic_status_total": {"ok", "skipped", "timeout", "invalid"},
+    "report_revision_batch_total": {"applied", "withheld"},
+    "report_critic_issue_total": {
+        f"{kind}:{severity}:{resolution}"
+        for kind in ("counter_evidence_gap", "survivorship_bias", "temporal_skew", "causal_overreach")
+        for severity in ("medium", "high")
+        for resolution in ("qualified", "surfaced", "withheld", "open")
+    },
+}
+
 DEFAULT_PRICING_CATALOG: dict[str, dict[str, dict[str, float]]] = {
     "default": {
         "default": {
@@ -343,6 +364,8 @@ class MetricsRegistry:
         self._budget_denial_reason_counts: dict[str, int] = {}
         self._replan_reason_counts: dict[str, int] = {}
         self._web_counters: dict[str, dict[tuple[str, ...], int]] = {}
+        self._report_counts: dict[str, dict[str, int]] = {}
+        self._report_cache: dict[str, dict[str, int]] = {}
         self._web_latencies: dict[str, dict[str, LatencyStats]] = {}
         self._web_l2_inflight: int | None = None
         self._kv_cache_by_stage: dict[str, dict[str, Any]] = {}
@@ -377,6 +400,8 @@ class MetricsRegistry:
             self._replan_reason_counts = {}
             self._web_counters.clear()
             self._web_latencies.clear()
+            self._report_counts.clear()
+            self._report_cache.clear()
             self._web_l2_inflight = None
             self._kv_cache_by_stage.clear()
             self._estimated_cost = 0.0
@@ -597,6 +622,26 @@ class MetricsRegistry:
         with self._lock:
             self._recent_requests.appendleft(_clone_dict(payload))
 
+    def record_report_count(self, name: str, label: str, amount: int = 1) -> None:
+        with self._lock:
+            counts = self._report_counts.setdefault(name, {})
+            counts[label] = counts.get(label, 0) + amount
+            self._counters[name] = self._counters.get(name, 0) + amount
+
+    def record_report_map_cache(self, provider: str, model: str, cached: int, eligible: int, missing: int) -> None:
+        with self._lock:
+            label = f"{provider[:80]}/{model[:120]}"
+            if label not in self._report_cache and len(self._report_cache) >= 32:
+                label = "other"
+            totals = self._report_cache.setdefault(label, {})
+            for name, value in (
+                ("report_map_cached_input_tokens", cached),
+                ("report_map_cache_eligible_input_tokens", eligible),
+                ("report_map_usage_missing_total", missing),
+            ):
+                totals[name] = totals.get(name, 0) + value
+                self._counters[name] = self._counters.get(name, 0) + value
+
     def snapshot(
         self, *, include_recent_requests: bool = True, tenant_id: str | None = None,
     ) -> dict[str, Any]:
@@ -604,6 +649,12 @@ class MetricsRegistry:
             counters = dict(self._counters)
             latencies = {name: stats.to_dict() for name, stats in self._latencies.items()}
             web_extraction = self._web_extraction_snapshot(counters, latencies)
+            report_counts = _clone_dict(self._report_counts)
+            report_cache = _clone_dict(self._report_cache)
+            for values in report_cache.values():
+                values["report_map_cache_hit_ratio"] = _cache_hit_ratio(
+                    values["report_map_cached_input_tokens"], values["report_map_cache_eligible_input_tokens"],
+                )
             estimated_cost = round(self._estimated_cost, 6)
             recent_requests = [
                 _clone_dict(request)
@@ -668,6 +719,8 @@ class MetricsRegistry:
             if task_react_stop_total
             else 0.0,
             "recent_requests": recent_requests,
+            **({"report_breakdown": {**report_counts, "map_cache_by_model": report_cache}}
+               if report_counts or report_cache else {}),
             **({"web_extraction": web_extraction} if web_extraction else {}),
         }
 
@@ -896,6 +949,8 @@ class RequestTrace:
         self.task_react_continue_count = 0
         self.task_react_stop_count = 0
         self.task_react_stop_reasons: dict[str, int] = {}
+        self._report_operations: set[str] = set()
+        self._report_breakdown: dict[str, Any] = {}
         self.report_repair_triggered = False
         self.report_repair_added_tasks = 0
         self.report_repair_cycles = 0
@@ -1185,6 +1240,70 @@ class RequestTrace:
                 self.task_react_stop_reasons.get(normalized, 0) + 1
             )
 
+    def _record_report_count(self, name: str, label: str, amount: int = 1) -> None:
+        counts = self._report_breakdown.setdefault(name, {})
+        counts[label] = counts.get(label, 0) + amount
+        metrics_registry.record_report_count(name, label, amount)
+
+    def record_report_event(self, name: str, label: str, *, amount: int = 1) -> None:
+        if label in _REPORT_EVENTS.get(name, ()) and amount > 0:
+            with self._lock:
+                self._record_report_count(name, label, amount)
+
+    def record_report_timing(self, name: str, elapsed_ms: float, *, label: str = "report") -> None:
+        if name in {
+            "report_operation_ms", "report_section_queue_ms", "report_stage_ms",
+            "report_first_section_ms", "report_first_verified_chunk_ms",
+        } and label in _REPORT_OPERATIONS | {"report"}:
+            with self._lock:
+                timings = self._report_breakdown.setdefault(name, {})
+                timings.setdefault(label, LatencyStats()).add(max(0, elapsed_ms))
+                metrics_registry.add_latency(name, max(0, elapsed_ms))
+
+    def record_report_operation(
+        self, operation_key: str, *, kind: str, outcome: str, reason: str = "ok",
+        elapsed_ms: float | None = None, usage: dict[str, int] | None = None,
+        attempted: bool | None = None,
+    ) -> None:
+        if kind not in _REPORT_OPERATIONS or outcome not in _REPORT_OUTCOMES:
+            return
+        reason = reason if reason in _REPORT_REASONS else "other"
+        with self._lock:
+            if operation_key in self._report_operations:
+                return
+            self._report_operations.add(operation_key)
+            self._record_report_count("report_operation_total", f"{kind}:{outcome}:{reason}")
+            if kind == "map":
+                self._record_report_count("report_section_total", outcome)
+                if attempted is True or (attempted is None and outcome == "ok"):
+                    raw = normalize_reported_usage(usage) or {}
+                    cached = raw.get("cached_tokens")
+                    eligible = raw.get("prompt_tokens")
+                    missing = int(cached is None or not eligible)
+                    cached = min(cached, eligible) if not missing else 0
+                    eligible = eligible if not missing else 0
+                    for name, value in (
+                        ("report_map_cached_input_tokens", cached),
+                        ("report_map_cache_eligible_input_tokens", eligible),
+                        ("report_map_usage_missing_total", missing),
+                    ):
+                        self._report_breakdown[name] = self._report_breakdown.get(name, 0) + value
+                    metrics_registry.record_report_map_cache(self.provider or "", self.model or "", cached, eligible, missing)
+        if elapsed_ms is not None:
+            self.record_report_timing("report_operation_ms", elapsed_ms, label=kind)
+
+    def _report_breakdown_snapshot(self) -> dict[str, Any]:
+        result = {
+            name: {key: value.to_dict() if isinstance(value, LatencyStats) else value for key, value in values.items()}
+            if isinstance(values, dict) else values
+            for name, values in self._report_breakdown.items()
+        }
+        if "report_map_cache_eligible_input_tokens" in result:
+            result["report_map_cache_hit_ratio"] = _cache_hit_ratio(
+                result["report_map_cached_input_tokens"], result["report_map_cache_eligible_input_tokens"],
+            )
+        return result
+
     def record_report_repair(self, *, added_tasks: int, triggered: bool = True) -> None:
         if triggered:
             metrics_registry.increment("report_repair_trigger_total")
@@ -1439,6 +1558,7 @@ class RequestTrace:
                 )
                 if self.task_react_stop_count
                 else 0.0,
+                **({"report_breakdown": self._report_breakdown_snapshot()} if self._report_breakdown else {}),
                 "report_repair_triggered": self.report_repair_triggered,
                 "report_repair_added_tasks": self.report_repair_added_tasks,
                 "report_repair_cycles": self.report_repair_cycles,

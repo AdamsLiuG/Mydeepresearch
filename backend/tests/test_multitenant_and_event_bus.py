@@ -594,3 +594,13 @@ class SearchCacheAndBackendAdapterTests(unittest.TestCase):
             store = PostgresRequestStateStore(dsn="postgresql://example/test")
         self.assertIs(store._connect(), store._connect())
         self.assertEqual(store._pool.open_count, 1)
+
+
+def test_report_event_append_returns_original_cursor_after_delivery_retry():
+    bus = InMemoryStreamEventBus(max_events_per_request=10)
+    frame = {"type": "report_section_status", "schema_version": 1, "event_key": "report-section-1-started"}
+    assert bus.publish("a", "r", frame) == "1"
+    assert bus.publish("a", "r", {**frame, "state_version": 20}) == "1"
+    assert bus.publish("b", "r", frame) == "1"
+    assert bus.publish("a", "r", {"type": "other"}) == "2"
+    assert [event.event_id for event in bus.replay_since("a", "r", "1")] == ["2"]

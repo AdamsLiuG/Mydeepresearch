@@ -205,3 +205,29 @@ describe("interactive workbench utilities", () => {
     expect(conflictsForCitation(workbench, "T1-C1")).toHaveLength(0);
   });
 });
+
+it("keeps stable report bindings and deduplicates replayed chunks and statuses", async () => {
+  const { createReportStreamState } = await import("../utils/workbench");
+  const stream = createReportStreamState();
+  const outline = { type: "report_outline", outline_version: 1, sections: ["Evidence"], section_ids: ["sec-a"],
+    event_key: "report-outline-1" };
+  expect(stream.accept(outline, "req")).toBe(true);
+  stream.outline(outline);
+  const completed = { type: "report_section_status", outline_version: 1, section_id: "sec-a",
+    event_key: "report-section-1-completed", status: "completed" };
+  expect(stream.accept(completed, "req")).toBe(true);
+  expect(stream.sectionStatus(completed)).toEqual({ title: "Evidence", status: "completed" });
+  expect(stream.accept(completed, "req")).toBe(false);
+  expect(stream.sectionStatus({ ...completed, status: "started" })).toBeUndefined();
+  const second = { type: "report_chunk", event_key: "report-final-1-chunk-2", report_version: 1, index: 2, content: "B" };
+  expect(stream.accept(second, "req")).toBe(true);
+  expect(stream.chunk(second)).toBe("");
+  const first = { ...second, event_key: "report-final-1-chunk-1", index: 1, content: "A" };
+  expect(stream.accept(first, "req")).toBe(true);
+  expect(stream.chunk(first)).toBe("AB");
+  expect(stream.accept(outline, "req")).toBe(false);
+  const binding = { section_id: "sec-a", title: "Evidence", paragraph_index: 2 };
+  expect(normalizeReportWorkbench({ workbench: { section_bindings: [binding, binding] } }).section_bindings)
+    .toEqual([binding]);
+  expect(normalizeReportWorkbench({})).not.toHaveProperty("section_bindings");
+});

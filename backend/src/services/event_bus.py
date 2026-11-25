@@ -72,6 +72,11 @@ class StreamEventBus(Protocol):
         """Replay buffered events and block-tail new live events until terminal."""
 
 
+def _report_event_key(payload: dict[str, Any]) -> str:
+    key = payload.get("event_key")
+    return key if payload.get("schema_version") == 1 and isinstance(key, str) and key.startswith("report-") else ""
+
+
 class InMemoryStreamEventBus:
     """Process-local ring-buffered event bus keyed by (tenant_id, request_id)."""
 
@@ -81,16 +86,27 @@ class InMemoryStreamEventBus:
         self._buffers: dict[tuple[str, str], deque[tuple[int, dict[str, Any]]]] = defaultdict(
             lambda: deque(maxlen=self._max_events)
         )
+        self._event_keys: dict[tuple[str, str], dict[str, int]] = defaultdict(dict)
         self._counters: dict[tuple[str, str], int] = defaultdict(int)
         self._terminal_keys: set[tuple[str, str]] = set()
 
     def publish(self, tenant_id: str, request_id: str, payload: dict[str, Any]) -> str:
         key = (str(tenant_id or "default"), str(request_id or ""))
         with self._condition:
+            buffer = self._buffers[key]
+            event_key = _report_event_key(payload)
+            if event_key and (previous := self._event_keys[key].get(event_key)) is not None:
+                return str(previous)
+            if len(buffer) == self._max_events:
+                expired = _report_event_key(buffer[0][1])
+                if expired:
+                    self._event_keys[key].pop(expired, None)
             seq = self._counters[key] + 1
+            if event_key:
+                self._event_keys[key][event_key] = seq
             self._counters[key] = seq
             stored = dict(payload)
-            self._buffers[key].append((seq, stored))
+            buffer.append((seq, stored))
             if _is_terminal(stored):
                 self._terminal_keys.add(key)
             self._condition.notify_all()
@@ -182,6 +198,35 @@ class InMemoryStreamEventBus:
                 yield EventEnvelope(event_id="", payload={"type": "__keepalive__"})
 
 
+# Keep only keys with a replayable entry. The sorted set is scored by stream time
+# and the hash is trimmed with the stream in the same transaction.
+_REPORT_APPEND = """
+local previous = redis.call('HGET', KEYS[2], ARGV[1])
+if previous and #redis.call('XRANGE', KEYS[1], previous, previous) > 0 then
+    return previous
+end
+local id = redis.call('XADD', KEYS[1], 'MAXLEN', ARGV[3], '*', 'payload', ARGV[2])
+redis.call('HSET', KEYS[2], ARGV[1], id)
+redis.call('ZADD', KEYS[3], 0, id .. '|' .. ARGV[1])
+-- Report history is bounded. Remove stale keys even when the stream was trimmed by a legacy frame.
+for _, entry in ipairs(redis.call('ZRANGE', KEYS[3], 0, -1)) do
+    local delimiter = string.find(entry, '|', 1, true)
+    local cursor = string.sub(entry, 1, delimiter - 1)
+    if #redis.call('XRANGE', KEYS[1], cursor, cursor) == 0 then
+        local key = string.sub(entry, delimiter + 1)
+        if redis.call('HGET', KEYS[2], key) == cursor then
+            redis.call('HDEL', KEYS[2], key)
+        end
+        redis.call('ZREM', KEYS[3], entry)
+    end
+end
+if ARGV[4] == '1' then
+    for _, key in ipairs(KEYS) do redis.call('EXPIRE', key, ARGV[5]) end
+end
+return id
+"""
+
+
 class RedisStreamEventBus:
     """Redis Streams-backed SSE event bus supporting Last-Event-ID replay across gateway replicas."""
 
@@ -233,6 +278,13 @@ class RedisStreamEventBus:
         stream_key = self._stream_key(tenant_id, request_id)
         encoded = json.dumps(payload, ensure_ascii=False)
         terminal = _is_terminal(payload)
+        event_key = _report_event_key(payload)
+        if event_key:
+            entry_id = self._client.eval(
+                _REPORT_APPEND, 3, stream_key, f"{stream_key}:report-keys", f"{stream_key}:report-cursors",
+                event_key, encoded, self._max_events, "1" if terminal else "0", self._stream_ttl_seconds,
+            )
+            return entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
         pipeline = self._client.pipeline() if terminal and hasattr(self._client, "pipeline") else None
         entry_id = (pipeline if pipeline is not None else self._client).xadd(
             stream_key,

@@ -1182,3 +1182,18 @@ class CacheProviderModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_report_prefix_rendering_across_providers():
+    for mode in ("openai", "anthropic", "vllm", "disabled"):
+        config = Configuration(kv_cache_provider_mode=mode, kv_cache_min_segment_tokens=1)
+        builder = ContextPrefixBuilder(config)
+        prefix = builder.freeze_report_prefix(
+            tenant_id="tenant", request_id="request", topic="Topic", ledger_version=4, prefix_version=9,
+        )
+        first = prefix.request("map", {"section_id": "first", "excerpt": "</REPORT_DATA>"}, max_tokens=250)
+        second = prefix.request("map", {"section_id": "second"}, max_tokens=250)
+        assert first.prefix_fingerprint == second.prefix_fingerprint
+        assert first.messages != second.messages
+        assert "first" not in second.data_json
+        assert first.messages[-1]["content"] != []

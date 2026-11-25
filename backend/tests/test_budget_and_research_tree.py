@@ -662,3 +662,39 @@ class RePlannerAndStrictDagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_report_optional_can_use_finalization_pool_with_guarded_priority():
+    budget = build_request_budget("quick", limits={"llm_calls": 5}, finalization_reserve={"llm_calls": 3})
+    governor = BudgetGovernor(budget, tenant_id="default", request_id="reserved-report")
+    research = governor.reserve("research", {"llm_calls": 2}, "required")
+    assert governor.dispatch(research)
+    governor.settle(research, {"llm_calls": 2})
+    denied = governor.reserve("legacy", {"llm_calls": 1}, "optional", stage="report")
+    assert denied.reason == "finalization_reserved"
+    denied = governor.reserve(
+        "outline", {"llm_calls": 1}, "optional", stage="report",
+        allow_optional_finalization=True, keep_available={"llm_calls": 3},
+    )
+    assert isinstance(denied, BudgetDenial)
+    critic = governor.reserve(
+        "critic", {"llm_calls": 1}, "optional", stage="report", allow_optional_finalization=True,
+    )
+    assert isinstance(critic, BudgetLease)
+    assert critic.work_class == "optional"
+
+
+def test_unpublished_report_projection_filters_drafts_and_claims():
+    v4 = {
+        "schema_version": 1,
+        "report": {
+            "outline": {"outline_version": 1, "sections": [{"section_id": "sec-ab", "title": "A", "order": 1}]},
+            "sections_by_id": {"sec-ab": {"status": "started", "draft": "secret", "claim_ids": ["C-1"]}},
+            "operations_by_key": {"internal": {"lease": "secret"}},
+        },
+    }
+    assert public_v4_projection(v4)["report"] == {
+        "outline_version": 1,
+        "sections": [{"section_id": "sec-ab", "title": "A", "order": 1, "status": "started"}],
+        "critic_status": "skipped",
+    }

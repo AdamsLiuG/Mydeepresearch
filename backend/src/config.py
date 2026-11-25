@@ -1283,6 +1283,41 @@ class Configuration(BaseModel):
         title="V4 Replan Enabled",
         description="Enable the v4 Wave 1 research tree replanner",
     )
+    v4_parallel_report_enabled: bool = False
+    v4_hierarchical_report_enabled: bool = False
+    v4_red_team_enabled: bool = False
+    v4_red_team_critic_enabled: bool = False
+    v4_report_outline_llm_enabled: bool = False
+    v4_report_reducer_llm_enabled: bool = False
+    v4_report_revision_llm_enabled: bool = False
+    v4_report_map_max_concurrency: int = Field(default=3, gt=0, le=3)
+    v4_report_map_timeout_seconds: float = Field(default=12, gt=0, le=12)
+    v4_red_team_timeout_seconds: float = Field(default=12, gt=0, le=12)
+
+    @property
+    def parallel_report_enabled(self) -> bool:
+        return self.v4_parallel_report_enabled or self.v4_hierarchical_report_enabled
+
+    @property
+    def red_team_enabled(self) -> bool:
+        return self.v4_red_team_enabled or self.v4_red_team_critic_enabled
+
+    def report_config_projection(self) -> dict[str, Any]:
+        """Return effective, serializable report settings for request freezing."""
+        parallel = self.parallel_report_enabled
+        red_team = self.red_team_enabled
+        return {
+            "version": 1,
+            "v4_parallel_report_enabled": parallel,
+            "v4_red_team_enabled": red_team,
+            "v4_report_outline_llm_enabled": parallel and self.v4_report_outline_llm_enabled,
+            "v4_report_reducer_llm_enabled": parallel and self.v4_report_reducer_llm_enabled,
+            "v4_report_revision_llm_enabled": red_team and self.v4_report_revision_llm_enabled,
+            "v4_report_map_max_concurrency": self.v4_report_map_max_concurrency,
+            "v4_report_map_timeout_seconds": self.v4_report_map_timeout_seconds,
+            "v4_red_team_timeout_seconds": self.v4_red_team_timeout_seconds,
+        }
+
     v4_web_extractor_enabled: bool = False
     v4_web_extractor_tenants: list[str] = Field(default_factory=list, repr=False, exclude=True)
     v4_web_l2_adapter: Literal["off", "reader_http", "playwright"] = "off"

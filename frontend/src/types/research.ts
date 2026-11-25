@@ -26,6 +26,22 @@ export interface BudgetSnapshot {
   overrun?: Record<string, number>;
 }
 
+export type ReportSectionStatus = "pending" | "started" | "completed" | "degraded";
+
+export interface ReportProgress {
+  outline_version: number;
+  report_version?: number;
+  critic_status: "ok" | "skipped" | "timeout" | "invalid";
+  degradation_reason?: string;
+  sections: {
+    section_id: string;
+    title: string;
+    order: number;
+    status: ReportSectionStatus;
+    claim_ids?: string[];
+  }[];
+}
+
 export interface V4ResearchProjection {
   schema_version: 1;
   budget?: BudgetSnapshot;
@@ -34,7 +50,7 @@ export interface V4ResearchProjection {
     decision_id?: string;
     pruned_task_ids: number[];
   };
-  report?: Record<string, unknown>;
+  report?: ReportProgress;
 }
 
 interface V4ResearchEvent {
@@ -349,6 +365,22 @@ export interface VerifierBadge {
   status: string;
 }
 
+export interface ReportSectionBinding {
+  section_id: string;
+  title: string;
+  paragraph_index: number;
+}
+
+export interface ReportClaimBinding {
+  section_id: string;
+  block_id: string;
+  claim_id: string;
+  paragraph_index: number;
+  text_fingerprint: string;
+  citation_ids: string[];
+  evidence_anchors: { source_id: string; artifact_id?: string; anchor_id?: string }[];
+}
+
 export interface ReportWorkbenchPayload {
   citation_index: Record<string, WorkbenchCitationEntry>;
   paragraph_bindings: WorkbenchParagraphBinding[];
@@ -357,6 +389,9 @@ export interface ReportWorkbenchPayload {
   skill_governance: SkillGovernanceInfo;
   verifier_badges?: VerifierBadge[];
   charts_spec?: unknown[];
+  section_bindings?: ReportSectionBinding[];
+  claim_bindings?: ReportClaimBinding[];
+  critic_issues?: Record<string, unknown>[];
 }
 
 export interface AsyncResearchSubmitResponse {

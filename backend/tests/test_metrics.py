@@ -226,3 +226,15 @@ class MetricsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_report_metrics_are_bounded_and_idempotent():
+    metrics_registry.reset()
+    trace = RequestTrace(request_id="r", topic="t", search_api="stub", provider="p", model="m", pricing_catalog={})
+    trace.record_report_operation("map.1", kind="map", outcome="fallback", reason="private-provider-error")
+    trace.record_report_operation("map.1", kind="map", outcome="fallback", reason="timeout")
+    trace.record_report_operation("map.2", kind="map", outcome="ok", usage={"prompt_tokens": 100, "cached_prompt_tokens": 40})
+    report = trace.snapshot()["report_breakdown"]
+    assert report["report_operation_total"] == {"map:fallback:other": 1, "map:ok:ok": 1}
+    assert report["report_map_cached_input_tokens"] == 40
+    assert report["report_map_cache_eligible_input_tokens"] == 100

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 from hello_agents import ToolAwareSimpleAgent
 
@@ -828,6 +830,31 @@ class ReviewService:
             seen.add(key)
             merged.append(item)
         return merged
+
+    @staticmethod
+    def verify_report_claim(
+        claim_text: str, excerpts: tuple[str, ...], *, orchestrator=None, deadline: float | None = None,
+    ) -> Literal["rule_passed", "entailed", "disabled", "unsupported", "timeout"]:
+        """Check at most two already authorized report excerpts."""
+        excerpts = tuple(text for text in excerpts[:2] if text)
+        if deadline is not None and time.monotonic() >= deadline:
+            return "timeout"
+        if not claim_text.strip() or not excerpts or numeric_grounding_mismatch(claim_text, excerpts):
+            return "unsupported"
+
+        def normalize(value: str) -> str:
+            return " ".join(unicodedata.normalize("NFKC", value).casefold().split()).rstrip(".。")
+
+        claim = normalize(claim_text)
+        for excerpt in excerpts:
+            sentences = re.split(r"(?<=[.!?。！？])\s+|[。！？] *|\n+", excerpt)
+            if any(claim == normalize(sentence) for sentence in sentences):
+                return "rule_passed"
+        if orchestrator is None:
+            return "disabled"
+        return orchestrator.verify_report_excerpt(
+            claim_text, excerpts, deadline=deadline if deadline is not None else time.monotonic() + 2,
+        )
 
     def _verify_claim_against_evidence(
         self,

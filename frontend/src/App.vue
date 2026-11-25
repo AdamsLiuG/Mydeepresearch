@@ -741,7 +741,7 @@ import type {
 } from "./types/research";
 import { renderMarkdownBlock } from "./utils/markdown";
 import { createResearchV4State } from "./utils/researchV4";
-import { buildFallbackWorkbenchPayload, normalizeReportWorkbench, safeEvidenceUrl } from "./utils/workbench";
+import { buildFallbackWorkbenchPayload, createReportStreamState, normalizeReportWorkbench, safeEvidenceUrl } from "./utils/workbench";
 
 interface DemoScenario {
   id: string;
@@ -773,6 +773,7 @@ const isExpanded = ref(false);
 
 const todoTasks = ref<TodoTaskView[]>([]);
 const researchV4 = createResearchV4State();
+const reportStream = createReportStreamState();
 const activeTaskId = ref<number | null>(null);
 const reportMarkdown = ref("");
 const latestRequestMetrics = ref<UnknownRecord | null>(null);
@@ -1006,6 +1007,7 @@ async function hydrateLiveSnapshot(requestId: string, signal: AbortSignal) {
   signal.throwIfAborted();
   if (activeRequestId.value !== requestId) return;
   researchV4.hydrate(requestId, payload);
+  reportStream.hydrate((payload.v4 as ResearchStreamEvent["v4"])?.report);
   if (Array.isArray(payload.todo_items)) {
     todoTasks.value = mapHistoryTasks(payload.todo_items);
     if (!todoTasks.value.some((task) => task.id === activeTaskId.value)) {
@@ -1676,6 +1678,7 @@ async function refreshPersistedHistory(signal?: AbortSignal) {
 function resetWorkflowState() {
   todoTasks.value = [];
   researchV4.reset();
+  reportStream.reset();
   activeTaskId.value = null;
   activeRequestId.value = null;
   lastEventId.value = null;
@@ -1838,6 +1841,7 @@ async function viewHistoryResearch(item: RecentResearchView) {
     form.topic = detailTopic;
     form.searchApi = detailSearchApi === "-" ? item.searchApi : detailSearchApi;
     researchV4.hydrate(item.requestId, payload);
+    reportStream.hydrate((payload.v4 as ResearchStreamEvent["v4"])?.report);
     todoTasks.value = detailTasks.map(cloneHistoryTask);
     activeTaskId.value = todoTasks.value[0]?.id ?? null;
     reportMarkdown.value = detailReport;
@@ -2119,7 +2123,7 @@ function applyDemoScenario(scenario: DemoScenario) {
 }
 
 function handleResearchEvent(event: ResearchStreamEvent) {
-  if (!researchV4.accept(activeRequestId.value, event)) return;
+  if (!reportStream.accept(event, activeRequestId.value) || !researchV4.accept(activeRequestId.value, event)) return;
   if (typeof event.request_id === "string" && event.request_id.trim()) {
     activeRequestId.value = event.request_id.trim();
   }
@@ -2487,8 +2491,18 @@ function handleResearchEvent(event: ResearchStreamEvent) {
     return;
   }
 
+  if (event.type === "report_section_status") {
+    const section = reportStream.sectionStatus(event);
+    if (section) {
+      const label = { started: "撰写中", completed: "已完成", degraded: "已采用保守内容" }[section.status];
+      progressLogs.value.push(`${section.title} · ${label}`);
+    }
+    return;
+  }
+
   if (event.type === "report_outline") {
-    reportMarkdown.value = "";
+    if (typeof event.outline_version === "number") reportStream.outline(event);
+    else reportMarkdown.value = "";
     const sections = Array.isArray(event.sections) ? event.sections : [];
     if (sections.length > 0) {
       progressLogs.value.push(`报告大纲已就绪（${sections.length} 个章节）`);
@@ -2498,7 +2512,13 @@ function handleResearchEvent(event: ResearchStreamEvent) {
 
   if (event.type === "report_chunk") {
     const chunk = typeof event.content === "string" ? event.content : "";
-    if (chunk) {
+    if (typeof event.report_version === "number") {
+      const markdown = reportStream.chunk(event);
+      if (markdown !== undefined) {
+        reportMarkdown.value = markdown;
+        pulse(reportHighlight);
+      }
+    } else if (chunk) {
       reportMarkdown.value += chunk;
       pulse(reportHighlight);
     }

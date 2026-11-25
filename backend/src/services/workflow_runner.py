@@ -20,7 +20,7 @@ from services.budget import (
 )
 from services.event_bus import TERMINAL_EVENT_TYPES, RedisStreamEventBus, StreamEventBus
 from services.mcp_bridge import tool_approval_expired
-from services.request_state import SnapshotConflictError
+from services.request_state import SnapshotConflictError, queue_snapshot_events
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +105,11 @@ class WorkflowCheckpoint:
         research_depth: str | None = None,
         output_format: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        from state_manager import freeze_web_extraction
+        from state_manager import freeze_report, freeze_web_extraction
 
         budget_enabled = getattr(config, "v4_research_budget_enabled", False)
         web = freeze_web_extraction(config, self.tenant_id)
+        report = freeze_report(config, self.tenant_id, self.request_id)
         downstream_only = web is not None and not budget_enabled
         requested_depth = research_depth
         if budget_enabled and requested_depth is None:
@@ -159,6 +160,8 @@ class WorkflowCheckpoint:
                     snapshot["v4"]["web_extraction"] = web
                 if downstream_only:
                     snapshot["v4"]["web_downstream_only"] = True
+            if report is not None:
+                snapshot.setdefault("v4", {"schema_version": 1})["report"] = report
             return True
 
         return self._update(change)
@@ -218,6 +221,7 @@ class WorkflowCheckpoint:
         expected_wave_1_committed: bool | None = None,
         expected_plan_locked: bool | None = None,
         pending_events: tuple[dict[str, Any], ...] = (),
+        expected_report_revision: int | None = None,
     ) -> dict[str, Any]:
         updates = {name: value for name, value in payload.items() if name != "v4"}
         v4_updates = {name: value for name, value in (payload.get("v4") or {}).items() if name != "pending_events"}
@@ -230,6 +234,13 @@ class WorkflowCheckpoint:
         def change(snapshot: dict[str, Any]) -> bool:
             self.check_owner(snapshot)
             v4 = snapshot.get("v4") or {}
+            if expected_report_revision is not None:
+                if (v4.get("report") or {}).get("revision_number", 0) != expected_report_revision:
+                    raise SnapshotConflictError(f"Report checkpoint changed for {self.request_id}")
+                if snapshot.get("workflow_cancel_requested") and updates.get("status") != "cancelled":
+                    from state_manager import ReportCancelled
+
+                    raise ReportCancelled()
             replan = v4.get("replan") or {}
             proposed = v4_updates.get("replan") or {}
             if any(
@@ -261,19 +272,13 @@ class WorkflowCheckpoint:
                     if name in v4_updates:
                         merged[name] = {**(v4.get(name) or {}), **v4_updates[name]}
                 if pending_events:
-                    committed_version = int(snapshot["state_version"]) + 1
-                    queued = list(v4.get("pending_events") or [])
-                    keys = {event["event_key"] for event in queued}
-                    for event in pending_events:
-                        key = event["event_key"]
-                        if key in keys:
-                            continue
-                        queued.append({
-                            **event, "schema_version": 1, "request_id": self.request_id,
-                            "state_version": committed_version,
-                        })
-                        keys.add(key)
-                    merged["pending_events"] = queued
+                    merged["pending_events"] = queue_snapshot_events(snapshot, v4, pending_events, self.request_id)
+                if expected_report_revision is not None and (final := (merged.get("report") or {}).get("final")):
+                    if final.get("published") and final.get("frames"):
+                        merged["report"] = {**merged["report"], "final": {**final, "frames": [
+                            {**frame, "state_version": int(snapshot["state_version"]) + 1}
+                            for frame in final["frames"]
+                        ]}}
                 snapshot["v4"] = merged
             return True
 
@@ -472,7 +477,9 @@ def run_durable_attempt(
         checkpoint.check_owner(saved)
         for event in (saved.get("v4") or {}).get("pending_events", []):
             try:
-                publish(event)
+                from state_manager import materialize_report_event
+
+                publish(materialize_report_event(saved, event) if event["event_key"].startswith("report-") else event)
                 key = event["event_key"]
                 checkpoint.acknowledge_event(key)
                 delivered_keys.add(key)
@@ -661,7 +668,8 @@ def run_durable_attempt(
             publish(terminal_event)
             return terminal
         terminal = finish("completed")
-        publish(terminal_event or {"type": "done", "request_id": request_id})
+        if not terminal_event or terminal_event.get("event_key") not in delivered_keys:
+            publish(terminal_event or {"type": "done", "request_id": request_id})
         return terminal
     except (WorkflowLeaseLost, WorkflowEventDeliveryError):
         raise

@@ -228,3 +228,15 @@ class ReviewerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_report_verification_requires_frozen_grounding():
+    assert ReviewService.verify_report_claim(
+        "The sample reached 25%.", ("The sample reached 20%.",),
+    ) == "unsupported"
+    assert ReviewService.verify_report_claim(
+        "The sample reached 20%.", ("The sample reached 20%.",),
+    ) == "rule_passed"
+    assert ReviewService.verify_report_claim(
+        "The method caused growth.", ("The method correlated with growth.",),
+    ) == "disabled"

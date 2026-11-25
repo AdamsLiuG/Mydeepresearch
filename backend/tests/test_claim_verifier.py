@@ -1667,3 +1667,12 @@ def test_numeric_grounding_checks_quarter_and_currency_in_the_same_excerpt() -> 
 
 def test_binary_non_entailment_does_not_become_contradiction() -> None:
     assert _resolve_label_mapping({0: "unsupported", 1: "supported"}) == {"neutral": 0, "entailment": 1}
+
+
+def test_report_atomic_binding_uses_only_entailed_best_source():
+    from services.claim_verifier import report_atomic_sources
+
+    record = {"nli_label": "ENTAILED", "best_source_id": "T1-S1", "source_ids": ["T1-S1", "T2-S1"]}
+    assert report_atomic_sources(record, {"T1-S1", "T2-S1"}) == ("T1-S1",)
+    assert report_atomic_sources(record, {"T2-S1"}) == ()
+    assert report_atomic_sources({**record, "nli_label": "SKIPPED"}, {"T1-S1"}) == ()

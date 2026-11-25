@@ -945,9 +945,12 @@ def create_app(
         if snapshot.get("pending_tool_approval") or snapshot.get("approved_tool_calls"):
             raise HTTPException(status_code=409, detail="Request has a tool approval record")
         raw_v4 = snapshot.get("v4")
+        report_plan = isinstance(raw_v4, dict) and isinstance(raw_v4.get("report"), dict)
         web_plan = isinstance(raw_v4, dict) and isinstance(raw_v4.get("web_extraction"), dict)
-        budgeted_plan = isinstance(raw_v4, dict) and "budget" in raw_v4 and not raw_v4.get("web_downstream_only")
-        if (snapshot.get("workflow_run_id") or budgeted_plan or web_plan) and (
+        budgeted_plan = isinstance(raw_v4, dict) and "budget" in raw_v4 and not (
+            raw_v4.get("web_downstream_only") or raw_v4.get("report_only")
+        )
+        if (snapshot.get("workflow_run_id") or budgeted_plan or web_plan or report_plan) and (
             snapshot.get("phase") != "awaiting_approval"
             or snapshot.get("status") != "awaiting_approval"
             or snapshot.get("workflow_plan_revision") is not None
@@ -960,7 +963,7 @@ def create_app(
         config = app.state.base_config
         max_tasks = config.resolved_max_total_tasks()
         projection = None
-        if budgeted_plan or web_plan:
+        if budgeted_plan or web_plan or report_plan:
             if not _accepts_kwarg(store.save, "expected_version") or "state_version" not in snapshot:
                 raise HTTPException(status_code=409, detail="Budgeted plan edits require a versioned request snapshot")
             from state_manager import public_v4_projection
@@ -1120,11 +1123,14 @@ def create_app(
         return public_web_evidence_projection(public_payload, web_enabled=isinstance(payload["v4"], dict)
                                               and isinstance(payload["v4"].get("web_extraction"), dict))
 
-    def _sse_frame(payload: dict[str, Any], event_id: str = "") -> str:
+    def _public_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         from services.evidence import public_web_evidence_projection
 
+        return public_web_evidence_projection(payload)
+
+    def _sse_frame(payload: dict[str, Any], event_id: str = "") -> str:
         prefix = f"id: {event_id}\n" if event_id else ""
-        return f"{prefix}data: {json.dumps(public_web_evidence_projection(payload), ensure_ascii=False)}\n\n"
+        return f"{prefix}data: {json.dumps(_public_event_payload(payload), ensure_ascii=False)}\n\n"
 
     def _stream_response(iterator: AsyncIterator[str], request_id: str, backend: str | None = None) -> StreamingResponse:
         headers = {
@@ -1163,9 +1169,9 @@ def create_app(
             v4 = snap.get("v4")
             lease = snap.get("workflow_lease")
             expires_at = lease.get("expires_at") if isinstance(lease, dict) else None
-            if isinstance(v4, dict) and (
-                v4.get("pending_events") or (isinstance(expires_at, (int, float)) and expires_at > time.time())
-            ):
+            if isinstance(v4, dict) and v4.get("pending_events"):
+                return False
+            if isinstance(expires_at, (int, float)) and expires_at > time.time():
                 return False
             is_paused_inline = snap.get("runner_backend", "inline") == "inline" and status in {
                 "awaiting_approval", "approved_ready",
@@ -1207,6 +1213,36 @@ def create_app(
 
         return _stream_response(_follow_iter(), request_id, backend)
 
+    def _flush_inline_report_events(request_id: str, tenant_id: str) -> None:
+        from state_manager import materialize_report_event
+
+        store = app.state.request_state_store
+        if store is None:
+            return
+        bus = app.state.event_bus
+        for _ in range(5):
+            saved = _store_load(store, request_id, tenant_id=tenant_id) or {}
+            v4 = saved.get("v4") or {}
+            if saved.get("workflow_run_id") or not v4.get("report"):
+                return
+            pending = v4.get("pending_events") or []
+            if not pending:
+                return
+            delivered_keys = {
+                envelope.payload.get("event_key") for envelope in bus.replay_since(tenant_id, request_id)
+                if isinstance(envelope.payload.get("event_key"), str)
+            }
+            for item in pending:
+                if item.get("event_key") not in delivered_keys:
+                    bus.publish(tenant_id, request_id, materialize_report_event(saved, item))
+            saved["v4"] = {**v4, "pending_events": []}
+            try:
+                _store_save(store, request_id, saved, tenant_id=tenant_id)
+                return
+            except SnapshotConflictError:
+                continue
+        raise SnapshotConflictError("Report event acknowledgement changed")
+
     @app.get("/requests/{request_id}/events")
     async def replay_request_events(
         request_id: str,
@@ -1222,6 +1258,14 @@ def create_app(
                 event_id_parts(resolved_last_id)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if app.state.request_state_store is not None:
+            def _recover_inline() -> None:
+                saved = _store_load(app.state.request_state_store, request_id, tenant_id=tenant.tenant_id) or {}
+                final = ((saved.get("v4") or {}).get("report") or {}).get("final") or {}
+                if final.get("published"):
+                    _flush_inline_report_events(request_id, tenant.tenant_id)
+
+            await asyncio.to_thread(_recover_inline)
         if follow:
             def _exists() -> bool:
                 store = app.state.request_state_store
@@ -1252,7 +1296,7 @@ def create_app(
             "request_id": request_id,
             "tenant_id": tenant.tenant_id,
             "events": [
-                {"id": envelope.event_id, "data": envelope.payload}
+                {"id": envelope.event_id, "data": _public_event_payload(envelope.payload)}
                 for envelope in envelopes
             ],
         }
@@ -1494,6 +1538,8 @@ def create_app(
                 for event in iterator:
                     _enqueue(event)
                     if event.get("type") in TERMINAL_EVENT_TYPES:
+                        if str(event.get("event_key", "")).startswith("report-"):
+                            _flush_inline_report_events(request_id, tenant_id)
                         return
                     if event.get("type") == "tool_approval_required":
                         paused = True
@@ -1615,10 +1661,23 @@ def create_app(
         tracked = await asyncio.to_thread(
             app.state.workflow_runner.status, request_id, tenant_id=tenant.tenant_id,
         )
+        cursor = request.headers.get("last-event-id")
+        if cursor:
+            try:
+                event_id_parts(cursor)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if tracked and tracked.get("workflow_run_id"):
-            return _follow_events(request, request_id, tenant, None, tracked.get("runner_backend"))
+            return _follow_events(request, request_id, tenant, cursor, tracked.get("runner_backend"))
         await asyncio.to_thread(_ensure_request_ownership, request_id, tenant, inline_mutation=True)
         await asyncio.to_thread(_check_tool_approval_before_resume, request_id, tenant)
+        store = app.state.request_state_store
+        saved = await asyncio.to_thread(_store_load, store, request_id, tenant_id=tenant.tenant_id) if store is not None else {}
+        report = ((saved or {}).get("v4") or {}).get("report") or {}
+        if report:
+            await asyncio.to_thread(_flush_inline_report_events, request_id, tenant.tenant_id)
+            if cursor and (report.get("final") or {}).get("published"):
+                return _follow_events(request, request_id, tenant, cursor, "inline")
         lease_id = _acquire_rate_limit(tenant)
         try:
             config = _build_config(

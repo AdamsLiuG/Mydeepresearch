@@ -1,3 +1,4 @@
+import type { ReportClaimBinding, ReportProgress, ReportSectionBinding, ResearchStreamEvent } from "../types/research";
 import type {
   ChartSpecArtifact,
   ClaimVerificationSummary,
@@ -243,6 +244,114 @@ function entriesFor(value: unknown): Record<string, WorkbenchCitationEntry> {
   return entries;
 }
 
+function uniqueBindings<T>(value: unknown, keys: string[]): T[] {
+  if (!Array.isArray(value)) return [];
+  const byKey = new Map<string, T>();
+  for (const item of value) {
+    const fields = record(item);
+    const identity = keys.map((key) => fields[key]);
+    if (identity.some((id) => typeof id !== "string" || !id)) continue;
+    const key = JSON.stringify(identity);
+    if (!byKey.has(key)) byKey.set(key, item);
+  }
+  return [...byKey.values()];
+}
+
+export function createReportStreamState() {
+  let outlineVersion = 0;
+  let reportVersion = 0;
+  let finalized = false;
+  let requestId = "";
+  const keys = new Set<string>();
+  const chunks = new Map<number, string>();
+  const sections = new Map<string, string>();
+  const statuses = new Map<string, "started" | "completed" | "degraded">();
+
+  function reset() {
+    requestId = "";
+    outlineVersion = reportVersion = 0;
+    finalized = false;
+    keys.clear();
+    chunks.clear();
+    sections.clear();
+    statuses.clear();
+  }
+
+  function hydrate(report: ReportProgress | undefined) {
+    if (!report || report.outline_version < outlineVersion) return;
+    outlineVersion = report.outline_version;
+    if (report.report_version && report.report_version >= reportVersion) {
+      reportVersion = report.report_version;
+      finalized = true;
+    }
+    for (const section of report.sections || []) {
+      sections.set(section.section_id, section.title);
+      if (section.status !== "pending") statuses.set(section.section_id, section.status);
+    }
+  }
+
+  function accept(event: ResearchStreamEvent, activeRequestId: string | null) {
+    const version = typeof event.report_version === "number" ? event.report_version : 0;
+    const outline = typeof event.outline_version === "number" ? event.outline_version : 0;
+    const key = event.event_key;
+    if (typeof key !== "string" || !key.startsWith("report-")) return true;
+    if (typeof event.request_id === "string") {
+      if (activeRequestId && event.request_id !== activeRequestId) return false;
+      if (requestId && requestId !== event.request_id) reset();
+      requestId = event.request_id;
+    }
+    if (keys.has(key) || (outline && outline < outlineVersion) || (version && version < reportVersion)) return false;
+    keys.add(key);
+    if (outline > outlineVersion) {
+      outlineVersion = outline;
+      sections.clear();
+      statuses.clear();
+    }
+    if (version > reportVersion) {
+      reportVersion = version;
+      finalized = false;
+      chunks.clear();
+    }
+    if (event.type === "final_report") {
+      if (finalized) return false;
+      hydrate(event.v4?.report);
+      finalized = true;
+    }
+    return !(finalized && (event.type === "report_outline" || event.type === "report_chunk" ||
+      event.type === "report_section_status"));
+  }
+
+  function outline(event: ResearchStreamEvent) {
+    if (!Array.isArray(event.sections) || !Array.isArray(event.section_ids)) return;
+    for (const [index, id] of event.section_ids.entries()) {
+      const title = event.sections[index];
+      if (typeof id === "string" && typeof title === "string") sections.set(id, title);
+    }
+  }
+
+  function sectionStatus(event: ResearchStreamEvent) {
+    const id = event.section_id;
+    const status = event.status;
+    if (typeof id !== "string" || (status !== "started" && status !== "completed" && status !== "degraded")) return;
+    const previous = statuses.get(id);
+    if (previous === status || previous === "completed" || previous === "degraded") return;
+    statuses.set(id, status);
+    return { title: sections.get(id) || id, status };
+  }
+
+  function chunk(event: ResearchStreamEvent) {
+    const index = event.index;
+    if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 1 ||
+      chunks.has(index) || typeof event.content !== "string") return;
+    chunks.set(index, event.content);
+    let markdown = "";
+    for (let next = 1; chunks.has(next); next++) markdown += chunks.get(next);
+    return markdown;
+  }
+
+  return { reset, hydrate, accept, outline, sectionStatus, chunk };
+}
+
 export function normalizeReportWorkbench(payload: Record<string, unknown>): ReportWorkbenchPayload {
   const workbench = record(payload.workbench);
   const charts = payload.charts_spec ?? workbench.charts_spec ?? payload.charts ?? workbench.charts ?? payload.report_charts;
@@ -261,7 +370,16 @@ export function normalizeReportWorkbench(payload: Record<string, unknown>): Repo
     skill_governance: { pack_id: "_neutral", ...record(payload.skill_pack ?? payload.skill_pack_metadata), ...governance },
     verifier_badges: Array.isArray(badges) ? badges.filter((badge): badge is VerifierBadge =>
       typeof record(badge).badge_id === "string" && typeof record(badge).status === "string") : [],
-    charts_spec: Array.isArray(charts) ? charts : []
+    charts_spec: Array.isArray(charts) ? charts : [],
+    ...(Array.isArray(workbench.section_bindings) && {
+      section_bindings: uniqueBindings<ReportSectionBinding>(workbench.section_bindings, ["section_id"])
+    }),
+    ...(Array.isArray(workbench.claim_bindings) && {
+      claim_bindings: uniqueBindings<ReportClaimBinding>(workbench.claim_bindings, ["section_id", "block_id"])
+    }),
+    ...(Array.isArray(workbench.critic_issues) && {
+      critic_issues: uniqueBindings<Record<string, unknown>>(workbench.critic_issues, ["issue_id"])
+    })
   };
 }
 

@@ -727,6 +727,15 @@ _RATE_CONTEXT = re.compile(r"%|率|份额|占比|margin|rate|share|percent|cagr|
 _YEAR_COLUMN = re.compile(r"\b(?:year|date|period|quarter|fy)\b|年度|年份|期间|日期|季度", re.I)
 
 
+
+def report_atomic_sources(record: dict[str, Any], eligible_ids: set[str]) -> tuple[str, ...]:
+    """Expose the source scored for an entailed atomic record."""
+    best = record.get("best_source_id")
+    if record.get("nli_label") == "ENTAILED" and best in eligible_ids and best in (record.get("source_ids") or ()):
+        return (best,)
+    return ()
+
+
 def web_fact_excerpts(record: dict[str, Any]) -> list[str] | None:
     """Return verified web prose and independent table rows for numeric grounding."""
     if record.get("provenance_meta", {}).get("web_extraction", {}).get("tier") not in {"L1", "L2"}:
@@ -1932,6 +1941,36 @@ class ClaimVerificationOrchestrator:
             "summary": summary,
             "conflicts": state.evidence_conflicts,
         }
+
+    def verify_report_excerpt(
+        self, claim_text: str, excerpts: tuple[str, ...], *, deadline: float,
+    ) -> Literal["entailed", "disabled", "unsupported", "timeout"]:
+        """Score preselected excerpts within the report deadline."""
+        if not self._config.nli_verifier_enabled:
+            return "disabled"
+        deadline = min(deadline, time.monotonic() + 2)
+        if time.monotonic() >= deadline:
+            return "timeout"
+        pairs = [(text, claim_text) for text in excerpts[:2] if text]
+        if not pairs:
+            return "unsupported"
+        scores = _within_budget(
+            lambda: self._scorer.score_pairs_batched(pairs, deadline_monotonic=deadline), deadline,
+        )
+        if time.monotonic() >= deadline:
+            return "timeout"
+        if not scores or len(scores) != len(pairs):
+            return "unsupported"
+        entailed = max(
+            (p["entailment"] for (text, _), p in zip(pairs, scores)
+             if numeric_grounding_mismatch(claim_text, [text]) is None),
+            default=0.0,
+        )
+        contradicted = max(p["contradiction"] for p in scores)
+        if (entailed >= self._config.nli_entailment_threshold
+                and not (contradicted >= self._config.nli_contradiction_threshold and contradicted > entailed + 0.10)):
+            return "entailed"
+        return "unsupported"
 
     def as_review_callback(self) -> Callable[[str, list[dict[str, Any]]], tuple[bool, str] | None]:
         """Compatibility adapter matching legacy ReviewService(claim_verifier=...) signature."""

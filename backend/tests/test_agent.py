@@ -1951,6 +1951,45 @@ class AgentExecutionTests(unittest.TestCase):
         self.assertIn("client_disconnected", agent._request_trace.degraded_reasons)
 
 
+    def test_versioned_report_commits_before_chunks_and_reuses_published_result(self):
+        from tempfile import TemporaryDirectory
+
+        from services.reporter import ReportingService
+        from services.request_state import RequestStateStore
+
+        with TemporaryDirectory() as directory:
+            agent = self._build_agent()
+            agent.tenant_id = "default"
+            agent._request_state_store = RequestStateStore(directory)
+            agent.config = agent.config.model_copy(update={"v4_parallel_report_enabled": True})
+            agent.reporting = ReportingService(None, agent.config, evidence_store=agent._evidence_store)
+
+            def execute(state, tasks, channels):
+                for task in tasks:
+                    task.status = "completed"
+                yield from ()
+
+            agent._execute_task_batch_stream = execute
+            events = []
+            for event in agent.run_stream("Versioned report"):
+                events.append(event)
+                if event["type"] in {"report_outline", "report_chunk"}:
+                    saved = agent._request_state_store.load(agent.request_id)
+                    self.assertEqual(bool(saved["report_markdown"]), event["type"] == "report_chunk")
+            final = events[-2]
+            self.assertEqual([event["type"] for event in events[-2:]], ["final_report", "done"])
+            self.assertEqual("".join(e["content"] for e in events if e["type"] == "report_chunk"), final["report"])
+            self.assertEqual(final["v4"]["report"]["report_version"], 1)
+            self.assertIn("section_bindings", final["workbench"])
+            saved = agent._request_state_store.load(agent.request_id)
+            self.assertTrue(saved["v4"]["report_only"])
+            self.assertEqual(saved["v4"]["budget"]["snapshot"]["spent"]["llm_calls"], 0)
+            self.assertNotIn("operations_by_key", final["v4"]["report"])
+            recovered = self._build_agent()
+            recovered.tenant_id = "default"
+            recovered._request_state_store = agent._request_state_store
+            self.assertEqual(recovered.run_resume(recovered.request_id).report_markdown, final["report"])
+
+
 if __name__ == "__main__":
     unittest.main()
-    

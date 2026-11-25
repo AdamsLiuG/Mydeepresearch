@@ -390,22 +390,89 @@ class ApiTests(unittest.TestCase):
 
                 def exercise_tail(*args, is_terminal_fn: Callable[[], bool], **kwargs):
                     self.assertFalse(is_terminal_fn())
-                    saved = store.save(request_id, {
-                        **snapshot, "v4": {"schema_version": 1},
+                    leased = {
+                        **snapshot,
                         "workflow_lease": {"owner": "worker", "expires_at": time() + 60},
-                    }, expected_version=snapshot["state_version"])
+                    }
+                    leased.pop("v4")
+                    saved = store.save(request_id, leased, expected_version=snapshot["state_version"])
                     self.assertFalse(is_terminal_fn())
                     bus.publish("default", request_id, {"type": "budget_updated", "event_key": "budget-finished"})
                     bus.publish("default", request_id, {"type": "final_report", "report": "Ready"})
                     bus.publish("default", request_id, {"type": "done"})
-                    saved.pop("workflow_lease")
+                    saved["workflow_lease"]["expires_at"] = time() - 60
                     store.save(request_id, saved, expected_version=saved["state_version"])
+                    self.assertTrue(is_terminal_fn())
                     yield from tail(*args, is_terminal_fn=is_terminal_fn, **kwargs)
 
                 with patch.object(bus, "tail_since", side_effect=exercise_tail):
                     response = client.get(f"/requests/{request_id}/events?follow=1", headers={"Last-Event-ID": cursor})
                 events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
                 self.assertEqual([event["type"] for event in events], ["budget_updated", "final_report", "done"])
+
+    def test_v4_report_replay_matches_detail_and_keeps_committed_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir, isolated_configuration():
+            config = main.Configuration(request_state_enabled=True, request_state_dir=temp_dir)
+            with TestClient(main.create_app(base_config=config)) as client:
+                store = client.app.state.request_state_store
+                bus = client.app.state.event_bus
+                request_id = "versioned-report"
+                endpoint = f"/requests/{request_id}"
+                section = {"section_id": "s1", "title": "Findings", "order": 1}
+                report = {
+                    "outline": {"outline_version": 1, "sections": [section]},
+                    "sections_by_id": {"s1": {"status": "completed", "claim_ids": ["C-001"], "draft": "private"}},
+                    "critique": {"status": "ok", "diagnostics": "private"},
+                    "degradation_reason": "private",
+                    "final": {"report_version": 1, "markdown": "private"},
+                }
+                draft = store.save(request_id, {
+                    "status": "in_progress", "v4": {"schema_version": 1, "report": report},
+                })
+                public_report = {
+                    "outline_version": 1,
+                    "critic_status": "ok",
+                    "sections": [{**section, "status": "completed"}],
+                }
+                self.assertEqual(client.get(endpoint).json()["v4"]["report"], public_report)
+
+                markdown = "# Report\n\n## Findings\n\nCommitted text.\n"
+                workbench = {
+                    "section_bindings": [{"section_id": "s1", "title": "Findings", "paragraph_index": 0}],
+                    "claim_bindings": [],
+                }
+                budget = {"type": "budget_updated", "event_key": "versioned-report:budget:completed", "schema_version": 1}
+                frames = [
+                    {"type": kind, "event_key": key, "schema_version": 1, **fields}
+                    for kind, key, fields in (
+                        ("report_chunk", "report-v1-chunk-1", {"index": 1, "report_version": 1}),
+                        ("report_chunk", "report-v1-chunk-2", {"index": 2, "report_version": 1}),
+                        ("final_report", "report-v1-final", {"report_version": 1}),
+                        ("done", "report-v1-done", {}),
+                    )
+                ]
+                store.save(request_id, {
+                    **draft, "status": "success", "report_markdown": markdown, "workbench": workbench,
+                    "v4": {
+                        "schema_version": 1,
+                        "report": {**report, "final": {"report_version": 1, "published": True}},
+                        "pending_events": [budget, *frames],
+                    },
+                }, expected_version=draft["state_version"])
+                cursor = bus.publish("default", request_id, budget)
+                response = client.get(endpoint + "/events?follow=1", headers={"Last-Event-ID": cursor})
+                self.assertEqual(response.status_code, 200)
+                events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                self.assertEqual([event["type"] for event in events], ["report_chunk", "report_chunk", "final_report", "done"])
+                self.assertEqual("".join(event["content"] for event in events[:2]), events[-2]["report"])
+                self.assertEqual(events[-2]["report"], markdown)
+                self.assertEqual(events[-2]["workbench"], workbench)
+                self.assertEqual(events[-2]["v4"], client.get(endpoint).json()["v4"])
+                self.assertEqual(events[-2]["v4"]["report"], {
+                    **public_report, "report_version": 1,
+                    "sections": [{**public_report["sections"][0], "claim_ids": ["C-001"]}],
+                })
+                self.assertEqual(store.load(request_id)["v4"]["pending_events"], [])
 
     def test_dev_reload_only_watches_backend_src(self):
         with isolated_configuration():

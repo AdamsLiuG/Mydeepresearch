@@ -740,3 +740,113 @@ class ReportingServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HierarchicalReportTests(unittest.TestCase):
+    @staticmethod
+    def fixture(*, count=3, web=False):
+        store = EvidenceStore(web_extraction_enabled=web)
+        tasks = []
+        entries = []
+        for index in range(1, count + 1):
+            statement = f"Independent observation {index} was recorded in the study."
+            evidence = store.record_search_results(
+                task_id=index, query="fixture", backend="fixture",
+                search_payload={"results": [{"url": f"https://example.org/{index}", "content": statement}]},
+            )
+            source_ids = [item["source_id"] for item in evidence]
+            tasks.append(TodoItem(
+                id=index, title="Observations", intent="Scope", query="fixture", status="completed",
+                review_status="passed", evidence_items=evidence,
+                claims=[{"text": statement, "source_ids": source_ids, "support_status": "supported"}],
+            ))
+            entries.append({
+                "claim_id": f"C-{index}", "task_id": index, "statement": statement, "source_ids": source_ids,
+            })
+        state = SummaryState(
+            research_topic="Fixture", todo_items=tasks, fact_ledger={"version": 2, "entries": entries},
+            v4={"replan": {
+                "required_coverage": {f"scope-{i}": f"Scope {i}" for i in range(1, count + 1)},
+                "coverage_by_task": {str(i): [f"scope-{i}"] for i in range(1, count + 1)},
+            }},
+        )
+        return state, store
+
+    def test_outline_excludes_l0_from_facts_but_retains_discovery_cards(self):
+        state, store = self.fixture(count=1, web=True)
+        reporter = ReportingService(
+            DummyAgent(""), Configuration(v4_parallel_report_enabled=True), evidence_store=store,
+        )
+        report = reporter.generate_report(state)
+        self.assertNotIn("Independent observation", report)
+        self.assertNotIn("[T1-S1]", report)
+        self.assertIn("Scope 1", report)
+        self.assertIn("T1-S1", reporter.build_workbench_payload(state, report)["citation_index"])
+
+    def test_workers_share_prefix_and_reject_cross_section_references(self):
+        import json
+        from threading import Barrier
+
+        from models import ReportModelResponse
+
+        barrier = Barrier(3, timeout=2)
+        prefixes = []
+
+        def transport(request):
+            payload = json.loads(request.data_json)
+            claim = payload["claims"][0]
+            prefixes.append(request.prefix_fingerprint)
+            barrier.wait()
+            response = {"section_id": payload["section_id"], "blocks": [{
+                "kind": "fact", "claim_id": claim["claim_id"], "text": claim["text"],
+                "evidence_refs": [{"source_id": "T2-S1", "anchor_id": None}],
+            }]}
+            return ReportModelResponse(json.dumps(response), "stop")
+
+        state, store = self.fixture()
+        reporter = ReportingService(
+            DummyAgent(""), Configuration(v4_hierarchical_report_enabled=True),
+            evidence_store=store, report_transport=transport,
+        )
+        report = reporter.generate_report(state)
+        self.assertEqual(len(prefixes), 3)
+        self.assertEqual(len(set(prefixes)), 1)
+        self.assertLess(report.index("[T1-S1]"), report.index("[T2-S1]"))
+        workbench = reporter.build_workbench_payload(state, report)
+        body = [section for section in workbench["report_sections"] if section["kind"] == "body"]
+        self.assertEqual(len({section["section_id"] for section in body}), 3)
+        facts = [item for item in workbench["report_blocks"] if item["section_id"] == body[0]["section_id"]]
+        self.assertTrue(any(item["source_ids"] == ["T1-S1"] for item in facts))
+
+    def test_review_citation_status_cannot_authorize_a_different_proposition(self):
+        state, store = self.fixture(count=1)
+        unsupported = "The study independently replicated the result."
+        state.todo_items[0].claims[0]["text"] = unsupported
+        state.fact_ledger["entries"][0]["statement"] = unsupported
+        reporter = ReportingService(
+            DummyAgent(""), Configuration(v4_parallel_report_enabled=True), evidence_store=store,
+        )
+        report = reporter.generate_report(state)
+        self.assertNotIn(unsupported, report)
+        self.assertNotIn("[T1-S1]", report)
+        self.assertIn("Scope 1", report)
+
+    def test_merged_sections_preserve_individual_required_coverage_and_section_bound(self):
+        state, store = self.fixture(count=9)
+        state.todo_items[1].claims.clear()
+        reporter = ReportingService(
+            DummyAgent(""), Configuration(v4_parallel_report_enabled=True), evidence_store=store,
+        )
+        report = reporter.generate_report(state)
+        self.assertIn("Scope 2：现有证据不足", report)
+        self.assertLessEqual(len(state.report_workbench["report_sections"]), 8)
+
+    def test_module_workbench_uses_the_final_markdown_binding(self):
+        from services.reporter import build_report_workbench_payload
+
+        state, store = self.fixture(count=1)
+        config = Configuration(v4_parallel_report_enabled=True)
+        reporter = ReportingService(DummyAgent(""), config, evidence_store=store)
+        report = reporter.generate_report(state)
+        self.assertIn("report_blocks", build_report_workbench_payload(state, report, evidence_store=store, config=config))
+        self.assertNotIn("report_blocks", build_report_workbench_payload(state, report + " changed", evidence_store=store, config=config))

@@ -11,6 +11,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from hashlib import sha256
 from pathlib import Path
 from threading import Event, Lock, RLock, Semaphore, Thread, local
 from time import monotonic
@@ -32,7 +33,7 @@ from metrics import (
     normalize_reported_usage,
     reported_usage_fields,
 )
-from models import SummaryState, SummaryStateOutput, TodoItem
+from models import ReportModelResponse, SummaryState, SummaryStateOutput, TodoItem
 from prompts import (
     report_writer_instructions,
     request_reflection_system_prompt,
@@ -113,9 +114,13 @@ from services.web_extractor import ExtractionContext
 from services.web_fetch_gateway import FetchScope
 from state_manager import (
     BudgetDispatchDenied,
+    ReportCancelled,
     RequestBudgetController,
     StateManagerMixin,
+    materialize_report_event,
+    public_report_workbench,
     public_v4_projection,
+    report_chunks,
 )
 from stream_coordinator import StreamCoordinatorMixin
 from task_executor import TaskExecutorMixin
@@ -1298,6 +1303,7 @@ class DeepResearchAgent(
             or has_incomplete_tasks
             or review_blocked
             or (state.v4 or {}).get("degradation_reason")
+            or ((state.v4 or {}).get("report") or {}).get("degradation_reason")
             or getattr(getattr(self, "_research_budget", None), "blocked", False)
         ):
             return "partial_success"
@@ -2455,6 +2461,109 @@ class DeepResearchAgent(
             gaps = ["目前没有足够的可核验证据。"]
         return rendered + ("\n\n## 未完成的研究项\n" + "\n".join(f"- {gap}" for gap in dict.fromkeys(gaps)) if gaps else "")
 
+    def _report_transport(self):
+        """Capture provider identity and build a separate, retry-free client per call."""
+        llm = getattr(self, "llm", None)
+        if not isinstance(getattr(llm, "_client", None), OpenAI):
+            return None, None, None
+        api_key, base_url, model = llm.api_key, llm.base_url, llm.model
+        price = llm._budget_pricing(model)
+        trust_env = not llm._should_bypass_env_proxy(base_url)
+
+        def send(request):
+            if request.model != model:
+                raise ValueError("Report model identity changed")
+            with OpenAI(
+                api_key=api_key, base_url=base_url, max_retries=0,
+                http_client=httpx.Client(follow_redirects=False, trust_env=trust_env),
+            ) as client:
+                output_limit = "max_completion_tokens" if request.provider_mode == "openai" else "max_tokens"
+                response = client.chat.completions.create(
+                    model=model, messages=request.messages, timeout=request.timeout, temperature=0,
+                    **{output_limit: request.max_tokens}, **request.options,
+                )
+            choice = response.choices[0] if len(response.choices) == 1 else None
+            return ReportModelResponse(
+                choice.message.content or "" if choice else "",
+                choice.finish_reason if choice else "invalid",
+                tuple(reported_usage_fields(response.usage).items()),
+            )
+
+        return send, lambda request: price if request.model == model else None, (
+            lambda response: SafeHelloAgentsLLM._budget_reported_usage(dict(response.usage), price)
+            if price is not None else None
+        )
+
+    def _run_versioned_report(self, state, budget, observer, step, emit_stream):
+        report_state = state.v4["report"]
+        cp = self._init_report_checkpoint(state, budget, step=step, emit_stream=emit_stream)
+        final = report_state.get("final") or {}
+        report = final.get("markdown")
+        if final.get("published"):
+            report = state.structured_report
+        if isinstance(report, str) and sha256(report.encode()).hexdigest() == final.get("markdown_digest"):
+            state.report_workbench = final.get("workbench") or state.report_workbench
+            state.report_charts = list((state.report_workbench or {}).get("charts_spec") or [])
+            return report, cp
+        if final:
+            raise SnapshotConflictError("Saved report failed integrity validation")
+
+        if not report_state.get("input_digest"):
+            self._refresh_context_checkpoints(state)
+            self._persist_request_state(state, phase="report", status="in_progress")
+        selection = getattr(self, "_skill_selection", None)
+        fmt = getattr(selection, "format_pack", None) if selection is not None and not selection.shadow else None
+        transport, pricing, usage = self._report_transport()
+        report = yield from self.reporting.coordinate_report(
+            state, observer, self._skill_stage_context("report"), getattr(fmt, "outline_sections", None),
+            cp, transport, pricing, usage,
+        )
+        workbench = public_report_workbench(state.report_workbench)
+        cp.commit({"final": {"report_version": 1, "markdown": report, "workbench": workbench,
+                             "markdown_digest": sha256(report.encode()).hexdigest()}})
+        state.report_workbench = workbench
+        return report, cp
+
+    def _finish_versioned_report(self, state, report, cp, report_completed_event):
+        final = cp.data["final"]
+        state.evidence_conflicts = state.report_workbench["evidence_conflicts"]
+        if final.get("published"):
+            return []
+        descriptors = [
+            cp.event("report_chunk", f"final-1-chunk-{index}", index=index, report_version=1)
+            for index, _ in enumerate(report_chunks(report), 1)
+        ]
+        if report_completed_event:
+            descriptors.append({
+                **report_completed_event, "event_key": "report-final-1-stage-completed", "step": cp.step,
+            })
+        descriptors.extend(
+            cp.event("report_chart", f"final-1-chart-{index}", chart_index=index, report_version=1)
+            for index, _ in enumerate(state.report_charts)
+        )
+        note = cp.data.get("note") or {}
+        if not note and self.note_tool:
+            cp.commit({"note": {"status": "creating"}})
+            try:
+                note_event = self._persist_final_report(state, report)
+            except Exception:
+                logger.warning("Could not confirm research report note write", extra={"request_id": self.request_id})
+                note_event = None
+            note = {"status": "complete", "note_id": state.report_note_id, "note_path": state.report_note_path}
+            if note_event:
+                note["title"] = note_event["title"]
+            cp.commit({"note": note})
+        state.report_note_id = note.get("note_id")
+        state.report_note_path = note.get("note_path")
+        if note.get("title"):
+            descriptors.append(cp.event("report_note", "final-1-note", title=note["title"]))
+        # Shared budget and report statistics are projected after the terminal CAS.
+        if cp.controller and not cp.controller.blocked and self._research_budget is None:
+            state.v4["budget"] = cp.controller.payload()
+        cp.data["final"] = {key: value for key, value in final.items() if key not in {"markdown", "workbench"}}
+        cp.data["final"]["published"] = True
+        return descriptors
+
     def _execute_workflow(
         self,
         topic: str,
@@ -2474,9 +2583,13 @@ class DeepResearchAgent(
             state.pending_tool_approval = None
         report = state.structured_report or ""
         request_completed = False
+        report_checkpoint = None
+        versioned_report = False
+        report_completed_event = None
         try:
             budget = self._init_request_budget(state, resumed=resumed)
             self._configure_web_extraction(state)
+            versioned_report = isinstance((state.v4 or {}).get("report"), dict)
             if budget is not None and resume_phase != "completed":
                 report = ""
             if budget is not None and not resumed:
@@ -2484,7 +2597,7 @@ class DeepResearchAgent(
                     state, phase="planning", v4_expected=self._graph_expectation(budget.replan) if not budget.blocked else None,
                     v4_events=[self._budget_event(budget, "initialized")] if not budget.blocked else None,
                 )
-            elif not resumed and (state.v4 or {}).get("web_extraction"):
+            elif not resumed and (versioned_report or (state.v4 or {}).get("web_extraction")):
                 self._persist_request_state(state, phase="planning")
             self._select_skill_pack(state.research_topic or topic, observer, state=state)
             if emit_stream:
@@ -2500,16 +2613,17 @@ class DeepResearchAgent(
                 return
             if resumed and resume_phase:
                 self._restore_task_counters(observer, state)
-                self._refresh_context_checkpoints(state)
-                if budget is None or resume_phase != "awaiting_approval":
-                    self._persist_request_state(state, phase=resume_phase, status="in_progress")
+                if not (versioned_report and resume_phase in {"report", "completed"}):
+                    self._refresh_context_checkpoints(state)
+                    if budget is None or resume_phase != "awaiting_approval":
+                        self._persist_request_state(state, phase=resume_phase, status="in_progress")
                 if emit_stream:
                     yield {
                         "type": "status",
                         "message": f"已从持久化快照恢复请求：{self.request_id}",
                     }
 
-            needs_plan = not resumed or not state.todo_items
+            needs_plan = (not resumed or not state.todo_items) and not (versioned_report and resume_phase in {"report", "completed"})
             if budget is not None:
                 needs_plan = needs_plan and not budget.blocked and not budget.replan["slots_allocated"] and resume_phase != "awaiting_approval"
             if needs_plan:
@@ -2562,7 +2676,7 @@ class DeepResearchAgent(
                 for event in self._drain_tool_events(state, step=0):
                     yield event
 
-            if not state.todo_items and (budget is None or (
+            if not state.todo_items and not (versioned_report and resume_phase in {"report", "completed"}) and (budget is None or (
                 needs_plan and budget.can_dispatch({"tasks": 1, "search_calls": 1})
             )):
                 logger.info("No TODO items generated; falling back to single task")
@@ -2992,7 +3106,14 @@ class DeepResearchAgent(
                 request_completed = True
                 self._persist_request_state(state, phase="cancelled", status="cancelled", report_markdown=report)
                 return
-            if not report:
+            if versioned_report and report and resume_phase == "completed":
+                if emit_stream:
+                    saved = self._load_resume_snapshot(self.request_id)
+                    for descriptor in ((saved.get("v4") or {}).get("report") or {}).get("final", {}).get("frames", []):
+                        yield materialize_report_event(saved, descriptor)
+                observer.complete_request(status=self._request_status(state, report))
+                return
+            if not report or versioned_report:
                 if budget is not None:
                     budget.stage = "report"
                 report_span = observer.start_stage(
@@ -3005,47 +3126,56 @@ class DeepResearchAgent(
                     report_started["step"] = final_step
                     yield report_started
                 try:
-                    if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
-                        budget.refuse("limit_exceeded")
-                    if emit_stream and hasattr(self.reporting, "stream_generate_report"):
-                        stream_kwargs: dict[str, Any] = {
-                            "observer": observer,
-                            "skill_pack_context": self._skill_stage_context("report"),
-                        }
-                        selection = getattr(self, "_skill_selection", None)
-                        fmt_pack = getattr(selection, "format_pack", None) if selection is not None and not selection.shadow else None
-                        fmt_outline = getattr(fmt_pack, "outline_sections", None) if fmt_pack is not None else None
-                        if fmt_outline and self._callable_accepts_kwarg(
-                            self.reporting.stream_generate_report,
-                            "outline_sections",
-                        ):
-                            stream_kwargs["outline_sections"] = list(fmt_outline)
-                        for report_event in self.reporting.stream_generate_report(
-                            state,
-                            **stream_kwargs,
-                        ):
-                            if self._is_cancelled():
-                                break
-                            report_event.setdefault("step", final_step)
-                            yield report_event
-                        report = state.structured_report or ""
-                    else:
-                        report = self.reporting.generate_report(
-                            state,
-                            observer=observer,
-                            skill_pack_context=self._skill_stage_context("report"),
+                    if versioned_report:
+                        report, report_checkpoint = yield from self._run_versioned_report(
+                            state, budget, observer, final_step, emit_stream,
                         )
-                    if budget is not None and (not report.strip() or report == "报告生成失败，请检查输入。"):
-                        budget.refuse("dispatch_unbounded")
+                    else:
+                        if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
+                            budget.refuse("limit_exceeded")
+                        if emit_stream and hasattr(self.reporting, "stream_generate_report"):
+                            stream_kwargs: dict[str, Any] = {
+                                "observer": observer,
+                                "skill_pack_context": self._skill_stage_context("report"),
+                            }
+                            selection = getattr(self, "_skill_selection", None)
+                            fmt_pack = getattr(selection, "format_pack", None) if selection is not None and not selection.shadow else None
+                            fmt_outline = getattr(fmt_pack, "outline_sections", None) if fmt_pack is not None else None
+                            if fmt_outline and self._callable_accepts_kwarg(
+                                self.reporting.stream_generate_report,
+                                "outline_sections",
+                            ):
+                                stream_kwargs["outline_sections"] = list(fmt_outline)
+                            for report_event in self.reporting.stream_generate_report(
+                                state,
+                                **stream_kwargs,
+                            ):
+                                if self._is_cancelled():
+                                    break
+                                report_event.setdefault("step", final_step)
+                                yield report_event
+                            report = state.structured_report or ""
+                        else:
+                            report = self.reporting.generate_report(
+                                state,
+                                observer=observer,
+                                skill_pack_context=self._skill_stage_context("report"),
+                            )
+                        if budget is not None and (not report.strip() or report == "报告生成失败，请检查输入。"):
+                            budget.refuse("dispatch_unbounded")
                     completed_event = report_span.complete(
                         status="success",
                         metadata={"report_length": len(report or "")},
                     )
-                    if emit_stream:
+                    if versioned_report:
+                        report_completed_event = completed_event
+                    elif emit_stream:
                         completed_event["step"] = final_step
                         yield completed_event
+                except (ReportCancelled, SnapshotConflictError):
+                    raise
                 except Exception as exc:
-                    fallback = budget is not None and (
+                    fallback = not versioned_report and budget is not None and (
                         isinstance(exc, (BudgetDispatchDenied, TimeoutError, httpx.TimeoutException))
                         or type(exc).__name__ == "APITimeoutError"
                     )
@@ -3080,29 +3210,39 @@ class DeepResearchAgent(
             else:
                 self._drain_tool_events(state)
 
-            state.structured_report = report
-            state.running_summary = report
-            workbench = build_report_workbench_payload(
-                state, report, evidence_store=self._evidence_store, config=self.config,
-            )
-            state.report_charts = workbench["charts_spec"]
-            state.evidence_conflicts = workbench["evidence_conflicts"]
-            if (
-                workbench["citation_index"]
-                or workbench["evidence_conflicts"]
-                or workbench["claim_verification_summary"]
-                or workbench["verifier_badges"]
-                or workbench["skill_governance"]["pack_id"] != "_neutral"
-            ):
-                state.report_workbench = workbench
+            if report_checkpoint is not None:
+                report_frames = self._finish_versioned_report(state, report, report_checkpoint, report_completed_event)
+                workbench = state.report_workbench
+                if self._is_cancelled():
+                    raise ReportCancelled()
+            else:
+                state.structured_report = report
+                state.running_summary = report
+                workbench = build_report_workbench_payload(
+                    state, report, evidence_store=self._evidence_store, config=self.config,
+                )
+                state.report_charts = workbench["charts_spec"]
+                state.evidence_conflicts = workbench["evidence_conflicts"]
+                if (
+                    workbench["citation_index"]
+                    or workbench["evidence_conflicts"]
+                    or workbench["claim_verification_summary"]
+                    or workbench["verifier_badges"]
+                    or workbench["skill_governance"]["pack_id"] != "_neutral"
+                ):
+                    state.report_workbench = workbench
 
-            note_event = self._persist_final_report(state, report)
-            if emit_stream and note_event:
-                yield note_event
+                note_event = self._persist_final_report(state, report)
+                if emit_stream and note_event:
+                    yield note_event
 
             request_status = self._request_status(state, report)
             if emit_stream and request_status == "partial_success":
-                yield observer.record_degraded("partial_result_completed")
+                degraded = observer.record_degraded("partial_result_completed")
+                if report_checkpoint is not None:
+                    report_frames.append({**degraded, "event_key": "report-final-1-degraded"})
+                else:
+                    yield degraded
 
             observer.attach_result(
                 report_markdown=report,
@@ -3116,6 +3256,23 @@ class DeepResearchAgent(
             terminal_kwargs = {}
             if budget is not None and not budget.blocked:
                 terminal_kwargs["v4_events"] = [self._budget_event(budget, "completed")]
+            if report_checkpoint is not None:
+                cp = report_checkpoint
+                report_frames.extend(terminal_kwargs.get("v4_events", ()))
+                report_frames.extend((
+                    cp.event("metrics_snapshot", "final-1-metrics"),
+                    cp.event("final_report", "final-1", report_version=1),
+                    cp.event("done", "final-1-done"),
+                ))
+                state_version = state.state_version + 1
+                report_frames = [{**event, "schema_version": 1, "request_id": self.request_id,
+                                  "state_version": state_version} for event in report_frames]
+                cp.data["final"]["frames"] = [event for event in report_frames if event["event_key"].startswith("report-")]
+                cp.data["revision_number"] += 1
+                terminal_kwargs = {
+                    "v4_expected": {"expected_report_revision": cp.data["revision_number"] - 1},
+                    "v4_events": report_frames if emit_stream else [],
+                }
             terminal_events = self._persist_request_state(
                 state,
                 phase="completed",
@@ -3123,10 +3280,21 @@ class DeepResearchAgent(
                 report_markdown=report,
                 **terminal_kwargs,
             )
+            if report_checkpoint is not None:
+                state.structured_report = report
+                state.running_summary = report
             if budget is None:
                 self._refresh_strategy_memory_for_request(self.request_id, observer=observer)
 
-            if emit_stream:
+            if emit_stream and report_checkpoint is not None:
+                saved = self._load_resume_snapshot(self.request_id) if self._request_state_store is not None else {
+                    "report_markdown": report, "workbench": workbench, "report_note_id": state.report_note_id,
+                    "report_note_path": state.report_note_path, "v4": state.v4, "request_metrics": observer.snapshot(),
+                    "claim_verification_summary": state.claim_verification_summary, "evidence_conflicts": state.evidence_conflicts,
+                }
+                for event in terminal_events:
+                    yield materialize_report_event(saved, event)
+            elif emit_stream:
                 yield from terminal_events or ()
                 yield observer.metrics_event()
                 yield {
@@ -3147,6 +3315,10 @@ class DeepResearchAgent(
                     } if state.report_workbench else {}),
                 }
                 yield {"type": "done"}
+        except ReportCancelled:
+            observer.complete_request(status="cancelled")
+            self._persist_request_state(state, phase="cancelled", status="cancelled")
+            return
         except MCPHitlApprovalRequired as hitl_exc:
             pending_payload = hitl_exc.to_dict()
             pending_payload.update(request_id=self.request_id, tenant_id=self.tenant_id)
@@ -3178,7 +3350,7 @@ class DeepResearchAgent(
                 state,
                 phase="failed",
                 status="failed",
-                report_markdown=report,
+                report_markdown=report if not versioned_report else None,
             )
             if getattr(self, "_research_budget", None) is None:
                 self._refresh_strategy_memory_for_request(self.request_id, observer=observer)
@@ -3263,7 +3435,7 @@ class DeepResearchAgent(
                     state, phase="planning", v4_expected=self._graph_expectation(budget.replan),
                     v4_events=[self._budget_event(budget, "initialized")],
                 )
-            elif (state.v4 or {}).get("web_extraction"):
+            elif (state.v4 or {}).get("web_extraction") or (state.v4 or {}).get("report"):
                 self._persist_request_state(state, phase="planning")
             self._select_skill_pack(topic, observer, state=state)
             planning_span = observer.start_stage("planning", scope="request", metadata={"topic": topic})

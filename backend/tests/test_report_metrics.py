@@ -175,3 +175,14 @@ class ReportMetricsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_report_breakdown_keeps_cache_missing_out_of_hit_ratio():
+    from metrics import RequestTrace
+
+    trace = RequestTrace(request_id="r", topic="t", search_api="stub", provider="p", model="m", pricing_catalog={})
+    trace.record_report_operation("a", kind="map", outcome="ok", usage={"prompt_tokens": 20, "cached_prompt_tokens": 5})
+    trace.record_report_operation("b", kind="map", outcome="ok")
+    result = trace.snapshot()["report_breakdown"]
+    assert result["report_map_cache_hit_ratio"] == 0.25
+    assert result["report_map_usage_missing_total"] == 1

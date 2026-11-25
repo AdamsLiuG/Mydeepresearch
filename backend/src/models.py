@@ -297,6 +297,7 @@ class SummaryState:
     approved_tool_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
     report_charts: list[dict[str, Any]] = field(default_factory=list)
     report_workbench: dict[str, Any] = field(default_factory=dict)
+    report_workbench_fingerprint: str | None = None
     evidence_conflicts: list[dict[str, Any]] = field(default_factory=list)
     claim_verification_summary: dict[str, Any] = field(default_factory=dict)
     state_version: int = field(default=0)
@@ -323,3 +324,152 @@ class SummaryStateOutput:
     workflow_run_id: str | None = field(default=None)
     todo_items: List[TodoItem] = field(default_factory=list)
     v4: dict[str, Any] | None = field(default=None)
+
+
+@dataclass(frozen=True)
+class ReportEvidenceRef:
+    source_id: str
+    anchor_id: str | None
+    artifact_version: str | None
+    excerpt_fingerprint: str
+
+
+@dataclass(frozen=True)
+class ReportExcerpt:
+    ref: ReportEvidenceRef
+    text: str
+
+
+@dataclass(frozen=True)
+class ReportScope:
+    entity: str = "unknown"
+    metric: str = "unknown"
+    period_start: str = "unknown"
+    period_end: str = "unknown"
+    period_basis: str = "unknown"
+    unit: str = "unknown"
+    currency: str = "unknown"
+    denominator: str = "unknown"
+    population: str = "unknown"
+    methodology: str = "unknown"
+
+
+@dataclass(frozen=True)
+class ReportClaim:
+    claim_id: str
+    text: str
+    support_refs: tuple[ReportEvidenceRef, ...]
+    task_ids: tuple[int, ...]
+    scope: ReportScope = field(default_factory=ReportScope)
+    atomic_claim_id: str | None = None
+    value: str = ""
+    observed_period: str = ""
+
+
+@dataclass(frozen=True)
+class ReportConflict:
+    conflict_id: str
+    claim_ids: tuple[str, ...]
+    sides: tuple[ReportClaim, ...]
+    status: str
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReportSectionPlan:
+    section_id: str
+    order: int
+    title: str
+    scope: str
+    coverage_keys: tuple[str, ...]
+    claim_ids: tuple[str, ...]
+    allowed_source_ids: tuple[str, ...]
+    conflict_ids: tuple[str, ...]
+    kind: Literal["body", "summary", "conclusion", "conflicts", "references"]
+    slot_key: str = ""
+
+
+@dataclass(frozen=True)
+class ReportOutline:
+    outline_version: int
+    ledger_version: int
+    frozen_prefix_version: int
+    sections: tuple[ReportSectionPlan, ...]
+
+
+@dataclass(frozen=True)
+class ReportBlock:
+    block_id: str
+    kind: Literal["fact", "conflict", "gap", "transition"]
+    text: str
+    claim_id: str | None = None
+    evidence_refs: tuple[ReportEvidenceRef, ...] = ()
+    conflict_id: str | None = None
+    gap_code: str | None = None
+    coverage_key: str | None = None
+
+
+@dataclass(frozen=True)
+class SectionDraft:
+    section_id: str
+    markdown: str
+    claim_ids: tuple[str, ...]
+    source_ids: tuple[str, ...]
+    gap_codes: tuple[str, ...]
+    blocks: tuple[ReportBlock, ...]
+
+
+@dataclass(frozen=True)
+class ReportEvidencePack:
+    section: ReportSectionPlan
+    claims: tuple[ReportClaim, ...]
+    excerpts: tuple[ReportExcerpt, ...]
+    conflicts: tuple[ReportConflict, ...]
+    required_coverage: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class ReportInput:
+    outline: ReportOutline
+    packs: tuple[ReportEvidencePack, ...]
+    excerpts: tuple[ReportExcerpt, ...]
+    conflicts: tuple[ReportConflict, ...]
+    required_coverage: tuple[tuple[str, str], ...]
+    eligible_source_ids: frozenset[str]
+    omitted_claim_ids: tuple[str, ...] = ()
+    coverage_by_claim: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+
+@dataclass(frozen=True)
+class ReportModelResponse:
+    text: str
+    finish_reason: str
+    usage: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class CriticIssue:
+    section_id: str
+    claim_id: str | None
+    kind: Literal["counter_evidence_gap", "survivorship_bias", "temporal_skew", "causal_overreach"]
+    severity: Literal["medium", "high"]
+    source_ids: tuple[str, ...]
+    proposed_action: Literal["qualify", "surface_conflict", "mark_gap", "reverify"]
+    rationale: str
+    conflict_id: str | None = None
+    reason_code: str = ""
+    issue_id: str = ""
+
+
+@dataclass(frozen=True)
+class ReportRevisionPlan:
+    draft_digest: str
+    issues: tuple[CriticIssue, ...]
+    round_number: int = 1
+
+
+@dataclass(frozen=True)
+class ReportCriticResult:
+    status: Literal["ok", "skipped", "timeout", "invalid"]
+    issues: tuple[CriticIssue, ...] = ()
+    reason: str = "ok"

@@ -8,17 +8,22 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 from inspect import Parameter, signature
 from json import dumps
+from re import split
 from threading import RLock
 from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 from metrics import WEB_EXTRACTION_REASONS, RequestTrace, metrics_registry
 from models import BudgetDenial, RequestBudget, SummaryState, TodoItem
-from services.budget import BudgetGovernor, build_request_budget_for_config
+from services.budget import (
+    BudgetGovernor,
+    build_request_budget,
+    build_request_budget_for_config,
+)
 from services.dag_scheduler import normalize_depends_on
 from services.evidence import EvidenceStore, format_evidence_sources
 from services.mcp_bridge import tool_approval_expired
-from services.request_state import SnapshotConflictError
+from services.request_state import SnapshotConflictError, queue_snapshot_events
 from services.web_extractor import (
     POLICY_VERSION,
     QUALITY_VERSION,
@@ -102,6 +107,59 @@ def replace_unfinished_task_evidence(snapshot: dict[str, Any], task_id: int, rec
     return False
 
 
+def freeze_report(config: Any, tenant_id: str, request_id: str) -> dict[str, Any] | None:
+    if not (getattr(config, "parallel_report_enabled", False) or getattr(config, "red_team_enabled", False)):
+        return None
+    quick = build_request_budget_for_config(config, tenant_id, depth="quick")
+    return {
+        "schema_version": 1, "tenant_id": tenant_id, "request_id": request_id,
+        "frozen_options": {**config.report_config_projection(), "report_layout_mode": config.resolved_report_layout_mode()},
+        "budget_policy": {"limits": quick.limits, "reserve": quick.finalization_reserve,
+                          "reserve_ms": quick.finalization_reserve_ms},
+        "operations_by_key": {}, "sections_by_id": {},
+    }
+
+
+_REPORT_REASONS = frozenset({
+    "budget_denied", "deadline", "timeout", "invalid_output", "missing_scope", "outcome_unknown",
+    "input_limit", "no_model", "no_candidates", "provider_error", "input_changed", "disabled",
+})
+
+
+def public_report_projection(report: Any) -> dict[str, Any] | None:
+    outline = report.get("outline") if isinstance(report, dict) else None
+    if not isinstance(outline, dict) or type(outline.get("outline_version")) is not int:
+        return None
+    final = report.get("final") or {}
+    published = final.get("published") is True
+    finished_sections = report.get("sections_by_id") or {}
+    sections = []
+    for item in (outline.get("sections") or [])[:10]:
+        if not isinstance(item, dict):
+            continue
+        sid, title, order = item.get("section_id"), item.get("title"), item.get("order")
+        if not isinstance(sid, str) or not isinstance(title, str) or type(order) is not int:
+            continue
+        row = finished_sections.get(sid) or {}
+        status = row.get("status")
+        section = {"section_id": sid[:80], "title": title[:120], "order": order,
+                   "status": status if status in ("pending", "started", "completed", "degraded") else "pending"}
+        if published:
+            section["claim_ids"] = [claim[:80] for claim in (row.get("claim_ids") or [])[:64] if isinstance(claim, str)]
+        sections.append(section)
+    critic = (report.get("critique") or {}).get("status")
+    result = {
+        "outline_version": outline["outline_version"], "sections": sections,
+        "critic_status": critic if critic in ("ok", "timeout", "invalid", "skipped") else "skipped",
+    }
+    if published and type(final.get("report_version")) is int:
+        result["report_version"] = final["report_version"]
+    reason = report.get("degradation_reason")
+    if isinstance(reason, str) and reason in _REPORT_REASONS:
+        result["degradation_reason"] = reason
+    return result
+
+
 def public_v4_projection(v4: Any) -> dict[str, Any] | None:
     if not isinstance(v4, dict) or v4.get("schema_version") != 1:
         return None
@@ -124,7 +182,7 @@ def public_v4_projection(v4: Any) -> dict[str, Any] | None:
                 ) if key in limit
             }
     replan = v4.get("replan")
-    if isinstance(replan, dict) and not v4.get("web_downstream_only"):
+    if isinstance(replan, dict) and not (v4.get("web_downstream_only") or v4.get("report_only")):
         result["replan"] = {
             key: deepcopy(replan[key]) for key in ("dag_revision", "decision_id", "pruned_task_ids")
             if key in replan and replan[key] is not None
@@ -136,7 +194,80 @@ def public_v4_projection(v4: Any) -> dict[str, Any] | None:
             "tier_counts": _public_web_counts(web.get("tier_counts"), _WEB_TIERS),
             "degraded_counts": _public_web_counts(web.get("degraded_counts"), WEB_EXTRACTION_REASONS),
         }
+    report = public_report_projection(v4.get("report"))
+    if report is not None:
+        result["report"] = report
     return result
+
+
+def public_report_workbench(workbench):
+    """Project guarded report bindings onto the public workbench contract."""
+    public = dict(workbench or {})
+    sections = public.pop("report_sections", [])
+    blocks = public.pop("report_blocks", [])
+    red_team = public.pop("red_team", {})
+    public["section_bindings"] = [
+        {key: item[key] for key in ("section_id", "title", "paragraph_index") if key in item}
+        for item in sections
+    ]
+    public["claim_bindings"] = [
+        {**{key: block[key] for key in ("section_id", "block_id", "claim_id", "paragraph_index", "text_fingerprint")},
+         "citation_ids": block["source_ids"],
+         "evidence_anchors": [
+             {key: ref[key] for key in ("source_id", "artifact_id", "anchor_id") if key in ref}
+             for ref in block["evidence_refs"]
+         ]}
+        for block in blocks if block["kind"] == "fact" and block["claim_id"]
+    ]
+    if red_team:
+        public["critic_issues"] = [
+            {**{key: item[key] for key in ("section_id", "claim_id", "kind", "severity", "source_ids", "issue_id")},
+             "status": "handled" if item["resolution"] == "withheld" else "unresolved"}
+            for item in red_team["issues"][:8]
+        ]
+    return public
+
+
+def report_chunks(markdown: str) -> list[str]:
+    return split(r"(?<=\n\n)(?=## )", markdown)
+
+
+def materialize_report_event(snapshot, descriptor):
+    """Build wire frames from the single committed Markdown/workbench pair."""
+    event = dict(descriptor)
+    kind = event["type"]
+    markdown = snapshot.get("report_markdown") or ""
+    workbench = snapshot.get("workbench") or {}
+    charts = workbench.get("charts_spec") or []
+    if kind == "report_chunk" and "content" not in event:
+        chunks = report_chunks(markdown)
+        event.update(content=chunks[event["index"] - 1], total_chunks=len(chunks))
+    elif kind == "report_chart" and "chart_index" in event:
+        event["chart"] = charts[event.pop("chart_index")]
+    elif kind == "report_note":
+        event.update(note_id=snapshot.get("report_note_id"), content=markdown.strip())
+        if snapshot.get("report_note_path"):
+            event["note_path"] = snapshot["report_note_path"]
+    elif kind == "metrics_snapshot" and "request_metrics" not in event:
+        event.update(request_metrics=snapshot.get("request_metrics") or {},
+                     aggregate_metrics=metrics_registry.snapshot(include_recent_requests=False))
+    elif kind == "final_report":
+        event.update(
+            report=markdown, note_id=snapshot.get("report_note_id"), note_path=snapshot.get("report_note_path"),
+            evidence_conflicts=snapshot.get("evidence_conflicts") or [],
+            claim_verification_summary=snapshot.get("claim_verification_summary") or {},
+            v4=public_v4_projection(snapshot.get("v4")),
+        )
+        if charts:
+            event["charts_spec"] = charts
+        if workbench:
+            event.update(workbench=workbench, citation_drawer_map=workbench.get("citation_index", {}),
+                         verifier_badges=workbench.get("verifier_badges", []))
+    return event
+
+
+class ReportCancelled(Exception):
+    """Cancellation observed before publishing a final report."""
 
 
 class BudgetDispatchDenied(RuntimeError):
@@ -150,6 +281,8 @@ class BudgetAttempt:
     timeout: float
     usage: dict[str, int] | None = None
     associate_dynamic_url: Callable[[str], bool] | None = None
+    outcome_unknown: bool = False
+    reserved: dict[str, int] | None = None
 
 
 class RequestBudgetController:
@@ -267,13 +400,26 @@ class RequestBudgetController:
     def attempt(
         self, demand: dict[str, int], *, llm=None, required: bool = True,
         stage: str | None = None, dynamic_urls: tuple[str, ...] | None = None,
+        operation_id: str | None = None, commit_attempt: Callable[..., None] | None = None,
+        allow_optional_finalization: bool = False, keep_available: dict[str, int] | None = None,
+        deadline_margin: float = 0, maximum_seconds: float | None = None,
     ) -> Iterator[BudgetAttempt]:
         work_class = "required" if required else "optional"
         stage = stage or self.stage
+        def persist(phase: str, lease=None) -> None:
+            if commit_attempt is not None:
+                commit_attempt(phase, lease)
+            else:
+                self.agent._persist_v4_budget(self.state, self.payload())
+
+        def remaining_timeout() -> float:
+            remaining = self.governor.remaining_timeout(stage=stage, work_class=work_class) - deadline_margin
+            return min(remaining, maximum_seconds) if maximum_seconds is not None else remaining
+
         with self.lock:
             if self.blocked or self.agent._is_cancelled():
                 self.refuse("dispatch_unbounded" if self.blocked else "lease_lost", required=required)
-            operation_id = self._operation_id()
+            operation_id = operation_id or self._operation_id()
             dynamic_targets = None
             if dynamic_urls is not None:
                 targets = self._dynamic_targets()
@@ -295,21 +441,23 @@ class RequestBudgetController:
                 lease = self.governor.reserve_llm_attempt(
                     operation_id, input_tokens=input_tokens, output_tokens=output_tokens,
                     pricing=pricing, work_class=work_class, stage=stage,
+                    allow_optional_finalization=allow_optional_finalization, keep_available=keep_available,
                 )
             if isinstance(lease, BudgetDenial):
                 if required:
                     self.degrade(lease.reason)
-                self.agent._persist_v4_budget(self.state, self.payload())
+                if commit_attempt is None:
+                    persist("denied")
                 raise BudgetDispatchDenied(lease.reason)
-            self.agent._persist_v4_budget(self.state, self.payload())
-            timeout = self.governor.remaining_timeout(stage=stage, work_class=work_class)
+            persist("reserved", lease)
+            timeout = remaining_timeout()
             if timeout <= 0 or self.agent._is_cancelled():
                 self.governor.release(lease)
-                self.agent._persist_v4_budget(self.state, self.payload())
+                persist("released", lease)
                 self.refuse("deadline_exceeded" if timeout <= 0 else "lease_lost", required=required)
             def commit() -> None:
                 if dynamic_targets is None:
-                    self.agent._persist_v4_budget(self.state, self.payload())
+                    persist("dispatched", lease)
                 else:
                     self._persist_web_dispatch(dynamic_targets)
 
@@ -319,13 +467,13 @@ class RequestBudgetController:
                 self.blocked = True
                 raise
             if not dispatched:
-                self.agent._persist_v4_budget(self.state, self.payload())
+                persist("released", lease)
                 self.refuse("deadline_exceeded", required=required)
             if dynamic_targets is not None:
                 adapter = self.state.v4["web_extraction"].get("adapter")
                 if adapter in _DYNAMIC_ADAPTERS:
                     metrics_registry.record_web_extraction("l2_selected", adapter=adapter)
-            attempt = BudgetAttempt(self.governor.remaining_timeout(stage=stage, work_class=work_class))
+            attempt = BudgetAttempt(remaining_timeout(), reserved=lease.reserved)
             if dynamic_targets is not None:
                 attempt.associate_dynamic_url = lambda url: self._associate_dynamic_url(url, operation_id=operation_id)
         try:
@@ -335,12 +483,136 @@ class RequestBudgetController:
         except BaseException:
             with self.lock:
                 self.governor.settle_timeout(lease)
-                self.agent._persist_v4_budget(self.state, self.payload())
+                persist("settled", lease)
             raise
         else:
             with self.lock:
-                self.governor.settle(lease, attempt.usage, usage_source="reported" if attempt.usage is not None else "estimated")
-                self.agent._persist_v4_budget(self.state, self.payload())
+                self.governor.settle(
+                    lease, attempt.usage, usage_source="reported" if attempt.usage is not None else "estimated",
+                    outcome_unknown=attempt.outcome_unknown,
+                )
+                persist("settled", lease)
+
+
+class ReportCheckpoint:
+    """Single-writer report journal. Workers receive only detached model requests."""
+
+    def __init__(self, agent, state, controller, *, step, emit_stream, supported=True):
+        self.agent = agent
+        self.state = state
+        self.controller = controller
+        self.step = step
+        self.emit_stream = emit_stream
+        self.supported = supported
+        self.events = []
+
+    @property
+    def data(self):
+        return self.state.v4["report"]
+
+    def key(self, kind, section_id=""):
+        return sha256(dumps((self.agent.tenant_id, self.agent.request_id, 1, kind, section_id)).encode()).hexdigest()
+
+    def event(self, event_type, key, **fields):
+        return {"type": event_type, "event_key": f"report-{key}", "step": self.step, **fields}
+
+    def section_event(self, section_id, status, reason=None):
+        return self.event(
+            "report_section_status", f"section-1-{section_id}-{status}", section_id=section_id,
+            outline_version=1, status=status, **({"reason_code": reason} if reason in _REPORT_REASONS else {}),
+        )
+
+    def commit(self, update, *events, operation=None):
+        if self.agent._is_cancelled():
+            raise ReportCancelled()
+        current = self.data
+        expected = current.get("revision_number", 0)
+        proposed = {**current, **update, "revision_number": expected + 1}
+        if operation:
+            key, record = operation
+            proposed["operations_by_key"] = {**current["operations_by_key"], key: record}
+        v4_update = {"report": proposed}
+        if self.state.v4.get("report_only"):
+            v4_update["report_only"] = True
+        if self.controller and not self.controller.blocked:
+            v4_update["budget"] = self.controller.payload()
+        pending = events if self.emit_stream else ()
+        if self.supported:
+            saved = self.agent._persist_report_checkpoint(self.state, v4_update, expected, pending)
+        else:
+            saved = None
+        self.state.v4.update(v4_update)
+        committed_version = saved["state_version"] if saved else None
+        self.events.extend({
+            **event, "schema_version": 1, "request_id": self.agent.request_id,
+            **({"state_version": committed_version} if committed_version is not None else {}),
+        } for event in pending)
+
+    def drain(self):
+        events, self.events = self.events, []
+        return events
+
+    def start(self, kind, section_id, request, pricing, *, required, keep_available=None):
+        """Return an entered budget attempt whose settlement commits the guarded result."""
+        if not self.controller or self.controller.blocked or not self.supported or pricing is None:
+            raise BudgetDispatchDenied("dispatch_unbounded")
+        key = self.key(kind, section_id)
+        digest = sha256((request.messages_json + request.options_json).encode()).hexdigest()
+        if (self.data["operations_by_key"].get(key) or {}).get("status") not in (None, "reserved"):
+            raise SnapshotConflictError("Report operation already dispatched")
+        update = {}
+        events = ()
+        terminal = {"status": "degraded", "reason": "outcome_unknown"}
+
+        def commit_attempt(phase, lease):
+            if phase == "released":
+                phase = "reserved"
+            record = {"kind": kind, "section_id": section_id, "input_digest": digest,
+                      "upper_bound": lease.reserved, "status": phase}
+            if phase == "dispatched" and section_id:
+                started = {**self.data["sections_by_id"], section_id: {"status": "started"}}
+                self.commit({"sections_by_id": started}, self.section_event(section_id, "started"),
+                            operation=(key, record))
+            elif phase == "settled":
+                self.commit(update, *events, operation=(key, {**record, **terminal}))
+            else:
+                self.commit({}, operation=(key, record))
+
+        context = self.controller.attempt(
+            {}, llm=(request.input_upper_bound, request.max_tokens, pricing), required=required,
+            stage="report", operation_id=key, commit_attempt=commit_attempt, allow_optional_finalization=True,
+            keep_available=keep_available, deadline_margin=3, maximum_seconds=request.timeout,
+        )
+        attempt = context.__enter__()
+
+        def settle(result, changes, progress, usage, reason):
+            nonlocal events
+            update.update(changes)
+            events = progress
+            terminal.update(result)
+            attempt.usage = usage
+            attempt.outcome_unknown = reason in {"timeout", "provider_error", "outcome_unknown"}
+            context.__exit__(None, None, None)
+
+        return attempt.timeout, settle
+
+    def previous(self, kind, section_id=""):
+        return self.data["operations_by_key"].get(self.key(kind, section_id), {})
+
+    def complete(self, kind, section_id, reason, result, *, settle=None, usage=None, update=None):
+        record = {"kind": kind, "section_id": section_id, "reason": reason, "result": result,
+                  "status": "completed" if reason == "ok" else "degraded"}
+        changes = dict(update or {})
+        events = ()
+        if kind == "map":
+            status = record["status"]
+            changes["sections_by_id"] = {**self.data["sections_by_id"], section_id: {"status": status}}
+            events = (self.section_event(section_id, status, reason),)
+        if settle is None:
+            previous = self.previous(kind, section_id)
+            self.commit(changes, *events, operation=(self.key(kind, section_id), {**previous, **record}))
+        else:
+            settle(record, changes, events, usage, reason)
 
 
 class StateManagerMixin:
@@ -365,6 +637,14 @@ class StateManagerMixin:
                 state.v4 = {"schema_version": 1, "web_extraction": web, "replan": {}}
                 if not research_budget_enabled:
                     state.v4["web_downstream_only"] = True
+        if not (resumed or frozen):
+            report = freeze_report(self.config, tenant_id, self.request_id)
+            if report is not None:
+                if state.v4 is None:
+                    state.v4 = {"schema_version": 1}
+                state.v4["report"] = report
+                if research_budget_enabled:
+                    state.v4.setdefault("replan", {})
         v4 = state.v4
         if v4 is None and (resumed or frozen or not research_budget_enabled):
             return None
@@ -377,11 +657,13 @@ class StateManagerMixin:
         downstream_only = isinstance(v4, dict) and v4.get("web_downstream_only") is True
         web = v4.get("web_extraction") if isinstance(v4, dict) else None
         new_web_request = web is not None and not (resumed or frozen)
-        if isinstance(v4, dict) and "budget" not in v4 and not new_web_request:
+        if isinstance(v4, dict) and (v4.get("report_only") or (
+            "budget" not in v4 and not new_web_request and (resumed or frozen or not research_budget_enabled)
+        )):
             return None
         blocked = False
         try:
-            if v4 is None or (new_web_request and "budget" not in v4):
+            if v4 is None or "budget" not in v4:
                 budget = build_request_budget_for_config(
                     self.config, tenant_id=tenant_id, depth="quick" if downstream_only else None,
                 )
@@ -421,6 +703,59 @@ class StateManagerMixin:
         if not downstream_only:
             self._research_budget = controller
         return self._research_budget
+
+    def _init_report_checkpoint(self, state, budget, *, step, emit_stream):
+        store = self._request_state_store
+        supported = store is None or (
+            self._store_supports_tenant_id("load") and self._store_supports_tenant_id("save")
+            and self._callable_accepts_kwarg(store.save, "expected_version")
+        )
+        controller = budget or getattr(self, "_web_budget", None)
+        if controller is None and supported:
+            v4 = state.v4
+            existing = v4.get("budget")
+            policy = v4["report"].get("budget_policy") or {}
+            try:
+                if existing:
+                    limit = RequestBudget(**existing["limit"])
+                else:
+                    limit = build_request_budget(
+                        "quick", limits=policy["limits"], finalization_reserve=policy["reserve"],
+                        finalization_reserve_ms=policy["reserve_ms"],
+                    )
+                governor = BudgetGovernor(limit, tenant_id=self.tenant_id, request_id=self.request_id)
+                if existing:
+                    governor.restore_ledger(existing["ledger"])
+                else:
+                    v4["report_only"] = True
+                controller = RequestBudgetController(self, state, governor)
+            except (KeyError, TypeError, ValueError):
+                controller = None
+        if controller:
+            controller.stage = "report"
+        return ReportCheckpoint(self, state, controller, step=step, emit_stream=emit_stream, supported=supported)
+
+    def _persist_report_checkpoint(self, state, updates, expected, events):
+        checkpoint = getattr(self, "_workflow_checkpoint", None)
+        if checkpoint is not None:
+            saved = checkpoint.persist(
+                {"v4": updates}, expected_report_revision=expected, pending_events=events,
+            )
+        elif self._request_state_store is not None:
+            current = self._load_resume_snapshot(self.request_id)
+            v4 = current.get("v4") or {}
+            if current["state_version"] != state.state_version or (v4.get("report") or {}).get("revision_number", 0) != expected:
+                raise SnapshotConflictError("Report checkpoint changed")
+            current["v4"] = {**v4, **updates}
+            if events:
+                current["v4"]["pending_events"] = queue_snapshot_events(current, v4, events, self.request_id)
+            saved = self._request_state_store.save(
+                self.request_id, current, tenant_id=self.tenant_id, expected_version=state.state_version,
+            )
+        else:
+            return None
+        state.state_version = saved["state_version"]
+        return saved
 
     def _persist_v4_budget(
         self, state: SummaryState, budget: dict[str, Any], *, web_extraction: dict[str, Any] | None = None,
@@ -497,6 +832,11 @@ class StateManagerMixin:
         research_controller = getattr(self, "_research_budget", None)
         controller = research_controller or getattr(self, "_web_budget", None)
         web_enabled = isinstance(state.v4, dict) and "web_extraction" in state.v4
+        report_state = (state.v4 or {}).get("report")
+        report_cas = report_state is not None and self._request_state_store is not None and (
+            self._store_supports_tenant_id("load") and self._store_supports_tenant_id("save")
+            and self._callable_accepts_kwarg(self._request_state_store.save, "expected_version")
+        )
         if self._request_state_store is None:
             if controller is not None and not controller.blocked:
                 state.v4["budget"] = controller.payload()
@@ -519,7 +859,8 @@ class StateManagerMixin:
             "error": observer_snapshot.get("error"),
             "search_api": observer_snapshot.get("search_api"),
             "elapsed_ms": observer_snapshot.get("elapsed_ms"),
-            "report_markdown": report_markdown or state.structured_report or state.running_summary or "",
+            "report_markdown": (report_markdown or state.structured_report or "") if report_state is not None
+            else (report_markdown or state.structured_report or state.running_summary or ""),
             "report_charts": list(getattr(state, "report_charts", None) or []),
             **({"charts_spec": list(state.report_charts)} if state.report_charts else {}),
             **({
@@ -582,8 +923,8 @@ class StateManagerMixin:
                 if checkpoint is not None and v4_expected is None:
                     # The coordinator sends the graph explicitly when it advances.
                     payload["v4"].pop("replan", None)
-            elif state.v4 is not None and (checkpoint is None or web_enabled):
-                payload["v4"] = deepcopy(state.v4)
+            elif state.v4 is not None and (checkpoint is None or web_enabled or report_state):
+                payload["v4"] = {key: deepcopy(value) for key, value in state.v4.items() if key != "pending_events"}
             if checkpoint is not None:
                 payload["runner_backend"] = checkpoint.backend
                 payload["workflow_run_id"] = checkpoint.run_id
@@ -595,13 +936,20 @@ class StateManagerMixin:
                     saved = checkpoint.persist(payload)
             elif self._store_supports_tenant_id("save"):
                 kwargs: dict[str, Any] = {"tenant_id": tenant_id}
-                if controller is not None:
+                if controller is not None or report_cas:
                     current = self._request_state_store.load(self.request_id, tenant_id=tenant_id) or {}
                     previous_v4 = current.get("v4")
                     if isinstance(previous_v4, dict) and "v4" in payload:
                         payload["v4"] = {**previous_v4, **payload["v4"]}
                     payload = {**current, **payload}
-                if controller is not None or payload["pending_tool_approval"] or payload["approved_tool_calls"]:
+                    if report_cas and v4_events:
+                        payload["v4"]["pending_events"] = queue_snapshot_events(
+                            current, previous_v4 or {}, v4_events, self.request_id,
+                        )
+                    if v4_expected and "expected_report_revision" in v4_expected:
+                        if ((previous_v4 or {}).get("report") or {}).get("revision_number") != v4_expected["expected_report_revision"]:
+                            raise SnapshotConflictError("Report checkpoint changed")
+                if controller is not None or report_cas or payload["pending_tool_approval"] or payload["approved_tool_calls"]:
                     kwargs["expected_version"] = payload["state_version"]
                 saved = self._request_state_store.save(self.request_id, payload, **kwargs)
             else:
@@ -751,7 +1099,11 @@ class StateManagerMixin:
             if isinstance(item, dict):
                 todo_items.append(self._task_from_payload(item))
 
-        report_markdown = str(payload.get("report_markdown") or "").strip() or None
+        raw_report = payload.get("report_markdown")
+        tracked_report = (payload.get("v4") or {}).get("report")
+        report_markdown = (
+            raw_report if (tracked_report.get("final") or {}).get("published") is True else None
+        ) if isinstance(tracked_report, dict) else (str(raw_report or "").strip() or None)
         state = SummaryState(
             research_topic=str(payload.get("topic") or "").strip() or None,
             running_summary=report_markdown,
