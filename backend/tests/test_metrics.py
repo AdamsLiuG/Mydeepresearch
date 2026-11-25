@@ -238,3 +238,21 @@ def test_report_metrics_are_bounded_and_idempotent():
     assert report["report_operation_total"] == {"map:fallback:other": 1, "map:ok:ok": 1}
     assert report["report_map_cached_input_tokens"] == 40
     assert report["report_map_cache_eligible_input_tokens"] == 100
+
+
+def test_v4_metrics_are_bounded_and_tenant_filtered():
+    from metrics import MetricsRegistry
+
+    registry = MetricsRegistry()
+    assert "v4_memory_graph" not in registry.snapshot()
+    registry.record_v4_memory_partition("note", "read", "ok", tenant_id="A")
+    registry.record_v4_memory_partition("evidence", "read", "denied", tenant_id="B")
+    registry.record_v4_graph_receipt("rejected", reason="private-url", tenant_id="A")
+    registry.record_v4_graph_query("task", "sqlite", "hit", 12, tenant_id="A")
+    result = registry.snapshot(tenant_id="A")["v4_memory_graph"]
+    assert result["v4_memory_partition_total"] == [
+        {"store": "note", "operation": "read", "outcome": "ok", "count": 1},
+    ]
+    assert result["v4_graph_query_duration_ms"][0]["le_ms"] == 25
+    assert "v4_graph_receipts_total" not in result
+    assert "v4_memory_graph" not in registry.snapshot(tenant_id="C")

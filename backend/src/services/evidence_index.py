@@ -7,9 +7,10 @@ import json
 import logging
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from itertools import islice
 from pathlib import Path
 from threading import Lock
 from time import time
@@ -18,8 +19,31 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
+from models import MemoryPurpose
 from services.embeddings import embeddings_available, encode_text, encode_texts
+from services.memory_sanitizer import WEB_SANITIZER_VERSION
+from services.memory_scope import (
+    MemoryPolicy,
+    MemoryScope,
+    authorize,
+    checked_path,
+    open_partition_directory,
+    partition_lock,
+    partition_root,
+    read_partition_text,
+    remove_partition_file,
+    scope_is_current,
+    strict_memory_text,
+    strict_partition_required,
+    valid_internal_id,
+    valid_scope,
+    write_partition_text,
+)
 from services.text_processing import truncate_cited_text
+from services.web_extractor import POLICY_VERSION as WEB_POLICY_VERSION
+from services.web_extractor import QUALITY_VERSION as WEB_QUALITY_VERSION
+from services.web_fetch_gateway import GatewayError
+from services.web_fetch_gateway import normalize_url as normalize_web_url
 
 try:  # pragma: no cover - optional dependency
     import chromadb
@@ -30,6 +54,12 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
 _COLLECTION_NAME = "deep_research_evidence_v1"
+_PARTITION_SCHEMA_VERSION = 1
+_MAX_MAINTENANCE_ROWS = 64
+_MAX_PARTITION_QUERY_VERSIONS = 256
+_MAX_PARTITION_CHUNKS = 64
+_MAX_PAYLOAD_BYTES = 8_388_608
+_ARCHIVE_HEX_ID = re.compile(r"[0-9a-f]{64}")
 _DEFAULT_QUERY_MULTIPLIER = 4
 _WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?")
 _CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -94,6 +124,7 @@ class EvidenceChunk:
     anchor_id: str | None = None
     modality: str = "text"
     structured_payload: dict[str, Any] | None = None
+    archive_artifact_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +260,7 @@ class EvidenceRetrievalHit:
     bbox: list[float] | None = None
     anchor_id: str | None = None
     structured_payload: dict[str, Any] | None = None
+    _partitioned_history: bool = field(default=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -251,6 +283,9 @@ class EvidenceRetrievalHit:
                 for key, value in (self.score_breakdown or {}).items()
             },
         }
+        if self._partitioned_history:
+            for key in ("task_id", "source_id", "archive_doc_key", "archive_version_id", "chunk_id"):
+                payload.pop(key)
         if self.modality and self.modality != "text":
             payload["modality"] = self.modality
         if self.page_no is not None:
@@ -684,6 +719,13 @@ def _record_archive_version_id(record: Any) -> str | None:
     return value or None
 
 
+def _web_artifact_version(record: Any) -> str | None:
+    provenance = getattr(record, "provenance_meta", None)
+    web = provenance.get("web_extraction") if isinstance(provenance, dict) else None
+    version = web.get("artifact_version") if isinstance(web, dict) else None
+    return str(version) if type(version) is int and version > 0 else None
+
+
 class EvidenceRuntimeIndex(EvidenceStoreListener):
     """Request-scoped evidence chunk index used for current grounding."""
 
@@ -692,9 +734,13 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         config: Configuration,
         *,
         archive_loader: Any | None = None,
+        scope: MemoryScope | None = None,
+        frozen_strict: bool = False,
     ) -> None:
         self._config = config
         self._archive_loader = archive_loader
+        self._scope = scope
+        self._frozen_strict = frozen_strict
         self._lock = Lock()
         self._chunks_by_task: dict[int, list[EvidenceChunk]] = {}
         self._chunk_embeddings: dict[str, list[float] | None] = {}
@@ -704,6 +750,11 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
     def enabled(self) -> bool:
         return bool(self._config.evidence_runtime_enabled)
 
+    def _strict(self) -> bool:
+        return strict_partition_required(
+            self._config, self._config.evidence_memory_dir, self._scope, frozen_strict=self._frozen_strict,
+        )
+
     def on_records_changed(
         self,
         *,
@@ -712,17 +763,23 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         reason: str,
         request_id: str | None = None,
     ) -> None:
-        del request_id
         if not self.enabled or reason not in {"search", "fetch", "hydrate", "mcp", "compute"}:
             return
 
+        strict = self._strict()
+        if strict and self._scope is not None and (
+            not valid_scope(self._scope) or request_id != self._scope.request_id
+        ):
+            return
         with self._lock:
             generation = self._generation
         source_chunks: dict[str, list[EvidenceChunk]] = {}
         texts: list[str] = []
         chunk_ids: list[str] = []
         for record in records:
-            chunks = self._chunks_for_record(task_id, record, reason=reason)
+            if strict and self._scope is not None and getattr(record, "tenant_id", None) != self._scope.tenant_id:
+                continue
+            chunks = self._chunks_for_record(task_id, record, reason=reason, strict=strict)
             source_chunks[str(getattr(record, "source_id", ""))] = chunks
             for chunk in chunks:
                 texts.append(chunk.text)
@@ -774,11 +831,29 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         record: Any,
         *,
         reason: str,
+        strict: bool,
     ) -> list[EvidenceChunk]:
         web_managed = getattr(record, "_web_managed", False)
         if web_managed and not record._web_verified:
             return []
         archive_version_id = _record_archive_version_id(record)
+        if strict and reason == "hydrate" and archive_version_id:
+            if not (
+                self._archive_loader is not None and valid_scope(self._scope)
+                and web_managed and getattr(record, "_web_verified", False)
+                and getattr(record, "source_origin", None) == "web"
+                and (artifact_version := _web_artifact_version(record))
+            ):
+                return []
+            return self._archive_loader.load_runtime_chunks(
+                archive_version_id,
+                task_id=task_id,
+                source_id=str(getattr(record, "source_id", "") or ""),
+                expected_url=str(getattr(record, "url", "") or ""),
+                origin_request_id=self._scope.request_id,
+                artifact_version=artifact_version,
+                scope=self._scope,
+            )
         if (
             not web_managed and reason == "hydrate" and archive_version_id and self._archive_loader is not None
             and _normalize_text(getattr(record, "source_origin", "web")) == "web"
@@ -888,14 +963,40 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                 )
         return chunks
 
+    def _visible_chunks(self, chunks: list[EvidenceChunk]) -> list[EvidenceChunk]:
+        direct = [chunk for chunk in chunks if chunk.archive_artifact_version is None]
+        if len(direct) == len(chunks) or self._archive_loader is None or not valid_scope(self._scope):
+            return direct
+        checked: dict[tuple[str, str, str], set[str]] = {}
+        visible = []
+        for chunk in chunks:
+            if chunk.archive_artifact_version is None:
+                visible.append(chunk)
+                continue
+            key = (chunk.archive_version_id, chunk.source_id, chunk.archive_artifact_version)
+            if key not in checked:
+                restored = self._archive_loader.load_runtime_chunks(
+                    chunk.archive_version_id,
+                    task_id=chunk.task_id,
+                    source_id=chunk.source_id,
+                    expected_url=chunk.url,
+                    origin_request_id=self._scope.request_id,
+                    artifact_version=chunk.archive_artifact_version,
+                    scope=self._scope,
+                )
+                checked[key] = {item.chunk_id for item in restored}
+            if chunk.chunk_id in checked[key]:
+                visible.append(chunk)
+        return visible
+
     def chunk_counts_by_source(self) -> dict[str, int]:
         if not self.enabled:
             return {}
         counts: dict[str, int] = {}
         with self._lock:
-            for chunk_list in self._chunks_by_task.values():
-                for chunk in chunk_list:
-                    counts[chunk.source_id] = counts.get(chunk.source_id, 0) + 1
+            chunks = [chunk for chunk_list in self._chunks_by_task.values() for chunk in chunk_list]
+        for chunk in self._visible_chunks(chunks):
+            counts[chunk.source_id] = counts.get(chunk.source_id, 0) + 1
         return counts
 
     def reset(self) -> None:
@@ -920,10 +1021,12 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         target_ids = set(ordered_ids)
         by_source: dict[str, list[EvidenceChunk]] = {}
         with self._lock:
-            for chunks in self._chunks_by_task.values():
-                for chunk in chunks:
-                    if chunk.source_id in target_ids:
-                        by_source.setdefault(chunk.source_id, []).append(chunk)
+            candidates = [
+                chunk for chunks in self._chunks_by_task.values() for chunk in chunks
+                if chunk.source_id in target_ids
+            ]
+        for chunk in self._visible_chunks(candidates):
+            by_source.setdefault(chunk.source_id, []).append(chunk)
         chunk_cap = self._config.evidence_lazy_load_max_chunks_per_source
         char_cap = self._config.evidence_lazy_load_char_budget
         return pack_lazy_chunks(
@@ -974,6 +1077,7 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
                 chunk.chunk_id: self._chunk_embeddings.get(chunk.chunk_id)
                 for chunk in chunks
             }
+        chunks = self._visible_chunks(chunks)
         if not chunks:
             return []
 
@@ -1158,6 +1262,61 @@ class EvidenceRuntimeIndex(EvidenceStoreListener):
         return selected
 
 
+@dataclass(frozen=True)
+class EvidenceArchiveSource:
+    """One authoritative tenant record supplied to an offline archive rebuild."""
+
+    request_id: str
+    task_id: int
+    record: Any
+
+
+def _archive_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+_CREDENTIAL_QUERY_KEY = re.compile(
+    r"(?:auth|token|key|secret|password|credential|signature|session|^sig$|^code$|^x-amz-)", re.I,
+)
+
+
+def _safe_evidence_url(value: Any) -> str:
+    try:
+        url = normalize_web_url(value)
+    except (GatewayError, TypeError, ValueError):
+        return ""
+    parts = urlsplit(url)
+    # Remove credential-bearing query fields before the URL becomes a historical lead.
+    query = urlencode([
+        (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not _CREDENTIAL_QUERY_KEY.search(key)
+    ])
+    return _normalize_url(parts._replace(query=query).geturl())
+
+
+def _clean_archive_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return strict_memory_text(value) is not None
+    if isinstance(value, list):
+        return all(_clean_archive_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and strict_memory_text(key) is not None and _clean_archive_value(item)
+            for key, item in value.items()
+        )
+    return value is None or type(value) in {int, bool} or (type(value) is float and math.isfinite(value))
+
+
+def _archive_chunk(chunk: EvidenceChunk) -> dict[str, Any]:
+    return {
+        "chunk_id": chunk.chunk_id, "text": chunk.text,
+        "start_char": chunk.start_char, "end_char": chunk.end_char,
+        "has_full_content": chunk.has_full_content, "modality": chunk.modality,
+        "page_no": chunk.page_no, "bbox": chunk.bbox, "anchor_id": chunk.anchor_id,
+        "structured_payload": chunk.structured_payload,
+    }
+
+
 class EvidenceMemoryService(EvidenceStoreListener):
     """Persistent cross-request archive for evidence chunks."""
 
@@ -1166,9 +1325,15 @@ class EvidenceMemoryService(EvidenceStoreListener):
         config: Configuration,
         *,
         client: Any | None = None,
+        scope: MemoryScope | None = None,
+        policy: MemoryPolicy | None = None,
+        frozen_strict: bool = False,
     ) -> None:
         self._config = config
         self._client = client
+        self._scope = scope
+        self._policy = policy
+        self._frozen_strict = frozen_strict
         self._collection: Any | None = None
         self._lock = Lock()
         self._memory_dir = Path(self._config.evidence_memory_dir)
@@ -1180,6 +1345,573 @@ class EvidenceMemoryService(EvidenceStoreListener):
     def enabled(self) -> bool:
         return bool(self._config.evidence_memory_enabled)
 
+    def for_scope(
+        self, scope: MemoryScope | None, *, policy: MemoryPolicy | None = None, frozen_strict: bool = False,
+    ) -> EvidenceMemoryService:
+        return EvidenceMemoryService(
+            self._config, client=self._client, scope=scope, policy=self._policy if policy is None else policy,
+            frozen_strict=self._frozen_strict or frozen_strict,
+        )
+
+    def _strict(self) -> bool:
+        return strict_partition_required(
+            self._config, self._memory_dir, self._scope, frozen_strict=self._frozen_strict,
+        )
+
+    def _record_partition(self, operation: str, outcome: str) -> None:
+        metrics_registry.record_v4_memory_partition(
+            "evidence", operation, outcome,
+            tenant_id=self._scope.tenant_id if valid_scope(self._scope) else None,
+        )
+
+    def _partition_manifest(self, root: Path) -> dict[str, Any]:
+        identity = {
+            "schema_version": _PARTITION_SCHEMA_VERSION,
+            "tenant_id": self._scope.tenant_id,
+            "namespace": self._scope.namespace,
+            "sanitizer_version": WEB_SANITIZER_VERSION,
+        }
+        try:
+            manifest = json.loads(read_partition_text(root, "manifest.json"))
+        except FileNotFoundError:
+            return {**identity, "versions": {}, "tombstones": []}
+        versions = manifest.get("versions") if isinstance(manifest, dict) else None
+        if (
+            not isinstance(manifest, dict)
+            or any(manifest.get(key) != value for key, value in identity.items())
+            or not isinstance(versions, dict)
+            or not isinstance(manifest.get("tombstones"), list)
+            or not all(valid_internal_id(item) for item in manifest["tombstones"])
+            or not all(
+                _ARCHIVE_HEX_ID.fullmatch(key) and isinstance(entry, dict) and isinstance(entry.get("provenance"), list)
+                and all(
+                    isinstance(origin, dict) and origin.get("tenant_id") == self._scope.tenant_id
+                    and valid_internal_id(origin.get("request_id")) and valid_internal_id(origin.get("source_id"))
+                    and valid_internal_id(origin.get("artifact_version"))
+                    and type(origin.get("task_id")) is int and origin["task_id"] > 0
+                    for origin in entry["provenance"]
+                )
+                for key, entry in versions.items()
+            )
+        ):
+            raise ValueError("invalid evidence partition manifest")
+        return manifest
+
+    def _write_partition_manifest(self, root: Path, manifest: dict[str, Any]) -> None:
+        encoded = _archive_json(manifest)
+        if len(encoded.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
+            raise ValueError("evidence partition manifest exceeds size limit")
+        write_partition_text(root, "manifest.json", text=encoded)
+
+    def _strict_payload(
+        self, source: EvidenceArchiveSource, *, purpose: MemoryPurpose,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        record = source.record
+        source_id = getattr(record, "source_id", None)
+        if (
+            type(source.task_id) is not int or source.task_id < 1 or getattr(record, "task_id", None) != source.task_id
+            or not valid_internal_id(source_id) or getattr(record, "tenant_id", None) != self._scope.tenant_id
+            or getattr(record, "source_origin", None) != "web"
+            or getattr(record, "_web_managed", False) is not True
+            or getattr(record, "_web_verified", False) is not True
+            or getattr(record, "derived_from_source_ids", None) or getattr(record, "computation_artifact", None)
+        ):
+            return None
+        version = _web_artifact_version(record)
+        if not version or not authorize(
+            self._policy, self._scope, source.request_id, purpose, object_id=source_id, content_version=version,
+        ):
+            return None
+        url = _safe_evidence_url(getattr(record, "url", ""))
+        artifact = record.provenance_meta["web_extraction"]
+        flags = artifact.get("quality_flags")
+        if (
+            not url or (artifact.get("tier"), artifact.get("adapter"))
+            not in {("L1", "static"), ("L2", "reader_http"), ("L2", "playwright")}
+            or type(artifact.get("sanitizer_version")) is not int
+            or artifact["sanitizer_version"] != WEB_SANITIZER_VERSION
+            or type(artifact.get("quality_version")) is not int or artifact["quality_version"] != WEB_QUALITY_VERSION
+            or type(artifact.get("policy_version")) is not int or artifact["policy_version"] != WEB_POLICY_VERSION
+            or not isinstance(flags, list) or any(
+                not isinstance(flag, str) or flag in {"visibility_uncertain", "snippet_only", "link_only"}
+                for flag in flags
+            )
+            or artifact.get("quarantined") or artifact.get("dropped_text")
+        ):
+            return None
+        text = getattr(record, "full_content", "")
+        title = getattr(record, "title", "")
+        if strict_memory_text(text) is None or strict_memory_text(title) is None:
+            return None
+        anchors = artifact.get("text_anchors")
+        if not isinstance(anchors, list):
+            return None
+        chunks = []
+        seen_anchors: set[str] = set()
+        prior_end = 0
+        for anchor in anchors[:min(self._config.evidence_runtime_max_chunks, _MAX_PARTITION_CHUNKS)]:
+            if not isinstance(anchor, dict):
+                return None
+            key, start, end = anchor.get("anchor_id"), anchor.get("start"), anchor.get("end")
+            if (
+                not valid_internal_id(key) or key in seen_anchors
+                or type(start) is not int or type(end) is not int or not prior_end <= start < end <= len(text)
+                or not text[start:end].strip() or strict_memory_text(text[start:end]) is None
+            ):
+                return None
+            seen_anchors.add(key)
+            prior_end = end
+            chunks.append(_archive_chunk(EvidenceChunk(
+                chunk_id=f"chunk::{len(chunks) + 1}", task_id=0, source_id="", text=text[start:end],
+                start_char=start, end_char=end, has_full_content=True, origin="history", anchor_id=key,
+            )))
+        blocks = getattr(record, "multimodal_blocks", None) or []
+        if not isinstance(blocks, list) or len(blocks) > _MAX_PARTITION_CHUNKS or not _clean_archive_value(blocks):
+            return None
+        for chunk in _multimodal_chunks(record, task_id=0, source_id="archive", origin="history"):
+            if len(chunks) >= _MAX_PARTITION_CHUNKS:
+                break
+            if chunk.modality != "table" or not valid_internal_id(chunk.anchor_id) or chunk.anchor_id in seen_anchors:
+                return None
+            seen_anchors.add(chunk.anchor_id)
+            chunk.chunk_id = f"mm::{chunk.anchor_id}"
+            chunks.append(_archive_chunk(chunk))
+        if not chunks:
+            return None
+        doc = {
+            "normalized_url": url, "title": _normalize_text(title) or url,
+            "url": url, "domain": urlsplit(url).hostname or "",
+            "quality_label": getattr(record, "quality_label", "medium"),
+            "freshness_label": getattr(record, "freshness_label", "unknown"),
+            "published_at": getattr(record, "published_at", None),
+            "has_full_content": True,
+        }
+        if not _clean_archive_value({key: value for key, value in doc.items() if key not in {"url", "normalized_url", "title"}}):
+            return None
+        payload = {
+            "tenant_id": self._scope.tenant_id,
+            "sanitizer_version": WEB_SANITIZER_VERSION,
+            "doc": doc,
+            "chunks": chunks,
+        }
+        origin = {
+            "request_id": source.request_id, "source_id": source_id, "task_id": source.task_id,
+            "artifact_version": version, "tenant_id": self._scope.tenant_id,
+        }
+        return payload, origin
+
+    def _partition_collection_name(self) -> str:
+        signature = _sha256_text(_archive_json({
+            "tenant_id": self._scope.tenant_id,
+            "policy_version": self._scope.policy_version,
+            "embedding_model": self._config.resolved_evidence_memory_embedding_model(),
+        }))
+        return f"deep_research_evidence_v4_{signature}"
+
+    def _partition_collection(self, root: Path, *, create: bool = False) -> Any | None:
+        if (self._client is None and chromadb is None) or not embeddings_available():
+            return None
+        try:
+            name = self._partition_collection_name()
+            directory = checked_path(root, "chromadb")
+            if self._client is not None:
+                client = self._client
+            else:
+                if not create and not directory.is_dir():
+                    return None
+                with open_partition_directory(root, "chromadb", create=create) as fd:
+                    path = Path(f"/proc/self/fd/{fd}")
+                    if path.resolve() != directory:
+                        return None
+                    checked_path(directory, "chroma.sqlite3")
+                    client = chromadb.PersistentClient(path=str(path))
+                    return client.get_or_create_collection(name) if create else client.get_collection(name)
+            return client.get_or_create_collection(name) if create else client.get_collection(name)
+        except Exception:
+            return None
+
+    def _upsert_partition_vectors(self, collection: Any, version: str, payload: dict[str, Any]) -> None:
+        chunks = payload["chunks"]
+        vectors = encode_texts(
+            [chunk["text"] for chunk in chunks], model_name=self._config.resolved_evidence_memory_embedding_model(),
+        )
+        indexed = [(chunk, vector) for chunk, vector in zip(chunks, vectors) if vector is not None]
+        if indexed:
+            collection.upsert(
+                ids=[f"{version}::{chunk['chunk_id']}" for chunk, _ in indexed],
+                embeddings=[vector for _, vector in indexed],
+                metadatas=[
+                    {"tenant_id": self._scope.tenant_id, "doc_version_id": version, "chunk_id": chunk["chunk_id"]}
+                    for chunk, _ in indexed
+                ],
+            )
+
+    def _write_strict_sources(
+        self, root: Path, manifest: dict[str, Any],
+        candidates: list[tuple[EvidenceArchiveSource, dict[str, Any], dict[str, Any]]],
+    ) -> list[tuple[EvidenceArchiveSource, str, str]]:
+        committed = []
+        versions = manifest["versions"]
+        collection = None
+        for source, payload, origin in candidates:
+            if source.request_id in manifest["tombstones"]:
+                continue
+            canonical_key = _sha256_text(_archive_json({
+                "tenant_id": self._scope.tenant_id, "url": payload["doc"]["normalized_url"],
+            }))
+            payload["doc"]["canonical_doc_key"] = canonical_key
+            encoded = _archive_json(payload)
+            if len(encoded.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
+                continue
+            version = _sha256_text(encoded)
+            entry = versions.get(version)
+            if entry is None:
+                write_partition_text(root, "docs", f"{version}.json", text=encoded)
+                entry = versions[version] = {"provenance": []}
+                try:
+                    collection = collection or self._partition_collection(root, create=True)
+                    if collection is not None:
+                        self._upsert_partition_vectors(collection, version, payload)
+                except Exception:
+                    logger.debug("tenant evidence vector indexing unavailable")
+            provenance = entry["provenance"]
+            # A source refresh transfers only that source's authority to the current document version.
+            for old_version, old_entry in versions.items():
+                if old_version != version:
+                    old_entry["provenance"] = [
+                        old for old in old_entry["provenance"]
+                        if (old["request_id"], old["source_id"]) != (origin["request_id"], origin["source_id"])
+                    ]
+            if origin not in provenance:
+                provenance.append(origin)
+            committed.append((source, canonical_key, version))
+        if committed:
+            self._write_partition_manifest(root, manifest)
+        return committed
+
+    def _strict_ingest(
+        self, sources: Iterable[EvidenceArchiveSource], *, purpose: MemoryPurpose,
+        operation: str, dry_run: bool, limit: int = _MAX_MAINTENANCE_ROWS,
+    ) -> dict[str, int]:
+        accepted = 0
+        rows = list(islice(sources, max(0, min(limit, _MAX_MAINTENANCE_ROWS))))
+        try:
+            candidates = [
+                (source, *prepared) for source in rows
+                if isinstance(source, EvidenceArchiveSource) and (prepared := self._strict_payload(source, purpose=purpose))
+            ]
+            if candidates and dry_run:
+                tombstones = []
+                try:
+                    root = partition_root(self._memory_dir, self._scope)
+                except PermissionError:
+                    namespace_path = checked_path(self._memory_dir, "v4", "tenants", self._scope.namespace)
+                    if namespace_path.exists():
+                        raise
+                else:
+                    tombstones = self._partition_manifest(root)["tombstones"]
+                accepted = sum(source.request_id not in tombstones for source, _, _ in candidates)
+            elif candidates:
+                root = partition_root(self._memory_dir, self._scope, create=True)
+                with self._lock, partition_lock(root):
+                    manifest = self._partition_manifest(root)
+                    candidates = [
+                        item for item in candidates if item[0].request_id not in manifest["tombstones"] and authorize(
+                            self._policy, self._scope, item[0].request_id, purpose,
+                            object_id=item[2]["source_id"], content_version=item[2]["artifact_version"],
+                        )
+                    ]
+                    committed = self._write_strict_sources(root, manifest, candidates)
+                accepted = len(committed)
+                for source, doc_key, version in committed:
+                    source.record.archive_doc_key = doc_key
+                    source.record.archive_version_id = version
+                    source.record.archive_has_full_content = True
+            if not dry_run:
+                self._record_partition(operation, "ok" if accepted else "denied")
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            if not dry_run:
+                self._record_partition(operation, "unavailable")
+        return {"accepted": accepted, "rejected": len(rows) - accepted}
+
+    def rebuild(
+        self, sources: Iterable[EvidenceArchiveSource], *, dry_run: bool = True, limit: int = _MAX_MAINTENANCE_ROWS,
+    ) -> dict[str, int]:
+        if not self.enabled or not self._strict() or not scope_is_current(self._policy, self._scope) or not authorize(
+            self._policy, self._scope, self._scope.request_id, "maintenance",
+        ):
+            return {"accepted": 0, "rejected": 0}
+        return self._strict_ingest(sources, purpose="maintenance", operation="rebuild", dry_run=dry_run, limit=limit)
+
+    def _partition_payload(self, root: Path, version: str) -> dict[str, Any]:
+        if not isinstance(version, str) or not _ARCHIVE_HEX_ID.fullmatch(version):
+            return {}
+        try:
+            text = read_partition_text(root, "docs", f"{version}.json")
+            if _sha256_text(text) != version:
+                return {}
+            payload = json.loads(text)
+            if (
+                not isinstance(payload, dict) or payload.get("tenant_id") != self._scope.tenant_id
+                or payload.get("sanitizer_version") != WEB_SANITIZER_VERSION
+            ):
+                return {}
+            doc = payload.get("doc")
+            chunks = payload.get("chunks")
+            if (
+                not isinstance(doc, dict) or not isinstance(chunks, list)
+                or not 1 <= len(chunks) <= _MAX_PARTITION_CHUNKS
+                or not (url := _safe_evidence_url(doc.get("url")))
+                or url != doc.get("normalized_url") or url != doc.get("url")
+                or doc.get("canonical_doc_key") != _sha256_text(_archive_json({
+                    "tenant_id": self._scope.tenant_id, "url": url,
+                }))
+                or not _clean_archive_value({key: value for key, value in doc.items() if key not in {
+                    "url", "normalized_url",
+                } and not (key == "title" and value == url)})
+                or not all(
+                    isinstance(chunk, dict) and isinstance(chunk.get("chunk_id"), str)
+                    and chunk["chunk_id"].startswith(("chunk::", "mm::"))
+                    and valid_internal_id(chunk["chunk_id"].split("::", 1)[-1])
+                    and valid_internal_id(chunk.get("anchor_id"))
+                    and chunk.get("has_full_content") is True and _clean_archive_value(chunk)
+                    for chunk in chunks
+                )
+            ):
+                return {}
+            return payload
+        except (OSError, ValueError, TypeError, RecursionError):
+            return {}
+
+    def _visible_origins(
+        self, manifest: dict[str, Any], version: str, *, purpose: MemoryPurpose, exclude: str | None = None,
+    ) -> list[dict[str, Any]]:
+        origins = manifest["versions"].get(version, {}).get("provenance", [])
+        return [
+            origin for origin in origins
+            if origin["request_id"] != exclude and origin["request_id"] not in manifest["tombstones"]
+            and authorize(
+                self._policy, self._scope, origin["request_id"], purpose,
+                object_id=origin["source_id"], content_version=origin["artifact_version"],
+            )
+        ]
+
+    def retract(
+        self, origin_request_id: str, *, dry_run: bool = True, limit: int = _MAX_MAINTENANCE_ROWS,
+    ) -> dict[str, int]:
+        if (
+            not self.enabled or not self._strict() or not valid_internal_id(origin_request_id)
+            or not scope_is_current(self._policy, self._scope) or not authorize(
+                self._policy, self._scope, self._scope.request_id, "maintenance",
+            )
+        ):
+            return {"removed": 0}
+        capped_limit = max(0, min(limit, _MAX_MAINTENANCE_ROWS))
+        try:
+            root = partition_root(self._memory_dir, self._scope, create=not dry_run)
+            if dry_run:
+                manifest = self._partition_manifest(root)
+                return {"removed": sum(
+                    any(origin["request_id"] == origin_request_id for origin in entry["provenance"])
+                    for entry in manifest["versions"].values()
+                )}
+            with self._lock, partition_lock(root):
+                manifest = self._partition_manifest(root)
+                affected = []
+                if origin_request_id not in manifest["tombstones"]:
+                    manifest["tombstones"].append(origin_request_id)
+                    self._write_partition_manifest(root, manifest)
+                collection = self._partition_collection(root)
+                for version, entry in manifest["versions"].items():
+                    if len(affected) >= capped_limit:
+                        break
+                    retained = [origin for origin in entry["provenance"] if origin["request_id"] != origin_request_id]
+                    if not retained:
+                        if collection is not None:
+                            try:
+                                collection.delete(where={"doc_version_id": version})
+                            except Exception:
+                                continue
+                        try:
+                            remove_partition_file(root, "docs", f"{version}.json")
+                        except FileNotFoundError:
+                            pass
+                    if retained != entry["provenance"] or not retained:
+                        affected.append((version, retained))
+                for version, retained in affected:
+                    if retained:
+                        manifest["versions"][version]["provenance"] = retained
+                    else:
+                        del manifest["versions"][version]
+                if affected:
+                    self._write_partition_manifest(root, manifest)
+            self._record_partition("delete", "ok")
+            return {"removed": len(affected)}
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            if not dry_run:
+                self._record_partition("delete", "unavailable")
+            return {"removed": 0}
+
+    def _vector_partition_matches(
+        self, root: Path, *, embedding: list[float] | None, versions: list[str], limit: int,
+    ) -> dict[tuple[str, str], float]:
+        collection = self._partition_collection(root)
+        if not versions or collection is None or embedding is None:
+            return {}
+        matches = {}
+        try:
+            result = collection.query(
+                query_embeddings=[embedding], n_results=limit, include=["distances", "metadatas"],
+                where={"$and": [
+                    {"tenant_id": self._scope.tenant_id},
+                    {"doc_version_id": {"$in": versions}},
+                ]},
+            )
+            allowed = set(versions)
+            for metadata, distance in zip((result.get("metadatas") or [[]])[0], (result.get("distances") or [[]])[0]):
+                if (
+                    not isinstance(metadata, dict) or metadata.get("tenant_id") != self._scope.tenant_id
+                    or metadata.get("doc_version_id") not in allowed or not isinstance(metadata.get("chunk_id"), str)
+                    or type(distance) not in {float, int} or not math.isfinite(distance)
+                ):
+                    continue
+                key = (metadata["doc_version_id"], metadata["chunk_id"])
+                matches[key] = max(0.0, min(1.0, 1.0 - distance))
+        except Exception:
+            return {}
+        return matches
+
+    def _query_partition(
+        self, *, text: str, top_k: int, request_id_exclude: str | None, mode: str, purpose: MemoryPurpose,
+    ) -> list[EvidenceRetrievalHit]:
+        if purpose not in {"plan", "task", "report"} or not scope_is_current(self._policy, self._scope):
+            self._record_partition("read", "denied")
+            return []
+        normalized = _clean_text(text)
+        if not normalized or type(top_k) is not int or top_k < 1:
+            return []
+        cap = min(top_k, _MAX_PARTITION_CHUNKS)
+        try:
+            root = partition_root(self._memory_dir, self._scope)
+            manifest = self._partition_manifest(root)
+            payloads = {}
+            for version in sorted(manifest["versions"]):
+                if not self._visible_origins(manifest, version, purpose=purpose, exclude=request_id_exclude):
+                    continue
+                payload = self._partition_payload(root, version)
+                if payload:
+                    payloads[version] = payload
+                if len(payloads) >= _MAX_PARTITION_QUERY_VERSIONS:
+                    break
+            if not payloads:
+                self._record_partition("read", "empty")
+                return []
+            try:
+                embedding = encode_text(normalized, model_name=self._config.resolved_evidence_memory_embedding_model())
+            except Exception:
+                embedding = None
+            dense = self._vector_partition_matches(
+                root, embedding=embedding, versions=list(payloads), limit=cap * _DEFAULT_QUERY_MULTIPLIER,
+            )
+            members = [
+                (version, payload["doc"], item)
+                for version, payload in payloads.items()
+                for item in payload["chunks"]
+            ]
+            lexical = _bm25_scores(normalized, [item["text"] for _, _, item in members])
+            current = self._partition_manifest(root)
+            visible = {
+                version for version in payloads
+                if self._visible_origins(current, version, purpose=purpose, exclude=request_id_exclude)
+            }
+            scored = []
+            for (version, doc, item), bm25 in zip(members, lexical):
+                if version not in visible:
+                    continue
+                dense_score = dense.get((version, item["chunk_id"]), 0.0)
+                lexical_score = bm25 / (1 + bm25)
+                if not (lexical_score or dense_score):
+                    continue
+                quality = _quality_prior(doc.get("quality_label", "medium"))
+                freshness = _freshness_prior(doc.get("freshness_label", "unknown"))
+                if mode == "repair":
+                    score = 0.45 * dense_score + 0.20 * lexical_score + 0.25 * quality + 0.10 * freshness
+                else:
+                    score = 0.55 * dense_score + 0.25 * lexical_score + 0.15 * quality + 0.05 * freshness
+                chunk = EvidenceChunk(
+                    chunk_id=f"{version}::{item['chunk_id']}", task_id=0, source_id=doc["canonical_doc_key"],
+                    text=item["text"], start_char=item["start_char"], end_char=item["end_char"],
+                    has_full_content=True, origin="history", title=doc["title"], url=doc["url"],
+                    domain=doc["domain"], quality_label=doc["quality_label"], freshness_label=doc["freshness_label"],
+                    archive_doc_key=doc["canonical_doc_key"], archive_version_id=version, **_layout_fields(item),
+                )
+                scored.append((chunk, score, {
+                    "dense": dense_score, "lexical": lexical_score, "quality": quality, "freshness": freshness,
+                    "citation_eligible": 0.0,
+                }))
+            hits = EvidenceRuntimeIndex(self._config)._select_hits(
+                scored, top_k=cap, per_source_limit=2, max_sources=cap, citation_eligible=False,
+            )
+            latest = self._partition_manifest(root)
+            result = [
+                replace(hit, source_id="", _partitioned_history=True) for hit in hits
+                if self._visible_origins(latest, hit.archive_version_id, purpose=purpose, exclude=request_id_exclude)
+            ]
+            self._record_partition("read", "ok" if result else "empty")
+            return result
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            self._record_partition("read", "unavailable")
+            return []
+
+    def _load_partition_runtime_chunks(
+        self, version: str, *, task_id: int, source_id: str, expected_url: str | None,
+        scope: MemoryScope | None, origin_request_id: str | None, artifact_version: str | None,
+    ) -> list[EvidenceChunk]:
+        if (
+            not scope_is_current(self._policy, self._scope)
+            or (scope is not None and scope != self._scope)
+            or origin_request_id != self._scope.request_id or not valid_internal_id(source_id)
+            or not valid_internal_id(artifact_version) or not (url := _safe_evidence_url(expected_url))
+            or not authorize(
+                self._policy, self._scope, origin_request_id, "task",
+                object_id=source_id, content_version=artifact_version,
+            )
+        ):
+            self._record_partition("hydrate", "denied")
+            return []
+        try:
+            root = partition_root(self._memory_dir, self._scope)
+            manifest = self._partition_manifest(root)
+            origin = {
+                "tenant_id": self._scope.tenant_id, "request_id": origin_request_id, "source_id": source_id,
+                "task_id": task_id, "artifact_version": artifact_version,
+            }
+            if origin not in self._visible_origins(manifest, version, purpose="task"):
+                return []
+            payload = self._partition_payload(root, version)
+            if not payload or payload["doc"]["normalized_url"] != url:
+                self._record_partition("hydrate", "empty")
+                return []
+            doc = payload["doc"]
+            chunks = [
+                EvidenceChunk(
+                    chunk_id=f"{source_id}::{item['chunk_id']}", task_id=task_id, source_id=source_id,
+                    text=item["text"], start_char=item["start_char"], end_char=item["end_char"], has_full_content=True,
+                    origin="current", title=doc["title"], url=doc["url"], domain=doc["domain"],
+                    quality_label=doc["quality_label"], freshness_label=doc["freshness_label"],
+                    published_at=doc["published_at"], archive_doc_key=doc["canonical_doc_key"],
+                    archive_version_id=version, archive_artifact_version=artifact_version, **_layout_fields(item),
+                )
+                for item in payload["chunks"]
+            ]
+            if origin not in self._visible_origins(self._partition_manifest(root), version, purpose="task"):
+                return []
+            self._record_partition("hydrate", "ok")
+            return chunks
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            self._record_partition("hydrate", "unavailable")
+            return []
+
     def on_records_changed(
         self,
         *,
@@ -1188,8 +1920,15 @@ class EvidenceMemoryService(EvidenceStoreListener):
         reason: str,
         request_id: str | None = None,
     ) -> None:
-        del task_id
         if not self.enabled or reason not in {"search", "fetch"}:
+            return
+
+        if self._strict():
+            if not scope_is_current(self._policy, self._scope) or request_id != self._scope.request_id:
+                self._record_partition("write", "denied")
+                return
+            sources = [EvidenceArchiveSource(request_id, task_id, record) for record in records]
+            self._strict_ingest(sources, purpose="task", operation="write", dry_run=False)
             return
 
         eligible_records = [
@@ -1513,9 +2252,17 @@ class EvidenceMemoryService(EvidenceStoreListener):
         task_id: int,
         source_id: str,
         expected_url: str | None = None,
+        scope: MemoryScope | None = None,
+        origin_request_id: str | None = None,
+        artifact_version: str | None = None,
     ) -> list[EvidenceChunk]:
         if not self.enabled or not archive_version_id:
             return []
+        if self._strict() or scope is not None or origin_request_id is not None or artifact_version is not None:
+            return self._load_partition_runtime_chunks(
+                archive_version_id, task_id=task_id, source_id=source_id, expected_url=expected_url,
+                scope=scope, origin_request_id=origin_request_id, artifact_version=artifact_version,
+            )
         payload = self._load_doc_payload(archive_version_id)
         doc = payload.get("doc") if isinstance(payload.get("doc"), dict) else {}
         if not payload or (
@@ -1564,9 +2311,14 @@ class EvidenceMemoryService(EvidenceStoreListener):
         top_k: int,
         request_id_exclude: str | None = None,
         mode: str = "lead",
+        purpose: MemoryPurpose = "task",
     ) -> list[EvidenceRetrievalHit]:
         if not self.enabled:
             return []
+        if self._strict():
+            return self._query_partition(
+                text=text, top_k=top_k, request_id_exclude=request_id_exclude, mode=mode, purpose=purpose,
+            )
         normalized_query = _clean_text(text)
         if not normalized_query:
             return []

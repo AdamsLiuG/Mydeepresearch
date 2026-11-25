@@ -53,7 +53,11 @@ from services.evidence_index import (
     EvidenceStoreListener,
     pack_lazy_chunks,
 )
-from services.memory_sanitizer import WEB_SANITIZER_VERSION, sanitize_injection_text
+from services.memory_sanitizer import (
+    WEB_SANITIZER_VERSION,
+    sanitize_injection_text,
+    sanitize_web_text,
+)
 from services.search import dispatch_search, projected_search_snippet
 from services.text_processing import (
     CITATION_PATTERN,
@@ -2488,6 +2492,132 @@ class EvidenceStore:
             references.append(ref_entry)
         return references
 
+    def register_historical_evidence(
+        self,
+        *,
+        task_id: int,
+        historical: Any,
+        url: str = "",
+        title: str = "",
+        origin_request_id: str | None = None,
+        origin_source_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Re-register verified historical GraphEvidence into a current task with a fresh Tn-Sm ID."""
+        from services.knowledge_graph import GraphEvidence, graph_evidence_from_payload
+        from services.memory_scope import valid_internal_id
+
+        ev = historical if isinstance(historical, GraphEvidence) else graph_evidence_from_payload(historical)
+        if ev is None:
+            return None
+        if (
+            ev.origin != "web" or ev.level not in {"L1", "L2"} or ev.isolated
+            or ev.trusted is not True or ev.visible is not True or ev.facts_eligible is not True
+            or ev.sanitizer_version != WEB_SANITIZER_VERSION or not ev.fragments
+        ):
+            return None
+        origin_req = str(origin_request_id or ev.request_id or "").strip()
+        origin_sid = str(origin_source_id or ev.source_id or "").strip()
+        if not valid_internal_id(origin_req) or not valid_internal_id(origin_sid):
+            return None
+
+        cleaned_url = _normalize_url(url) if url else ""
+        if url and not cleaned_url:
+            return None
+        if not cleaned_url:
+            cleaned_url = f"https://historical.invalid/{origin_req}/{origin_sid}"
+        safe_title = sanitize_web_text(title or origin_sid, max_chars=240) or origin_sid
+
+        fragments_parts: list[str] = []
+        anchors: list[dict[str, Any]] = []
+        cursor = 0
+        for index, frag in enumerate(ev.fragments, 1):
+            clean_frag = sanitize_web_text(frag.text, max_chars=50_000)
+            if not clean_frag:
+                continue
+            anchor_id = frag.chunk_id if re.fullmatch(r"(?:html-p|text-p|pdf-p)[0-9]{1,6}", frag.chunk_id) else f"text-p{index}"
+            if cursor:
+                fragments_parts.append("\n\n")
+                cursor += 2
+            start = cursor
+            fragments_parts.append(clean_frag)
+            cursor += len(clean_frag)
+            anchors.append({"anchor_id": anchor_id, "start": start, "end": cursor})
+        full_text = "".join(fragments_parts)
+        if not full_text or not anchors:
+            return None
+
+        artifact_ver = int(ev.artifact_version) if str(ev.artifact_version).isascii() and str(ev.artifact_version).isdecimal() else 1
+        adapter = "static" if ev.level == "L1" else "reader_http"
+        changed_record: EvidenceRecord | None = None
+        with self._lock:
+            task_ids = self._task_source_ids.setdefault(task_id, [])
+            url_index = self._task_url_index.setdefault(task_id, {})
+            for existing_id in task_ids:
+                existing = self._records_by_id.get(existing_id)
+                hist_meta = (existing.provenance_meta or {}).get("historical_origin") if existing else None
+                if isinstance(hist_meta, dict) and (
+                    hist_meta.get("origin_request_id"),
+                    hist_meta.get("origin_source_id"),
+                    str(hist_meta.get("artifact_version") or ""),
+                ) == (origin_req, origin_sid, ev.artifact_version):
+                    return existing.to_dict()
+            dedup_key = _normalize_url(cleaned_url) or f"title::{safe_title.casefold()}"
+            existing_by_url = url_index.get(dedup_key)
+            if existing_by_url and existing_by_url in self._records_by_id:
+                return self._records_by_id[existing_by_url].to_dict()
+
+            next_index = _next_source_sequence(task_ids, f"T{task_id}-S")
+            source_id = f"T{task_id}-S{next_index}"
+            record = EvidenceRecord(
+                source_id=source_id,
+                task_id=task_id,
+                query="",
+                title=safe_title,
+                url=cleaned_url,
+                snippet=sanitize_web_snippet(full_text[:320]),
+                raw_content="",
+                full_content=full_text,
+                archive_has_full_content=True,
+                backend="graph_historical",
+                domain=_domain(cleaned_url),
+                source_type=_classify_source_type(cleaned_url, safe_title),
+                tenant_id=ev.tenant_id,
+                source_origin="web",
+                provenance_meta={
+                    "web_extraction": {
+                        "tier": ev.level,
+                        "adapter": adapter,
+                        "sanitizer_version": WEB_SANITIZER_VERSION,
+                        "quality_version": QUALITY_VERSION,
+                        "policy_version": POLICY_VERSION,
+                        "artifact_version": max(1, artifact_ver),
+                        "fact_eligible": True,
+                        "text_anchors": anchors,
+                    },
+                    "historical_origin": {
+                        "origin_request_id": origin_req,
+                        "origin_source_id": origin_sid,
+                        "artifact_version": ev.artifact_version,
+                    },
+                },
+                created_at=time.time(),
+                updated_at=time.time(),
+            )
+            if self.web_extraction_enabled:
+                record._web_managed = True
+                record._web_verified = True
+                record._web_published = True
+            _apply_quality_metadata(record)
+            self._records_by_id[source_id] = record
+            task_ids.append(source_id)
+            url_index[dedup_key] = source_id
+            changed_record = deepcopy(record) if self.web_extraction_enabled else record
+
+        if changed_record is not None:
+            self._notify_listeners(task_id=task_id, records=[changed_record], reason="hydrate")
+            return self.get_evidence(changed_record.source_id)
+        return None
+
     def hydrate_from_tasks(self, tasks: list[Any], *, trusted_web_snapshot: bool = False) -> None:
         """Rebuild evidence indices. Opt in to web artifact reuse for published internal snapshots."""
 
@@ -3403,3 +3533,116 @@ class EvidenceLookupTool(Tool):
         return json.dumps(
             {"mode": "lazy_chunks", "results": [result.to_dict() for result in results]}, ensure_ascii=False,
         )
+
+
+def build_graph_evidence(
+    record_or_dict: Any,
+    *,
+    tenant_id: str,
+    request_id: str,
+    acl_reference: str = "",
+) -> Any | None:
+    """Build a fail-closed GraphEvidence object from a strict L1/L2 web evidence record."""
+    from services.knowledge_graph import EvidenceFragment, GraphEvidence
+    from services.memory_scope import valid_internal_id
+
+    data = (
+        record_or_dict.to_dict(include_full_content=True)
+        if hasattr(record_or_dict, "to_dict")
+        else dict(record_or_dict) if isinstance(record_or_dict, dict) else {}
+    )
+    if not data:
+        return None
+    source_id = str(data.get("source_id") or "").strip()
+    if not valid_internal_id(source_id) or not valid_internal_id(request_id) or not valid_internal_id(tenant_id):
+        return None
+    record_tenant = str(data.get("tenant_id") or tenant_id).strip() or tenant_id
+    if record_tenant != tenant_id or str(data.get("source_origin") or "web") != "web":
+        return None
+
+    meta = (data.get("provenance_meta") or {}).get("web_extraction")
+    if not isinstance(meta, dict):
+        return None
+    tier = meta.get("tier")
+    adapter = meta.get("adapter")
+    if (tier, adapter) not in (("L1", "static"), ("L2", "reader_http"), ("L2", "playwright")):
+        return None
+    if (
+        meta.get("sanitizer_version") != WEB_SANITIZER_VERSION
+        or meta.get("quality_version") != QUALITY_VERSION
+        or meta.get("policy_version") != POLICY_VERSION
+    ):
+        return None
+    artifact_version = meta.get("artifact_version")
+    if type(artifact_version) is not int or artifact_version <= 0:
+        return None
+    if bool(data.get("isolated")) or bool(meta.get("isolated")) or meta.get("fact_eligible", True) is not True:
+        return None
+    url = str(data.get("url") or "").strip()
+    if url:
+        try:
+            normalize_web_url(url)
+        except GatewayError:
+            return None
+
+    full_text = str(data.get("full_content") or "")
+    multimodal_blocks = data.get("multimodal_blocks") or []
+    flags = set(meta.get("quality_flags") or ())
+    if flags & {"snippet_only", "link_only", "visibility_uncertain"}:
+        return None
+
+    fragments: list[EvidenceFragment] = []
+    seen_chunks: set[str] = set()
+    for anchor in meta.get("text_anchors") or ():
+        if not isinstance(anchor, dict):
+            continue
+        anchor_id = str(anchor.get("anchor_id") or "").strip()
+        start, end = anchor.get("start"), anchor.get("end")
+        if (
+            not valid_internal_id(anchor_id) or anchor_id in seen_chunks
+            or type(start) is not int or type(end) is not int or not (0 <= start < end <= len(full_text))
+        ):
+            continue
+        cleaned = sanitize_web_text(full_text[start:end], max_chars=50_000)
+        if cleaned:
+            seen_chunks.add(anchor_id)
+            fragments.append(EvidenceFragment(chunk_id=anchor_id, anchor=anchor_id, text=cleaned))
+            if len(fragments) >= 256:
+                break
+
+    for block in multimodal_blocks:
+        if len(fragments) >= 256 or not isinstance(block, dict) or block.get("modality") != "table":
+            continue
+        anchor_id = str(block.get("anchor_id") or "").strip()
+        if not valid_internal_id(anchor_id) or anchor_id in seen_chunks:
+            continue
+        payload = block.get("structured_payload") or block.get("text") or ""
+        raw_table = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if isinstance(payload, dict) else str(payload)
+        cleaned = sanitize_web_text(raw_table, max_chars=50_000)
+        if cleaned:
+            seen_chunks.add(anchor_id)
+            fragments.append(EvidenceFragment(chunk_id=anchor_id, anchor=anchor_id, text=cleaned))
+
+    if not fragments and full_text.strip():
+        cleaned = sanitize_web_text(full_text, max_chars=50_000)
+        if cleaned:
+            fragments.append(EvidenceFragment(chunk_id="text-p1", anchor="text-p1", text=cleaned))
+
+    if not fragments:
+        return None
+    return GraphEvidence(
+        tenant_id=tenant_id,
+        request_id=request_id,
+        source_id=source_id,
+        artifact_version=str(artifact_version),
+        fragments=tuple(fragments),
+        level=str(tier),
+        trusted=True,
+        visible=True,
+        facts_eligible=True,
+        sanitizer_version=WEB_SANITIZER_VERSION,
+        isolated=False,
+        origin="web",
+        acl_reference=acl_reference,
+    )
+

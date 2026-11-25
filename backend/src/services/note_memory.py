@@ -16,6 +16,19 @@ from config import Configuration
 from metrics import RequestTrace, metrics_registry
 from services.embeddings import embeddings_available, encode_text, encode_texts
 from services.memory_sanitizer import collapse_whitespace, sanitize_memory_text
+from services.memory_scope import (
+    MemoryPolicy,
+    MemoryScope,
+    checked_path,
+    partition_lock,
+    partition_root,
+    read_partition_text,
+    scope_is_current,
+    strict_partition_required,
+    valid_internal_id,
+    write_partition_text,
+)
+from services.notes import ScopedNoteWorkspace
 from utils import truncate_text
 
 try:  # pragma: no cover - exercised through runtime fallback
@@ -245,6 +258,9 @@ class NoteMemoryService:
         config: Configuration,
         *,
         client: Any | None = None,
+        scope: MemoryScope | None = None,
+        policy: MemoryPolicy | None = None,
+        frozen_strict: bool = False,
     ) -> None:
         self._config = config
         self._client = client
@@ -255,6 +271,36 @@ class NoteMemoryService:
         self._collection_dir = self._memory_dir / "chromadb"
         self._reconciled = False
         self._backend_unavailable_logged = False
+        self._scope = scope
+        self._policy = policy
+        self._frozen_strict = frozen_strict or scope is not None
+        self._memory_root = self._memory_dir
+        self._scoped_notes = ScopedNoteWorkspace(config.notes_workspace, scope, policy) if scope and policy else None
+        self._collection_name = f"{_DEFAULT_COLLECTION_NAME}_{scope.namespace}" if scope else _DEFAULT_COLLECTION_NAME
+        self._strict_initialized = False
+
+    def _strict(self) -> bool:
+        return any(strict_partition_required(self._config, root, self._scope, frozen_strict=self._frozen_strict)
+                   for root in (self._memory_root, self._config.notes_workspace))
+
+    def _prepare_strict(self, *, create: bool = False) -> bool:
+        if not scope_is_current(self._policy, self._scope):
+            return False
+        try:
+            directory = partition_root(self._memory_root, self._scope, create=create)
+            self._scoped_notes.root
+            self._memory_dir = directory
+            self._manifest_path = checked_path(directory, "manifest.json")
+            self._collection_dir = checked_path(directory, "chromadb")
+        except (OSError, ValueError):
+            return False
+        self._strict_initialized = True
+        return True
+
+    def _partition_metric(self, operation: str, outcome: str) -> None:
+        metrics_registry.record_v4_memory_partition(
+            "note", operation, outcome, tenant_id=self._scope.tenant_id if self._scope else None,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -262,10 +308,15 @@ class NoteMemoryService:
             self._config.note_memory_enabled
             and self._config.enable_notes
             and str(self._config.notes_workspace or "").strip()
+            and (not self._strict() or scope_is_current(self._policy, self._scope))
         )
 
     def ensure_reconciled(self, *, observer: RequestTrace | None = None) -> None:
         if not self.enabled:
+            return
+
+        if self._strict():
+            self._rebuild_strict(dry_run=False)
             return
 
         with self._lock:
@@ -336,14 +387,102 @@ class NoteMemoryService:
             {
                 str(note_id or "").strip()
                 for note_id in note_ids or []
-                if str(note_id or "").strip()
+                if str(note_id or "").strip() and (not self._strict() or valid_internal_id(note_id))
             }
         )
         if not normalized_ids:
             return
 
+        if self._strict():
+            self._rebuild_strict(dry_run=False, note_ids=normalized_ids[:64], operation="write")
+            return
         with self._lock:
             self._refresh_locked(normalized_ids, observer=observer)
+
+    def rebuild(self, *, dry_run: bool = True, limit: int = 16, after: str = "") -> dict[str, Any]:
+        return self._rebuild_strict(dry_run=dry_run, limit=limit, after=after)
+
+    def _rebuild_strict(
+        self, *, dry_run: bool, limit: int = 64, after: str = "",
+        note_ids: list[str] | None = None, operation: str = "rebuild",
+    ) -> dict[str, Any]:
+        result = {"eligible": 0, "indexed": 0, "next_cursor": ""}
+        if not self.enabled or not self._strict() or self._scoped_notes is None:
+            return result
+        try:
+            note_ids = note_ids if note_ids is not None else self._scoped_notes.candidate_ids(after=after, limit=limit)
+            purpose = "task" if operation == "write" else "maintenance"
+            candidates = [(note_id, self._scoped_notes.read_record(note_id, purpose=purpose)) for note_id in note_ids]
+            result["eligible"] = sum(record is not None for _, record in candidates)
+            result["next_cursor"] = note_ids[-1] if note_ids else ""
+            if dry_run or not candidates:
+                return result
+            with self._lock:
+                if not self._prepare_strict(create=True):
+                    return result
+                with partition_lock(self._memory_dir):
+                    manifest = self._load_manifest()
+                    if self._manifest_requires_reset(manifest):
+                        manifest = self._empty_manifest()
+                    collection = self._get_collection()
+                    if collection is None:
+                        return result
+                    stale_chunks = []
+                    for note_id, record in candidates:
+                        if record is None or record != self._scoped_notes.read_record(note_id, purpose=purpose):
+                            continue
+                        body, provenance = record
+                        document = self._document_from_text(self._scoped_notes.root / (note_id + ".md"), body)
+                        if document is None or document.note_id != note_id:
+                            continue
+                        previous = manifest["notes"].get(note_id) or {}
+                        if previous.get("checksum") == document.checksum and previous.get("request_id") == provenance["request_id"]:
+                            continue
+                        stale_chunks.extend(previous.get("chunk_ids") or ())
+                        manifest["notes"].pop(note_id, None)
+                        self._upsert_document(collection, manifest, document, {
+                            "request_id": provenance["request_id"], "content_sha256": provenance["content_sha256"],
+                        })
+                        if note_id in manifest["notes"]:
+                            manifest["notes"][note_id]["request_id"] = provenance["request_id"]
+                            result["indexed"] += 1
+                    if result["indexed"] and scope_is_current(self._policy, self._scope):
+                        self._write_manifest(manifest)
+                        if stale_chunks:
+                            collection.delete(ids=stale_chunks)
+            self._partition_metric(operation, "ok")
+        except Exception:
+            self._partition_metric(operation, "unavailable")
+        return result
+
+    def retract_request(self, request_id: str, *, dry_run: bool = True, limit: int = 64) -> int:
+        from services.memory_scope import authorize
+
+        if not self._strict() or not authorize(self._policy, self._scope, request_id, "maintenance"):
+            return 0
+        try:
+            if not self._prepare_strict():
+                return 0
+            manifest = self._load_manifest()
+            affected = [key for key, data in sorted(manifest["notes"].items())
+                        if data.get("request_id") == request_id][:max(0, min(64, limit))]
+            if dry_run or not affected:
+                return len(affected)
+            with self._lock, partition_lock(self._memory_dir):
+                if not authorize(self._policy, self._scope, request_id, "maintenance"):
+                    return 0
+                manifest = self._load_manifest()
+                removed = [manifest["notes"].pop(key) for key in affected
+                           if manifest["notes"].get(key, {}).get("request_id") == request_id]
+                self._write_manifest(manifest)
+                collection = self._get_collection()
+                ids = [item for row in removed for item in row.get("chunk_ids", [])]
+                if collection is not None and ids:
+                    collection.delete(ids=ids)
+                return len(removed)
+        except Exception:
+            self._partition_metric("delete", "unavailable")
+            return 0
 
     def _search_and_render(
         self,
@@ -359,7 +498,12 @@ class NoteMemoryService:
             return ""
 
         try:
-            self.ensure_reconciled(observer=observer)
+            if self._strict():
+                if not self._prepare_strict() or self._get_collection(observer=observer) is None:
+                    return ""
+                current_request_id = self._scope.request_id
+            else:
+                self.ensure_reconciled(observer=observer)
         except Exception as exc:  # pragma: no cover - defensive runtime guard
             logger.warning("note memory reconcile failed stage=%s error=%s", stage, exc)
             if observer:
@@ -380,6 +524,8 @@ class NoteMemoryService:
             current_request_id=current_request_id,
             exclude_note_ids=exclude_note_ids or set(),
         )
+        if self._strict_initialized:
+            self._partition_metric("read", "ok" if hits else "empty")
         if observer:
             observer.record_note_memory_query(
                 hit_count=len(hits),
@@ -531,7 +677,7 @@ class NoteMemoryService:
             self._client = client
 
         self._collection = client.get_or_create_collection(
-            name=_DEFAULT_COLLECTION_NAME,
+            name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
         )
         return self._collection
@@ -539,7 +685,13 @@ class NoteMemoryService:
     def _create_default_client(self) -> Any:
         if chromadb is None:
             raise RuntimeError("chromadb is not installed")
-        self._collection_dir.mkdir(parents=True, exist_ok=True)
+        if self._strict_initialized:
+            from services.memory_scope import open_partition_directory
+
+            with open_partition_directory(self._memory_dir, "chromadb", create=True):
+                pass
+        else:
+            self._collection_dir.mkdir(parents=True, exist_ok=True)
         return chromadb.PersistentClient(path=str(self._collection_dir))
 
     def _recreate_collection_locked(self) -> None:
@@ -549,11 +701,11 @@ class NoteMemoryService:
             self._client = client
 
         try:
-            client.delete_collection(_DEFAULT_COLLECTION_NAME)
+            client.delete_collection(self._collection_name)
         except Exception:
             pass
         self._collection = client.get_or_create_collection(
-            name=_DEFAULT_COLLECTION_NAME,
+            name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -569,15 +721,26 @@ class NoteMemoryService:
         if not self._manifest_path.exists():
             return self._empty_manifest()
         try:
-            payload = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+            text = (
+                read_partition_text(self._memory_dir, "manifest.json")
+                if self._strict_initialized else self._manifest_path.read_text(encoding="utf-8")
+            )
+            payload = json.loads(text)
         except (OSError, json.JSONDecodeError):
             return self._empty_manifest()
         if not isinstance(payload, dict):
+            return self._empty_manifest()
+        if self._strict_initialized and (
+            payload.get("tenant_id") != self._scope.tenant_id or not isinstance(payload.get("notes"), dict)
+        ):
             return self._empty_manifest()
         payload.setdefault("notes", {})
         return payload
 
     def _write_manifest(self, manifest: dict[str, Any]) -> None:
+        if self._strict_initialized:
+            write_partition_text(self._memory_dir, "manifest.json", text=json.dumps(manifest, ensure_ascii=False))
+            return
         self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self._manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -589,6 +752,7 @@ class NoteMemoryService:
             "schema_version": _SCHEMA_VERSION,
             "embedding_model": self._config.resolved_note_memory_embedding_model(),
             "chunking_version": _CHUNKING_VERSION,
+            **({"tenant_id": self._scope.tenant_id} if self._strict_initialized else {}),
             "notes": {},
         }
 
@@ -604,6 +768,9 @@ class NoteMemoryService:
         except OSError:
             return None
 
+        return self._document_from_text(path, raw_text)
+
+    def _document_from_text(self, path: Path, raw_text: str) -> NoteDocument | None:
         frontmatter, body = self._split_frontmatter(raw_text)
         note_id = str(frontmatter.get("id") or "").strip()
         note_type = str(frontmatter.get("type") or "").strip()
@@ -697,7 +864,13 @@ class NoteMemoryService:
         collection.upsert(
             ids=[chunk.chunk_id for chunk, _ in valid_triplets],
             documents=[chunk.to_document() for chunk, _ in valid_triplets],
-            metadatas=[chunk.to_metadata() for chunk, _ in valid_triplets],
+            metadatas=[
+                {**chunk.to_metadata(), **(
+                    {"tenant_id": self._scope.tenant_id, "content_sha256": document.checksum}
+                    if self._strict_initialized else {}
+                )}
+                for chunk, _ in valid_triplets
+            ],
             embeddings=[embedding for _, embedding in valid_triplets],
         )
 
@@ -739,7 +912,10 @@ class NoteMemoryService:
                 chunk_index += 1
                 chunks.append(
                     NoteChunk(
-                        chunk_id=f"{document.note_id}::chunk::{chunk_index}",
+                        chunk_id=(
+                            f"{document.note_id}::{document.checksum}::{chunk_index}"
+                            if self._strict_initialized else f"{document.note_id}::chunk::{chunk_index}"
+                        ),
                         note_id=document.note_id,
                         note_type=document.note_type,
                         title=document.title,
@@ -831,11 +1007,19 @@ class NoteMemoryService:
             return []
 
         request_n = max(top_k * _DEFAULT_QUERY_MULTIPLIER, top_k)
-        result = self._collection.query(
-            query_embeddings=[query_embedding],
-            n_results=request_n,
-            include=["documents", "distances", "metadatas"],
-        )
+        manifest = self._load_manifest() if self._strict_initialized else {}
+        filters = {"where": {"tenant_id": self._scope.tenant_id}} if self._strict_initialized else {}
+        try:
+            result = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=request_n,
+                include=["documents", "distances", "metadatas"],
+                **filters,
+            )
+        except Exception:
+            if self._strict_initialized:
+                return []
+            raise
 
         documents = (result.get("documents") or [[]])[0]
         distances = (result.get("distances") or [[]])[0]
@@ -851,6 +1035,33 @@ class NoteMemoryService:
             if not note_id or note_id in exclude_note_ids:
                 continue
 
+            if self._strict_initialized:
+                indexed = manifest["notes"].get(note_id) or {}
+                purpose = "plan" if stage == "planning" else "task"
+                if (
+                    metadata.get("tenant_id") != self._scope.tenant_id
+                    or metadata.get("content_sha256") != indexed.get("checksum")
+                    or metadata.get("chunk_id") not in (indexed.get("chunk_ids") or ())
+                ):
+                    continue
+                record = self._scoped_notes.read_record(note_id, purpose=purpose)
+                if record is None:
+                    continue
+                body, provenance = record
+                if (
+                    provenance["content_sha256"] != indexed["checksum"]
+                    or provenance["request_id"] != indexed.get("request_id")
+                ):
+                    continue
+                path = self._scoped_notes.root / (note_id + ".md")
+                doc = self._document_from_text(path, body)
+                if doc is None or doc.note_id != note_id:
+                    continue
+                canonical = next((chunk for chunk in self._chunk_document(doc, provenance=provenance)
+                                  if chunk.chunk_id == metadata["chunk_id"]), None)
+                if canonical is None:
+                    continue
+                metadata = canonical.to_metadata()
             resolved_request_id = str(metadata.get("resolved_request_id") or "").strip() or None
             if current_request_id and resolved_request_id == current_request_id:
                 continue
@@ -889,6 +1100,12 @@ class NoteMemoryService:
                 grouped[note_id] = hit
 
         ranked = sorted(grouped.values(), key=lambda item: (item.score, item.similarity), reverse=True)
+        if self._strict_initialized:
+            purpose = "plan" if stage == "planning" else "task"
+            ranked = [
+                hit for hit in ranked if (record := self._scoped_notes.read_record(hit.note_id, purpose=purpose))
+                and record[1]["content_sha256"] == manifest["notes"][hit.note_id]["checksum"]
+            ]
         return ranked[:top_k]
 
     def _score_hit(

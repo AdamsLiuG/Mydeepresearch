@@ -96,6 +96,14 @@ class MemoryShadowGateTests(unittest.TestCase):
         config = Configuration.from_env(load_env_file=False)
         self.assertFalse(config.memory_shadow_mode)
 
+    def test_internal_strategy_usage_id_is_kept_out_of_shadow_metrics_event(self):
+        trace = _make_trace()
+        trace.record_strategy_memory_query(hit_count=1, match_kinds=["planning_pattern"],
+                                           strategy_ids=["sc_private"], internal_ids=True)
+        trace.record_memory_shadow_suppression("planning_strategy")
+        self.assertEqual(trace.strategy_memory_hit_ids, ["sc_private"])
+        self.assertNotIn("sc_private", json.dumps(trace.metrics_event(), ensure_ascii=False))
+
 
 class MemoryJudgeMetricTests(unittest.TestCase):
     def test_effective_injection_is_zero_under_shadow_mode(self):

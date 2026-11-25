@@ -10,6 +10,7 @@ from threading import Lock
 from typing import Any, Callable
 
 from models import SummaryState, TodoItem
+from services.notes import ScopedNoteWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,13 @@ class ToolCallEvent:
 class ToolCallTracker:
     """Collects tool call events and converts them to SSE payloads."""
 
-    def __init__(self, notes_workspace: str | None) -> None:
-        self._notes_workspace = notes_workspace
+    def __init__(
+        self, notes_workspace: str | None, *, scoped_notes: ScopedNoteWorkspace | None = None,
+        strict_notes: bool = False,
+    ) -> None:
+        self._strict_notes = strict_notes or scoped_notes is not None
+        self._scoped_notes = scoped_notes
+        self._notes_workspace = None if self._strict_notes else notes_workspace
         self._events: list[ToolCallEvent] = []
         self._cursor = 0
         self._lock = Lock()
@@ -56,6 +62,8 @@ class ToolCallTracker:
             note_id = parsed_parameters.get("note_id")
             if note_id is None:
                 note_id = self._extract_note_id(result_text)
+            if self._strict_notes and self._note_path(note_id) is None:
+                note_id = None
 
         event = ToolCallEvent(
             id=len(self._events) + 1,
@@ -148,8 +156,7 @@ class ToolCallTracker:
             "task_id": event.task_id,
             "note_id": event.note_id,
         }
-        if event.note_id and self._notes_workspace:
-            note_path = Path(self._notes_workspace) / f"{event.note_id}.md"
+        if event.note_id and (note_path := self._note_path(event.note_id)) is not None:
             payload["note_path"] = str(note_path)
         if step is not None:
             payload["step"] = step
@@ -158,18 +165,28 @@ class ToolCallTracker:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _note_path(self, note_id: str | None) -> Path | None:
+        if not note_id:
+            return None
+        if self._scoped_notes is not None:
+            return self._scoped_notes.path(note_id, owned=True)
+        return Path(self._notes_workspace) / f"{note_id}.md" if self._notes_workspace else None
+
     def _attach_note_to_task(self, tasks: list[TodoItem], task_id: int, note_id: str) -> None:
         """Update matching TODO item with note metadata."""
+        note_path = self._note_path(note_id)
+        if self._strict_notes and note_path is None:
+            return
         for task in tasks:
             if task.id != task_id:
                 continue
 
             if task.note_id != note_id:
                 task.note_id = note_id
-                if self._notes_workspace:
-                    task.note_path = str(Path(self._notes_workspace) / f"{note_id}.md")
-            elif task.note_path is None and self._notes_workspace:
-                task.note_path = str(Path(self._notes_workspace) / f"{note_id}.md")
+                if note_path is not None:
+                    task.note_path = str(note_path)
+            elif task.note_path is None and note_path is not None:
+                task.note_path = str(note_path)
             break
 
     def _infer_task_id(self, parameters: dict[str, Any]) -> int | None:

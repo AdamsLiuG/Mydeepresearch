@@ -22,6 +22,36 @@ Resource = Literal[
 ]
 DagActionName = Literal["PIVOT", "DEEPEN", "PRUNE"]
 BudgetPressure = Literal["normal", "high", "exhausted"]
+GraphPurpose = Literal["plan", "task", "report"]
+MemoryPurpose = Literal["plan", "task", "report", "strategy_synthesis", "maintenance"]
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    """Internal reference to a versioned set of evidence fragments."""
+
+    request_id: str
+    source_id: str
+    chunk_ids: tuple[str, ...]
+    artifact_version: str
+    content_sha256: str
+
+
+@dataclass(frozen=True)
+class VerifiedFactReceipt:
+    """Internal binding between a ledger fact and its calibrated verification."""
+
+    tenant_id: str
+    request_id: str
+    ledger_version: int
+    claim_id: str
+    fact_fingerprint: str
+    atomic_claim_ids: tuple[str, ...]
+    nli_label: Literal["ENTAILED"]
+    confidence_ppm: int
+    verifier_version: str
+    verified_at: str
+    support: tuple[EvidenceRef, ...]
 
 RESOURCE_NAMES: tuple[str, ...] = (
     "tasks",

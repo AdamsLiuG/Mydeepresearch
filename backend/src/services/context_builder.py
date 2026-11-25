@@ -25,6 +25,58 @@ def _web_evidence_frame(items: list[str]) -> str:
     return f'<WEB_EVIDENCE_DATA chars="{len(body)}">\n{body}\n</WEB_EVIDENCE_DATA>'
 
 
+def render_graph_projection_data(projection: Any, *, max_bytes: int = 512) -> str:
+    """Render bounded, citation-free graph projection records wrapped in an explicit frame."""
+    if projection is None or max_bytes <= 0:
+        return ""
+    raw_records: list[Any] = []
+    phase = "graph"
+    status = "hit"
+    if isinstance(projection, str):
+        stripped = projection.strip()
+        if not stripped:
+            return ""
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return ""
+        if isinstance(parsed, dict):
+            raw_records = list(parsed.get("records") or ())
+            phase = str(parsed.get("phase") or "graph")
+            status = str(parsed.get("status") or "hit")
+        elif isinstance(parsed, list):
+            raw_records = list(parsed)
+    elif isinstance(projection, dict):
+        raw_records = list(projection.get("records") or ())
+        phase = str(projection.get("phase") or "graph")
+        status = str(projection.get("status") or "hit")
+    else:
+        records_attr = getattr(projection, "records", None)
+        if records_attr is None:
+            return ""
+        raw_records = list(records_attr)
+        phase = str(getattr(projection, "phase", "graph") or "graph")
+        status = str(getattr(projection, "status", "hit") or "hit")
+
+    if not raw_records:
+        return ""
+    capped_bytes = min(512, int(max_bytes))
+    kept: list[dict[str, Any]] = []
+    for record in raw_records:
+        if not isinstance(record, dict):
+            continue
+        candidate_payload = {"phase": phase, "status": status, "records": [*kept, record]}
+        encoded = _evidence_json(candidate_payload)
+        if len(encoded.encode("utf-8")) <= capped_bytes:
+            kept.append(record)
+        else:
+            break
+    if not kept:
+        return ""
+    body = _evidence_json({"phase": phase, "status": status, "records": kept})
+    return f'<GRAPH_MEMORY_DATA chars="{len(body)}">\n{body}\n</GRAPH_MEMORY_DATA>'
+
+
 def render_web_evidence_data(
     records: Sequence[dict[str, Any]], evidence_store: Any, *, max_chars: int = 6000,
 ) -> str:
@@ -182,6 +234,7 @@ class ContextPrefixBuilder:
         skill_pack_context: str = "",
         frozen_index_and_ledger: str = "",
         volatile_blocks: list[tuple[str, str]] | None = None,
+        graph_projection: str = "",
         cache_key_scope: str = "request",
     ) -> PromptEnvelope:
         sys_segments: list[PromptSegment] = []
@@ -247,6 +300,17 @@ class ContextPrefixBuilder:
             for name, text in (volatile_blocks or ())
             if str(text or "").strip()
         ]
+        graph_text = str(graph_projection or "").strip()
+        if graph_text:
+            volatile_segments.append(
+                PromptSegment(
+                    name="graph_memory",
+                    tier="volatile_suffix",
+                    text=graph_text,
+                    cacheable=False,
+                    breakpoint=False,
+                )
+            )
 
         sys_material = "\n\n".join(seg.text for seg in sys_segments)
         # Encode the message boundary as well as the rendered text to avoid ambiguous joins.

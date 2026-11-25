@@ -14,12 +14,17 @@ from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
 from prompts import (
     get_current_date,
+    graph_memory_prompt_rules,
     planner_output_contract,
     report_repair_task_prompt,
     supplemental_planner_instructions,
     todo_planner_instructions,
 )
-from services.context_builder import ContextPrefixBuilder, PromptEnvelope
+from services.context_builder import (
+    ContextPrefixBuilder,
+    PromptEnvelope,
+    render_graph_projection_data,
+)
 from services.dag_scheduler import normalize_depends_on, sanitize_task_dependencies
 from services.fact_ledger import render_context_checkpoint, render_context_delta
 from utils import strip_thinking_tokens
@@ -104,6 +109,7 @@ class PlanningService:
         historical_memory_context: str | None = None,
         strategy_memory_context: str | None = None,
         skill_pack_context: str | None = None,
+        graph_context: Any | None = None,
     ) -> List[TodoItem]:
         """Ask the planner agent to break the topic into actionable tasks."""
         body_prompt = todo_planner_instructions.format(
@@ -116,6 +122,7 @@ class PlanningService:
             historical_memory_context=historical_memory_context,
             strategy_memory_context=strategy_memory_context,
             skill_pack_context=skill_pack_context,
+            graph_context=graph_context,
         )
         response = self._invoke_planner(
             envelope.to_flat_prompt(),
@@ -139,6 +146,7 @@ class PlanningService:
                 historical_memory_context=historical_memory_context,
                 strategy_memory_context=strategy_memory_context,
                 skill_pack_context=skill_pack_context,
+                graph_context=graph_context,
             )
             repaired_response = self._invoke_planner(
                 repair_envelope.to_flat_prompt(),
@@ -201,6 +209,7 @@ class PlanningService:
         observer: RequestTrace | None = None,
         historical_memory_context: str | None = None,
         skill_pack_context: str | None = None,
+        graph_context: Any | None = None,
     ) -> List[TodoItem]:
         """Generate supplemental tasks that cover missing angles without duplicating existing work."""
 
@@ -226,6 +235,7 @@ class PlanningService:
             body_prompt=body_prompt,
             historical_memory_context=historical_memory_context,
             skill_pack_context=skill_pack_context,
+            graph_context=graph_context,
         )
         response = self._invoke_planner(
             envelope.to_flat_prompt(),
@@ -1045,13 +1055,15 @@ class PlanningService:
         historical_memory_context: str | None = None,
         strategy_memory_context: str | None = None,
         skill_pack_context: str | None = None,
+        graph_context: Any | None = None,
     ) -> PromptEnvelope:
         hist_block = self._historical_memory_block(historical_memory_context)
         strat_block = self._strategy_memory_block(strategy_memory_context)
+        graph_block = render_graph_projection_data(graph_context, max_bytes=256)
         builder = ContextPrefixBuilder(self._config)
         frozen = render_context_checkpoint(state, self._config)
         delta = render_context_delta(state, self._config)
-        rules = planner_output_contract
+        rules = planner_output_contract + graph_memory_prompt_rules(bool(graph_block))
         role = str(getattr(self._agent, "system_prompt", "") or "")
         if not builder.enabled():
             return builder.build_envelope(
@@ -1066,6 +1078,7 @@ class PlanningService:
                     ("strategy_memory", strat_block),
                     ("skills", str(skill_pack_context or "")),
                 ],
+                graph_projection=graph_block,
             )
         return builder.build_envelope(
             stage="planning",
@@ -1079,6 +1092,7 @@ class PlanningService:
                 ("context_delta", delta),
                 ("historical_memory", hist_block),
             ],
+            graph_projection=graph_block,
         )
 
     def _invoke_planner(

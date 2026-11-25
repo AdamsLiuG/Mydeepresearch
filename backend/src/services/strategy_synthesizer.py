@@ -6,14 +6,21 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
-
-from hello_agents import ToolAwareSimpleAgent
+from typing import TYPE_CHECKING, Any, Callable
 
 from config import Configuration
 from services.memory_sanitizer import normalize_list as _shared_normalize_list
 from services.memory_sanitizer import normalize_text as _shared_normalize_text
+from services.memory_scope import (
+    MemoryScope,
+    strict_memory_text,
+    strict_partition_required,
+    valid_scope,
+)
 from utils import strip_thinking_tokens, truncate_text
+
+if TYPE_CHECKING:
+    from hello_agents import ToolAwareSimpleAgent
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +95,36 @@ _KIND_TO_STAGE = {
     # while allowing the memory service to reuse them more broadly.
     "anti_pattern": "reflection",
 }
+_CARD_LIST_LIMITS = {
+    "match_signals": 4,
+    "recommended_actions": 4,
+    "query_templates": 3,
+    "preferred_sources": 3,
+    "pitfalls_to_avoid": 3,
+}
+_CARD_OUTPUT_FIELDS = {
+    "strategy_kind", "title", "applicable_when", "topic_domain", *_CARD_LIST_LIMITS,
+}
+
+
+def clean_strategy_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the same bounded fields before staging cards and before projection."""
+    cleaned: dict[str, Any] = {}
+    for key, limit in (("title", 120), ("applicable_when", 320)):
+        value = strict_memory_text(payload.get(key))
+        if not value:
+            return None
+        cleaned[key] = value[:limit]
+
+    for key, count in _CARD_LIST_LIMITS.items():
+        values = payload.get(key, [])
+        if not isinstance(values, list) or len(values) > count:
+            return None
+        texts = [strict_memory_text(value) for value in values]
+        if any(not value for value in texts):
+            return None
+        cleaned[key] = [value[:240] for value in texts if value]
+    return cleaned
 
 
 def _utc_now() -> str:
@@ -117,6 +154,7 @@ class StrategySourceRequest:
     tasks: list[dict[str, Any]] = field(default_factory=list)
     request_metrics: dict[str, Any] = field(default_factory=dict)
     requested_kinds: list[str] = field(default_factory=list)
+    _verified_scope: MemoryScope | None = field(default=None, init=False, repr=False)
 
     def to_prompt_payload(self) -> dict[str, Any]:
         return {
@@ -233,8 +271,15 @@ class StrategySynthesizer:
         if not source_request.requested_kinds:
             return []
 
+        strict = source_request._verified_scope is not None or strict_partition_required(
+            self._config, self._config.strategy_memory_dir,
+        )
+        if strict and not valid_scope(source_request._verified_scope):
+            return []
         prompt = self._build_prompt(source_request)
         agent = self._agent_factory()
+        if strict and getattr(agent, "enable_tool_calling", False):
+            return []
         try:
             response = agent.run(prompt)
         finally:
@@ -242,11 +287,18 @@ class StrategySynthesizer:
         return self._parse_response(response, source_request)
 
     def _build_prompt(self, source_request: StrategySourceRequest) -> str:
-        payload_json = json.dumps(
-            source_request.to_prompt_payload(),
-            ensure_ascii=False,
-            indent=2,
-        )
+        payload = source_request.to_prompt_payload()
+        if source_request._verified_scope is not None:
+            payload.pop("request_id")
+            payload.pop("topic")
+            payload.pop("request_metrics")
+            # Escape delimiters before enclosing the structured, prevalidated data.
+            payload_json = (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+            )
+        else:
+            payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
         requested_kinds = ", ".join(source_request.requested_kinds)
         allowed_domains = ", ".join(TOPIC_DOMAINS)
         return (
@@ -287,6 +339,9 @@ class StrategySynthesizer:
         source_request: StrategySourceRequest,
     ) -> list[StrategyCard]:
         text = str(raw_response or "").strip()
+        strict = source_request._verified_scope is not None
+        if strict and len(text) > 16_384:
+            return []
         if self._config.strip_thinking_tokens:
             text = strip_thinking_tokens(text).strip()
         if not text or "```" in text:
@@ -295,11 +350,14 @@ class StrategySynthesizer:
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            logger.warning(
-                "strategy synthesizer returned invalid JSON request_id=%s response=%s",
-                source_request.request_id,
-                truncate_text(text, 400),
-            )
+            if strict:
+                logger.warning("strategy synthesizer returned invalid JSON")
+            else:
+                logger.warning(
+                    "strategy synthesizer returned invalid JSON request_id=%s response=%s",
+                    source_request.request_id,
+                    truncate_text(text, 400),
+                )
             return []
 
         if not isinstance(payload, list):
@@ -320,7 +378,7 @@ class StrategySynthesizer:
             }
         )
         created_at = _utc_now()
-        for item in payload:
+        for item in payload[:8] if strict else payload:
             card = self._normalize_card(
                 item,
                 source_request=source_request,
@@ -349,6 +407,25 @@ class StrategySynthesizer:
             return None
         if strategy_kind not in source_request.requested_kinds:
             return None
+
+        if source_request._verified_scope is not None:
+            if set(payload) - _CARD_OUTPUT_FIELDS:
+                return None
+            if payload.get("topic_domain", DOMAIN_GENERAL) not in TOPIC_DOMAINS:
+                return None
+            clean = clean_strategy_fields(payload)
+            if clean is None:
+                return None
+            sensitive = [
+                value.casefold()
+                for task in source_request.tasks
+                for key in ("title", "intent", "query")
+                if isinstance(value := task.get(key), str) and len(value) >= 60
+            ]
+            proposed = json.dumps(clean, ensure_ascii=False).casefold()
+            if any(snippet in proposed for snippet in sensitive):
+                return None
+            payload = {**payload, **clean}
 
         title = truncate_text(_normalize_text(payload.get("title")), 120)
         applicable_when = truncate_text(_normalize_text(payload.get("applicable_when")), 320)

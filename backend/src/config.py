@@ -1331,6 +1331,26 @@ class Configuration(BaseModel):
     v4_web_l2_per_tenant: int = Field(default=1, gt=0, le=1)
     v4_web_l2_timeout_seconds: float = Field(default=12, gt=0, le=12)
     v4_web_config_reason: WebConfigReason | None = None
+    v4_tenant_memory_partition_enabled: bool = False
+    v4_knowledge_graph_enabled: bool = False
+    v4_knowledge_graph_tenants: list[str] = Field(default_factory=list, repr=False, exclude=True)
+    v4_knowledge_graph_backend: Literal["sqlite", "postgres", "memory"] = "sqlite"
+    v4_knowledge_graph_dir: str = Field(default=".memory/knowledge_graph", repr=False, exclude=True)
+    v4_graph_allow_in_memory_fallback: bool = False
+    v4_graph_min_entailment: float = Field(default=0.85, ge=0.85, le=1)
+    v4_graph_query_timeout_ms: int = Field(default=100, ge=1, le=250)
+    v4_graph_request_timeout_ms: int = Field(default=300, ge=1, le=1000)
+    v4_graph_max_candidates: int = Field(default=100, ge=1, le=100)
+    v4_graph_max_projection_tokens: int = Field(default=512, ge=1, le=512)
+    v4_graph_reconcile_enabled: bool = False
+
+    def knowledge_graph_enabled_for(self, tenant_id: str) -> bool:
+        return (
+            self.v4_tenant_memory_partition_enabled
+            and self.v4_knowledge_graph_enabled
+            and self.request_state_enabled
+            and tenant_id in self.v4_knowledge_graph_tenants
+        )
 
     def web_extraction_enabled_for(self, tenant_id: str) -> bool:
         return self.v4_web_extractor_enabled and tenant_id in self.v4_web_extractor_tenants
@@ -1341,6 +1361,7 @@ class Configuration(BaseModel):
         for key in (
             "v4_web_extractor_tenants", "v4_web_l2_origin_rules",
             "v4_web_reader_url", "v4_web_reader_token",
+            "v4_knowledge_graph_tenants", "v4_knowledge_graph_dir",
         ):
             values[key] = deepcopy(getattr(self, key))
         return values
@@ -1862,6 +1883,47 @@ class Configuration(BaseModel):
                 return "invalid_web_reader_token"
         return None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_graph_settings(cls, raw_values: Any) -> Any:
+        if not isinstance(raw_values, dict):
+            return raw_values
+        values = dict(raw_values)
+        partition_key = "v4_tenant_memory_partition_enabled"
+        if partition_key in values:
+            try:
+                values[partition_key] = _web_bool(values[partition_key])
+            except ValueError:
+                values[partition_key] = False
+
+        invalid = False
+        for key, field in cls.model_fields.items():
+            if not key.startswith(("v4_graph_", "v4_knowledge_graph_")) or key not in values:
+                continue
+            try:
+                value = values[key]
+                if key == "v4_knowledge_graph_tenants":
+                    tenants = _web_structured(value, list)
+                    value = _web_tenants(tenants)
+                    if len(tenants) != len(value):
+                        raise ValueError("duplicate graph tenant")
+                elif key == "v4_knowledge_graph_dir":
+                    if not isinstance(value, str) or not value.strip() or not value.isprintable():
+                        raise ValueError("invalid graph storage path")
+                elif field.annotation is bool:
+                    value = _web_bool(value)
+                elif field.annotation in (int, float) and type(value) not in (
+                    (str, int) if field.annotation is int else (str, int, float)
+                ):
+                    raise ValueError("invalid graph limit type")
+                values[key] = TypeAdapter(field.rebuild_annotation()).validate_python(value)
+            except ValueError:
+                values.pop(key)
+                invalid = True
+        if invalid:
+            values["v4_knowledge_graph_enabled"] = False
+        return values
+
     @field_validator("v4_default_research_depth", mode="before")
     @classmethod
     def _normalize_v4_research_depth(cls, value: Any) -> str:
@@ -1906,6 +1968,10 @@ class Configuration(BaseModel):
 
     @model_validator(mode="after")
     def _normalize_paths(self) -> "Configuration":
+        graph_path = Path(os.path.expanduser(self.v4_knowledge_graph_dir))
+        if not graph_path.is_absolute():
+            graph_path = _BACKEND_ROOT / graph_path
+        self.v4_knowledge_graph_dir = str(graph_path)
         workspace = (self.notes_workspace or "").strip()
         if workspace:
             workspace_path = Path(workspace).expanduser()

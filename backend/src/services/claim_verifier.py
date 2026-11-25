@@ -14,7 +14,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
@@ -208,9 +208,11 @@ class AtomicClaimRecord:
     matched_excerpt: str = ""
     verifier_backend: str = "none"
     degraded_reason: str | None = None
+    verified_at: str = ""
+    matched_fragments: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "atomic_id": self.atomic_id,
             "task_id": self.task_id,
             "parent_claim_index": self.parent_claim_index,
@@ -226,6 +228,11 @@ class AtomicClaimRecord:
             "verifier_backend": self.verifier_backend,
             "degraded_reason": self.degraded_reason,
         }
+        if self.verified_at:
+            payload["verified_at"] = self.verified_at
+        if self.matched_fragments:
+            payload["matched_fragments"] = [dict(item) for item in self.matched_fragments]
+        return payload
 
 
 @dataclass(kw_only=True)
@@ -1769,6 +1776,17 @@ class ClaimVerificationOrchestrator:
                     atomic.matched_chunk_ids = [max_ent_pair[0].chunk_id]
                     atomic.matched_excerpt = truncate_text(max_ent_pair[0].text, 220)
                     atomic.verifier_backend = backend_used
+                    atomic.verified_at = datetime.now(timezone.utc).isoformat()
+                    matched_chunk = (
+                        str(getattr(max_ent_pair[0], "anchor_id", "") or "").strip()
+                        or str(max_ent_pair[0].chunk_id or "").strip()
+                    )
+                    atomic.matched_fragments = [{
+                        "source_id": max_ent_pair[0].source_id,
+                        "chunk_id": matched_chunk,
+                        "anchor": matched_chunk,
+                        "text": max_ent_pair[0].text,
+                    }]
                     entailed_cnt += 1
                 else:
                     atomic.nli_label = "NEUTRAL"
@@ -2038,3 +2056,268 @@ class ClaimVerificationOrchestrator:
             return True, ""
 
         return _callback
+
+
+def _sanitize_verifier_version(value: Any) -> str:
+    raw = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "nli-v1").strip()).strip("-.")
+    return raw[:48] or "nli-v1"
+
+
+def _match_fragments_for_source(
+    atomic: dict[str, Any],
+    graph_evidence: Any,
+) -> tuple[Any, ...]:
+    """Resolve verified atomic excerpts to exact fragments in a GraphEvidence artifact."""
+    fragments = getattr(graph_evidence, "fragments", ()) or ()
+    if not fragments:
+        return ()
+    by_chunk = {frag.chunk_id: frag for frag in fragments}
+    matched: list[Any] = []
+    seen: set[str] = set()
+    for item in atomic.get("matched_fragments") or ():
+        if not isinstance(item, dict) or item.get("source_id") != graph_evidence.source_id:
+            continue
+        cid = str(item.get("chunk_id") or item.get("anchor") or "").strip()
+        if cid in by_chunk and cid not in seen:
+            matched.append(by_chunk[cid])
+            seen.add(cid)
+            continue
+        frag_text = " ".join(str(item.get("text") or "").split())
+        if frag_text:
+            for candidate_frag in fragments:
+                candidate_norm = " ".join(candidate_frag.text.split())
+                if candidate_norm and (frag_text in candidate_norm or candidate_norm in frag_text):
+                    if candidate_frag.chunk_id not in seen:
+                        matched.append(candidate_frag)
+                        seen.add(candidate_frag.chunk_id)
+                    break
+    if not matched:
+        for cid in atomic.get("matched_chunk_ids") or ():
+            cid_str = str(cid or "").strip()
+            if cid_str in by_chunk and cid_str not in seen:
+                matched.append(by_chunk[cid_str])
+                seen.add(cid_str)
+    if not matched:
+        excerpt_norm = " ".join(str(atomic.get("matched_excerpt") or "").split())
+        atomic_text = str(atomic.get("text") or "")
+        for candidate_frag in fragments:
+            candidate_norm = " ".join(candidate_frag.text.split())
+            if excerpt_norm and excerpt_norm[:80] in candidate_norm:
+                matched.append(candidate_frag)
+                break
+            if numeric_grounding_mismatch(atomic_text, [candidate_frag.text]) is None:
+                matched.append(candidate_frag)
+                break
+    return tuple(matched[:8])
+
+
+def build_verified_graph_candidates(
+    state: Any,
+    *,
+    scope: Any,
+    evidence_store: Any,
+    ledger: Any,
+    publication_bindings: dict[str, Any],
+    min_entailment: float = 0.85,
+    nli_entailment_threshold: float = 0.85,
+    verifier_version: str | None = None,
+) -> tuple[Any, ...]:
+    """Assemble strict ENTAILED + published VerifiedCandidate items from verified task state."""
+    from models import EvidenceRef
+    from services.evidence import build_graph_evidence
+    from services.knowledge_graph import (
+        BoundAtom,
+        VerifiedCandidate,
+        evidence_digest,
+    )
+    from services.memory_sanitizer import sanitize_web_text
+    from services.memory_scope import valid_internal_id
+
+    if not getattr(ledger, "entries", None) or not getattr(ledger, "version", 0) or not publication_bindings:
+        return ()
+
+    threshold = max(0.85, float(min_entailment or 0.85), float(nli_entailment_threshold or 0.85))
+    records_by_sid: dict[str, Any] = {}
+    if evidence_store is not None:
+        for raw_record in evidence_store.lookup(include_full_content=True):
+            sid = str(raw_record.get("source_id") or "").strip()
+            if sid and (not getattr(evidence_store, "web_extraction_enabled", False) or evidence_store.is_eligible_for_facts(sid)):
+                ge = build_graph_evidence(raw_record, tenant_id=scope.tenant_id, request_id=scope.request_id)
+                if ge is not None:
+                    records_by_sid[sid] = ge
+
+    atomics_by_task: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for task in getattr(state, "todo_items", ()) or ():
+        for raw_atomic in getattr(task, "atomic_claims", ()) or ():
+            data = raw_atomic.to_dict() if hasattr(raw_atomic, "to_dict") else (dict(raw_atomic) if isinstance(raw_atomic, dict) else {})
+            if data:
+                atomics_by_task[int(getattr(task, "id", 0) or data.get("task_id") or 0)].append(data)
+
+    unresolved_keys: set[tuple[str, str]] = set()
+    unresolved_sources: set[str] = set()
+    for conflict in getattr(state, "evidence_conflicts", ()) or ():
+        if isinstance(conflict, dict) and conflict.get("adjudication_status") == "unresolved_divergence":
+            ent_key = str(conflict.get("entity") or "").strip().casefold()
+            met_key = str(conflict.get("metric") or "").strip().casefold()
+            if ent_key and met_key:
+                unresolved_keys.add((ent_key, met_key))
+            for side in conflict.get("sides") or ():
+                if isinstance(side, dict) and side.get("source_id"):
+                    unresolved_sources.add(str(side["source_id"]))
+
+    candidates: list[VerifiedCandidate] = []
+    default_timestamp = datetime.now(timezone.utc).isoformat()
+    for entry in ledger.entries:
+        if (
+            getattr(entry, "stance", "asserted") == "gap"
+            or getattr(entry, "conflict_group_id", None)
+            or not valid_internal_id(getattr(entry, "claim_id", ""))
+        ):
+            continue
+        if (str(entry.entity).strip().casefold(), str(entry.metric).strip().casefold()) in unresolved_keys:
+            continue
+        if unresolved_sources.intersection(entry.source_ids):
+            continue
+
+        fact = entry.to_typed_fact() if hasattr(entry, "to_typed_fact") else None
+        fingerprint = entry.fact_fingerprint(ledger.version) if hasattr(entry, "fact_fingerprint") else None
+        if fact is None or not fingerprint:
+            continue
+        statement = sanitize_web_text(
+            entry.statement or f"{entry.entity} {entry.metric}: {entry.value} ({entry.period})",
+            max_chars=2048,
+        )
+        if not statement:
+            continue
+
+        publication = publication_bindings.get(entry.claim_id)
+        if (
+            publication is None or publication.allowed is not True
+            or (publication.ledger_version, publication.claim_id, publication.fact_fingerprint)
+            != (ledger.version, entry.claim_id, fingerprint)
+        ):
+            continue
+
+        task_pool = []
+        for tid in dict.fromkeys([entry.task_id, *(entry.supporting_task_ids or [])]):
+            task_pool.extend(atomics_by_task.get(int(tid), ()))
+        entry_sources = set(entry.source_ids)
+        matching_atomics = [
+            item for item in task_pool
+            if entry_sources.intersection(item.get("source_ids") or ())
+            and str(item.get("nli_label") or "") != "SKIPPED"
+        ]
+        if not matching_atomics or len(matching_atomics) > 8:
+            continue
+
+        bound_atoms: list[BoundAtom] = []
+        seen_atom_ids: set[str] = set()
+        combined_refs: list[EvidenceRef] = []
+        seen_chunks: set[tuple[str, str, str]] = set()
+        chosen_version = _sanitize_verifier_version(
+            verifier_version or matching_atomics[0].get("verifier_backend") or "nli-v1"
+        )
+        failed_gate = False
+        for idx, atomic in enumerate(matching_atomics, 1):
+            backend = str(atomic.get("verifier_backend") or "none")
+            label = str(atomic.get("nli_label") or "SKIPPED")
+            conf = float(atomic.get("calibrated_confidence") or 0.0)
+            if label != "ENTAILED" or backend in {"none", "numeric_fallback"} or conf < threshold:
+                failed_gate = True
+                break
+            raw_aid = str(atomic.get("atomic_id") or f"{entry.claim_id}-a{idx}").strip()
+            atom_id = _sanitize_verifier_version(raw_aid)
+            if not valid_internal_id(atom_id) or atom_id in seen_atom_ids:
+                atom_id = f"{entry.claim_id}-a{idx}"
+            seen_atom_ids.add(atom_id)
+
+            atom_sources = [
+                sid for sid in (
+                    [atomic.get("best_source_id")] if atomic.get("best_source_id") else list(atomic.get("source_ids") or [])
+                )
+                if sid in entry_sources and sid in records_by_sid
+            ]
+            atom_refs: list[EvidenceRef] = []
+            for sid in atom_sources[:4]:
+                ge = records_by_sid[sid]
+                frags = _match_fragments_for_source(atomic, ge)
+                if not frags:
+                    continue
+                unique_frags = tuple(
+                    frag for frag in frags
+                    if (sid, ge.artifact_version, frag.chunk_id) not in seen_chunks
+                )
+                if not unique_frags:
+                    continue
+                for frag in unique_frags:
+                    seen_chunks.add((sid, ge.artifact_version, frag.chunk_id))
+                ref = EvidenceRef(
+                    request_id=scope.request_id,
+                    source_id=sid,
+                    chunk_ids=tuple(frag.chunk_id for frag in unique_frags),
+                    artifact_version=ge.artifact_version,
+                    content_sha256=evidence_digest(unique_frags),
+                )
+                atom_refs.append(ref)
+                combined_refs.append(ref)
+
+            if not atom_refs:
+                failed_gate = True
+                break
+            verified_at = str(atomic.get("verified_at") or "").strip() or default_timestamp
+            bound_atoms.append(
+                BoundAtom(
+                    atom_id=atom_id,
+                    ledger_version=ledger.version,
+                    claim_id=entry.claim_id,
+                    fact_fingerprint=fingerprint,
+                    nli_label="ENTAILED",
+                    confidence=round(min(1.0, conf), 6),
+                    verifier_version=chosen_version,
+                    support=tuple(atom_refs),
+                    is_fallback=False,
+                    verified_at=verified_at,
+                    decomposition_version=1,
+                )
+            )
+            if len(seen_chunks) > 8 or len(combined_refs) > 8:
+                failed_gate = True
+                break
+
+        if failed_gate or not bound_atoms or not combined_refs:
+            continue
+        sorted_refs = tuple(sorted(
+            combined_refs,
+            key=lambda ref: (ref.source_id, ref.artifact_version, ref.chunk_ids, ref.content_sha256),
+        ))
+        aligned_pub = publication
+        if set(aligned_pub.support) != set(sorted_refs):
+            pub_sids = {ref.source_id for ref in aligned_pub.support}
+            if not {ref.source_id for ref in sorted_refs} <= pub_sids:
+                continue
+            from services.knowledge_graph import PublicationBinding
+
+            aligned_pub = PublicationBinding(
+                ledger_version=aligned_pub.ledger_version,
+                claim_id=aligned_pub.claim_id,
+                fact_fingerprint=aligned_pub.fact_fingerprint,
+                support=sorted_refs,
+                allowed=True,
+            )
+
+        candidates.append(
+            VerifiedCandidate(
+                ledger_version=ledger.version,
+                claim_id=entry.claim_id,
+                statement=statement,
+                fact=fact,
+                required_atomic_claim_ids=tuple(atom.atom_id for atom in bound_atoms),
+                atoms=tuple(bound_atoms),
+                publication=aligned_pub,
+                deterministically_checked=True,
+                unresolved_conflict=False,
+                conflict_id="",
+            )
+        )
+    return tuple(candidates[:100])
+

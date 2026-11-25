@@ -1,7 +1,6 @@
 import json
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
@@ -12,16 +11,6 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
-
-hello_agents_stub = sys.modules.get("hello_agents") or types.ModuleType("hello_agents")
-
-
-class DummyToolAwareSimpleAgent:
-    pass
-
-
-hello_agents_stub.ToolAwareSimpleAgent = DummyToolAwareSimpleAgent
-sys.modules.setdefault("hello_agents", hello_agents_stub)
 
 from config import Configuration
 from services.strategy_memory import StrategyHit, StrategyMemoryService
@@ -173,6 +162,16 @@ class MatchReasonTests(unittest.TestCase):
 
 
 class MaturityPersistenceTests(unittest.TestCase):
+    def test_strict_promotion_without_scope_does_not_touch_legacy_card(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir)
+            card = _card()
+            service._write_card_file(card)
+            service._config = service._config.model_copy(update={"v4_tenant_memory_partition_enabled": True})
+
+            self.assertFalse(service.set_card_maturity(card.strategy_id, "promoted"))
+            self.assertEqual(service._read_card_maturity(card.strategy_id), "draft")
+
     """A promotion must survive re-synthesis, which rewrites cards from scratch."""
 
     def test_read_card_maturity_defaults_to_draft_when_absent(self):

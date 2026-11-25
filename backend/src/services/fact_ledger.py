@@ -6,10 +6,11 @@ import math
 import re
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import date
 from html import escape
 from typing import Any
 
-from services.memory_sanitizer import strip_tool_directives
+from services.memory_sanitizer import sanitize_web_text, strip_tool_directives
 from services.text_processing import CITATION_PATTERN, strip_citation_markers
 from utils import truncate_text
 
@@ -21,6 +22,10 @@ _PERIOD_RE = re.compile(
     r"\b(?:20\d{2}(?:[-/]Q[1-4]|[-/]H[12]|[-/]\d{2})?|FY\d{2,4}|Q[1-4])\b",
     re.IGNORECASE,
 )
+_OBS_VALUE_RE = re.compile(r"^\s*([+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+))\s*([^\s]*)\s*$")
+_YEAR_RE = re.compile(r"^(20\d{2}|19\d{2})$")
+_QUARTER_RE = re.compile(r"^(20\d{2}|19\d{2})[-/]?Q([1-4])$", re.IGNORECASE)
+_MONTH_RE = re.compile(r"^(20\d{2}|19\d{2})[-/](\d{1,2})$")
 _LEDGER_OPEN = "<FACT_LEDGER>"
 _LEDGER_CLOSE = "</FACT_LEDGER>"
 _LEDGER_CHAR_BUDGET = 4200
@@ -106,6 +111,101 @@ class FactEntry:
         conflict_tag = f" [CONFLICT:{self.conflict_group_id}]" if self.conflict_group_id else ""
         body = self.statement or f"{self.entity} | {self.metric}={self.value} {self.unit} ({self.period})"
         return f"- {self.claim_id}{conflict_tag}: {_prompt_line(body, 200)} {cites}".rstrip()
+
+    def to_typed_fact(
+        self, *, scope_fields: tuple[tuple[str, str], ...] = (), entity_type: str = "organization",
+    ) -> Any | None:
+        """Convert this entry into a normalized ObservationFact when metric, value, and period validate."""
+        from services.knowledge_graph import GraphEntity, ObservationFact
+
+        entity_name = sanitize_web_text(str(self.entity or ""), max_chars=200)
+        if not entity_name:
+            return None
+        raw_value = str(self.value or "").strip()
+        raw_unit = str(self.unit or "").strip()
+        match = _OBS_VALUE_RE.fullmatch(raw_value)
+        if match is None:
+            return None
+        num_str, inline_unit = match.group(1), match.group(2)
+        unit_text = raw_unit or inline_unit
+        if unit_text in {"亿元", "人民币亿元"}:
+            unit_text = "亿人民币"
+        elif unit_text in {"万元", "人民币万元"}:
+            unit_text = "万人民币"
+        elif unit_text in {"元", "人民币"}:
+            unit_text = "人民币"
+        elif unit_text in {"亿美元", "万美元"}:
+            unit_text = unit_text.replace("美元", "USD")
+        elif unit_text in {"$"}:
+            unit_text = "USD"
+        try:
+            subject = GraphEntity(entity_type=entity_type, name=entity_name)
+            period = parse_valid_period(self.period)
+            return ObservationFact(
+                subject=subject,
+                metric_key=str(self.metric or "count"),
+                value=num_str,
+                unit=unit_text,
+                period=period,
+                scope=scope_fields,
+            )
+        except (ValueError, TypeError):
+            return None
+
+    def fact_fingerprint(
+        self,
+        ledger_version: int,
+        *,
+        scope_fields: tuple[tuple[str, str], ...] = (),
+        entity_type: str = "organization",
+    ) -> str | None:
+        """Compute canonical SHA-256 fingerprint bound to ledger version and typed fact."""
+        from services.knowledge_graph import fact_fingerprint as _kg_fact_fingerprint
+
+        fact = self.to_typed_fact(scope_fields=scope_fields, entity_type=entity_type)
+        if fact is None:
+            return None
+        statement = (
+            sanitize_web_text(self.statement, max_chars=2048)
+            or f"{self.entity} {self.metric}: {self.value} ({self.period})"
+        )
+        try:
+            return _kg_fact_fingerprint(int(ledger_version), statement, fact)
+        except (ValueError, TypeError):
+            return None
+
+
+def parse_valid_period(period_text: Any) -> Any:
+    """Parse canonical calendar periods while leaving ambiguous/fiscal labels unbounded."""
+    from services.knowledge_graph import ValidPeriod
+
+    raw = sanitize_web_text(str(period_text or ""), max_chars=64).strip()
+    if not raw or raw.casefold() in {"unspecified", "unknown", "none", "n/a"}:
+        return ValidPeriod(label=raw or "unspecified")
+    if raw.casefold().startswith("fy"):
+        return ValidPeriod(label=raw)
+    if match := _YEAR_RE.fullmatch(raw):
+        year = int(match.group(1))
+        return ValidPeriod(date(year, 1, 1), date(year + 1, 1, 1), label=raw, calendar_id="gregorian", grain="year")
+    if match := _QUARTER_RE.fullmatch(raw):
+        year, quarter = int(match.group(1)), int(match.group(2))
+        start_month = (quarter - 1) * 3 + 1
+        end_year = year + (1 if quarter == 4 else 0)
+        end_month = 1 if quarter == 4 else start_month + 3
+        return ValidPeriod(
+            date(year, start_month, 1), date(end_year, end_month, 1),
+            label=f"{year}-Q{quarter}", calendar_id="gregorian", grain="quarter",
+        )
+    if match := _MONTH_RE.fullmatch(raw):
+        year, month = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            end_year = year + (1 if month == 12 else 0)
+            end_month = 1 if month == 12 else month + 1
+            return ValidPeriod(
+                date(year, month, 1), date(end_year, end_month, 1),
+                label=f"{year}-{month:02d}", calendar_id="gregorian", grain="month",
+            )
+    return ValidPeriod(label=raw)
 
 
 @dataclass

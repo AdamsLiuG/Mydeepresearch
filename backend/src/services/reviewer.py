@@ -17,11 +17,16 @@ from hello_agents import ToolAwareSimpleAgent
 from config import Configuration
 from metrics import RequestTrace, extract_llm_usage
 from models import SummaryState, TodoItem
-from prompts import get_current_date, web_evidence_prompt_rules
+from prompts import (
+    get_current_date,
+    graph_memory_prompt_rules,
+    web_evidence_prompt_rules,
+)
 from services.claim_verifier import numeric_grounding_mismatch, web_fact_excerpts
 from services.context_builder import (
     ContextPrefixBuilder,
     PromptEnvelope,
+    render_graph_projection_data,
     render_web_evidence_data,
 )
 from services.evidence import extract_citation_ids, format_evidence_sources
@@ -172,6 +177,7 @@ class ReviewService:
         observer: RequestTrace | None = None,
         skill_pack_context: str | None = None,
         active_verifiers: list[str] | tuple[str, ...] | None = None,
+        graph_context: Any | None = None,
     ) -> dict[str, Any]:
         """Review task summaries and evidence before final report generation."""
 
@@ -238,7 +244,12 @@ class ReviewService:
         llm_summary: dict[str, Any] = {}
 
         if self._config.review_agent_enabled and self._agent is not None:
-            envelope = self._build_envelope(state, issues, skill_pack_context=skill_pack_context)
+            envelope = self._build_envelope(
+                state,
+                issues,
+                skill_pack_context=skill_pack_context,
+                graph_context=graph_context,
+            )
             prompt = envelope.to_flat_prompt()
             run_env = getattr(self._agent, "run_envelope", None)
             try:
@@ -290,6 +301,7 @@ class ReviewService:
         issues: list[ReviewIssue],
         *,
         skill_pack_context: str | None = None,
+        graph_context: Any | None = None,
     ) -> PromptEnvelope:
         builder = ContextPrefixBuilder(self._config)
         web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
@@ -351,11 +363,12 @@ class ReviewService:
             else "当前运行模式不启用工具调用，请直接基于任务概览、事实账本、来源目录和规则审查结果补充指出证据问题。"
             "历史修补候选只能作为线索，不能直接当作当前 source_id 引用。"
         )
+        graph_block = render_graph_projection_data(graph_context, max_bytes=256)
         static_rules = (
             "请基于以下任务结果补充指出仍然存在的证据问题。"
             f"{tool_guidance}"
             "不要重写报告正文，也不要重复输出规则已明确指出的问题。"
-        ) + web_evidence_prompt_rules(web_enabled)
+        ) + web_evidence_prompt_rules(web_enabled) + graph_memory_prompt_rules(bool(graph_block))
 
         frozen = render_context_checkpoint(state, self._config)
         volatile_delta = f"当前日期：{get_current_date()}\n\n{''.join(task_blocks)}"
@@ -388,6 +401,7 @@ class ReviewService:
                     ("checkpoint", frozen),
                     ("skills", str(skill_pack_context or "")),
                 ],
+                graph_projection=graph_block,
             )
         return builder.build_envelope(
             stage="review",
@@ -397,6 +411,7 @@ class ReviewService:
             skill_pack_context=str(skill_pack_context or "").strip(),
             frozen_index_and_ledger=frozen,
             volatile_blocks=volatile_blocks,
+            graph_projection=graph_block,
         )
 
     def _build_prompt(

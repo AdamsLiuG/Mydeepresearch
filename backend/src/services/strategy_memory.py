@@ -5,21 +5,39 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol
 
 from config import Configuration
 from metrics import RequestTrace, metrics_registry
+from models import MemoryPurpose
 from services.embeddings import embeddings_available, encode_text, encode_texts
 from services.memory_sanitizer import (
     collapse_whitespace,
     normalize_list,
     parse_json_list,
     sanitize_memory_text,
+)
+from services.memory_scope import (
+    MemoryPolicy,
+    MemoryScope,
+    authorize,
+    checked_path,
+    open_partition_directory,
+    partition_lock,
+    partition_root,
+    read_partition_text,
+    remove_partition_file,
+    scope_is_current,
+    strict_memory_text,
+    strict_partition_required,
+    valid_internal_id,
+    write_partition_text,
 )
 from services.strategy_synthesizer import (
     DOMAIN_GENERAL,
@@ -30,6 +48,7 @@ from services.strategy_synthesizer import (
     StrategyCard,
     StrategySourceRequest,
     StrategySynthesizer,
+    clean_strategy_fields,
     maturity_meets_gate,
     normalize_maturity,
     normalize_topic_domain,
@@ -49,6 +68,23 @@ _SCHEMA_VERSION = 1
 _DEFAULT_COLLECTION_NAME = "deep_research_strategies_v1"
 _DEFAULT_QUERY_MULTIPLIER = 4
 _SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+_PARTITION_SAMPLE_LIMIT = 16
+_PARTITION_REQUEST_LIMIT = 256
+_SANITIZATION_VERSION = 1
+_PARTITION_MANIFEST = "strategies.json"
+_STRATEGY_STAGES = {
+    "planning_pattern": "planning",
+    "reflection_pattern": "reflection",
+    "anti_pattern": "reflection",
+}
+
+
+class StrategySnapshotReader(Protocol):
+    def load(self, scope: MemoryScope, request_id: str) -> dict[str, Any] | None: ...
+
+    def iter_terminal(
+        self, scope: MemoryScope, *, after: str = "", limit: int = 64,
+    ) -> list[dict[str, Any]]: ...
 
 
 def _safe_status(value: Any) -> str:
@@ -133,6 +169,10 @@ class StrategyMemoryService:
         *,
         synthesizer: StrategySynthesizer | None = None,
         client: Any | None = None,
+        scope: MemoryScope | None = None,
+        policy: MemoryPolicy | None = None,
+        snapshot_reader: StrategySnapshotReader | None = None,
+        frozen_strict: bool = False,
     ) -> None:
         self._config = config
         self._synthesizer = synthesizer
@@ -145,16 +185,35 @@ class StrategyMemoryService:
         self._collection_dir = self._memory_dir / "chromadb"
         self._reconciled = False
         self._backend_unavailable_logged = False
+        self._scope = scope
+        self._policy = policy
+        self._snapshot_reader = snapshot_reader
+        self._frozen_strict = frozen_strict
+        self._partition_collection: Any | None = None
 
     @property
     def enabled(self) -> bool:
+        if self._strict:
+            return bool(
+                self._config.strategy_memory_enabled and self._config.request_state_enabled
+                and self._snapshot_reader is not None and scope_is_current(self._policy, self._scope)
+            )
         return bool(
             self._config.strategy_memory_enabled
             and self._config.request_state_enabled
             and str(self._config.request_state_dir or "").strip()
         )
 
+    @property
+    def _strict(self) -> bool:
+        return strict_partition_required(
+            self._config, self._memory_dir, self._scope, frozen_strict=self._frozen_strict,
+        )
+
     def ensure_reconciled(self, *, observer: RequestTrace | None = None) -> None:
+        if self._strict:
+            self.rebuild(dry_run=False)
+            return
         if not self.enabled:
             return
 
@@ -174,6 +233,9 @@ class StrategyMemoryService:
         *,
         observer: RequestTrace | None = None,
     ) -> None:
+        if self._strict:
+            self._refresh_partition_request(request_id, observer=observer)
+            return
         if not self.enabled:
             return
 
@@ -285,6 +347,11 @@ class StrategyMemoryService:
         observer: RequestTrace | None,
         topic_domains: set[str] | None = None,
     ) -> str:
+        if self._strict:
+            return self._search_partition(
+                query_text, stage=stage, top_k=top_k, current_request_id=current_request_id,
+                observer=observer, topic_domains=topic_domains,
+            )
         if not self.enabled or not _normalize_text(query_text):
             return ""
 
@@ -325,6 +392,521 @@ class StrategyMemoryService:
                 match_kinds=[hit.strategy_kind for hit in hits],
             )
         return rendered
+
+    def _partition_path(self, *, create: bool = False) -> Path:
+        if not self.enabled or self._scope is None:
+            raise PermissionError("strategy scope unavailable")
+        tenant_dir = partition_root(self._memory_dir, self._scope, create=create)
+        policy_dir = f"policy-{self._scope.policy_version}"
+        if create:
+            with open_partition_directory(tenant_dir, policy_dir, create=True):
+                pass
+        return checked_path(tenant_dir, policy_dir)
+
+    def _partition_manifest(self, root: Path) -> dict[str, Any]:
+        binding = {
+            "schema_version": _SCHEMA_VERSION,
+            "tenant_id": self._scope.tenant_id,
+            "policy_version": self._scope.policy_version,
+            "sanitization_version": _SANITIZATION_VERSION,
+            "embedding_model": self._config.resolved_strategy_memory_embedding_model(),
+        }
+        try:
+            manifest = json.loads(read_partition_text(root, _PARTITION_MANIFEST))
+        except FileNotFoundError:
+            return {**binding, "requests": {}, "revoked": {}}
+        if (
+            not isinstance(manifest, dict)
+            or any(manifest.get(key) != value for key, value in binding.items())
+            or not isinstance(manifest.get("requests"), dict)
+            or not isinstance(manifest.get("revoked"), dict)
+            or len(manifest["requests"]) > _PARTITION_REQUEST_LIMIT
+        ):
+            raise ValueError("invalid strategy manifest")
+        return manifest
+
+    def _save_partition_manifest(self, root: Path, manifest: dict[str, Any]) -> None:
+        write_partition_text(
+            root, _PARTITION_MANIFEST, text=json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        )
+
+    def _get_partition_collection(self, root: Path) -> Any:
+        if self._partition_collection is not None:
+            return self._partition_collection
+        client = self._client
+        if client is None:
+            if chromadb is None:
+                raise RuntimeError("strategy vector service unavailable")
+            with open_partition_directory(root, "chromadb", create=True):
+                collection_dir = checked_path(root, "chromadb")
+                for leaf in ("chroma.sqlite3", "chroma.sqlite3-wal", "chroma.sqlite3-shm"):
+                    checked_path(collection_dir, leaf)
+                client = chromadb.PersistentClient(path=str(collection_dir))
+        collection_name = f"sc_{self._scope.namespace[2:]}_{self._scope.policy_version}"
+        self._partition_collection = client.get_or_create_collection(
+            name=collection_name, metadata={"hnsw:space": "cosine"},
+        )
+        return self._partition_collection
+
+    def _record_partition(self, operation: str, outcome: str) -> None:
+        metrics_registry.record_v4_memory_partition(
+            "strategy", operation, outcome, tenant_id=self._scope.tenant_id if self._scope else None,
+        )
+
+    def _strict_snapshot(self, request_id: str, purpose: MemoryPurpose) -> dict[str, Any] | None:
+        if not authorize(self._policy, self._scope, request_id, purpose):
+            return None
+        snapshot = self._snapshot_reader.load(self._scope, request_id)
+        if (
+            not isinstance(snapshot, dict) or snapshot.get("tenant_id") != self._scope.tenant_id
+            or snapshot.get("request_id") != request_id or not self._is_terminal_snapshot(snapshot)
+            or type(snapshot.get("state_version")) is not int or snapshot["state_version"] < 1
+        ):
+            return None
+        return snapshot
+
+    def _strict_source(
+        self, snapshot: dict[str, Any],
+    ) -> tuple[StrategySourceRequest | None, str | None]:
+        topic = strict_memory_text(snapshot.get("topic")) or ""
+        statuses = {"completed", "pending", "in_progress", "running", "failed", "skipped"}
+        items = snapshot.get("todo_items")
+        if not isinstance(items, list):
+            return None, None
+        tasks = [
+            {
+                "id": item.get("id") if type(item.get("id")) is int else None,
+                "title": (strict_memory_text(item.get("title")) or "")[:80],
+                "intent": (strict_memory_text(item.get("intent")) or "")[:140],
+                "status": item.get("status") if isinstance(item.get("status"), str)
+                and item["status"] in statuses else "unknown",
+            }
+            for item in items[:16] if isinstance(item, dict)
+        ]
+        review = snapshot.get("review_summary")
+        review_status = review.get("overall_status") if isinstance(review, dict) else None
+        repair_cycles = snapshot.get("report_repair_cycles")
+        metrics = snapshot.get("request_metrics")
+        if type(repair_cycles) is not int and isinstance(metrics, dict):
+            repair_cycles = metrics.get("report_repair_cycles")
+        gaps = metrics.get("reflection_gap_signals") if isinstance(metrics, dict) else None
+        gaps = [
+            clean[:120] for item in gaps[:6] if (clean := strict_memory_text(item))
+        ] if isinstance(gaps, list) else []
+        source, checksum = self._build_source_request({
+            "request_id": snapshot["request_id"],
+            "topic": topic[:200] or "已完成研究",
+            "status": snapshot["status"],
+            "todo_items": tasks,
+            "report_markdown": "published" if snapshot.get("report_markdown") else "",
+            "review_summary": {
+                "overall_status": review_status if review_status in ("passed", "blocked", "warning") else "unknown",
+            },
+            "report_repair_cycles": repair_cycles if type(repair_cycles) is int else 0,
+            "request_metrics": {"reflection_gap_signals": gaps},
+        })
+        if source is not None:
+            source._verified_scope = self._scope
+        return source, checksum
+
+    def _partition_card(
+        self, root: Path, card_id: str, record_id: str, request_id: str, source_version: int,
+    ) -> dict[str, Any] | None:
+        if not valid_internal_id(card_id) or not valid_internal_id(record_id):
+            return None
+        try:
+            card = json.loads(read_partition_text(root, "cards", f"{record_id}.json", max_bytes=32_768))
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(card, dict) or card.get("tenant_id") != self._scope.tenant_id
+            or card.get("policy_version") != self._scope.policy_version
+            or card.get("sanitization_version") != _SANITIZATION_VERSION
+            or card.get("source_version") != source_version or card.get("origin_request_id") != request_id
+            or card.get("strategy_id") != card_id or card.get("record_id") != record_id
+            or clean_strategy_fields(card) is None
+        ):
+            return None
+        identity = {
+            key: value for key, value in card.items()
+            if key not in {"record_id", "hit_count", "last_hit_at", "maturity", "created_at"}
+        }
+        return card if "sr_" + _checksum_payload(identity) == record_id else None
+
+    def _stage_strategy_cards(
+        self, root: Path, manifest: dict[str, Any], snapshot: dict[str, Any], *,
+        observer: RequestTrace | None = None,
+    ) -> bool:
+        request_id = snapshot["request_id"]
+        source_version = snapshot["state_version"]
+        if request_id in manifest["revoked"]:
+            return False
+        old = manifest["requests"].get(request_id, {})
+        if (
+            old.get("source_version") == source_version
+            and old.get("cards")
+            and all(
+                self._partition_card(root, card_id, record_id, request_id, source_version)
+                for card_id, record_id in old["cards"].items()
+            )
+        ):
+            return False
+        if not old and len(manifest["requests"]) >= _PARTITION_REQUEST_LIMIT:
+            return False
+        source, checksum = self._strict_source(snapshot)
+        if source is None or self._synthesizer is None:
+            return False
+
+        cards: dict[str, StrategyCard] = {}
+        for candidate in self._synthesizer.synthesize(source):
+            kind = candidate.strategy_kind
+            if kind not in source.requested_kinds or kind in cards:
+                continue
+            clean = clean_strategy_fields(candidate.to_json_dict())
+            if clean is None:
+                continue
+            strategy_id = "sc_" + _checksum_payload({
+                "tenant_id": self._scope.tenant_id, "policy_version": self._scope.policy_version,
+                "request_id": request_id, "kind": kind, "candidate": kind,
+            })
+            cards[kind] = StrategyCard(
+                strategy_id=strategy_id, strategy_kind=kind, stage_scope=_STRATEGY_STAGES[kind],
+                **clean, origin_request_id=request_id, origin_status=source.status,
+                origin_review_status=source.review_status, created_at=_utc_now(),
+                origin_task_ids=[task["id"] for task in source.tasks if type(task["id"]) is int],
+                topic_domain=normalize_topic_domain(candidate.topic_domain),
+            )
+        if not cards:
+            return False
+        embeddings = encode_texts(
+            [card.to_document() for card in cards.values()],
+            model_name=self._config.resolved_strategy_memory_embedding_model(),
+        )
+        if not embeddings or len(embeddings) != len(cards) or not all(embeddings):
+            if observer:
+                observer.record_degraded("strategy_memory_embedding_failed")
+            return False
+
+        current = self._strict_snapshot(request_id, "strategy_synthesis")
+        if current is None or current["state_version"] != source_version or self._strict_source(current)[1] != checksum:
+            return False
+        collection = self._get_partition_collection(root)
+        record_ids: dict[str, str] = {}
+        metadata = []
+        for card in cards.values():
+            card_id = card.strategy_id
+            old_record_id = old.get("cards", {}).get(card_id)
+            previous = self._partition_card(root, card_id, old_record_id, request_id, old.get("source_version"))
+            if previous:
+                card.hit_count = max(0, _safe_int(previous.get("hit_count")) or 0)
+                card.last_hit_at = str(previous.get("last_hit_at") or "")
+                # Prior grades reviewed a different source version.
+                if old.get("source_version") == source_version:
+                    card.maturity = normalize_maturity(previous.get("maturity"))
+            binding = {
+                "tenant_id": self._scope.tenant_id, "policy_version": self._scope.policy_version,
+                "source_version": source_version, "sanitization_version": _SANITIZATION_VERSION,
+            }
+            payload = {**card.to_json_dict(), **binding}
+            record_id = "sr_" + _checksum_payload({
+                key: value for key, value in payload.items()
+                if key not in {"hit_count", "last_hit_at", "maturity", "created_at"}
+            })
+            payload["record_id"] = record_id
+            write_partition_text(root, "cards", f"{record_id}.json", text=json.dumps(payload, ensure_ascii=False))
+            record_ids[card_id] = record_id
+            metadata.append({
+                **binding, "record_id": record_id, "strategy_id": card_id, "origin_request_id": request_id,
+            })
+        collection.upsert(
+            ids=list(record_ids.values()), documents=[card.to_document() for card in cards.values()],
+            metadatas=metadata, embeddings=embeddings,
+        )
+        manifest["requests"][request_id] = {"source_version": source_version, "cards": record_ids}
+        return True
+
+    def _refresh_partition_request(self, request_id: str, *, observer: RequestTrace | None) -> None:
+        if not self.enabled or not valid_internal_id(request_id):
+            self._record_partition("write", "denied")
+            return
+        try:
+            snapshot = self._strict_snapshot(request_id, "strategy_synthesis")
+            if snapshot is None:
+                self._record_partition("write", "denied")
+                return
+            root = self._partition_path(create=True)
+            with self._lock, partition_lock(root):
+                manifest = self._partition_manifest(root)
+                previous = manifest["requests"].get(request_id, {}).get("cards", {})
+                changed = self._stage_strategy_cards(root, manifest, snapshot, observer=observer)
+                if changed:
+                    self._save_partition_manifest(root, manifest)
+                    self._delete_partition_records(
+                        root, set(previous.values()) - set(manifest["requests"][request_id]["cards"].values()),
+                    )
+                self._record_partition("write", "ok" if changed else "empty")
+        except Exception:
+            self._record_partition("write", "unavailable")
+            if observer:
+                observer.record_degraded("strategy_memory_refresh_failed")
+
+    def rebuild(self, *, dry_run: bool = True, limit: int = 16, after: str = "") -> dict[str, Any]:
+        """Rebuild a bounded page from the authoritative terminal snapshot reader."""
+        report = {"scanned": 0, "eligible": 0, "rebuilt": 0, "after": after, "unavailable": False}
+        if (
+            not self._strict or not self.enabled or type(limit) is not int or limit < 1
+            or (after and not valid_internal_id(after))
+        ):
+            return report
+        try:
+            count = min(limit, _PARTITION_SAMPLE_LIMIT)
+            rows = self._snapshot_reader.iter_terminal(self._scope, after=after, limit=count)
+            ids = sorted({
+                row["request_id"] for row in rows[:count]
+                if isinstance(row, dict) and row.get("tenant_id") == self._scope.tenant_id
+                and valid_internal_id(row.get("request_id")) and row["request_id"] > after
+            })
+            report["scanned"] = len(ids)
+            report["after"] = ids[-1] if ids else after
+            snapshots = []
+            for request_id in ids:
+                if not authorize(self._policy, self._scope, request_id, "maintenance"):
+                    continue
+                snapshot = self._strict_snapshot(request_id, "strategy_synthesis")
+                if snapshot and self._strict_source(snapshot)[0]:
+                    snapshots.append(snapshot)
+            report["eligible"] = len(snapshots)
+            if dry_run or not snapshots:
+                return report
+            root = self._partition_path(create=True)
+            with self._lock, partition_lock(root):
+                manifest = self._partition_manifest(root)
+                obsolete: set[str] = set()
+                for snapshot in snapshots:
+                    request_id = snapshot["request_id"]
+                    previous = manifest["requests"].get(request_id, {}).get("cards", {})
+                    if self._stage_strategy_cards(root, manifest, snapshot):
+                        report["rebuilt"] += 1
+                        obsolete.update(
+                            set(previous.values()) - set(manifest["requests"][request_id]["cards"].values()),
+                        )
+                if report["rebuilt"]:
+                    self._save_partition_manifest(root, manifest)
+                    self._delete_partition_records(root, obsolete)
+            self._record_partition("rebuild", "ok" if report["rebuilt"] else "empty")
+        except Exception:
+            report["rebuilt"] = 0
+            report["unavailable"] = True
+            if not dry_run:
+                self._record_partition("rebuild", "unavailable")
+        return report
+
+    def _delete_partition_records(self, root: Path, record_ids: set[str]) -> None:
+        ids = sorted(record_id for record_id in record_ids if valid_internal_id(record_id))
+        if not ids:
+            return
+        try:
+            self._get_partition_collection(root).delete(ids=ids)
+        except Exception:
+            self._record_partition("delete", "unavailable")
+            return
+        for record_id in ids:
+            try:
+                remove_partition_file(root, "cards", f"{record_id}.json")
+            except OSError:
+                continue
+
+    def retract_request(self, request_id: str, *, dry_run: bool = True) -> int:
+        """Tombstone an authorized request before purging its staged records."""
+        if not self._strict or not self.enabled or not authorize(
+            self._policy, self._scope, request_id, "maintenance",
+        ):
+            return 0
+        try:
+            root = self._partition_path(create=not dry_run)
+            if dry_run:
+                return len(self._partition_manifest(root)["requests"].get(request_id, {}).get("cards", {}))
+            with self._lock, partition_lock(root):
+                if not authorize(self._policy, self._scope, request_id, "maintenance"):
+                    return 0
+                manifest = self._partition_manifest(root)
+                cards = manifest["requests"].pop(request_id, {}).get("cards", {})
+                pending = set(manifest["revoked"].get(request_id, ())) | set(cards.values())
+                manifest["revoked"][request_id] = sorted(pending)
+                self._save_partition_manifest(root, manifest)
+                self._delete_partition_records(root, pending)
+            self._record_partition("delete", "ok")
+            return len(cards)
+        except Exception:
+            if not dry_run:
+                self._record_partition("delete", "unavailable")
+            return 0
+
+    def _update_partition_cards(
+        self, *, strategy_ids: list[str] | None = None, maturity: str | None = None,
+        cutoff: datetime | None = None,
+    ) -> list[str]:
+        if not self.enabled:
+            return []
+        selected = {
+            strategy_id for strategy_id in (strategy_ids or [])[:64] if valid_internal_id(strategy_id)
+        }
+        if not selected and cutoff is None:
+            return []
+        updated = []
+        try:
+            root = self._partition_path()
+            if not root.is_dir():
+                return []
+            with self._lock, partition_lock(root):
+                manifest = self._partition_manifest(root)
+                for request_id, entry in manifest["requests"].items():
+                    cards = entry["cards"]
+                    if cutoff is None and not selected.intersection(cards):
+                        continue
+                    purpose: MemoryPurpose = "maintenance" if (cutoff is not None or maturity is not None) else "plan"
+                    current = self._strict_snapshot(request_id, purpose)
+                    if current is None and purpose == "plan":
+                        current = self._strict_snapshot(request_id, "task")
+                    if current is None or current["state_version"] != entry["source_version"]:
+                        continue
+                    for card_id, record_id in cards.items():
+                        if cutoff is None and card_id not in selected:
+                            continue
+                        card = self._partition_card(root, card_id, record_id, request_id, entry["source_version"])
+                        if card is None:
+                            continue
+                        if cutoff is not None:
+                            last_use = _parse_timestamp(card["last_hit_at"]) or _parse_timestamp(card["created_at"])
+                            if card["maturity"] != MATURITY_DRAFT or last_use is None or last_use >= cutoff:
+                                continue
+                            card["maturity"] = MATURITY_ARCHIVED
+                        elif maturity is not None:
+                            card["maturity"] = normalize_maturity(maturity)
+                        else:
+                            card["hit_count"] = max(0, _safe_int(card["hit_count"]) or 0) + 1
+                            card["last_hit_at"] = _utc_now()
+                        write_partition_text(
+                            root, "cards", f"{record_id}.json", text=json.dumps(card, ensure_ascii=False),
+                        )
+                        updated.append(card_id)
+            self._record_partition("write", "ok" if updated else "empty")
+        except (OSError, ValueError, TypeError, KeyError):
+            self._record_partition("write", "unavailable")
+        return updated
+
+    def _search_partition(
+        self, query_text: str, *, stage: str, top_k: int, current_request_id: str | None,
+        observer: RequestTrace | None, topic_domains: set[str] | None,
+    ) -> str:
+        if not self.enabled or current_request_id not in (None, self._scope.request_id):
+            self._record_partition("read", "denied")
+            return ""
+        if not _normalize_text(query_text):
+            return ""
+        if observer is not None and (
+            observer.tenant_id != self._scope.tenant_id or observer.request_id != self._scope.request_id
+        ):
+            observer = None
+        purpose: MemoryPurpose = "plan" if stage == "planning" else "task"
+        try:
+            root = self._partition_path()
+            manifest = self._partition_manifest(root)
+            candidates = {}
+            for request_id, entry in manifest["requests"].items():
+                if request_id == self._scope.request_id or request_id in manifest["revoked"]:
+                    continue
+                current = self._strict_snapshot(request_id, purpose)
+                if current is None or current["state_version"] != entry["source_version"]:
+                    continue
+                for card_id, record_id in entry["cards"].items():
+                    card = self._partition_card(root, card_id, record_id, request_id, entry["source_version"])
+                    if card and self._eligible_partition_card(card, stage, topic_domains):
+                        candidates[record_id] = card
+            hits = self._rank_partition_cards(root, query_text, candidates, stage, top_k, observer)
+            visible = []
+            for hit, source_version in hits:
+                latest = self._strict_snapshot(hit.origin_request_id, purpose)
+                if latest is not None and latest["state_version"] == source_version:
+                    visible.append(hit)
+            # Recheck manifest after ranking so a concurrent local tombstone is honored.
+            if manifest != self._partition_manifest(root) or not scope_is_current(self._policy, self._scope):
+                return ""
+            if observer:
+                observer.record_strategy_memory_query(
+                    hit_count=len(visible), match_kinds=[hit.strategy_kind for hit in visible],
+                    strategy_ids=[hit.strategy_id for hit in visible], internal_ids=True,
+                )
+            rendered = self._render_prompt_context(visible, stage=stage)
+            if rendered and observer:
+                observer.record_strategy_memory_prompt_injection(
+                    match_kinds=[hit.strategy_kind for hit in visible],
+                )
+            self._record_partition("read", "ok" if rendered else "empty")
+            return rendered
+        except Exception:
+            self._record_partition("read", "unavailable")
+            return ""
+
+    def _eligible_partition_card(
+        self, card: dict[str, Any], stage: str, topic_domains: set[str] | None,
+    ) -> bool:
+        kind = card.get("strategy_kind")
+        return (
+            kind in _STRATEGY_STAGES
+            and (kind == "anti_pattern" or _STRATEGY_STAGES[kind] == stage)
+            and maturity_meets_gate(card.get("maturity"), self._config.memory_maturity_gate)
+            and (not topic_domains or card.get("topic_domain") in topic_domains)
+        )
+
+    def _rank_partition_cards(
+        self, root: Path, query_text: str, candidates: dict[str, dict[str, Any]],
+        stage: str, top_k: int, observer: RequestTrace | None,
+    ) -> list[tuple[StrategyHit, int]]:
+        if not candidates:
+            return []
+        query_embedding = self._encode_query(query_text, observer=observer)
+        if query_embedding is None:
+            return []
+        top_k = max(1, int(top_k or 1))
+        result = self._get_partition_collection(root).query(
+            query_embeddings=[query_embedding], n_results=min(len(candidates), top_k * _DEFAULT_QUERY_MULTIPLIER),
+            include=["distances", "metadatas"], where={"record_id": {"$in": sorted(candidates)}},
+        )
+        matches = []
+        seen = set()
+        binding = ("tenant_id", "policy_version", "source_version", "sanitization_version", "strategy_id",
+                   "origin_request_id", "record_id")
+        for record_id, metadata, distance in zip(
+            (result.get("ids") or [[]])[0], (result.get("metadatas") or [[]])[0],
+            (result.get("distances") or [[]])[0],
+        ):
+            card = candidates.get(record_id)
+            if (
+                card is None or record_id in seen or not isinstance(metadata, dict)
+                or any(metadata.get(key) != card[key] for key in binding)
+                or type(distance) not in (int, float) or not math.isfinite(distance)
+            ):
+                continue
+            seen.add(record_id)
+            similarity = min(1.0, max(0.0, 1.0 - distance))
+            maturity = normalize_maturity(card["maturity"])
+            origin_status = _safe_status(card["origin_status"])
+            kind = card["strategy_kind"]
+            hit = StrategyHit(
+                strategy_id=card["strategy_id"], strategy_kind=kind, stage_scope=card["stage_scope"],
+                **clean_strategy_fields(card), origin_request_id=card["origin_request_id"],
+                origin_status=origin_status, origin_review_status=card["origin_review_status"],
+                similarity=similarity, maturity=maturity, topic_domain=card["topic_domain"], match_reason="",
+                score=self._score_hit(
+                    similarity=similarity, stage=stage, strategy_kind=kind, origin_status=origin_status,
+                    maturity=maturity,
+                ),
+            )
+            hit.match_reason = self._build_match_reason(hit, stage=stage)
+            matches.append((hit, card["source_version"]))
+        matches.sort(key=lambda pair: (-pair[0].score, -pair[0].similarity, pair[0].strategy_id))
+        return matches[:top_k]
 
     def _reconcile_locked(self, *, observer: RequestTrace | None = None) -> None:
         metrics_registry.increment("strategy_memory_refresh_total")
@@ -751,6 +1333,8 @@ class StrategyMemoryService:
         useful from one that merely exists.
         """
 
+        if self._strict:
+            return len(self._update_partition_cards(strategy_ids=strategy_ids))
         updated = 0
         timestamp = _utc_now()
         for strategy_id in dict.fromkeys(_normalize_list(strategy_ids or [], max_items=64)):
@@ -786,6 +1370,8 @@ class StrategyMemoryService:
 
         reference = now or datetime.now(timezone.utc)
         cutoff = reference - timedelta(days=idle_days)
+        if self._strict:
+            return self._update_partition_cards(cutoff=cutoff)
         archived: list[str] = []
         if not self._cards_dir.is_dir():
             return []
@@ -837,6 +1423,8 @@ class StrategyMemoryService:
         successful grade change.
         """
 
+        if self._strict:
+            return bool(self._update_partition_cards(strategy_ids=[strategy_id], maturity=maturity))
         normalized_id = _normalize_text(strategy_id)
         if not normalized_id:
             return False

@@ -257,6 +257,17 @@ class LatencyStats:
         }
 
 
+_V4_GRAPH_STAGES = {"planning", "task", "report"}
+_V4_GRAPH_BACKENDS = {"sqlite", "postgres", "memory"}
+_V4_GRAPH_QUERY_OUTCOMES = {"hit", "empty", "ambiguous", "truncated", "timeout", "unavailable"}
+_V4_GRAPH_REJECTION_REASONS = {
+    "unbound", "unsupported", "confidence", "ineligible", "sanitizer", "conflict", "report_blocked", "missing_scope",
+}
+_V4_GRAPH_LATENCY_BOUNDS = (5, 10, 25, 50, 100, 250, 1000)
+_V4_METRICS_CAP = 2**63 - 1
+_V4_TENANT_METRICS_CAP = 128
+
+
 class MetricsRegistry:
     """Thread-safe process-local metrics aggregation."""
 
@@ -366,6 +377,8 @@ class MetricsRegistry:
         self._web_counters: dict[str, dict[tuple[str, ...], int]] = {}
         self._report_counts: dict[str, dict[str, int]] = {}
         self._report_cache: dict[str, dict[str, int]] = {}
+        self._v4_metrics: dict[tuple[str, tuple[tuple[str, Any], ...]], int] = {}
+        self._v4_tenant_metrics: dict[str, dict[tuple[str, tuple[tuple[str, Any], ...]], int]] = {}
         self._web_latencies: dict[str, dict[str, LatencyStats]] = {}
         self._web_l2_inflight: int | None = None
         self._kv_cache_by_stage: dict[str, dict[str, Any]] = {}
@@ -402,6 +415,8 @@ class MetricsRegistry:
             self._web_latencies.clear()
             self._report_counts.clear()
             self._report_cache.clear()
+            self._v4_metrics.clear()
+            self._v4_tenant_metrics.clear()
             self._web_l2_inflight = None
             self._kv_cache_by_stage.clear()
             self._estimated_cost = 0.0
@@ -642,11 +657,91 @@ class MetricsRegistry:
                 totals[name] = totals.get(name, 0) + value
                 self._counters[name] = self._counters.get(name, 0) + value
 
+    def _record_v4_metric(
+        self, name: str, amount: int, tenant_id: str | None, *, gauge: bool = False, **labels: Any,
+    ) -> None:
+        if type(amount) is not int or amount < 0 or (not gauge and amount == 0):
+            return
+        key = (name, tuple(labels.items()))
+        with self._lock:
+            targets = [self._v4_metrics] if not gauge or tenant_id is None else []
+            if isinstance(tenant_id, str) and tenant_id:
+                if tenant_id not in self._v4_tenant_metrics and len(self._v4_tenant_metrics) >= _V4_TENANT_METRICS_CAP:
+                    del self._v4_tenant_metrics[next(iter(self._v4_tenant_metrics))]
+                targets.append(self._v4_tenant_metrics.setdefault(tenant_id, {}))
+            for target in targets:
+                value = amount if gauge else target.get(key, 0) + amount
+                target[key] = min(_V4_METRICS_CAP, value)
+
+    def record_v4_graph_receipt(
+        self, outcome: str, *, reason: str | None = None, amount: int = 1, tenant_id: str | None = None,
+    ) -> None:
+        if outcome == "rejected" and reason in _V4_GRAPH_REJECTION_REASONS:
+            self._record_v4_metric("v4_graph_receipts_total", amount, tenant_id, outcome=outcome, reason=reason)
+        elif outcome in {"eligible", "inserted", "duplicate", "revoked", "superseded"} and reason is None:
+            self._record_v4_metric("v4_graph_receipts_total", amount, tenant_id, outcome=outcome)
+
+    def record_v4_graph_apply(
+        self, outcome: str, *, amount: int = 1, tenant_id: str | None = None,
+    ) -> None:
+        if outcome in {"inserted", "duplicate", "revoked", "superseded", "stale", "error", "rejected"}:
+            self._record_v4_metric("v4_graph_apply_total", amount, tenant_id, outcome=outcome)
+
+    def record_v4_graph_query(
+        self, stage: str, backend: str, outcome: str, elapsed_ms: float, *,
+        projected_tokens: int = 0, tenant_id: str | None = None,
+    ) -> None:
+        if stage not in _V4_GRAPH_STAGES or backend not in _V4_GRAPH_BACKENDS or outcome not in _V4_GRAPH_QUERY_OUTCOMES:
+            return
+        labels = {"stage": stage, "backend": backend, "outcome": outcome}
+        self._record_v4_metric("v4_graph_query_total", 1, tenant_id, **labels)
+        if isinstance(elapsed_ms, (int, float)) and 0 <= elapsed_ms < float("inf"):
+            bucket = next((bound for bound in _V4_GRAPH_LATENCY_BOUNDS if elapsed_ms <= bound), "inf")
+            self._record_v4_metric("v4_graph_query_duration_ms", 1, tenant_id, **labels, le_ms=bucket)
+        if type(projected_tokens) is int and 0 < projected_tokens <= 512:
+            self._record_v4_metric("v4_graph_projected_tokens_total", projected_tokens, tenant_id, **labels)
+
+    def record_v4_memory_partition(
+        self, store: str, operation: str, outcome: str, *, tenant_id: str | None = None,
+    ) -> None:
+        if (
+            store in {"note", "strategy", "evidence"}
+            and operation in {"read", "write", "rebuild", "hydrate", "delete"}
+            and outcome in {"ok", "empty", "denied", "unavailable", "sanitized"}
+        ):
+            self._record_v4_metric(
+                "v4_memory_partition_total", 1, tenant_id, store=store, operation=operation, outcome=outcome,
+            )
+
+    def record_v4_graph_pending(
+        self, status: str, oldest_age: str, count: int, *, tenant_id: str | None = None,
+    ) -> None:
+        if status not in {"pending", "retry_deferred"} or oldest_age not in {"<1m", "<10m", "<1h", "≥1h"}:
+            return
+        if type(count) is not int or not 0 <= count <= 16:
+            return
+        with self._lock:
+            target = self._v4_metrics if tenant_id is None else self._v4_tenant_metrics.get(tenant_id, {})
+            for key in tuple(target):
+                if key[0] == "v4_graph_pending_batches" and dict(key[1]).get("status") == status:
+                    del target[key]
+        self._record_v4_metric(
+            "v4_graph_pending_batches", count, tenant_id, gauge=True, status=status, oldest_age=oldest_age,
+        )
+
+    def _v4_snapshot(self, tenant_id: str | None) -> dict[str, list[dict[str, Any]]]:
+        source = self._v4_metrics if tenant_id is None else self._v4_tenant_metrics.get(tenant_id, {})
+        result: dict[str, list[dict[str, Any]]] = {}
+        for (name, labels), count in sorted(source.items(), key=lambda item: repr(item[0])):
+            result.setdefault(name, []).append(dict(labels, count=count))
+        return result
+
     def snapshot(
         self, *, include_recent_requests: bool = True, tenant_id: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             counters = dict(self._counters)
+            v4_snapshot = self._v4_snapshot(tenant_id)
             latencies = {name: stats.to_dict() for name, stats in self._latencies.items()}
             web_extraction = self._web_extraction_snapshot(counters, latencies)
             report_counts = _clone_dict(self._report_counts)
@@ -722,6 +817,7 @@ class MetricsRegistry:
             **({"report_breakdown": {**report_counts, "map_cache_by_model": report_cache}}
                if report_counts or report_cache else {}),
             **({"web_extraction": web_extraction} if web_extraction else {}),
+            **({"v4_memory_graph": v4_snapshot} if v4_snapshot else {}),
         }
 
 
@@ -963,6 +1059,7 @@ class RequestTrace:
         self.strategy_memory_prompt_injections = 0
         self.strategy_memory_last_match_kinds: list[str] = []
         self.strategy_memory_hit_ids: list[str] = []
+        self._private_strategy_memory_ids: set[str] = set()
         self.memory_shadow_mode = False
         self.memory_shadow_suppressions = 0
         self.memory_shadow_suppressed_stages: dict[str, int] = {}
@@ -1360,6 +1457,7 @@ class RequestTrace:
         hit_count: int,
         match_kinds: list[str] | None = None,
         strategy_ids: list[str] | None = None,
+        internal_ids: bool = False,
     ) -> None:
         metrics_registry.increment("strategy_memory_query_total")
         if hit_count > 0:
@@ -1385,6 +1483,8 @@ class RequestTrace:
             # Accumulated across the whole request so usage can be flushed to the cards once,
             # instead of writing on every retrieval in the hot path.
             for strategy_id in normalized_ids:
+                if internal_ids:
+                    self._private_strategy_memory_ids.add(strategy_id)
                 if strategy_id not in self.strategy_memory_hit_ids:
                     self.strategy_memory_hit_ids.append(strategy_id)
 
@@ -1570,7 +1670,9 @@ class RequestTrace:
                 "strategy_memory_hits": self.strategy_memory_hits,
                 "strategy_memory_prompt_injections": self.strategy_memory_prompt_injections,
                 "strategy_memory_last_match_kinds": list(self.strategy_memory_last_match_kinds),
-                "strategy_memory_hit_ids": list(self.strategy_memory_hit_ids),
+                "strategy_memory_hit_ids": [
+                    item for item in self.strategy_memory_hit_ids if item not in self._private_strategy_memory_ids
+                ],
                 "memory_shadow_mode": self.memory_shadow_mode,
                 "memory_shadow_suppressions": self.memory_shadow_suppressions,
                 "memory_shadow_suppressed_stages": dict(self.memory_shadow_suppressed_stages),

@@ -13,8 +13,12 @@ from typing import Any, Callable, Iterator
 
 from metrics import RequestTrace, extract_llm_usage, metrics_registry
 from models import SummaryState, TodoItem
-from prompts import web_evidence_prompt_rules
-from services.context_builder import ContextPrefixBuilder, render_web_evidence_data
+from prompts import graph_memory_prompt_rules, web_evidence_prompt_rules
+from services.context_builder import (
+    ContextPrefixBuilder,
+    render_graph_projection_data,
+    render_web_evidence_data,
+)
 from services.evidence import (
     EvidenceStore,
     build_task_context,
@@ -1072,8 +1076,14 @@ class TaskExecutorMixin:
             ("task_react_delta", volatile_delta),
             ("context_delta", render_context_delta(state, self.config)),
         ]
+        graph_fn = getattr(self, "_graph_projection_for_task", None)
+        graph_block = render_graph_projection_data(
+            graph_fn(state, task) if callable(graph_fn) else None,
+            max_bytes=256,
+        )
         role = str(getattr(self.task_react_agent, "system_prompt", "") or "")
         role += web_evidence_prompt_rules(bool(getattr(getattr(self, "_evidence_store", None), "web_extraction_enabled", False)))
+        role += graph_memory_prompt_rules(bool(graph_block))
         if builder.enabled():
             envelope = builder.build_envelope(
                 stage="task_react",
@@ -1082,6 +1092,7 @@ class TaskExecutorMixin:
                 skill_pack_context=self._skill_stage_context("task_execution"),
                 frozen_index_and_ledger=frozen,
                 volatile_blocks=volatile_blocks,
+                graph_projection=graph_block,
             )
         else:
             envelope = builder.build_envelope(
@@ -1092,6 +1103,7 @@ class TaskExecutorMixin:
                     *volatile_blocks,
                     ("checkpoint", frozen),
                 ],
+                graph_projection=graph_block,
             )
         prompt = envelope.to_flat_prompt()
         run_env = getattr(self.task_react_agent, "run_envelope", None)
@@ -1716,6 +1728,17 @@ class TaskExecutorMixin:
             build_context = build_task_context_from_hits if grounding_hits else build_task_context
             context = build_context(grounding_hits or task.evidence_items, answer_text=answer_text, config=self.config)
         historical_memory_context = self._task_memory_context(state, task, observer)
+        graph_fn = getattr(self, "_graph_projection_for_task", None)
+        graph_block = render_graph_projection_data(
+            graph_fn(state, task) if callable(graph_fn) else None,
+            max_bytes=256,
+        )
+        if graph_block:
+            graph_notice = graph_memory_prompt_rules(True).strip()
+            extra = f"{graph_notice}\n{graph_block}" if graph_notice else graph_block
+            historical_memory_context = (
+                f"{historical_memory_context}\n\n{extra}".strip() if historical_memory_context else extra
+            )
         upstream_context = str(getattr(task, "upstream_context", "") or "").strip()
         if upstream_context:
             context = (

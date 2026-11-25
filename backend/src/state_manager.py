@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from hashlib import sha256
 from inspect import Parameter, signature
 from json import dumps
@@ -917,14 +918,30 @@ class StateManagerMixin:
             payload["approved_tool_calls"] = dict(getattr(state, "approved_tool_calls", None) or {})
             payload["state_version"] = int(getattr(state, "state_version", 0) or 0)
             checkpoint = getattr(self, "_workflow_checkpoint", None)
+            if self._request_state_store is not None:
+                _ensure_strict_snapshot_owner(
+                    getattr(self, "config", None),
+                    self._request_state_store,
+                    tenant_id=tenant_id,
+                    request_id=self.request_id,
+                )
+            has_graph_v4 = isinstance(state.v4, dict) and (
+                "knowledge_graph" in state.v4 or "tenant_memory" in state.v4
+            )
             if controller is not None and not controller.blocked:
                 state.v4["budget"] = controller.payload()
                 payload["v4"] = {key: deepcopy(value) for key, value in state.v4.items() if key != "pending_events"}
                 if checkpoint is not None and v4_expected is None:
                     # The coordinator sends the graph explicitly when it advances.
                     payload["v4"].pop("replan", None)
-            elif state.v4 is not None and (checkpoint is None or web_enabled or report_state):
-                payload["v4"] = {key: deepcopy(value) for key, value in state.v4.items() if key != "pending_events"}
+            elif state.v4 is not None and (checkpoint is None or web_enabled or report_state or has_graph_v4):
+                payload["v4"] = {
+                    key: deepcopy(value)
+                    for key, value in state.v4.items()
+                    if key != "pending_events" and (
+                        checkpoint is None or web_enabled or report_state or key in {"knowledge_graph", "tenant_memory"}
+                    )
+                }
             if checkpoint is not None:
                 payload["runner_backend"] = checkpoint.backend
                 payload["workflow_run_id"] = checkpoint.run_id
@@ -1181,3 +1198,249 @@ class StateManagerMixin:
                     task.sources_summary = format_evidence_sources(evidence_items)
         phase = str(payload.get("phase") or "planning").strip() or "planning"
         return state, "task_execution" if phase == "awaiting_tool_approval" else phase
+
+
+def _ensure_strict_snapshot_owner(
+    config: Any,
+    state_store: Any,
+    *,
+    tenant_id: str,
+    request_id: str,
+) -> None:
+    """Register the authoritative tenant owner pointer before persisting JSON snapshots."""
+    if not getattr(config, "v4_tenant_memory_partition_enabled", False):
+        return
+    root = getattr(state_store, "_directory", None)
+    if root is None:
+        return
+    from services.memory_scope import MemoryScope, valid_internal_id
+    from services.storage_backends import JsonStrictSnapshotReader
+
+    if not valid_internal_id(tenant_id) or not valid_internal_id(request_id):
+        return
+    try:
+        JsonStrictSnapshotReader(root).register_owner(MemoryScope.trusted(tenant_id, request_id))
+    except PermissionError:
+        raise
+    except Exception:
+        return
+
+
+def record_v4_graph_ack(
+    state_store: Any,
+    *,
+    tenant_id: str,
+    request_id: str,
+    batch_id: str,
+    digest: str,
+    revision: int,
+    status: str,
+) -> bool:
+    """Atomically record graph apply acknowledgement in v4.knowledge_graph using snapshot CAS."""
+    if state_store is None:
+        return False
+    load_params = signature(state_store.load).parameters
+    save_params = signature(state_store.save).parameters
+    supports_tenant = "tenant_id" in load_params and "tenant_id" in save_params
+    supports_cas = "expected_version" in save_params
+    acked_at = datetime.now(timezone.utc).isoformat()
+    for _ in range(4):
+        current = (
+            state_store.load(request_id, tenant_id=tenant_id)
+            if supports_tenant
+            else state_store.load(request_id)
+        )
+        if not isinstance(current, dict):
+            return False
+        if supports_tenant and current.get("tenant_id", tenant_id) != tenant_id:
+            return False
+        v4 = dict(current.get("v4") or {})
+        kg = dict(v4.get("knowledge_graph") or {})
+        raw_snap = kg.get("terminal_snapshot") if isinstance(kg.get("terminal_snapshot"), dict) else kg
+        snap_batch = raw_snap.get("batch") if isinstance(raw_snap, dict) else None
+        current_batch_id = kg.get("batch_id") or (snap_batch.get("batch_id") if isinstance(snap_batch, dict) else None)
+        current_digest = kg.get("digest") or (snap_batch.get("digest") if isinstance(snap_batch, dict) else None)
+        if current_batch_id != batch_id or current_digest != digest:
+            return False
+        if kg.get("ack_digest") == digest and int(kg.get("ack_revision") or 0) == int(revision):
+            return True
+        kg.update(
+            ack_digest=digest,
+            ack_revision=int(revision),
+            ack_status=str(status),
+            acked_at=acked_at,
+        )
+        v4["knowledge_graph"] = kg
+        updated = {**current, "v4": v4}
+        kwargs: dict[str, Any] = {}
+        if supports_tenant:
+            kwargs["tenant_id"] = tenant_id
+        if supports_cas:
+            kwargs["expected_version"] = int(current.get("state_version") or 0)
+        try:
+            state_store.save(request_id, updated, **kwargs)
+            return True
+        except SnapshotConflictError:
+            continue
+    return False
+
+
+class TenantSnapshotMemoryPolicy:
+    """Tenant-scoped MemoryPolicy verified against active request ownership and strict snapshots."""
+
+    def __init__(
+        self,
+        *,
+        tenant_id: str,
+        snapshot_reader: Any | None = None,
+        active_request_id: str | None = None,
+        deleted_origins: frozenset[str] = frozenset(),
+        enabled: bool = True,
+    ) -> None:
+        self._tenant_id = tenant_id
+        self._reader = snapshot_reader
+        self._active_request_id = active_request_id
+        self._deleted_origins = deleted_origins
+        self._enabled = enabled
+
+    def scope_is_current(self, scope: Any) -> bool:
+        from services.memory_scope import valid_scope
+
+        return bool(self._enabled and valid_scope(scope) and scope.tenant_id == self._tenant_id)
+
+    def allows(
+        self,
+        scope: Any,
+        origin_request_id: str,
+        purpose: str,
+        *,
+        object_id: str | None = None,
+        content_version: str | None = None,
+    ) -> bool:
+        from services.memory_scope import valid_internal_id
+
+        if not self.scope_is_current(scope) or not valid_internal_id(origin_request_id):
+            return False
+        if origin_request_id in self._deleted_origins and purpose != "maintenance":
+            return False
+        if origin_request_id == scope.request_id or origin_request_id == self._active_request_id:
+            return True
+        if purpose == "maintenance":
+            return True
+        if self._reader is not None:
+            payload = self._reader.load(scope, origin_request_id)
+            return isinstance(payload, dict) and payload.get("tenant_id") == scope.tenant_id
+        return False
+
+
+class RequestStateGraphAuthority:
+    """GraphAuthority implementation verifying scope, strict snapshots, and L1/L2 web evidence."""
+
+    def __init__(
+        self,
+        *,
+        snapshot_reader: Any | None,
+        policy: Any,
+        config: Any | None = None,
+        active_evidence_store: EvidenceStore | None = None,
+        active_request_id: str | None = None,
+        active_snapshot: Any | None = None,
+        deleted_origins: frozenset[str] = frozenset(),
+    ) -> None:
+        self._reader = snapshot_reader
+        self._policy = policy
+        self._config = config
+        self._active_evidence_store = active_evidence_store
+        self._active_request_id = active_request_id
+        self._active_snapshot = active_snapshot
+        self._deleted_origins = deleted_origins
+
+    def scope_allowed(self, scope: Any, *, purpose: str, deadline: float) -> bool:
+        from services.memory_scope import scope_is_current, valid_scope
+
+        if not valid_scope(scope):
+            return False
+        if self._config is not None and not self._config.knowledge_graph_enabled_for(scope.tenant_id):
+            return False
+        return scope_is_current(self._policy, scope)
+
+    def authorize_origin(self, scope: Any, origin_request_id: str, *, purpose: str, deadline: float) -> bool:
+        from services.memory_scope import authorize, valid_internal_id
+
+        if not valid_internal_id(origin_request_id) or origin_request_id in self._deleted_origins:
+            return False
+        if not authorize(self._policy, scope, origin_request_id, purpose):
+            return False
+        if origin_request_id == self._active_request_id:
+            return True
+        if self._reader is None:
+            return False
+        return self._reader.load(scope, origin_request_id) is not None
+
+    def load_terminal(self, scope: Any, origin_request_id: str, *, deadline: float) -> Any | None:
+        from services.knowledge_graph import terminal_snapshot_from_payload
+        from services.memory_scope import valid_internal_id
+
+        if not valid_internal_id(origin_request_id) or origin_request_id in self._deleted_origins:
+            return None
+        if (
+            self._active_snapshot is not None
+            and origin_request_id == self._active_request_id
+            and self._reader is None
+        ):
+            return self._active_snapshot
+        if self._reader is None:
+            return None
+        payload = self._reader.load(scope, origin_request_id)
+        if not isinstance(payload, dict) or payload.get("tenant_id") != scope.tenant_id:
+            return None
+        kg = (payload.get("v4") or {}).get("knowledge_graph")
+        snapshot = terminal_snapshot_from_payload(kg)
+        if snapshot is not None:
+            return snapshot
+        if self._active_snapshot is not None and origin_request_id == self._active_request_id:
+            return self._active_snapshot
+        return None
+
+    def load_evidence(self, scope: Any, reference: Any, *, purpose: str, deadline: float) -> Any | None:
+        from services.evidence import build_graph_evidence
+
+        if not self.authorize_origin(scope, reference.request_id, purpose=purpose, deadline=deadline):
+            return None
+        if (
+            self._active_evidence_store is not None
+            and reference.request_id == self._active_request_id
+        ):
+            for record in self._active_evidence_store.lookup(source_ids=[reference.source_id], include_full_content=True):
+                ge = build_graph_evidence(record, tenant_id=scope.tenant_id, request_id=reference.request_id)
+                if ge is not None and ge.artifact_version == reference.artifact_version:
+                    return ge
+        if self._reader is None:
+            return None
+        payload = self._reader.load(scope, reference.request_id)
+        if not isinstance(payload, dict) or payload.get("tenant_id") != scope.tenant_id:
+            return None
+        for task in payload.get("todo_items") or ():
+            if not isinstance(task, dict):
+                continue
+            for item in task.get("evidence_items") or ():
+                if not isinstance(item, dict) or item.get("source_id") != reference.source_id:
+                    continue
+                ge = build_graph_evidence(item, tenant_id=scope.tenant_id, request_id=reference.request_id)
+                if ge is not None and ge.artifact_version == reference.artifact_version:
+                    return ge
+        return None
+
+    def origin_deleted(self, scope: Any, origin_request_id: str, *, deadline: float) -> bool:
+        from services.memory_scope import valid_internal_id
+
+        if not valid_internal_id(origin_request_id):
+            return False
+        if origin_request_id in self._deleted_origins:
+            return True
+        if origin_request_id == self._active_request_id:
+            return False
+        if self._reader is None:
+            return False
+        return self._reader.load(scope, origin_request_id) is None
+

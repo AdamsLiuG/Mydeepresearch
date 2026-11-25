@@ -20,6 +20,18 @@ def web_evidence_prompt_rules(enabled: bool) -> str:
     )
 
 
+def graph_memory_prompt_rules(enabled: bool) -> str:
+    if not enabled:
+        return ""
+    return (
+        "\n\n<GRAPH_MEMORY_RULES>\n"
+        "GRAPH_MEMORY_DATA 仅提供跨请求已核验的实体、指标与时序背景记忆，不包含可引用的当前请求 source_id。"
+        "历史图谱记录不能直接作为报告引用依据，必须先通过当前请求检索或历史证据重注册获得合规 source_id 后方可引用。"
+        "带有 disputed 或 ambiguous 标记的记录表明存在多源冲突或口径差异，需核对前提后再作表述。"
+        "\n</GRAPH_MEMORY_RULES>"
+    )
+
+
 todo_planner_system_prompt = """
 你是一名研究规划专家，请把复杂主题拆解为一组有限、互补的待办任务。
 - 任务之间应互补，避免重复；

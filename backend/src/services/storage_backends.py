@@ -4,10 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
+from services.memory_scope import (
+    MemoryScope,
+    open_partition_directory,
+    partition_lock,
+    partition_root,
+    read_partition_text,
+    valid_internal_id,
+    valid_scope,
+    write_partition_text,
+)
 from services.request_state import RequestStateStore, SnapshotConflictError
 
 try:  # pragma: no cover - optional dependency
@@ -275,6 +289,40 @@ class PostgresRequestStateStore:
             payload.setdefault("error", resolved_error)
         return payload
 
+    def load_scoped(self, scope: MemoryScope, request_id: str) -> dict[str, Any] | None:
+        if not valid_scope(scope) or not valid_internal_id(request_id):
+            return None
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(self._SELECT_BY_ID_TENANT_SQL, (request_id, scope.tenant_id))
+                row = cur.fetchone()
+            if not row or row[0] != scope.tenant_id:
+                return None
+            return _strict_payload(row[1], scope, request_id, row_version=row[2])
+        except Exception:
+            return None
+
+    def iter_terminal(
+        self, scope: MemoryScope, *, after: str = "", limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        if not valid_scope(scope) or (after and not valid_internal_id(after)):
+            return []
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT request_id, tenant_id, payload_json, state_version FROM deepresearch_request_states "
+                    'WHERE tenant_id = %s AND request_id COLLATE "C" > %s AND status IN (%s, %s, %s, %s, %s) '
+                    'ORDER BY request_id COLLATE "C" LIMIT %s',
+                    (scope.tenant_id, after, *_TERMINAL_STATUSES, _page_limit(limit)),
+                )
+                rows = cur.fetchall()
+            return [payload for request_id, tenant_id, raw, version in rows
+                    if tenant_id == scope.tenant_id and valid_internal_id(request_id)
+                    and (payload := _strict_payload(raw, scope, request_id, row_version=version))
+                    and payload.get("status") in _TERMINAL_STATUSES]
+        except Exception:
+            return []
+
     def list_recent(
         self,
         *,
@@ -332,3 +380,264 @@ def build_request_state_store(config: Any) -> Any | None:
         str(getattr(config, "request_state_dir", "./.state/requests")),
         recent_limit=recent_limit,
     )
+
+
+_TERMINAL_STATUSES = ("success", "partial_success", "failed", "canceled", "cancelled")
+
+
+def _page_limit(limit: int) -> int:
+    return max(0, min(64, limit)) if type(limit) is int else 0
+
+
+def _strict_payload(
+    raw: str, scope: MemoryScope, request_id: str, *, row_version: int | None = None,
+) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict) or payload.get("request_id") != request_id
+        or payload.get("tenant_id") != scope.tenant_id
+    ):
+        return None
+    version = payload.get("state_version") if row_version is None else row_version
+    if type(version) is not int or version < 1:
+        return None
+    if row_version is not None and payload.get("state_version", row_version) != row_version:
+        return None
+    payload["state_version"] = version
+    return payload
+
+
+class StrictSnapshotReader(Protocol):
+    def load(self, scope: MemoryScope, request_id: str) -> dict[str, Any] | None: ...
+
+    def iter_terminal(
+        self, scope: MemoryScope, *, after: str = "", limit: int = 64,
+    ) -> list[dict[str, Any]]: ...
+
+
+class JsonStrictSnapshotReader:
+    """Per-tenant owner pointers for the existing authoritative JSON snapshots."""
+
+    def __init__(self, root: str | Path) -> None:
+        self._root = Path(root)
+
+    @staticmethod
+    def _owner_pointer(scope: MemoryScope, request_id: str) -> str:
+        return json.dumps({"tenant_id": scope.tenant_id, "request_id": request_id, "schema_version": 1})
+
+    def register_owner(self, scope: MemoryScope) -> None:
+        """Register a trusted owner before first save or from a verified offline mapping."""
+        if not valid_scope(scope):
+            raise PermissionError("invalid snapshot scope")
+        # The legacy raw files are keyed globally, so a request ID can have one owner.
+        registry = self._root / "v4" / "owners"
+        pointer = scope.request_id + ".json"
+        expected = self._owner_pointer(scope, scope.request_id)
+        with partition_lock(registry):
+            try:
+                owner = read_partition_text(registry, pointer, max_bytes=16384)
+            except FileNotFoundError:
+                try:
+                    existing = read_partition_text(self._root, pointer)
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None and _strict_payload(existing, scope, scope.request_id) is None:
+                    raise PermissionError("snapshot owner unavailable")
+                write_partition_text(registry, pointer, text=expected)
+            else:
+                if owner != expected:
+                    raise PermissionError("snapshot owner mismatch")
+            tenant_dir = partition_root(self._root, scope, create=True)
+            with partition_lock(tenant_dir):
+                write_partition_text(tenant_dir, "owners", pointer, text=expected)
+
+    def load(self, scope: MemoryScope, request_id: str) -> dict[str, Any] | None:
+        if not valid_scope(scope) or not valid_internal_id(request_id):
+            return None
+        try:
+            tenant_dir = partition_root(self._root, scope)
+            pointer = request_id + ".json"
+            expected = self._owner_pointer(scope, request_id)
+            if read_partition_text(tenant_dir, "owners", pointer, max_bytes=16384) != expected:
+                return None
+            if read_partition_text(self._root, "v4", "owners", pointer, max_bytes=16384) != expected:
+                return None
+            return _strict_payload(read_partition_text(self._root, pointer), scope, request_id)
+        except (OSError, ValueError):
+            return None
+
+    def iter_terminal(
+        self, scope: MemoryScope, *, after: str = "", limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        if not valid_scope(scope) or (after and not valid_internal_id(after)):
+            return []
+        try:
+            tenant_dir = partition_root(self._root, scope)
+            with open_partition_directory(tenant_dir, "owners") as directory:
+                ids = sorted(
+                    name[:-5] for name in os.listdir(directory)
+                    if name.endswith(".json") and name[:-5] > after and valid_internal_id(name[:-5])
+                )
+            rows = []
+            for request_id in ids:
+                if len(rows) >= _page_limit(limit):
+                    break
+                payload = self.load(scope, request_id)
+                if payload is not None and payload.get("status") in _TERMINAL_STATUSES:
+                    rows.append(payload)
+            return rows
+        except (OSError, ValueError):
+            return []
+
+
+class PostgresStrictSnapshotReader:
+    def __init__(self, store: PostgresRequestStateStore) -> None:
+        self._store = store
+
+    def load(self, scope: MemoryScope, request_id: str) -> dict[str, Any] | None:
+        return self._store.load_scoped(scope, request_id)
+
+    def iter_terminal(
+        self, scope: MemoryScope, *, after: str = "", limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        return self._store.iter_terminal(scope, after=after, limit=limit)
+
+
+def build_strict_snapshot_reader(config: Any, *, postgres_store: PostgresRequestStateStore | None = None):
+    if not config.request_state_enabled:
+        return None
+    if config.database_url:
+        if not isinstance(postgres_store, PostgresRequestStateStore):
+            return None
+        return PostgresStrictSnapshotReader(postgres_store)
+    return JsonStrictSnapshotReader(config.request_state_dir)
+
+
+_GRAPH_SCHEMA = "deepresearch_graph"
+_GRAPH_POLICY = "graph_tenant_scope"
+_GRAPH_TENANT_PREDICATE = "tenant_id = NULLIF(current_setting('deepresearch.tenant_id', true), '')"
+
+
+def migrate_postgres_graph(connection: Any, *, runtime_role: str) -> None:
+    """Run once per deployment as the graph schema owner or migration role."""
+    from services.knowledge_graph import GRAPH_SCHEMA_SQL, GRAPH_TABLES
+
+    if not isinstance(runtime_role, str) or not runtime_role or len(runtime_role.encode()) > 63 or not runtime_role.isprintable():
+        raise ValueError("invalid Postgres graph runtime role")
+    role = '"' + runtime_role.replace('"', '""') + '"'
+    with connection.transaction():
+        connection.execute("SELECT pg_advisory_xact_lock(hashtext('deepresearch_graph_schema'))")
+        if connection.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s AND NOT rolsuper AND NOT rolbypassrls "
+            "AND rolname <> current_user", (runtime_role,),
+        ).fetchone() is None:
+            raise PermissionError("invalid graph runtime role")
+        connection.execute(f"CREATE SCHEMA IF NOT EXISTS {_GRAPH_SCHEMA}")
+        connection.execute(f"SET LOCAL search_path TO {_GRAPH_SCHEMA}, pg_catalog")
+        connection.execute(f"REVOKE ALL ON SCHEMA {_GRAPH_SCHEMA} FROM PUBLIC")
+        connection.execute(f"GRANT USAGE ON SCHEMA {_GRAPH_SCHEMA} TO {role}")
+        for statement in GRAPH_SCHEMA_SQL:
+            connection.execute(statement)
+        for table in GRAPH_TABLES:
+            connection.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+            connection.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
+            connection.execute(f"DROP POLICY IF EXISTS {_GRAPH_POLICY} ON {table}")
+            connection.execute(
+                f"CREATE POLICY {_GRAPH_POLICY} ON {table} FOR ALL "
+                f"USING ({_GRAPH_TENANT_PREDICATE}) WITH CHECK ({_GRAPH_TENANT_PREDICATE})",
+            )
+            connection.execute(f"REVOKE ALL ON TABLE {table} FROM PUBLIC")
+            connection.execute(f"REVOKE ALL ON TABLE {table} FROM {role}")
+            connection.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {table} TO {role}")
+
+
+class PostgresGraphStore:
+    backend = "postgres"
+
+    def __init__(self, *, dsn: str = "", connection_factory: Callable[[], Any] | None = None) -> None:
+        self._dsn = dsn
+        self._connection_factory = connection_factory
+        if connection_factory is None and (not dsn or psycopg is None):
+            raise RuntimeError("Postgres graph connection unavailable")
+
+    @contextmanager
+    def _connect(self, deadline: float) -> Iterator[Any]:
+        from services.knowledge_graph import _remaining
+
+        seconds = _remaining(deadline)
+        connection = (
+            self._connection_factory() if self._connection_factory is not None
+            else psycopg.connect(self._dsn, connect_timeout=max(2, min(3, int(seconds) + 1)))
+        )
+        with connection as conn:
+            _remaining(deadline)
+            yield conn
+
+    @staticmethod
+    def _validate_role(connection: Any) -> None:
+        from services.knowledge_graph import GRAPH_TABLES
+
+        safe = connection.execute(
+            "SELECT NOT r.rolsuper AND NOT r.rolbypassrls AND NOT "
+            "has_schema_privilege(current_user, %s, 'CREATE') "
+            "FROM pg_roles AS r WHERE r.rolname = current_user", (_GRAPH_SCHEMA,),
+        ).fetchone()
+        if safe is None or safe[0] is not True:
+            raise PermissionError("invalid graph runtime role")
+        rows = connection.execute(
+            "SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity, "
+            "pg_has_role(current_user, c.relowner, 'MEMBER'), p.policyname, p.cmd, p.roles, "
+            "p.qual, p.with_check, has_table_privilege(current_user, c.oid, 'TRUNCATE'), "
+            "has_table_privilege(current_user, c.oid, 'SELECT') "
+            "FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+            "LEFT JOIN pg_policies AS p ON p.schemaname = n.nspname AND p.tablename = c.relname "
+            "WHERE n.nspname = %s AND c.relname = ANY(%s) AND c.relkind = 'r'",
+            (_GRAPH_SCHEMA, list(GRAPH_TABLES)),
+        ).fetchall()
+        expected = "(tenant_id = NULLIF(current_setting('deepresearch.tenant_id'::text, true), ''::text))"
+        if len(rows) != len(GRAPH_TABLES) or {row[0] for row in rows} != set(GRAPH_TABLES):
+            raise PermissionError("incomplete graph RLS schema")
+        for _, enabled, forced, owner, policy, command, roles, using, check, truncate, select in rows:
+            if (
+                not enabled or not forced or owner or policy != _GRAPH_POLICY or command != "ALL"
+                or list(roles) != ["public"] or using != expected or check != expected or truncate or not select
+            ):
+                raise PermissionError("invalid graph RLS policy")
+
+    @contextmanager
+    def _transaction(self, tenant_id: str, *, write: bool, deadline: float) -> Iterator[Any]:
+        from services.knowledge_graph import _remaining
+
+        with self._connect(deadline) as conn, conn.transaction():
+            if not write:
+                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            conn.execute("SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+                         (str(max(1, int(_remaining(deadline) * 1000))),) * 2)
+            conn.execute(
+                "SELECT set_config('deepresearch.tenant_id', %s, true), set_config('search_path', %s, true), "
+                "set_config('row_security', 'on', true)", (tenant_id, f"pg_catalog, {_GRAPH_SCHEMA}, pg_temp"),
+            )
+            self._validate_role(conn)
+            if write:
+                conn.execute("SELECT pg_advisory_xact_lock(hashtext('deepresearch_graph'), hashtext(%s))", (tenant_id,))
+            _remaining(deadline)
+            yield conn
+            _remaining(deadline)
+
+    def probe(self, *, deadline: float) -> None:
+        with self._transaction("", write=False, deadline=deadline):
+            pass
+
+    @contextmanager
+    def transaction(
+        self, scope: MemoryScope, *, write: bool, deadline: float,
+    ) -> Iterator[Any]:
+        from services.knowledge_graph import SqlGraphTransaction
+
+        if not valid_scope(scope):
+            raise PermissionError("invalid graph scope")
+        with self._transaction(scope.tenant_id, write=write, deadline=deadline) as conn:
+            yield SqlGraphTransaction(conn, scope.tenant_id, placeholder="%s")

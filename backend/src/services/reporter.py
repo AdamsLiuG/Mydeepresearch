@@ -50,6 +50,7 @@ from prompts import (
     REPORT_REDUCER_SCHEMA,
     REPORT_REVISION_ROLE,
     REPORT_REVISION_SCHEMA,
+    graph_memory_prompt_rules,
     web_evidence_prompt_rules,
 )
 from services.claim_verifier import (
@@ -63,6 +64,7 @@ from services.context_builder import (
     PromptEnvelope,
     ReportModelRequest,
     parse_report_json,
+    render_graph_projection_data,
     render_web_evidence_data,
     report_json,
 )
@@ -182,12 +184,18 @@ class ReportingService:
         state: SummaryState,
         observer: RequestTrace | None = None,
         skill_pack_context: str | None = None,
+        *,
+        graph_context: Any | None = None,
     ) -> str:
         """Generate a structured report based on completed tasks."""
         settings = self._report_settings(state)
         if settings.parallel_report_enabled or settings.red_team_enabled:
-            return ReportCoordinator(self, state, settings, observer, skill_pack_context).generate()
-        envelope = self._build_envelope(state, skill_pack_context=skill_pack_context)
+            return ReportCoordinator(
+                self, state, settings, observer, skill_pack_context, graph_context=graph_context,
+            ).generate()
+        envelope = self._build_envelope(
+            state, skill_pack_context=skill_pack_context, graph_context=graph_context,
+        )
         prompt = envelope.to_flat_prompt()
         run_env = getattr(self._agent, "run_envelope", None)
         use_envelope = callable(run_env)
@@ -255,10 +263,13 @@ class ReportingService:
             "v4_red_team_critic_enabled": False,
         })
 
-    def coordinate_report(self, state, observer, skill_context, outline_sections, checkpoint, transport, pricing, usage):
+    def coordinate_report(
+        self, state, observer, skill_context, outline_sections, checkpoint, transport, pricing, usage,
+        *, graph_context: Any | None = None,
+    ):
         coordinator = ReportCoordinator(
             self, state, self._report_settings(state), observer, skill_context, outline_sections,
-            checkpoint=checkpoint, transport=transport, pricing=pricing, usage=usage,
+            checkpoint=checkpoint, transport=transport, pricing=pricing, usage=usage, graph_context=graph_context,
         )
         return (yield from coordinator.run())
 
@@ -268,12 +279,17 @@ class ReportingService:
         observer: RequestTrace | None = None,
         skill_pack_context: str | None = None,
         outline_sections: list[str] | None = None,
+        *,
+        graph_context: Any | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield progressive outline + validated report_chunk events while populating state.structured_report."""
 
         settings = self._report_settings(state)
         if settings.parallel_report_enabled or settings.red_team_enabled:
-            coordinator = ReportCoordinator(self, state, settings, observer, skill_pack_context, outline_sections)
+            coordinator = ReportCoordinator(
+                self, state, settings, observer, skill_pack_context, outline_sections,
+                graph_context=graph_context,
+            )
             report = coordinator.generate()
             state.structured_report = report
             sections = state.report_workbench["report_sections"]
@@ -431,6 +447,7 @@ class ReportingService:
         state: SummaryState,
         *,
         skill_pack_context: str | None = None,
+        graph_context: Any | None = None,
     ) -> PromptEnvelope:
         builder = ContextPrefixBuilder(self._config)
         web_enabled = getattr(self._evidence_store, "web_extraction_enabled", False)
@@ -462,10 +479,15 @@ class ReportingService:
                 f"- 来源概览：\n{sources_block}\n"
             )
 
+        graph_block = render_graph_projection_data(graph_context, max_bytes=512)
         tools_enabled = self._tools_enabled()
         layout_mode = self._config.resolved_report_layout_mode()
         build_contract = self._build_fixed_prompt if layout_mode == self._FIXED_LAYOUT_MODE else self._build_flexible_prompt
-        static_schema = build_contract(tools_enabled=tools_enabled) + web_evidence_prompt_rules(web_enabled)
+        static_schema = (
+            build_contract(tools_enabled=tools_enabled)
+            + web_evidence_prompt_rules(web_enabled)
+            + graph_memory_prompt_rules(bool(graph_block))
+        )
 
         frozen = render_context_checkpoint(state, self._config)
         volatile_blocks: list[tuple[str, str]] = [
@@ -517,6 +539,7 @@ class ReportingService:
                     ("checkpoint", frozen),
                     ("skills", str(skill_pack_context or "")),
                 ],
+                graph_projection=graph_block,
             )
         return builder.build_envelope(
             stage="report",
@@ -526,6 +549,7 @@ class ReportingService:
             skill_pack_context=str(skill_pack_context or "").strip(),
             frozen_index_and_ledger=frozen,
             volatile_blocks=volatile_blocks,
+            graph_projection=graph_block,
         )
 
     def _build_prompt(self, state: SummaryState) -> str:
@@ -2762,7 +2786,7 @@ class ReportCoordinator:
 
     def __init__(
         self, reporter, state, settings, observer, skill_context, outline_sections=(), *,
-        checkpoint=None, transport=None, pricing=None, usage=None,
+        checkpoint=None, transport=None, pricing=None, usage=None, graph_context: Any | None = None,
     ):
         self.reporter = reporter
         self.state = state
@@ -2781,6 +2805,7 @@ class ReportCoordinator:
         self.critic_transport = reporter._critic_transport or self.transport
         self.pricing = pricing
         self.usage = usage
+        self.graph_context = graph_context
         self.attempt = None
         self.local_only = False
         self.reducer = CoherenceReducer()
@@ -2926,8 +2951,8 @@ class ReportCoordinator:
             pool.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
-    def _payload(pack):
-        return {
+    def _payload(pack, graph_block: str = ""):
+        payload = {
             "section_id": pack.section.section_id,
             "title": pack.section.title,
             "scope": pack.section.scope,
@@ -2936,11 +2961,15 @@ class ReportCoordinator:
             "conflicts": [asdict(group) for group in pack.conflicts],
             "excerpts": [asdict(excerpt) for excerpt in pack.excerpts],
         }
+        if graph_block:
+            payload["graph_context"] = graph_block
+        return payload
 
     def _map_request(self, prefix, pack):
+        graph_block = render_graph_projection_data(getattr(self, "graph_context", None), max_bytes=192)
         while pack.claims or pack.conflicts:
             request = prefix.request(
-                "map", self._payload(pack), max_tokens=768, timeout=self.settings.v4_report_map_timeout_seconds,
+                "map", self._payload(pack, graph_block), max_tokens=768, timeout=self.settings.v4_report_map_timeout_seconds,
             )
             if request.input_upper_bound <= _REPORT_INPUT_LIMITS["map"]:
                 return request, pack
@@ -3631,3 +3660,95 @@ class ReportCoordinator:
             self.observer.record_report_timing("report_stage_ms", elapsed)
             self.observer.record_report_timing("report_first_verified_chunk_ms", elapsed)
         return report
+
+
+def build_publication_bindings(
+    state: SummaryState,
+    *,
+    evidence_store: Any,
+    ledger: Any,
+    request_id: str,
+    tenant_id: str,
+) -> dict[str, Any]:
+    """Bind claims published in the final report to eligible GraphEvidence support references."""
+    from models import EvidenceRef
+    from services.evidence import build_graph_evidence
+    from services.knowledge_graph import PublicationBinding, evidence_digest
+    from services.memory_scope import valid_internal_id
+
+    if not getattr(ledger, "entries", None) or not getattr(ledger, "version", 0):
+        return {}
+    if not valid_internal_id(request_id) or not valid_internal_id(tenant_id):
+        return {}
+
+    workbench = getattr(state, "report_workbench", None)
+    published_blocks = workbench.get("report_blocks") if isinstance(workbench, dict) else None
+    claim_sources_from_report: dict[str, set[str]] = {}
+    if isinstance(published_blocks, list) and published_blocks:
+        for block in published_blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("kind") not in {"fact", "claim"}:
+                continue
+            cid = str(block.get("claim_id") or "").strip()
+            sids = {str(s).strip() for s in (block.get("source_ids") or ()) if str(s).strip()}
+            for ref in block.get("evidence_refs") or ():
+                if isinstance(ref, dict) and ref.get("source_id"):
+                    sids.add(str(ref["source_id"]).strip())
+            if cid and sids:
+                claim_sources_from_report.setdefault(cid, set()).update(sids)
+    else:
+        cited_in_report = set(extract_citation_ids(str(getattr(state, "structured_report", "") or "")))
+        for entry in ledger.entries:
+            matched = cited_in_report.intersection(getattr(entry, "source_ids", ()) or ())
+            if matched:
+                claim_sources_from_report[entry.claim_id] = set(matched)
+
+    if not claim_sources_from_report:
+        return {}
+
+    graph_evidence_by_sid: dict[str, Any] = {}
+    if evidence_store is not None:
+        for record in evidence_store.lookup(include_full_content=True):
+            sid = str(record.get("source_id") or "").strip()
+            if not sid:
+                continue
+            if getattr(evidence_store, "web_extraction_enabled", False) and not evidence_store.is_eligible_for_facts(sid):
+                continue
+            ge = build_graph_evidence(record, tenant_id=tenant_id, request_id=request_id)
+            if ge is not None:
+                graph_evidence_by_sid[sid] = ge
+
+    bindings: dict[str, PublicationBinding] = {}
+    for entry in ledger.entries:
+        published_sids = claim_sources_from_report.get(entry.claim_id)
+        if not published_sids:
+            continue
+        fingerprint = entry.fact_fingerprint(ledger.version) if hasattr(entry, "fact_fingerprint") else None
+        if not fingerprint:
+            continue
+        support_refs: list[EvidenceRef] = []
+        for sid in sorted(published_sids):
+            ge = graph_evidence_by_sid.get(sid)
+            if ge is None or not ge.fragments:
+                continue
+            frags = tuple(ge.fragments[:8])
+            support_refs.append(
+                EvidenceRef(
+                    request_id=request_id,
+                    source_id=sid,
+                    chunk_ids=tuple(frag.chunk_id for frag in frags),
+                    artifact_version=ge.artifact_version,
+                    content_sha256=evidence_digest(frags),
+                )
+            )
+        if support_refs:
+            bindings[entry.claim_id] = PublicationBinding(
+                ledger_version=int(ledger.version),
+                claim_id=entry.claim_id,
+                fact_fingerprint=fingerprint,
+                support=tuple(support_refs),
+                allowed=True,
+            )
+    return bindings
+

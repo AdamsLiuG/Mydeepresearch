@@ -1,7 +1,6 @@
 import json
 import sys
 import tempfile
-import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,16 +12,6 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
-
-hello_agents_stub = sys.modules.get("hello_agents") or types.ModuleType("hello_agents")
-
-
-class DummyToolAwareSimpleAgent:
-    pass
-
-
-hello_agents_stub.ToolAwareSimpleAgent = DummyToolAwareSimpleAgent
-sys.modules.setdefault("hello_agents", hello_agents_stub)
 
 from config import Configuration
 from metrics import RequestTrace
@@ -290,6 +279,21 @@ class DecayTests(StrategyUsageTestCase):
 
 
 class MaintenanceTests(StrategyUsageTestCase):
+    def test_partition_without_scope_never_updates_legacy_card_usage_or_decay(self):
+        service = self._service(idle_days=3)
+        strategy_id = "req-1::planning_pattern"
+        path = self._write_card(
+            strategy_id,
+            created_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        )
+        original = path.read_bytes()
+        service._config = service._config.model_copy(update={"v4_tenant_memory_partition_enabled": True})
+
+        self.assertEqual(service.record_card_hits([strategy_id]), 0)
+        self.assertEqual(service.archive_stale_cards(), [])
+        self.assertEqual(service.run_maintenance([strategy_id]), {"recorded_hits": 0, "archived": []})
+        self.assertEqual(path.read_bytes(), original)
+
     def test_maintenance_records_hits_and_archives_in_one_pass(self):
         service = self._service(idle_days=30)
         self._write_card("req-a::planning_pattern")

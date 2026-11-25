@@ -6,10 +6,12 @@ import ipaddress
 import json
 import logging
 import re
+import time
 import unicodedata
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
@@ -43,7 +45,10 @@ from prompts import (
     todo_planner_system_prompt,
 )
 from repair_orchestrator import RepairOrchestratorMixin
-from services.claim_verifier import ClaimVerificationOrchestrator
+from services.claim_verifier import (
+    ClaimVerificationOrchestrator,
+    build_verified_graph_candidates,
+)
 from services.context_builder import (
     ContextPrefixBuilder,
     PromptEnvelope,
@@ -79,18 +84,36 @@ from services.fact_ledger import (
     build_evidence_index_cards,
 )
 from services.hitl import HitlService
+from services.knowledge_graph import (
+    GraphEntity,
+    GraphQuery,
+    KnowledgeGraphService,
+    TerminalGraphSnapshot,
+    build_graph_store,
+    fact_fingerprint,
+    receipt_id_for,
+    seal_terminal_batch,
+    terminal_snapshot_to_payload,
+)
 from services.mcp_bridge import (
     MCPBridgeManager,
     MCPHitlApprovalRequired,
     ScopedToolRegistry,
 )
+from services.memory_sanitizer import sanitize_web_text
+from services.memory_scope import MemoryPolicy, valid_internal_id
 from services.multimodal_parser import MultimodalEvidenceParser
 from services.note_memory import NoteMemoryService
+from services.notes import ScopedNoteTool, ScopedNoteWorkspace
 from services.observability import LangfuseTraceAdapter
 from services.planner import PlanningService
 from services.policy_controller import build_policy_controller
 from services.reflection import ReflectionAssessment, ReflectionService
-from services.reporter import ReportingService, build_report_workbench_payload
+from services.reporter import (
+    ReportingService,
+    build_publication_bindings,
+    build_report_workbench_payload,
+)
 from services.request_state import SnapshotConflictError
 from services.reviewer import ReviewService
 from services.sandbox_executor import (
@@ -105,10 +128,16 @@ from services.skill_pack import (
     SkillSelection,
     apply_skill_pack_overrides,
 )
-from services.storage_backends import build_request_state_store
+from services.storage_backends import (
+    JsonStrictSnapshotReader,
+    PostgresRequestStateStore,
+    build_request_state_store,
+    build_strict_snapshot_reader,
+)
 from services.strategy_memory import StrategyMemoryService
 from services.strategy_synthesizer import StrategySynthesizer
 from services.summarizer import SummarizationService
+from services.tenant import TenantContext, authenticated_memory_scope
 from services.tool_events import ToolCallTracker
 from services.web_extractor import ExtractionContext
 from services.web_fetch_gateway import FetchScope
@@ -116,10 +145,13 @@ from state_manager import (
     BudgetDispatchDenied,
     ReportCancelled,
     RequestBudgetController,
+    RequestStateGraphAuthority,
     StateManagerMixin,
+    TenantSnapshotMemoryPolicy,
     materialize_report_event,
     public_report_workbench,
     public_v4_projection,
+    record_v4_graph_ack,
     report_chunks,
 )
 from stream_coordinator import StreamCoordinatorMixin
@@ -1124,6 +1156,15 @@ class DeepResearchAgent(
             self._refresh_scoped_tools_for_request()
         self._last_search_notices: list[str] = []
         self._request_trace: RequestTrace | None = None
+        self._memory_scope: Any | None = None
+        self._memory_policy: MemoryPolicy | None = None
+        self._snapshot_reader: Any | None = None
+        self._graph_store: Any | None = None
+        self._graph_authority: RequestStateGraphAuthority | None = None
+        self._graph_service: KnowledgeGraphService | None = None
+        self._graph_queries_used: int = 0
+        self._graph_deadline: float = 0.0
+        self._init_partitioned_memory_and_graph()
 
     # ------------------------------------------------------------------
     # Public API
@@ -1901,6 +1942,298 @@ class DeepResearchAgent(
                 close()
         self._workflow_checkpoint = checkpoint
         self._request_state_store = checkpoint.store
+        self._init_partitioned_memory_and_graph()
+
+    def _init_partitioned_memory_and_graph(self) -> None:
+        """Bind strict tenant partitions, scoped note workspace, and KnowledgeGraphService."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return
+        partition_enabled = bool(getattr(config, "v4_tenant_memory_partition_enabled", False))
+        graph_enabled = bool(
+            getattr(config, "knowledge_graph_enabled_for", lambda _: False)(self.tenant_id)
+        )
+        if not partition_enabled and not graph_enabled:
+            return
+        if not valid_internal_id(self.tenant_id) or not valid_internal_id(self.request_id):
+            return
+
+        store = getattr(self, "_request_state_store", None)
+        if isinstance(store, PostgresRequestStateStore):
+            self._snapshot_reader = build_strict_snapshot_reader(config, postgres_store=store)
+        elif store is not None and getattr(store, "_directory", None) is not None:
+            self._snapshot_reader = JsonStrictSnapshotReader(store._directory)
+        else:
+            self._snapshot_reader = build_strict_snapshot_reader(config)
+
+        scope = authenticated_memory_scope(
+            TenantContext(tenant_id=self.tenant_id, authenticated=True),
+            self.request_id,
+        )
+        if scope is None:
+            return
+        policy = TenantSnapshotMemoryPolicy(
+            tenant_id=self.tenant_id,
+            snapshot_reader=self._snapshot_reader,
+            active_request_id=self.request_id,
+        )
+        self._memory_scope = scope
+        self._memory_policy = policy
+
+        if partition_enabled:
+            self._evidence_memory = EvidenceMemoryService(
+                config, scope=scope, policy=policy, frozen_strict=True,
+            )
+            self._evidence_runtime = EvidenceRuntimeIndex(
+                config,
+                archive_loader=self._evidence_memory if self._evidence_memory.enabled else None,
+            )
+            if hasattr(self, "_evidence_store") and self._evidence_store is not None:
+                listeners = getattr(self._evidence_store, "_listeners", None)
+                if isinstance(listeners, list):
+                    listeners[:] = [
+                        item for item in listeners
+                        if not isinstance(item, (EvidenceMemoryService, EvidenceRuntimeIndex))
+                    ]
+                    listeners.append(self._evidence_runtime)
+                    if self._evidence_memory.enabled:
+                        listeners.append(self._evidence_memory)
+            self._note_memory = NoteMemoryService(
+                config, scope=scope, policy=policy, frozen_strict=True,
+            )
+            self._strategy_memory = StrategyMemoryService(
+                config,
+                synthesizer=self._strategy_synthesizer,
+                scope=scope,
+                policy=policy,
+                snapshot_reader=self._snapshot_reader,
+                frozen_strict=True,
+            )
+            if getattr(config, "enable_notes", False):
+                self.note_tool = ScopedNoteTool(
+                    ScopedNoteWorkspace(config.notes_workspace, scope, policy),
+                )
+                if getattr(self, "tools_registry", None) is not None:
+                    self.tools_registry.register_tool(self.note_tool)
+                    self._core_tools = [
+                        tool for tool in (
+                            self.search_web_tool,
+                            self.fetch_page_tool,
+                            self.evidence_lookup_tool,
+                            self.note_tool,
+                        )
+                        if tool is not None
+                    ]
+
+        if graph_enabled:
+            if self._graph_store is None:
+                self._graph_store = build_graph_store(config)
+            self._graph_authority = RequestStateGraphAuthority(
+                snapshot_reader=self._snapshot_reader,
+                policy=policy,
+                config=config,
+                active_evidence_store=getattr(self, "_evidence_store", None),
+                active_request_id=self.request_id,
+            )
+            self._graph_service = KnowledgeGraphService(
+                self._graph_store,
+                self._graph_authority,
+                min_entailment=config.v4_graph_min_entailment,
+                nli_entailment_threshold=max(config.nli_entailment_threshold, config.v4_graph_min_entailment),
+                max_candidates=config.v4_graph_max_candidates,
+                max_projection_tokens=config.v4_graph_max_projection_tokens,
+                query_timeout_ms=config.v4_graph_query_timeout_ms,
+                tenants=tuple(config.v4_knowledge_graph_tenants) or None,
+                metrics=metrics_registry,
+            )
+
+    @staticmethod
+    def _graph_seed_entities(seed_text: str) -> tuple[GraphEntity, ...]:
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,40}|[\u4e00-\u9fff]{2,20}", str(seed_text or ""))
+        seeds: list[GraphEntity] = []
+        seen: set[str] = set()
+        for raw in tokens:
+            cleaned = sanitize_web_text(raw, max_chars=80)
+            key = cleaned.casefold()
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            try:
+                seeds.append(GraphEntity(entity_type="organization", name=cleaned))
+            except ValueError:
+                continue
+            if len(seeds) >= 3:
+                break
+        return tuple(seeds)
+
+    def _query_graph_context(
+        self,
+        state: SummaryState,
+        *,
+        purpose: str,
+        seed_text: str,
+        max_bytes: int,
+    ) -> Any | None:
+        graph_service = getattr(self, "_graph_service", None)
+        memory_scope = getattr(self, "_memory_scope", None)
+        if graph_service is None or memory_scope is None:
+            return None
+        used = int(getattr(self, "_graph_queries_used", 0) or 0)
+        if used >= 8:
+            return None
+        # Reserve the final query slot and >=100ms budget exclusively for reporting.
+        if purpose != "report" and used >= 7:
+            return None
+        now = monotonic()
+        deadline = getattr(self, "_graph_deadline", 0.0) or (
+            now + max(0.1, float(self.config.v4_graph_request_timeout_ms or 300) / 1000.0)
+        )
+        remaining = deadline - now
+        if purpose != "report" and remaining <= 0.10:
+            return None
+        if remaining <= 0.01:
+            return None
+        seeds = self._graph_seed_entities(seed_text)
+        if not seeds:
+            return None
+        self._graph_queries_used = used + 1
+        try:
+            projection = graph_service.project(
+                memory_scope,
+                GraphQuery(seed_entities=seeds, max_hops=2, limit=6),
+                purpose=purpose,  # type: ignore[arg-type]
+                deadline=min(deadline, now + float(self.config.v4_graph_query_timeout_ms or 100) / 1000.0),
+                token_limit=max_bytes,
+            )
+            return projection if getattr(projection, "records", ()) else None
+        except Exception:
+            return None
+
+    def _graph_projection_for_task(self, state: SummaryState, task: TodoItem) -> Any | None:
+        return self._query_graph_context(
+            state,
+            purpose="task",
+            seed_text=f"{task.title} {task.intent} {state.research_topic}",
+            max_bytes=256,
+        )
+
+    def _seal_v4_knowledge_graph(
+        self,
+        state: SummaryState,
+        *,
+        request_status: str,
+    ) -> tuple[TerminalGraphSnapshot, Any] | None:
+        partition_enabled = bool(getattr(self.config, "v4_tenant_memory_partition_enabled", False))
+        if partition_enabled:
+            if state.v4 is None:
+                state.v4 = {"schema_version": 1}
+            state.v4["tenant_memory"] = {
+                "schema_version": 1,
+                "partition_enabled": True,
+                "tenant_id": getattr(self, "tenant_id", "default"),
+            }
+        graph_service = getattr(self, "_graph_service", None)
+        memory_scope = getattr(self, "_memory_scope", None)
+        if graph_service is None or memory_scope is None:
+            return None
+        if request_status not in {"success", "partial_success", "completed"}:
+            return None
+
+        ledger = FactLedger.from_dict(state.fact_ledger)
+        if not ledger.version and any(getattr(t, "status", "") == "completed" for t in state.todo_items):
+            ledger = FactLedgerCompactor().update_ledger(
+                ledger, state.todo_items, evidence_store=self._evidence_store,
+            )
+            state.fact_ledger = ledger.to_dict()
+
+        bindings = build_publication_bindings(
+            state,
+            evidence_store=self._evidence_store,
+            ledger=ledger,
+            request_id=self.request_id,
+            tenant_id=self.tenant_id,
+        )
+        candidates = build_verified_graph_candidates(
+            state,
+            scope=memory_scope,
+            evidence_store=self._evidence_store,
+            ledger=ledger,
+            publication_bindings=bindings,
+            min_entailment=self.config.v4_graph_min_entailment,
+            nli_entailment_threshold=self.config.nli_entailment_threshold,
+        )
+        active_receipt_ids = tuple(
+            receipt_id_for(
+                memory_scope,
+                candidate.ledger_version,
+                candidate.claim_id,
+                fact_fingerprint(candidate.ledger_version, candidate.statement, candidate.fact),
+            )
+            for candidate in candidates
+        )
+        source_epoch = max(1, int(getattr(state, "state_version", 0) or 0) + 1)
+        ledger_version = max(1, int(ledger.version or 1))
+        batch = seal_terminal_batch(
+            memory_scope,
+            candidates,
+            source_epoch=source_epoch,
+            ledger_version=ledger_version,
+            report_version=1,
+        )
+        terminal_snapshot = TerminalGraphSnapshot(
+            tenant_id=self.tenant_id,
+            request_id=self.request_id,
+            status="completed" if request_status == "success" else "partial_success",
+            policy_version=memory_scope.policy_version,
+            owner_epoch=memory_scope.owner_epoch,
+            batch=batch,
+            active_receipt_ids=active_receipt_ids,
+        )
+        if state.v4 is None:
+            state.v4 = {"schema_version": 1}
+        state.v4["knowledge_graph"] = {
+            "schema_version": 1,
+            "batch_id": batch.batch_id,
+            "digest": batch.digest,
+            "source_epoch": batch.source_epoch,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "ack_status": "pending",
+            "terminal_snapshot": terminal_snapshot_to_payload(terminal_snapshot),
+        }
+        return terminal_snapshot, batch
+
+    def _commit_v4_knowledge_graph_post_persist(
+        self,
+        sealed_pair: tuple[TerminalGraphSnapshot, Any] | None,
+    ) -> None:
+        graph_service = getattr(self, "_graph_service", None)
+        memory_scope = getattr(self, "_memory_scope", None)
+        if sealed_pair is None or graph_service is None or memory_scope is None:
+            return
+        terminal_snapshot, batch = sealed_pair
+        authority = getattr(self, "_graph_authority", None)
+        if authority is not None:
+            authority._active_snapshot = terminal_snapshot
+            authority._active_evidence_store = getattr(self, "_evidence_store", None)
+        deadline = time.monotonic() + max(0.1, float(self.config.v4_graph_request_timeout_ms or 300) / 1000.0)
+        result = graph_service.apply_terminal_batch(
+            memory_scope, batch.batch_id, deadline=deadline,
+        )
+        if result.outcome in {"applied", "duplicate", "volatile_applied"} and result.watermark is not None:
+            if getattr(self, "_request_state_store", None) is not None:
+                record_v4_graph_ack(
+                    self._request_state_store,
+                    tenant_id=self.tenant_id,
+                    request_id=self.request_id,
+                    batch_id=batch.batch_id,
+                    digest=batch.digest,
+                    revision=result.watermark.graph_revision,
+                    status=result.outcome,
+                )
+        else:
+            metrics_registry.record_v4_graph_pending(
+                "retry_deferred", "<1m", 1, tenant_id=self.tenant_id,
+            )
 
     def close_workflow(self) -> None:
         if self._owns_mcp_bridge and self._mcp_bridge is not None:
@@ -2129,6 +2462,11 @@ class DeepResearchAgent(
         }
         if active_verifiers and self._callable_accepts_kwarg(self.reviewer.review_request, "active_verifiers"):
             review_kwargs["active_verifiers"] = active_verifiers
+        review_graph = self._query_graph_context(
+            state, purpose="task", seed_text=state.research_topic or "", max_bytes=256,
+        )
+        if review_graph is not None and self._callable_accepts_kwarg(self.reviewer.review_request, "graph_context"):
+            review_kwargs["graph_context"] = review_graph
         review_summary = self.reviewer.review_request(state, **review_kwargs)
 
         if review_summary.get("overall_status") == "blocked":
@@ -2514,9 +2852,17 @@ class DeepResearchAgent(
         selection = getattr(self, "_skill_selection", None)
         fmt = getattr(selection, "format_pack", None) if selection is not None and not selection.shadow else None
         transport, pricing, usage = self._report_transport()
+        report_graph = self._query_graph_context(
+            state, purpose="report", seed_text=state.research_topic or "", max_bytes=512,
+        )
+        coord_kwargs: dict[str, Any] = {}
+        if report_graph is not None and self._callable_accepts_kwarg(
+            self.reporting.coordinate_report, "graph_context",
+        ):
+            coord_kwargs["graph_context"] = report_graph
         report = yield from self.reporting.coordinate_report(
             state, observer, self._skill_stage_context("report"), getattr(fmt, "outline_sections", None),
-            cp, transport, pricing, usage,
+            cp, transport, pricing, usage, **coord_kwargs,
         )
         workbench = public_report_workbench(state.report_workbench)
         cp.commit({"final": {"report_version": 1, "markdown": report, "workbench": workbench,
@@ -2587,6 +2933,10 @@ class DeepResearchAgent(
         versioned_report = False
         report_completed_event = None
         try:
+            self._graph_queries_used = 0
+            self._graph_deadline = monotonic() + max(
+                0.1, float(getattr(self.config, "v4_graph_request_timeout_ms", 300) or 300) / 1000.0,
+            )
             budget = self._init_request_budget(state, resumed=resumed)
             self._configure_web_extraction(state)
             versioned_report = isinstance((state.v4 or {}).get("report"), dict)
@@ -2639,12 +2989,20 @@ class DeepResearchAgent(
                     if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
                         budget.refuse("limit_exceeded")
                     historical_memory_context = self._planning_memory_context(state, observer)
+                    plan_graph = self._query_graph_context(
+                        state, purpose="plan", seed_text=state.research_topic or topic, max_bytes=256,
+                    )
+                    plan_kwargs: dict[str, Any] = {
+                        "observer": observer,
+                        "historical_memory_context": historical_memory_context,
+                        "strategy_memory_context": self._planning_strategy_context(state, observer),
+                        "skill_pack_context": self._skill_stage_context("planning"),
+                    }
+                    if plan_graph is not None and self._callable_accepts_kwarg(self.planner.plan_todo_list, "graph_context"):
+                        plan_kwargs["graph_context"] = plan_graph
                     state.todo_items = self.planner.plan_todo_list(
                         state,
-                        observer=observer,
-                        historical_memory_context=historical_memory_context,
-                        strategy_memory_context=self._planning_strategy_context(state, observer),
-                        skill_pack_context=self._skill_stage_context("planning"),
+                        **plan_kwargs,
                     )
                     completed_event = planning_span.complete(
                         status="success",
@@ -3133,11 +3491,18 @@ class DeepResearchAgent(
                     else:
                         if budget is not None and not budget.can_dispatch({"llm_calls": 1}):
                             budget.refuse("limit_exceeded")
+                        report_graph = self._query_graph_context(
+                            state, purpose="report", seed_text=state.research_topic or topic, max_bytes=512,
+                        )
                         if emit_stream and hasattr(self.reporting, "stream_generate_report"):
                             stream_kwargs: dict[str, Any] = {
                                 "observer": observer,
                                 "skill_pack_context": self._skill_stage_context("report"),
                             }
+                            if report_graph is not None and self._callable_accepts_kwarg(
+                                self.reporting.stream_generate_report, "graph_context",
+                            ):
+                                stream_kwargs["graph_context"] = report_graph
                             selection = getattr(self, "_skill_selection", None)
                             fmt_pack = getattr(selection, "format_pack", None) if selection is not None and not selection.shadow else None
                             fmt_outline = getattr(fmt_pack, "outline_sections", None) if fmt_pack is not None else None
@@ -3156,10 +3521,17 @@ class DeepResearchAgent(
                                 yield report_event
                             report = state.structured_report or ""
                         else:
+                            report_kwargs: dict[str, Any] = {
+                                "observer": observer,
+                                "skill_pack_context": self._skill_stage_context("report"),
+                            }
+                            if report_graph is not None and self._callable_accepts_kwarg(
+                                self.reporting.generate_report, "graph_context",
+                            ):
+                                report_kwargs["graph_context"] = report_graph
                             report = self.reporting.generate_report(
                                 state,
-                                observer=observer,
-                                skill_pack_context=self._skill_stage_context("report"),
+                                **report_kwargs,
                             )
                         if budget is not None and (not report.strip() or report == "报告生成失败，请检查输入。"):
                             budget.refuse("dispatch_unbounded")
@@ -3256,6 +3628,7 @@ class DeepResearchAgent(
             terminal_kwargs = {}
             if budget is not None and not budget.blocked:
                 terminal_kwargs["v4_events"] = [self._budget_event(budget, "completed")]
+            sealed_graph = self._seal_v4_knowledge_graph(state, request_status=request_status)
             if report_checkpoint is not None:
                 cp = report_checkpoint
                 report_frames.extend(terminal_kwargs.get("v4_events", ()))
@@ -3280,6 +3653,7 @@ class DeepResearchAgent(
                 report_markdown=report,
                 **terminal_kwargs,
             )
+            self._commit_v4_knowledge_graph_post_persist(sealed_graph)
             if report_checkpoint is not None:
                 state.structured_report = report
                 state.running_summary = report

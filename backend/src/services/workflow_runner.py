@@ -162,6 +162,17 @@ class WorkflowCheckpoint:
                     snapshot["v4"]["web_downstream_only"] = True
             if report is not None:
                 snapshot.setdefault("v4", {"schema_version": 1})["report"] = report
+            if getattr(config, "v4_tenant_memory_partition_enabled", False):
+                snapshot.setdefault("v4", {"schema_version": 1})["tenant_memory"] = {
+                    "schema_version": 1,
+                    "partition_enabled": True,
+                    "tenant_id": self.tenant_id,
+                }
+                from state_manager import _ensure_strict_snapshot_owner
+
+                _ensure_strict_snapshot_owner(
+                    config, self.store, tenant_id=self.tenant_id, request_id=self.request_id,
+                )
             return True
 
         return self._update(change)

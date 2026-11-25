@@ -6,12 +6,14 @@ import hmac
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import ceil
 from threading import Lock
 from typing import Any
 from uuid import uuid4
+
+from services.memory_scope import MemoryPolicy, MemoryScope, scope_is_current
 
 logger = logging.getLogger(__name__)
 
@@ -215,3 +217,37 @@ class TenantRateLimiter:
                 self._redis.zrem(self._redis_keys(tenant_id)[1], lease_id)
             except Exception as exc:
                 logger.warning("Redis rate limiter release failed (%s)", type(exc).__name__)
+
+
+def authenticated_memory_scope(
+    tenant: TenantContext, request_id: str, *, policy_version: int = 1,
+) -> MemoryScope | None:
+    """Bind scope to the tenant authentication result at the gateway."""
+    if not tenant.authenticated:
+        return None
+    try:
+        return MemoryScope.trusted(tenant.tenant_id, request_id, policy_version=policy_version)
+    except ValueError:
+        return None
+
+
+def verified_worker_memory_scope(
+    tenant_id: str, request_id: str, owner_epoch: int, *,
+    verify_owner: Callable[[MemoryScope], bool], policy_version: int = 1,
+) -> MemoryScope | None:
+    """Recheck current durable ownership through the trusted runner adapter."""
+    try:
+        scope = MemoryScope.trusted(tenant_id, request_id, owner_epoch=owner_epoch, policy_version=policy_version)
+        return scope if scope.owner_epoch is not None and verify_owner(scope) is True else None
+    except Exception:
+        return None
+
+
+def restored_memory_scope(
+    scope: MemoryScope | None, frozen: Any, *, policy: MemoryPolicy,
+) -> MemoryScope | None:
+    """Accept a frozen partition only when its trusted request owner and live policy agree."""
+    if not scope_is_current(policy, scope) or not isinstance(frozen, dict):
+        return None
+    expected = scope.frozen_partition()
+    return scope if all(frozen.get(key) == value for key, value in expected.items()) else None

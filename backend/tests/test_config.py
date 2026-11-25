@@ -479,3 +479,26 @@ class WebExtractionMetricsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_v4_graph_env_settings_are_bounded_and_deployment_only(monkeypatch):
+    from config import Configuration
+
+    monkeypatch.setenv("V4_TENANT_MEMORY_PARTITION_ENABLED", "true")
+    monkeypatch.setenv("V4_KNOWLEDGE_GRAPH_ENABLED", "true")
+    monkeypatch.setenv("V4_KNOWLEDGE_GRAPH_TENANTS", '["Example"]')
+    config = Configuration.from_env(load_env_file=False)
+    assert config.knowledge_graph_enabled_for("Example")
+    assert not config.knowledge_graph_enabled_for("example")
+    assert config.v4_graph_query_timeout_ms == 100
+    assert config.v4_graph_request_timeout_ms == 300
+    assert "v4_knowledge_graph_dir" not in config.model_dump()
+    assert "v4_knowledge_graph_tenants" not in config.model_dump()
+
+    monkeypatch.setenv("V4_KNOWLEDGE_GRAPH_TENANTS", '["Example","Example"]')
+    assert not Configuration.from_env(load_env_file=False).knowledge_graph_enabled_for("Example")
+    monkeypatch.setenv("V4_KNOWLEDGE_GRAPH_TENANTS", '["Example"]')
+    monkeypatch.setenv("V4_GRAPH_MIN_ENTAILMENT", "nan")
+    config = Configuration.from_env(load_env_file=False)
+    assert not config.knowledge_graph_enabled_for("Example")
+    assert config.v4_tenant_memory_partition_enabled
